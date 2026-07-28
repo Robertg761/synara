@@ -619,6 +619,18 @@ export function createWsNativeApi(): NativeApi {
         await transport.dispose();
         return result;
       },
+      // Owner-gated control plane over the socket: the packaged desktop renderer
+      // (origin synara://app) has an owner WS identity but no owner HTTP cookie.
+      mobileAccess: {
+        getStatus: () => transport.request(WS_METHODS.serverGetMobileAccessStatus),
+        listAccess: () => transport.request(WS_METHODS.serverListAuthAccess),
+        createPairingCredential: (input: AuthCreatePairingCredentialInput) =>
+          transport.request(WS_METHODS.serverCreateAuthPairingCredential, input),
+        revokePairingLink: (input: AuthRevokePairingLinkInput) =>
+          transport.request(WS_METHODS.serverRevokeAuthPairingLink, input),
+        revokeClientSession: (input: AuthRevokeClientSessionInput) =>
+          transport.request(WS_METHODS.serverRevokeAuthClientSession, input),
+      },
       listExternalMcpIntegrations: () =>
         transport.request(WS_METHODS.serverListExternalMcpIntegrations),
       createExternalMcpIntegration: (input: ExternalMcpCreateIntegrationInput) =>

@@ -44,6 +44,11 @@ export const DESKTOP_IPC_CHANNELS = {
     error: "desktop:appsnap-error",
     state: "desktop:appsnap-state",
   },
+  mobileAccess: {
+    read: "desktop:mobile-access-read",
+    apply: "desktop:mobile-access-apply",
+    pickRoot: "desktop:mobile-access-pick-root",
+  },
   browser: {
     state: "desktop:browser-state",
     open: "desktop:browser-open",
@@ -71,6 +76,7 @@ export const DESKTOP_IPC_CHANNELS = {
 } as const;
 
 export const BROWSER_IPC_CHANNELS = DESKTOP_IPC_CHANNELS.browser;
+export const MOBILE_ACCESS_IPC_CHANNELS = DESKTOP_IPC_CHANNELS.mobileAccess;
 export const APPSNAP_IPC_CHANNELS = DESKTOP_IPC_CHANNELS.appSnap;
 export const DESKTOP_WS_URL_CHANNEL = DESKTOP_IPC_CHANNELS.wsUrl;
 export const SERVER_TRANSCRIBE_VOICE_CHANNEL = DESKTOP_IPC_CHANNELS.transcribeVoice;

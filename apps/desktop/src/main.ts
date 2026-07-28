@@ -37,6 +37,7 @@ import type {
 } from "electron";
 import * as Effect from "effect/Effect";
 import type {
+  DesktopMobileAccessState,
   DesktopTheme,
   DesktopUpdateActionResult,
   DesktopUpdateState,
@@ -102,6 +103,14 @@ import {
   shouldRefreshIconCache,
 } from "./macIconCacheRefresh";
 import { collectMacUpdateDiagnostics } from "./macUpdateDiagnostics";
+import {
+  gateMobileAccessConfig,
+  isMobileAccessConfigInput,
+  mobileAccessBackendEnv,
+  readMobileAccessConfig,
+  resolveMobileAccessConfigPath,
+  writeMobileAccessConfig,
+} from "./mobileAccessConfig";
 import { openInitialBackendWindow } from "./initialBackendWindowOpen";
 import { shouldAllowMediaPermissionRequest } from "./mediaPermissions";
 import {
@@ -2976,6 +2985,29 @@ function configureAutoUpdater(): void {
 
   scheduleUpdatePoll();
 }
+function mobileAccessConfigPath(): string {
+  return resolveMobileAccessConfigPath(app.getPath("userData"));
+}
+
+/**
+ * Only an unpackaged (development) build may bind the plaintext listener to a
+ * private LAN interface. Release publishes exclusively through the operator's
+ * system-trusted HTTPS endpoint.
+ */
+function isPrivateLanModeAvailable(): boolean {
+  return !app.isPackaged;
+}
+
+function readDesktopMobileAccessState(): DesktopMobileAccessState {
+  const configPath = mobileAccessConfigPath();
+  const privateLanAvailable = isPrivateLanModeAvailable();
+  return {
+    config: gateMobileAccessConfig(readMobileAccessConfig(configPath), { privateLanAvailable }),
+    privateLanAvailable,
+    configPath,
+  };
+}
+
 // Builds process-local Node args so provider/tool children do not inherit Synara's heap guard.
 function backendNodeArgs(): string[] {
   const configuredMaxOldSpaceMb =
@@ -3005,6 +3037,12 @@ function backendEnv(): NodeJS.ProcessEnv {
     SYNARA_HOME: BASE_DIR,
     SYNARA_AUTH_TOKEN: backendAuthToken,
     SYNARA_DESKTOP_SHUTDOWN_TOKEN: DESKTOP_BACKEND_SHUTDOWN_TOKEN,
+    // Explicit handoff: the backend reads the approved roots from this file, so
+    // neither the roots nor the published URL travel through the environment.
+    ...mobileAccessBackendEnv({
+      configPath: mobileAccessConfigPath(),
+      privateLanAvailable: isPrivateLanModeAvailable(),
+    }),
   };
   // The backend runs the same login-shell probe at startup and does not begin listening
   // until it returns, so an unmarked child serializes a second ~1s hydration behind ours.
@@ -3214,6 +3252,27 @@ async function restartBackendAfterCrash(
 
   startBackend(trigger);
   ensureInitialBackendWindowOpen(backendHttpUrl);
+}
+
+/**
+ * Operator-initiated restart after a settings change. Deliberately separate from
+ * `scheduleBackendRestart`/`restartBackendAfterCrash`: it must not consume the
+ * crash budget, present the give-up dialog, or leave a restart timer pending.
+ */
+async function restartBackendForConfigurationChange(reason: string): Promise<boolean> {
+  if (isQuitting || desktopStartupBlockedForMigrationRecovery) return false;
+  if (restartTimer !== null) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
+  }
+  cancelBackendReadinessWait();
+  await stopBackendAndWaitForExit();
+  // "lifecycle" clears the crash backoff and circuit breaker, so a deliberate
+  // restart always starts from a full budget instead of inheriting one.
+  await reserveBackendEndpoint(reason);
+  startBackend("lifecycle");
+  ensureInitialBackendWindowOpen(backendHttpUrl);
+  return true;
 }
 
 /**
@@ -3508,6 +3567,46 @@ function registerIpcHandlers(): void {
         });
     if (result.canceled) return null;
     return result.filePaths[0] ?? null;
+  });
+
+  ipcMain.removeHandler(IPC.mobileAccess.read);
+  ipcMain.handle(IPC.mobileAccess.read, async () => readDesktopMobileAccessState());
+
+  ipcMain.removeHandler(IPC.mobileAccess.apply);
+  ipcMain.handle(IPC.mobileAccess.apply, async (_event, input: unknown) => {
+    if (!isMobileAccessConfigInput(input)) {
+      throw new Error("Invalid mobile access configuration.");
+    }
+    const privateLanAvailable = isPrivateLanModeAvailable();
+    // Never log the config: it names the owner's approved directories.
+    const config = writeMobileAccessConfig(mobileAccessConfigPath(), input, {
+      privateLanAvailable,
+    });
+    try {
+      const restarted = await restartBackendForConfigurationChange(
+        "mobile access configuration changed",
+      );
+      return { config, restarted };
+    } catch (error) {
+      return { config, restarted: false, error: formatErrorMessage(error) };
+    }
+  });
+
+  ipcMain.removeHandler(IPC.mobileAccess.pickRoot);
+  ipcMain.handle(IPC.mobileAccess.pickRoot, async () => {
+    const owner = BrowserWindow.getFocusedWindow() ?? mainWindow;
+    const options = { properties: ["openDirectory", "createDirectory"] as const };
+    const result = owner
+      ? await dialog.showOpenDialog(owner, { properties: [...options.properties] })
+      : await dialog.showOpenDialog({ properties: [...options.properties] });
+    if (result.canceled) return null;
+    const picked = result.filePaths[0];
+    if (!picked) return null;
+    try {
+      return FS.realpathSync(picked);
+    } catch {
+      return picked;
+    }
   });
 
   ipcMain.removeHandler(IPC.saveFile);

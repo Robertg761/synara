@@ -18,6 +18,7 @@ export const SETTINGS_SECTION_IDS = [
   "skills",
   "usage",
   "integrations",
+  "mobile",
   "advanced",
 ] as const;
 
@@ -127,6 +128,14 @@ export const SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = [
     description: "Give Codex, Claude, and other local agents scoped access to Synara tasks.",
     icon: "plugin-1",
     eyebrow: "External agents",
+  },
+  {
+    id: "mobile",
+    group: "integrations",
+    label: "Mobile access",
+    description: "Pair the Synara iOS app and choose the folders it may reach.",
+    icon: "phone-dynamic-island",
+    eyebrow: "Paired devices",
   },
   {
     id: "providers",
