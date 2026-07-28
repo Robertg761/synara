@@ -1,0 +1,8 @@
+{
+  "type": "subscribe",
+  "subscriptionId": "99999999-9999-4999-8999-999999999999",
+  "stream": "orchestration.shell",
+  "params": {
+    "sinceSequence": 1024
+  }
+}

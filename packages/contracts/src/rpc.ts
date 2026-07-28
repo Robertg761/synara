@@ -22,6 +22,14 @@ import {
   AutomationStreamEvent,
   AutomationUpdateInput,
 } from "./automation";
+import {
+  AuthAccessSnapshot,
+  AuthCreatePairingCredentialInput,
+  AuthPairingCredentialResult,
+  AuthRevokeClientSessionInput,
+  AuthRevokePairingLinkInput,
+  AuthRevokeResult,
+} from "./auth";
 import { OpenInEditorInput } from "./editor";
 import {
   ExternalMcpCreateIntegrationInput,
@@ -90,6 +98,7 @@ import {
   PullRequestsUnavailableError,
 } from "./pullRequests";
 import { KeybindingRule } from "./keybindings";
+import { MobileAccessStatus } from "./mobile";
 import {
   ClientOrchestrationCommand,
   ORCHESTRATION_WS_METHODS,
@@ -744,6 +753,44 @@ export const WsServerRefreshExternalMcpPairingRpc = Rpc.make(
   },
 );
 
+// Owner-gated mobile-access control plane. Served over the WebSocket because the
+// packaged desktop renderer has an owner WS identity but no owner HTTP cookie.
+export const WsServerGetMobileAccessStatusRpc = Rpc.make(WS_METHODS.serverGetMobileAccessStatus, {
+  payload: Schema.Struct({}),
+  success: MobileAccessStatus,
+  error: WsRpcError,
+});
+
+export const WsServerListAuthAccessRpc = Rpc.make(WS_METHODS.serverListAuthAccess, {
+  payload: Schema.Struct({}),
+  success: AuthAccessSnapshot,
+  error: WsRpcError,
+});
+
+export const WsServerCreateAuthPairingCredentialRpc = Rpc.make(
+  WS_METHODS.serverCreateAuthPairingCredential,
+  {
+    payload: AuthCreatePairingCredentialInput,
+    success: AuthPairingCredentialResult,
+    error: WsRpcError,
+  },
+);
+
+export const WsServerRevokeAuthPairingLinkRpc = Rpc.make(WS_METHODS.serverRevokeAuthPairingLink, {
+  payload: AuthRevokePairingLinkInput,
+  success: AuthRevokeResult,
+  error: WsRpcError,
+});
+
+export const WsServerRevokeAuthClientSessionRpc = Rpc.make(
+  WS_METHODS.serverRevokeAuthClientSession,
+  {
+    payload: AuthRevokeClientSessionInput,
+    success: AuthRevokeResult,
+    error: WsRpcError,
+  },
+);
+
 export const WsServerListWorktreesRpc = Rpc.make(WS_METHODS.serverListWorktrees, {
   payload: Schema.Struct({}),
   success: ServerListWorktreesResult,
@@ -1059,6 +1106,11 @@ export const WsFeatureRpcGroup = RpcGroup.make(
   WsServerCreateExternalMcpIntegrationRpc,
   WsServerRevokeExternalMcpIntegrationRpc,
   WsServerRefreshExternalMcpPairingRpc,
+  WsServerGetMobileAccessStatusRpc,
+  WsServerListAuthAccessRpc,
+  WsServerCreateAuthPairingCredentialRpc,
+  WsServerRevokeAuthPairingLinkRpc,
+  WsServerRevokeAuthClientSessionRpc,
   WsServerListWorktreesRpc,
   WsServerListLocalServersRpc,
   WsServerStopLocalServerRpc,

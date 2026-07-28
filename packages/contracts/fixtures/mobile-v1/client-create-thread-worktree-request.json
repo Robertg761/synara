@@ -1,0 +1,26 @@
+{
+  "type": "request",
+  "requestId": "88888888-8888-4888-8888-888888888888",
+  "method": "workspaceThread.createAndStart",
+  "params": {
+    "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "projectId": "33333333-3333-4333-8333-333333333333",
+    "target": {
+      "mode": "worktree",
+      "baseRef": "main"
+    },
+    "title": "Fix the mobile sync gap",
+    "modelSelection": {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "options": {
+        "reasoningEffort": "high"
+      }
+    },
+    "runtimeMode": "approval-required",
+    "interactionMode": "plan",
+    "firstMessage": {
+      "text": "Fix the mobile sync gap."
+    }
+  }
+}

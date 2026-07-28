@@ -1,6 +1,19 @@
 import { Schema } from "effect";
 
 import { AuthSessionId, TrimmedNonEmptyString } from "./baseSchemas";
+import { MOBILE_AUTH_AUDIENCE } from "./mobile";
+
+/** Browser/desktop audience. Everything issued before audiences existed is this. */
+export const INTERACTIVE_AUTH_AUDIENCE = "interactive";
+
+/**
+ * Audiences partition credentials by transport. A credential minted for one
+ * audience must be rejected by every route that serves another, so the value
+ * travels on the pairing link, on the session row, and inside the signed
+ * WebSocket ticket claims.
+ */
+export const AuthAudience = Schema.Literals([INTERACTIVE_AUTH_AUDIENCE, MOBILE_AUTH_AUDIENCE]);
+export type AuthAudience = typeof AuthAudience.Type;
 
 export const ServerAuthPolicy = Schema.Literals([
   "desktop-managed-local",
@@ -63,17 +76,26 @@ export const AuthLogoutResult = Schema.Struct({
 });
 export type AuthLogoutResult = typeof AuthLogoutResult.Type;
 
+/** The only shape that ever carries the raw credential, returned once at creation. */
 export const AuthPairingCredentialResult = Schema.Struct({
   id: TrimmedNonEmptyString,
   credential: TrimmedNonEmptyString,
+  credentialHint: TrimmedNonEmptyString,
+  audience: AuthAudience,
   label: Schema.optionalKey(TrimmedNonEmptyString),
   expiresAt: Schema.DateTimeUtc,
 });
 export type AuthPairingCredentialResult = typeof AuthPairingCredentialResult.Type;
 
+/**
+ * Listings never carry the credential: it is stored only as a keyed digest.
+ * `credentialHint` is a short non-secret prefix that lets an owner recognize a
+ * pairing link they just created without being able to replay it.
+ */
 export const AuthPairingLink = Schema.Struct({
   id: TrimmedNonEmptyString,
-  credential: TrimmedNonEmptyString,
+  credentialHint: TrimmedNonEmptyString,
+  audience: AuthAudience,
   role: AuthSessionRole,
   subject: TrimmedNonEmptyString,
   label: Schema.optionalKey(TrimmedNonEmptyString),
@@ -105,6 +127,7 @@ export const AuthClientSession = Schema.Struct({
   sessionId: AuthSessionId,
   subject: TrimmedNonEmptyString,
   role: AuthSessionRole,
+  audience: AuthAudience,
   method: ServerAuthSessionMethod,
   client: AuthClientMetadata,
   issuedAt: Schema.DateTimeUtc,
@@ -121,6 +144,11 @@ export const AuthAccessSnapshot = Schema.Struct({
 });
 export type AuthAccessSnapshot = typeof AuthAccessSnapshot.Type;
 
+export const AuthRevokeResult = Schema.Struct({
+  revoked: Schema.Boolean,
+});
+export type AuthRevokeResult = typeof AuthRevokeResult.Type;
+
 export const AuthRevokePairingLinkInput = Schema.Struct({
   id: TrimmedNonEmptyString,
 });
@@ -133,6 +161,7 @@ export type AuthRevokeClientSessionInput = typeof AuthRevokeClientSessionInput.T
 
 export const AuthCreatePairingCredentialInput = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),
+  audience: Schema.optionalKey(AuthAudience),
 });
 export type AuthCreatePairingCredentialInput = typeof AuthCreatePairingCredentialInput.Type;
 

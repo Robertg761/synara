@@ -1,0 +1,10 @@
+{
+  "type": "failure",
+  "requestId": "88888888-8888-4888-8888-888888888888",
+  "method": "projects.listDirectories",
+  "error": {
+    "code": "path_not_authorized",
+    "message": "The requested path resolves outside every owner-approved workspace root.",
+    "retryable": false
+  }
+}

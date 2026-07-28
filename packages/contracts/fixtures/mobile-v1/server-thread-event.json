@@ -1,0 +1,25 @@
+{
+  "type": "event",
+  "subscriptionId": "99999999-9999-4999-8999-999999999999",
+  "stream": "orchestration.thread",
+  "event": {
+    "sequence": 1043,
+    "eventId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    "aggregateKind": "thread",
+    "aggregateId": "44444444-4444-4444-8444-444444444444",
+    "occurredAt": "2026-01-01T00:05:00.000Z",
+    "commandId": "66666666-6666-4666-8666-666666666666",
+    "causationEventId": null,
+    "correlationId": null,
+    "metadata": {},
+    "type": "thread.turn-start-requested",
+    "payload": {
+      "threadId": "44444444-4444-4444-8444-444444444444",
+      "messageId": "55555555-5555-4555-8555-555555555555",
+      "dispatchMode": "queue",
+      "runtimeMode": "full-access",
+      "interactionMode": "default",
+      "createdAt": "2026-01-01T00:05:00.000Z"
+    }
+  }
+}

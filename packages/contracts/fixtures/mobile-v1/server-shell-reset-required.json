@@ -1,0 +1,7 @@
+{
+  "type": "reset-required",
+  "subscriptionId": "99999999-9999-4999-8999-999999999999",
+  "stream": "orchestration.shell",
+  "reason": "stream-overflow",
+  "message": "Replay exceeded the durable event window; resubscribe for a fresh snapshot."
+}

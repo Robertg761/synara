@@ -1,0 +1,9 @@
+{
+  "type": "subscribe",
+  "subscriptionId": "99999999-9999-4999-8999-999999999999",
+  "stream": "orchestration.thread",
+  "params": {
+    "threadId": "44444444-4444-4444-8444-444444444444",
+    "sinceSequence": 1040
+  }
+}

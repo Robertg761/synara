@@ -1,4 +1,5 @@
 import type {
+  AuthAccessSnapshot,
   AuthBearerBootstrapResult,
   AuthBootstrapInput,
   AuthBootstrapResult,
@@ -9,6 +10,7 @@ import type {
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
+  AuthRevokeResult,
   AuthSessionState,
   AuthWebSocketTokenResult,
 } from "./auth";
@@ -180,6 +182,7 @@ import type {
   OrchestrationThreadStreamItem,
 } from "./orchestration";
 import type { EditorId } from "./editor";
+import type { MobileAccessConfig, MobileAccessStatus } from "./mobile";
 import type { ThreadId } from "./baseSchemas";
 import type {
   ProviderComposerCapabilities,
@@ -451,6 +454,20 @@ export interface DesktopWindowState {
   isFullscreen: boolean;
 }
 
+/** What the desktop shell knows about mobile access without asking the backend. */
+export interface DesktopMobileAccessState {
+  readonly config: MobileAccessConfig;
+  /** Development builds only. Release never offers the plaintext private-LAN bind. */
+  readonly privateLanAvailable: boolean;
+  readonly configPath: string;
+}
+
+export interface DesktopMobileAccessApplyResult {
+  readonly config: MobileAccessConfig;
+  readonly restarted: boolean;
+  readonly error?: string;
+}
+
 export interface SynaraStorageSnapshot {
   readonly version: 1;
   readonly exportedAt: string;
@@ -521,6 +538,17 @@ export interface DesktopBridge {
   storageMigration: {
     readSnapshot: () => SynaraStorageSnapshot | null;
     acknowledgeSnapshot: () => Promise<void>;
+  };
+  /**
+   * Present only in the packaged/dev desktop shell. Standalone web users get a
+   * read-only status view plus CLI guidance instead.
+   */
+  mobileAccess?: {
+    read: () => Promise<DesktopMobileAccessState>;
+    /** Persists the config (0600) and deliberately restarts the backend. */
+    apply: (input: MobileAccessConfig) => Promise<DesktopMobileAccessApplyResult>;
+    /** Native folder picker returning a canonical absolute path. */
+    pickRoot: () => Promise<string | null>;
   };
   server?: {
     transcribeVoice: (
@@ -657,6 +685,20 @@ export interface NativeApi {
     revokeAuthClient: (input: AuthRevokeClientSessionInput) => Promise<{ revoked: boolean }>;
     revokeOtherAuthClients: () => Promise<{ revokedCount: number }>;
     logoutAuthSession: () => Promise<AuthLogoutResult>;
+    /**
+     * Owner-gated mobile access control plane, served over the WebSocket so the
+     * packaged desktop renderer can use its owner WS identity instead of an
+     * owner HTTP cookie it does not have.
+     */
+    mobileAccess: {
+      getStatus: () => Promise<MobileAccessStatus>;
+      listAccess: () => Promise<AuthAccessSnapshot>;
+      createPairingCredential: (
+        input: AuthCreatePairingCredentialInput,
+      ) => Promise<AuthPairingCredentialResult>;
+      revokePairingLink: (input: AuthRevokePairingLinkInput) => Promise<AuthRevokeResult>;
+      revokeClientSession: (input: AuthRevokeClientSessionInput) => Promise<AuthRevokeResult>;
+    };
     listExternalMcpIntegrations: () => Promise<ReadonlyArray<ExternalMcpIntegration>>;
     createExternalMcpIntegration: (
       input: ExternalMcpCreateIntegrationInput,

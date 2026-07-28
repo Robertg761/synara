@@ -2,6 +2,11 @@ import { Schema, Struct } from "effect";
 import { NonNegativeInt, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas";
 
 import {
+  AuthCreatePairingCredentialInput,
+  AuthRevokeClientSessionInput,
+  AuthRevokePairingLinkInput,
+} from "./auth";
+import {
   AutomationCancelRunInput,
   AutomationArchiveRunInput,
   AutomationCreateInput,
@@ -206,6 +211,11 @@ export const WS_METHODS = {
   serverCreateExternalMcpIntegration: "server.createExternalMcpIntegration",
   serverRevokeExternalMcpIntegration: "server.revokeExternalMcpIntegration",
   serverRefreshExternalMcpPairing: "server.refreshExternalMcpPairing",
+  serverGetMobileAccessStatus: "server.getMobileAccessStatus",
+  serverListAuthAccess: "server.listAuthAccess",
+  serverCreateAuthPairingCredential: "server.createAuthPairingCredential",
+  serverRevokeAuthPairingLink: "server.revokeAuthPairingLink",
+  serverRevokeAuthClientSession: "server.revokeAuthClientSession",
   serverListWorktrees: "server.listWorktrees",
   serverListLocalServers: "server.listLocalServers",
   serverStopLocalServer: "server.stopLocalServer",
@@ -380,6 +390,11 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(WS_METHODS.serverCreateExternalMcpIntegration, ExternalMcpCreateIntegrationInput),
   tagRequestBody(WS_METHODS.serverRevokeExternalMcpIntegration, ExternalMcpRevokeIntegrationInput),
   tagRequestBody(WS_METHODS.serverRefreshExternalMcpPairing, ExternalMcpRefreshPairingInput),
+  tagRequestBody(WS_METHODS.serverGetMobileAccessStatus, Schema.Struct({})),
+  tagRequestBody(WS_METHODS.serverListAuthAccess, Schema.Struct({})),
+  tagRequestBody(WS_METHODS.serverCreateAuthPairingCredential, AuthCreatePairingCredentialInput),
+  tagRequestBody(WS_METHODS.serverRevokeAuthPairingLink, AuthRevokePairingLinkInput),
+  tagRequestBody(WS_METHODS.serverRevokeAuthClientSession, AuthRevokeClientSessionInput),
   tagRequestBody(WS_METHODS.serverListWorktrees, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverListLocalServers, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverStopLocalServer, ServerStopLocalServerInput),

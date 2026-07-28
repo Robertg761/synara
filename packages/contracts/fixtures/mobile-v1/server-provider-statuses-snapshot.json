@@ -1,0 +1,19 @@
+{
+  "type": "snapshot",
+  "subscriptionId": "99999999-9999-4999-8999-999999999999",
+  "stream": "provider.statuses",
+  "snapshot": {
+    "providers": [
+      {
+        "provider": "codex",
+        "displayName": "Codex",
+        "available": true,
+        "authStatus": "authenticated",
+        "defaultModel": "gpt-5.5",
+        "supportsAutoRuntimeMode": true,
+        "checkedAt": "2026-01-01T00:05:00.000Z"
+      }
+    ],
+    "updatedAt": "2026-01-01T00:05:00.000Z"
+  }
+}

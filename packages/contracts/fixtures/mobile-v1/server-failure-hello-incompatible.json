@@ -1,0 +1,10 @@
+{
+  "type": "failure",
+  "requestId": null,
+  "method": null,
+  "error": {
+    "code": "protocol_incompatible",
+    "message": "This Synara server speaks mobile.v1 revision 1 only. Update the iOS app.",
+    "retryable": false
+  }
+}

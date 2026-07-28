@@ -1,0 +1,24 @@
+{
+  "type": "success",
+  "requestId": "88888888-8888-4888-8888-888888888888",
+  "method": "git.listBranches",
+  "result": {
+    "projectId": "33333333-3333-4333-8333-333333333333",
+    "branches": [
+      {
+        "name": "main",
+        "current": true,
+        "isDefault": true,
+        "worktreePath": null
+      },
+      {
+        "name": "codex/mobile-v1",
+        "current": false,
+        "isDefault": false,
+        "worktreePath": null
+      }
+    ],
+    "isRepo": true,
+    "hasOriginRemote": true
+  }
+}

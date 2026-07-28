@@ -1,0 +1,56 @@
+{
+  "type": "success",
+  "requestId": "88888888-8888-4888-8888-888888888888",
+  "method": "workspaceThread.createAndStart",
+  "result": {
+    "status": "completed",
+    "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "threadId": "44444444-4444-4444-8444-444444444444",
+    "messageId": "55555555-5555-4555-8555-555555555555",
+    "commandId": "66666666-6666-4666-8666-666666666666",
+    "acceptedSequence": 1042,
+    "thread": {
+      "id": "44444444-4444-4444-8444-444444444444",
+      "projectId": "33333333-3333-4333-8333-333333333333",
+      "title": "Fix the mobile sync gap",
+      "modelSelection": {
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "options": {
+          "reasoningEffort": "high"
+        }
+      },
+      "runtimeMode": "full-access",
+      "interactionMode": "default",
+      "envMode": "local",
+      "branch": null,
+      "worktreePath": null,
+      "workingDirectory": null,
+      "associatedWorktreePath": null,
+      "associatedWorktreeBranch": null,
+      "associatedWorktreeRef": null,
+      "createBranchFlowCompleted": false,
+      "isPinned": false,
+      "parentThreadId": null,
+      "creationSource": null,
+      "sourceThreadId": null,
+      "sourceTurnId": null,
+      "gatewayOperationId": null,
+      "gatewayOperationIndex": null,
+      "subagentAgentId": null,
+      "subagentNickname": null,
+      "subagentRole": null,
+      "forkSourceThreadId": null,
+      "sidechatSourceThreadId": null,
+      "lastKnownPr": null,
+      "latestTurn": null,
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:05:00.000Z",
+      "archivedAt": null,
+      "handoff": null,
+      "session": null
+    },
+    "worktree": null,
+    "updatedAt": "2026-01-01T00:05:00.000Z"
+  }
+}

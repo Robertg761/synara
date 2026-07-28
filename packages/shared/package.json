@@ -232,6 +232,14 @@
       "types": "./src/unifiedPatchStats.ts",
       "import": "./src/unifiedPatchStats.ts"
     },
+    "./mobileAccess": {
+      "types": "./src/mobileAccess.ts",
+      "import": "./src/mobileAccess.ts"
+    },
+    "./mobilePairing": {
+      "types": "./src/mobilePairing.ts",
+      "import": "./src/mobilePairing.ts"
+    },
     "./providerDeliveryBlock": {
       "types": "./src/providerDeliveryBlock.ts",
       "import": "./src/providerDeliveryBlock.ts"

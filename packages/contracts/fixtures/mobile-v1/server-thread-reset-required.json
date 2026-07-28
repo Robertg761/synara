@@ -1,0 +1,7 @@
+{
+  "type": "reset-required",
+  "subscriptionId": "99999999-9999-4999-8999-999999999999",
+  "stream": "orchestration.thread",
+  "reason": "unknown-event",
+  "message": "Received an event discriminator this client build cannot apply."
+}

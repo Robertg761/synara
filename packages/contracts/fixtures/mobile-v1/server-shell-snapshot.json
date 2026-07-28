@@ -1,0 +1,73 @@
+{
+  "type": "snapshot",
+  "subscriptionId": "99999999-9999-4999-8999-999999999999",
+  "stream": "orchestration.shell",
+  "snapshot": {
+    "snapshotSequence": 1040,
+    "spaces": [],
+    "projects": [
+      {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "kind": "project",
+        "title": "Synara",
+        "workspaceRoot": "/Users/tester/Developer/synara",
+        "defaultModelSelection": {
+          "provider": "codex",
+          "model": "gpt-5.5",
+          "options": {
+            "reasoningEffort": "high"
+          }
+        },
+        "scripts": [],
+        "isPinned": false,
+        "spaceId": null,
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:05:00.000Z"
+      }
+    ],
+    "threads": [
+      {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "projectId": "33333333-3333-4333-8333-333333333333",
+        "title": "Fix the mobile sync gap",
+        "modelSelection": {
+          "provider": "codex",
+          "model": "gpt-5.5",
+          "options": {
+            "reasoningEffort": "high"
+          }
+        },
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "envMode": "local",
+        "branch": null,
+        "worktreePath": null,
+        "workingDirectory": null,
+        "associatedWorktreePath": null,
+        "associatedWorktreeBranch": null,
+        "associatedWorktreeRef": null,
+        "createBranchFlowCompleted": false,
+        "isPinned": false,
+        "parentThreadId": null,
+        "creationSource": null,
+        "sourceThreadId": null,
+        "sourceTurnId": null,
+        "gatewayOperationId": null,
+        "gatewayOperationIndex": null,
+        "subagentAgentId": null,
+        "subagentNickname": null,
+        "subagentRole": null,
+        "forkSourceThreadId": null,
+        "sidechatSourceThreadId": null,
+        "lastKnownPr": null,
+        "latestTurn": null,
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:05:00.000Z",
+        "archivedAt": null,
+        "handoff": null,
+        "session": null
+      }
+    ],
+    "updatedAt": "2026-01-01T00:05:00.000Z"
+  }
+}
