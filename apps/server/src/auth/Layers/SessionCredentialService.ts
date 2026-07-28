@@ -1,4 +1,10 @@
-import { AuthSessionId, type AuthClientMetadata, type AuthClientSession } from "@synara/contracts";
+import {
+  AuthAudience,
+  AuthSessionId,
+  INTERACTIVE_AUTH_AUDIENCE,
+  type AuthClientMetadata,
+  type AuthClientSession,
+} from "@synara/contracts";
 import * as Crypto from "node:crypto";
 import {
   Clock,
@@ -56,10 +62,13 @@ const SessionClaims = Schema.Struct({
 });
 type SessionClaims = typeof SessionClaims.Type;
 
+// v3 adds `aud`. Tickets are single-use, in-memory, and minutes-lived, so the
+// one-time invalidation of in-flight v2 tickets on upgrade costs a reconnect.
 const WebSocketClaims = Schema.Struct({
-  v: Schema.Literal(2),
+  v: Schema.Literal(3),
   kind: Schema.Literal("websocket"),
   sid: AuthSessionId,
+  aud: AuthAudience,
   jti: Schema.String,
   iat: Schema.Number,
   exp: Schema.Number,
@@ -112,6 +121,7 @@ type ActiveConnections = ReadonlyMap<AuthSessionId, ReadonlyMap<string, Effect.E
 
 interface OutstandingWebSocketTicket {
   readonly sessionId: AuthSessionId;
+  readonly audience: AuthAudience;
   readonly expiresAtMillis: number;
 }
 
@@ -154,6 +164,7 @@ export const makeSessionCredentialService = Effect.gen(function* () {
           sessionId: row.value.sessionId,
           subject: row.value.subject,
           role: row.value.role,
+          audience: row.value.audience,
           method: row.value.method,
           client: toClientMetadata(row.value.client),
           issuedAt: row.value.issuedAt,
@@ -315,6 +326,7 @@ export const makeSessionCredentialService = Effect.gen(function* () {
       const issuedAt = yield* DateTime.now;
       const expiresAt = DateTime.addDuration(issuedAt, input?.ttl ?? DEFAULT_SESSION_TTL);
       const client = input?.client ?? createDefaultClientMetadata();
+      const audience = input?.audience ?? INTERACTIVE_AUTH_AUDIENCE;
       const claims: SessionClaims = {
         v: 1,
         kind: "session",
@@ -332,6 +344,7 @@ export const makeSessionCredentialService = Effect.gen(function* () {
         sessionId,
         subject: claims.sub,
         role: claims.role,
+        audience,
         method: claims.method,
         client: {
           label: client.label ?? null,
@@ -349,6 +362,7 @@ export const makeSessionCredentialService = Effect.gen(function* () {
           sessionId,
           subject: claims.sub,
           role: claims.role,
+          audience,
           method: claims.method,
           client,
           issuedAt,
@@ -361,6 +375,7 @@ export const makeSessionCredentialService = Effect.gen(function* () {
       return {
         sessionId,
         token: `${encodedPayload}.${signature}`,
+        audience,
         method: claims.method,
         client,
         expiresAt,
@@ -398,6 +413,9 @@ export const makeSessionCredentialService = Effect.gen(function* () {
       return {
         sessionId: claims.sid,
         token,
+        // Read from the row, never from the token: adding a claim would have
+        // invalidated every live browser session for no security gain.
+        audience: row.value.audience,
         method: claims.method,
         client: toClientMetadata(row.value.client),
         expiresAt: DateTime.makeUnsafe(claims.exp),
@@ -469,16 +487,21 @@ export const makeSessionCredentialService = Effect.gen(function* () {
 
           const ticketId = Crypto.randomUUID();
           const claims: WebSocketClaims = {
-            v: 2,
+            v: 3,
             kind: "websocket",
             sid: sessionId,
+            aud: row.value.audience,
             jti: ticketId,
             iat: issuedAtMillis,
             exp: expiresAtMillis,
           };
           const encodedPayload = base64UrlEncode(JSON.stringify(claims));
           const signature = signPayload(encodedPayload, signingSecret);
-          currentTickets.set(ticketId, { sessionId, expiresAtMillis });
+          currentTickets.set(ticketId, {
+            sessionId,
+            audience: row.value.audience,
+            expiresAtMillis,
+          });
           yield* Ref.set(outstandingWebSocketTicketsRef, currentTickets);
           return { token: `${encodedPayload}.${signature}`, expiresAt };
         }),
@@ -518,6 +541,7 @@ export const makeSessionCredentialService = Effect.gen(function* () {
           if (
             !outstandingTicket ||
             outstandingTicket.sessionId !== claims.sid ||
+            outstandingTicket.audience !== claims.aud ||
             outstandingTicket.expiresAtMillis !== claims.exp ||
             claims.exp <= now
           ) {
@@ -534,9 +558,15 @@ export const makeSessionCredentialService = Effect.gen(function* () {
           if (row.value.revokedAt !== null) {
             return yield* toSessionCredentialError("Websocket session revoked.");
           }
+          // A ticket minted before the session's audience was what it is now
+          // must not be usable: the row is the authority.
+          if (row.value.audience !== claims.aud) {
+            return yield* toSessionCredentialError("Invalid websocket token.");
+          }
           return {
             sessionId: row.value.sessionId,
             token,
+            audience: row.value.audience,
             method: row.value.method,
             client: toClientMetadata(row.value.client),
             expiresAt: row.value.expiresAt,
@@ -563,6 +593,7 @@ export const makeSessionCredentialService = Effect.gen(function* () {
           sessionId: row.sessionId,
           subject: row.subject,
           role: row.role,
+          audience: row.audience,
           method: row.method,
           client: toClientMetadata(row.client),
           issuedAt: row.issuedAt,

@@ -3,9 +3,12 @@ import type { Effect } from "effect";
 
 import type { AuthPairingLinkRepositoryError } from "../Errors";
 
+const AuthAudienceColumn = Schema.Literals(["interactive", "mobile-v1"]);
+
 export const AuthPairingLinkRecord = Schema.Struct({
   id: Schema.String,
-  credential: Schema.String,
+  credentialHint: Schema.String,
+  audience: AuthAudienceColumn,
   method: Schema.Literals(["desktop-bootstrap", "one-time-token"]),
   role: Schema.Literals(["owner", "client"]),
   subject: Schema.String,
@@ -19,7 +22,9 @@ export type AuthPairingLinkRecord = typeof AuthPairingLinkRecord.Type;
 
 export const CreateAuthPairingLinkInput = Schema.Struct({
   id: Schema.String,
-  credential: Schema.String,
+  credentialDigest: Schema.String,
+  credentialHint: Schema.String,
+  audience: AuthAudienceColumn,
   method: Schema.Literals(["desktop-bootstrap", "one-time-token"]),
   role: Schema.Literals(["owner", "client"]),
   subject: Schema.String,
@@ -30,7 +35,7 @@ export const CreateAuthPairingLinkInput = Schema.Struct({
 export type CreateAuthPairingLinkInput = typeof CreateAuthPairingLinkInput.Type;
 
 export const ConsumeAuthPairingLinkInput = Schema.Struct({
-  credential: Schema.String,
+  credentialDigest: Schema.String,
   consumedAt: Schema.DateTimeUtcFromString,
   now: Schema.DateTimeUtcFromString,
 });
@@ -47,10 +52,10 @@ export const RevokeAuthPairingLinkInput = Schema.Struct({
 });
 export type RevokeAuthPairingLinkInput = typeof RevokeAuthPairingLinkInput.Type;
 
-export const GetAuthPairingLinkByCredentialInput = Schema.Struct({
-  credential: Schema.String,
+export const GetAuthPairingLinkByDigestInput = Schema.Struct({
+  credentialDigest: Schema.String,
 });
-export type GetAuthPairingLinkByCredentialInput = typeof GetAuthPairingLinkByCredentialInput.Type;
+export type GetAuthPairingLinkByDigestInput = typeof GetAuthPairingLinkByDigestInput.Type;
 
 export interface AuthPairingLinkRepositoryShape {
   readonly create: (
@@ -65,8 +70,12 @@ export interface AuthPairingLinkRepositoryShape {
   readonly revoke: (
     input: RevokeAuthPairingLinkInput,
   ) => Effect.Effect<boolean, AuthPairingLinkRepositoryError>;
-  readonly getByCredential: (
-    input: GetAuthPairingLinkByCredentialInput,
+  /**
+   * Digest-keyed lookup used only to classify an already-failed consume. It
+   * never returns the credential and must not change the caller's error.
+   */
+  readonly getByCredentialDigest: (
+    input: GetAuthPairingLinkByDigestInput,
   ) => Effect.Effect<Option.Option<AuthPairingLinkRecord>, AuthPairingLinkRepositoryError>;
 }
 

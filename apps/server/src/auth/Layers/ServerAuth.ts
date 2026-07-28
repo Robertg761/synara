@@ -1,10 +1,12 @@
-import type {
-  AuthBearerBootstrapResult,
-  AuthBootstrapResult,
-  AuthClientSession,
-  AuthPairingCredentialResult,
-  AuthSessionState,
-  AuthWebSocketTokenResult,
+import {
+  INTERACTIVE_AUTH_AUDIENCE,
+  type AuthAudience,
+  type AuthBearerBootstrapResult,
+  type AuthBootstrapResult,
+  type AuthClientSession,
+  type AuthPairingCredentialResult,
+  type AuthSessionState,
+  type AuthWebSocketTokenResult,
 } from "@synara/contracts";
 import { DateTime, Effect, Layer } from "effect";
 
@@ -33,6 +35,10 @@ type BootstrapExchangeResult = {
 };
 
 const AUTHORIZATION_PREFIX = "Bearer ";
+// Native clients cannot put a ticket in the URL without leaking it into logs and
+// proxies, but URLSessionWebSocketTask can set headers. Same single-use ticket,
+// same validator — only the transport differs.
+const WEBSOCKET_TICKET_AUTHORIZATION_PREFIX = "SynaraTicket ";
 const WEBSOCKET_TOKEN_QUERY_PARAM = "wsToken";
 
 export function toBootstrapExchangeAuthError(cause: BootstrapCredentialError): AuthError {
@@ -51,13 +57,26 @@ export function toBootstrapExchangeAuthError(cause: BootstrapCredentialError): A
   });
 }
 
-function parseBearerToken(headers: Record<string, string | undefined>): string | null {
+function parseAuthorizationToken(
+  headers: Record<string, string | undefined>,
+  prefix: string,
+): string | null {
   const header = headers.authorization;
-  if (typeof header !== "string" || !header.startsWith(AUTHORIZATION_PREFIX)) {
+  if (typeof header !== "string" || !header.startsWith(prefix)) {
     return null;
   }
-  const token = header.slice(AUTHORIZATION_PREFIX.length).trim();
+  const token = header.slice(prefix.length).trim();
   return token.length > 0 ? token : null;
+}
+
+function parseBearerToken(headers: Record<string, string | undefined>): string | null {
+  return parseAuthorizationToken(headers, AUTHORIZATION_PREFIX);
+}
+
+export function parseWebSocketTicketHeader(
+  headers: Record<string, string | undefined>,
+): string | null {
+  return parseAuthorizationToken(headers, WEBSOCKET_TICKET_AUTHORIZATION_PREFIX);
 }
 
 function toAuthenticatedSession(session: {
@@ -65,6 +84,7 @@ function toAuthenticatedSession(session: {
   readonly subject: string;
   readonly method: AuthenticatedSession["method"];
   readonly role: AuthenticatedSession["role"];
+  readonly audience: AuthAudience;
   readonly expiresAt?: DateTime.DateTime;
 }): AuthenticatedSession {
   return {
@@ -72,6 +92,7 @@ function toAuthenticatedSession(session: {
     subject: session.subject,
     method: session.method,
     role: session.role,
+    audience: session.audience,
     ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
   };
 }
@@ -152,6 +173,10 @@ export const makeServerAuth = Effect.gen(function* () {
             method: "browser-session-cookie",
             subject: grant.subject,
             role: grant.role,
+            // The pairing credential decides which transports the session may
+            // open; losing it here would silently promote a mobile pairing to a
+            // full interactive session.
+            audience: grant.audience,
             client: {
               ...requestMetadata,
               ...(grant.label ? { label: grant.label } : {}),
@@ -192,6 +217,7 @@ export const makeServerAuth = Effect.gen(function* () {
               method: "bearer-session-token",
               subject: grant.subject,
               role: grant.role,
+              audience: grant.audience,
               client: {
                 ...requestMetadata,
                 ...(grant.label ? { label: grant.label } : {}),
@@ -225,6 +251,7 @@ export const makeServerAuth = Effect.gen(function* () {
       .createPairingLink({
         role: input?.role ?? "client",
         subject: input?.role === "owner" ? "owner-bootstrap" : "one-time-token",
+        audience: input?.audience ?? INTERACTIVE_AUTH_AUDIENCE,
         ...(input?.label ? { label: input.label } : {}),
       })
       .pipe(
@@ -241,6 +268,8 @@ export const makeServerAuth = Effect.gen(function* () {
             ({
               id: issued.id,
               credential: issued.credential,
+              credentialHint: issued.credentialHint,
+              audience: issued.audience,
               ...(issued.label ? { label: issued.label } : {}),
               expiresAt: DateTime.toUtc(issued.expiresAt),
             }) satisfies AuthPairingCredentialResult,
@@ -369,25 +398,49 @@ export const makeServerAuth = Effect.gen(function* () {
       ),
     );
 
+  const enforceAudience = (
+    session: AuthenticatedSession,
+    requiredAudience: AuthAudience | undefined,
+  ): Effect.Effect<AuthenticatedSession, AuthError> =>
+    requiredAudience === undefined || session.audience === requiredAudience
+      ? Effect.succeed(session)
+      : Effect.logWarning("Rejected websocket upgrade for the wrong credential audience.").pipe(
+          Effect.annotateLogs({ required: requiredAudience, actual: session.audience }),
+          Effect.flatMap(() =>
+            Effect.fail(
+              new AuthError({
+                message: "This credential is not valid for this endpoint.",
+                status: 403,
+              }),
+            ),
+          ),
+        );
+
   const authenticateWebSocketUpgrade: ServerAuthShape["authenticateWebSocketUpgrade"] = (
     request,
+    options,
   ) => {
-    const websocketToken = request.url?.searchParams.get(WEBSOCKET_TOKEN_QUERY_PARAM);
-    if (websocketToken && websocketToken.trim().length > 0) {
-      return sessions.verifyWebSocketToken(websocketToken).pipe(
-        Effect.map(toAuthenticatedSession),
-        Effect.mapError(
-          (cause) =>
-            new AuthError({
-              message: "Unauthorized request.",
-              status: 401,
-              cause,
-            }),
-        ),
-      );
-    }
+    const queryTicket = request.url?.searchParams.get(WEBSOCKET_TOKEN_QUERY_PARAM)?.trim();
+    const headerTicket = parseWebSocketTicketHeader(request.headers);
+    const websocketTicket =
+      queryTicket && queryTicket.length > 0 ? queryTicket : (headerTicket ?? null);
+    const authenticated = websocketTicket
+      ? sessions.verifyWebSocketToken(websocketTicket).pipe(
+          Effect.map(toAuthenticatedSession),
+          Effect.mapError(
+            (cause) =>
+              new AuthError({
+                message: "Unauthorized request.",
+                status: 401,
+                cause,
+              }),
+          ),
+        )
+      : authenticateRequest(request);
 
-    return authenticateRequest(request);
+    return authenticated.pipe(
+      Effect.flatMap((session) => enforceAudience(session, options?.requiredAudience)),
+    );
   };
 
   const issueStartupPairingUrl: ServerAuthShape["issueStartupPairingUrl"] = (baseUrl) =>

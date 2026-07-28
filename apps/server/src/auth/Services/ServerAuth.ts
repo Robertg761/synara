@@ -1,4 +1,5 @@
 import type {
+  AuthAudience,
   AuthBearerBootstrapResult,
   AuthBootstrapResult,
   AuthClientMetadata,
@@ -28,6 +29,7 @@ export interface AuthenticatedSession {
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly role: SessionRole;
+  readonly audience: AuthAudience;
   readonly expiresAt?: DateTime.DateTime;
 }
 
@@ -79,8 +81,13 @@ export interface ServerAuthShape {
   readonly authenticateHttpRequest: (
     request: AuthRequest,
   ) => Effect.Effect<AuthenticatedHttpSession, AuthError>;
+  /**
+   * `requiredAudience` is the transport boundary: a credential minted for
+   * another audience is rejected here rather than at each call site.
+   */
   readonly authenticateWebSocketUpgrade: (
     request: AuthRequest,
+    options?: { readonly requiredAudience?: AuthAudience },
   ) => Effect.Effect<AuthenticatedSession, AuthError>;
   readonly issueWebSocketToken: (
     session: AuthenticatedSession,

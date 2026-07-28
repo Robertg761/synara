@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import {
   CommandId,
   DEFAULT_TERMINAL_ID,
+  INTERACTIVE_AUTH_AUDIENCE,
   ORCHESTRATION_WS_METHODS,
   ThreadId,
   WS_BOOTSTRAP_METHOD,
@@ -13,13 +14,11 @@ import {
   WsFeatureRpcGroup,
   WsRpcError,
   PullRequestsUnavailableError,
+  type AuthSessionId,
   type GitActionProgressEvent,
   type OrchestrationCommand,
-  type OrchestrationEvent,
   type ProjectDevServerEvent,
-  type OrchestrationShellStreamEvent,
   type OrchestrationShellStreamItem,
-  type OrchestrationThreadDetailSnapshot,
   type OrchestrationThreadStreamItem,
   type ServerConfigStreamEvent,
   type ServerDiagnosticsResult,
@@ -30,6 +29,7 @@ import { Effect, FileSystem, Layer, Option, Path, Queue, Schema, Scope, Stream }
 import { Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { RpcMiddleware, RpcSchema, RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
+import { toMobileAccessStatus } from "./mobile/mobileAccessStatus";
 import { AutomationService } from "./automation/Services/AutomationService";
 import { authErrorResponse, makeEffectAuthRequest } from "./auth/effectHttp";
 import {
@@ -74,10 +74,14 @@ import {
 import { Open, resolveAvailableEditors } from "./open";
 import { makeDispatchCommandNormalizer } from "./orchestration/dispatchCommandNormalization";
 import { makeImportThreadHandler } from "./orchestration/importThreadRoute";
+import {
+  makeShellStreamEventProjector,
+  makeShellSubscriptionStream,
+  makeThreadSubscriptionStream,
+} from "./orchestration/orchestrationSubscriptionStreams";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
 import { ProviderCommandReactor } from "./orchestration/Services/ProviderCommandReactor";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
-import { shouldPublishThreadShellForEvent } from "./orchestration/threadShellEvents";
 import { ProviderDiscoveryService } from "./provider/Services/ProviderDiscoveryService";
 import { discoverSkillsCatalog, synaraSkillsDir } from "./provider/skillsCatalog";
 import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegistry";
@@ -105,6 +109,7 @@ import {
 import { ThreadDiagnosticsQuery } from "./diagnostics/Services/ThreadDiagnosticsQuery";
 import { makeWsRequestAdmission } from "./wsRequestAdmission";
 import {
+  CurrentWsAuthSessionId,
   CurrentWsSessionRole,
   provideWsConnectionSession,
   WS_CONNECTION_SESSION_HEADER,
@@ -113,18 +118,43 @@ import {
   type WsConnectionSession,
 } from "./wsConnectionSessions";
 import { negotiateWsCompatibility, validateWsFeatureCompatibility } from "./wsCompatibility";
-import {
-  requiresWebSocketAuthentication,
-  shouldRejectUntrustedRequestOrigin,
-} from "./trustedOrigins";
+import { requiresWebSocketAuthentication } from "./trustedOrigins";
+import { trustedWebSocketRequestUrl } from "./wsUpgradeOrigin";
 import { bufferLiveUiStream, type LiveUiStreamDropReport } from "./wsStreamBackpressure";
-import { makeCursorSafeSnapshotLiveStream } from "./wsSnapshotLiveStream";
 import { PullRequestService } from "./pullRequests/Services/PullRequestService";
 import { resolveGitHubRepository } from "./pullRequests/repositoryResolution";
+
+/**
+ * Stands in for the unauthenticated loopback owner, which has no auth-session
+ * row. It matches nothing, so listings flag no session as current and the
+ * self-revocation guard can never be tripped by it.
+ */
+const NO_CURRENT_AUTH_SESSION_ID = "ws-unauthenticated-loopback-owner";
 
 export function canManageExternalMcp(role: "owner" | "client"): boolean {
   return role === "owner";
 }
+
+/**
+ * Owner role alone. The auth control plane has to stay reachable from every
+ * bind, so this gate deliberately omits external MCP's loopback-only constraint.
+ */
+export const requireWsOwnerRole = Effect.gen(function* () {
+  if ((yield* CurrentWsSessionRole) !== "owner") {
+    return yield* Effect.fail(
+      new WsRpcError({ message: "Owner authorization is required for this operation." }),
+    );
+  }
+});
+
+/**
+ * Client-session listings compare against the caller's own session; the
+ * unauthenticated loopback owner has none, so nothing is flagged current.
+ */
+export const currentWsAuthSessionId = Effect.gen(function* () {
+  const sessionId = yield* CurrentWsAuthSessionId;
+  return sessionId ?? (NO_CURRENT_AUTH_SESSION_ID as AuthSessionId);
+});
 
 const MAX_DIAGNOSTIC_CHILD_PROCESSES = 80;
 const MAX_DIAGNOSTIC_ARGS_CHARS = 500;
@@ -249,48 +279,6 @@ const failLiveUiStreamForSnapshotResync = (report: LiveUiStreamDropReport) =>
     }),
   );
 
-// Must mirror the cases of toShellStreamEvent: events rejected here are dropped
-// before the live-UI buffer so the sliding window only holds events that can
-// actually project to a shell update.
-function isShellRelevantEvent(event: OrchestrationEvent): boolean {
-  return (
-    event.type === "space.created" ||
-    event.type === "space.meta-updated" ||
-    event.type === "space.order-updated" ||
-    event.type === "space.deleted" ||
-    event.type === "project.created" ||
-    event.type === "project.meta-updated" ||
-    event.type === "project.deleted" ||
-    event.type === "thread.deleted" ||
-    (event.aggregateKind === "thread" && shouldPublishThreadShellForEvent(event))
-  );
-}
-
-function isThreadDetailEventFor(threadId: ThreadId, event: OrchestrationEvent): boolean {
-  return (
-    event.aggregateKind === "thread" &&
-    event.aggregateId === threadId &&
-    (event.type === "thread.message-sent" ||
-      event.type === "thread.proposed-plan-upserted" ||
-      event.type === "thread.activity-appended" ||
-      event.type === "thread.turn-diff-completed" ||
-      event.type === "thread.reverted" ||
-      event.type === "thread.conversation-rolled-back" ||
-      event.type === "thread.session-set" ||
-      event.type === "thread.meta-updated" ||
-      event.type === "thread.pinned-message-added" ||
-      event.type === "thread.pinned-message-removed" ||
-      event.type === "thread.pinned-message-done-set" ||
-      event.type === "thread.pinned-message-label-set" ||
-      event.type === "thread.marker-added" ||
-      event.type === "thread.marker-removed" ||
-      event.type === "thread.marker-done-set" ||
-      event.type === "thread.marker-label-set" ||
-      event.type === "thread.archived" ||
-      event.type === "thread.unarchived")
-  );
-}
-
 const makeWsRpcHandlersLayer = () =>
   AdmittedWsFeatureRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -317,6 +305,7 @@ const makeWsRpcHandlersLayer = () =>
       const providerService = yield* ProviderService;
       const lifecycleEvents = yield* ServerLifecycleEvents;
       const runtimeStartup = yield* ServerRuntimeStartup;
+      const serverAuth = yield* ServerAuth;
       const serverEnvironment = yield* ServerEnvironment;
       const serverSettings = yield* ServerSettingsService;
       const terminalManager = yield* TerminalManager;
@@ -649,92 +638,12 @@ const makeWsRpcHandlersLayer = () =>
           ),
         ),
       );
-      const getOrchestrationHighWaterSequence = orchestrationEngine.getEventHighWaterSequence.pipe(
-        Effect.mapError((cause) =>
-          toWsRpcError(cause, "Failed to capture orchestration high-water sequence"),
-        ),
-      );
-
-      const toShellStreamEvent = (
-        event: OrchestrationEvent,
-      ): Effect.Effect<Option.Option<OrchestrationShellStreamEvent>, never> => {
-        switch (event.type) {
-          case "space.created":
-          case "space.meta-updated":
-            return projectionReadModelQuery.getSpaceShellById(event.payload.spaceId).pipe(
-              Effect.map((space) =>
-                Option.map(space, (nextSpace) => ({
-                  kind: "space-upserted" as const,
-                  sequence: event.sequence,
-                  space: nextSpace,
-                })),
-              ),
-              Effect.catch(() => Effect.succeed(Option.none())),
-            );
-          case "space.order-updated":
-            return Effect.succeed(
-              Option.some({
-                kind: "space-order-updated" as const,
-                sequence: event.sequence,
-                orderedSpaceIds: event.payload.orderedSpaceIds,
-              }),
-            );
-          case "space.deleted":
-            return Effect.succeed(
-              Option.some({
-                kind: "space-removed" as const,
-                sequence: event.sequence,
-                spaceId: event.payload.spaceId,
-                updatedAt: event.payload.deletedAt,
-              }),
-            );
-          case "project.created":
-          case "project.meta-updated":
-            return projectionReadModelQuery.getProjectShellById(event.payload.projectId).pipe(
-              Effect.map((project) =>
-                Option.map(project, (nextProject) => ({
-                  kind: "project-upserted" as const,
-                  sequence: event.sequence,
-                  project: nextProject,
-                })),
-              ),
-              Effect.catch(() => Effect.succeed(Option.none())),
-            );
-          case "project.deleted":
-            return Effect.succeed(
-              Option.some({
-                kind: "project-removed" as const,
-                sequence: event.sequence,
-                projectId: event.payload.projectId,
-              }),
-            );
-          case "thread.deleted":
-            return Effect.succeed(
-              Option.some({
-                kind: "thread-removed" as const,
-                sequence: event.sequence,
-                threadId: event.payload.threadId,
-              }),
-            );
-          default:
-            if (event.aggregateKind !== "thread") return Effect.succeed(Option.none());
-            return projectionReadModelQuery
-              .getThreadShellById(ThreadId.makeUnsafe(String(event.aggregateId)))
-              .pipe(
-                Effect.map((thread) =>
-                  Option.map(thread, (nextThread) => ({
-                    kind: "thread-upserted" as const,
-                    sequence: event.sequence,
-                    thread: nextThread,
-                  })),
-                ),
-                Effect.catch(() => Effect.succeed(Option.none())),
-              );
-        }
-      };
+      const toShellStreamEvent = makeShellStreamEventProjector(projectionReadModelQuery);
 
       const rpcEffect = <A, E, R>(effect: Effect.Effect<A, E, R>, fallbackMessage: string) =>
         effect.pipe(Effect.mapError((cause) => toWsRpcError(cause, fallbackMessage)));
+
+      const requireOwnerRole = requireWsOwnerRole;
 
       const requireOwner = Effect.gen(function* () {
         if (!canManageExternalMcp(yield* CurrentWsSessionRole)) {
@@ -750,6 +659,8 @@ const makeWsRpcHandlersLayer = () =>
           );
         }
       });
+
+      const currentAuthSessionId = currentWsAuthSessionId;
 
       return AdmittedWsFeatureRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
@@ -847,42 +758,33 @@ const makeWsRpcHandlersLayer = () =>
           streamAdmission.guard(
             clientId,
             { key: "orchestration.shell" },
-            makeCursorSafeSnapshotLiveStream({
-              subscribeLive: orchestrationEngine.subscribeDomainEvents.pipe(
-                Effect.map((stream) =>
-                  bufferLiveUiStream(stream.pipe(Stream.filter(isShellRelevantEvent)), {
-                    label: "orchestration.shell",
-                    onDroppedEvents: failLiveUiStreamForSnapshotResync,
-                  }),
-                ),
-              ),
-              snapshot: projectionReadModelQuery
-                .getShellSnapshot()
-                .pipe(
-                  Effect.mapError((cause) => toWsRpcError(cause, "Failed to load shell snapshot")),
-                ),
-              snapshotSequence: (snapshot) => snapshot.snapshotSequence,
-              getHighWaterSequence: getOrchestrationHighWaterSequence,
-              replay: (fromSequenceExclusive, throughSequenceInclusive) =>
-                orchestrationEngine
-                  .readEventsThrough(fromSequenceExclusive, throughSequenceInclusive)
-                  .pipe(
-                    Stream.filter(isShellRelevantEvent),
-                    Stream.mapError((cause) =>
-                      toWsRpcError(cause, "Failed to replay shell events"),
-                    ),
-                  ),
+            makeShellSubscriptionStream({
+              orchestrationEngine,
+              snapshotQuery: projectionReadModelQuery,
+              toError: toWsRpcError,
+              bufferLive: (stream) =>
+                bufferLiveUiStream(stream, {
+                  label: "orchestration.shell",
+                  onDroppedEvents: failLiveUiStreamForSnapshotResync,
+                }),
             }).pipe(
-              Stream.mapEffect((item) =>
-                item.kind === "snapshot"
-                  ? Effect.succeed(
+              Stream.mapEffect((item) => {
+                switch (item.kind) {
+                  case "snapshot":
+                    return Effect.succeed(
                       Option.some<OrchestrationShellStreamItem>({
                         kind: "snapshot",
                         snapshot: item.snapshot,
                       }),
-                    )
-                  : toShellStreamEvent(item.event),
-              ),
+                    );
+                  case "event":
+                    return toShellStreamEvent(item.event);
+                  // The browser protocol has no synchronized frame; its snapshot
+                  // already is the client's sync point.
+                  case "synchronized":
+                    return Effect.succeedNone;
+                }
+              }),
               Stream.flatMap((item) =>
                 Option.isSome(item) ? Stream.succeed(item.value) : Stream.empty,
               ),
@@ -896,74 +798,45 @@ const makeWsRpcHandlersLayer = () =>
               key: `orchestration.thread:${input.threadId}`,
               threadId: input.threadId,
             },
-            makeCursorSafeSnapshotLiveStream({
+            makeThreadSubscriptionStream(input.threadId, {
+              orchestrationEngine,
+              snapshotQuery: projectionReadModelQuery,
+              toError: toWsRpcError,
               onResnapshotRequired: (report) =>
                 recordThreadResnapshotRequired(input.threadId, report),
-              subscribeLive: orchestrationEngine.subscribeDomainEvents.pipe(
-                Effect.map((stream) =>
-                  bufferLiveUiStream(
-                    stream.pipe(
-                      Stream.filter((event) => isThreadDetailEventFor(input.threadId, event)),
-                    ),
-                    {
-                      label: "orchestration.thread-detail",
-                      onDroppedEvents: (report) => recordThreadStreamDrop(input.threadId, report),
-                    },
-                  ),
-                ),
-              ),
-              snapshot: projectionReadModelQuery.getThreadDetailSnapshotById(input.threadId).pipe(
-                Effect.flatMap(
-                  Option.match({
-                    onNone: () =>
-                      projectionReadModelQuery.getSnapshotSequence().pipe(
-                        Effect.map(({ snapshotSequence }) => ({
-                          detail: Option.none<OrchestrationThreadDetailSnapshot>(),
-                          snapshotSequence,
-                        })),
-                      ),
-                    onSome: (detail) =>
-                      Effect.succeed({
-                        detail: Option.some(detail),
-                        snapshotSequence: detail.snapshotSequence,
-                      }),
-                  }),
-                ),
-                Effect.mapError((cause) => toWsRpcError(cause, "Failed to load thread snapshot")),
-              ),
-              snapshotSequence: (snapshot) => snapshot.snapshotSequence,
-              getHighWaterSequence: getOrchestrationHighWaterSequence,
-              replay: (fromSequenceExclusive, throughSequenceInclusive) =>
-                orchestrationEngine
-                  .readEventsThrough(fromSequenceExclusive, throughSequenceInclusive)
-                  .pipe(
-                    Stream.filter((event) => isThreadDetailEventFor(input.threadId, event)),
-                    Stream.mapError((cause) =>
-                      toWsRpcError(cause, "Failed to replay thread events"),
-                    ),
-                  ),
+              bufferLive: (stream) =>
+                bufferLiveUiStream(stream, {
+                  label: "orchestration.thread-detail",
+                  onDroppedEvents: (report) => recordThreadStreamDrop(input.threadId, report),
+                }),
             }).pipe(
               Stream.flatMap((item) => {
-                if (item.kind === "event") {
-                  return Stream.succeed<OrchestrationThreadStreamItem>({
-                    kind: "event",
-                    event: item.event,
-                  });
+                switch (item.kind) {
+                  case "event":
+                    return Stream.succeed<OrchestrationThreadStreamItem>({
+                      kind: "event",
+                      event: item.event,
+                    });
+                  // The browser protocol has no synchronized frame; its snapshot
+                  // already is the client's sync point.
+                  case "synchronized":
+                    return Stream.empty;
+                  case "snapshot":
+                    // A silently empty snapshot would leave the client waiting forever
+                    // for thread history; fail identifiably so it can surface the state.
+                    return Option.isSome(item.snapshot.detail)
+                      ? Stream.succeed<OrchestrationThreadStreamItem>({
+                          kind: "snapshot",
+                          snapshot: item.snapshot.detail.value,
+                        })
+                      : Stream.fail(
+                          new WsRpcError({
+                            message: `Thread detail snapshot not found for thread ${input.threadId}.`,
+                            code: "THREAD_SNAPSHOT_NOT_FOUND",
+                            retryable: false,
+                          }),
+                        );
                 }
-                // A silently empty snapshot would leave the client waiting forever
-                // for thread history; fail identifiably so it can surface the state.
-                return Option.isSome(item.snapshot.detail)
-                  ? Stream.succeed<OrchestrationThreadStreamItem>({
-                      kind: "snapshot",
-                      snapshot: item.snapshot.detail.value,
-                    })
-                  : Stream.fail(
-                      new WsRpcError({
-                        message: `Thread detail snapshot not found for thread ${input.threadId}.`,
-                        code: "THREAD_SNAPSHOT_NOT_FOUND",
-                        retryable: false,
-                      }),
-                    );
               }),
             ),
           ),
@@ -1358,6 +1231,56 @@ const makeWsRpcHandlersLayer = () =>
             requireOwner.pipe(Effect.andThen(externalMcp.refreshPairing(input))),
             "Failed to refresh external MCP pairing",
           ),
+        [WS_METHODS.serverGetMobileAccessStatus]: () =>
+          rpcEffect(
+            requireOwnerRole.pipe(
+              Effect.andThen(serverEnvironment.getEnvironmentId),
+              Effect.map((environmentId) =>
+                toMobileAccessStatus(config.mobileAccess, environmentId),
+              ),
+            ),
+            "Failed to read mobile access status",
+          ),
+        [WS_METHODS.serverListAuthAccess]: () =>
+          rpcEffect(
+            requireOwnerRole.pipe(
+              Effect.andThen(
+                Effect.all({
+                  pairingLinks: serverAuth.listPairingLinks(),
+                  clientSessions: currentAuthSessionId.pipe(
+                    Effect.flatMap((sessionId) => serverAuth.listClientSessions(sessionId)),
+                  ),
+                }),
+              ),
+            ),
+            "Failed to list mobile access sessions",
+          ),
+        [WS_METHODS.serverCreateAuthPairingCredential]: (input) =>
+          rpcEffect(
+            requireOwnerRole.pipe(
+              Effect.andThen(serverAuth.issuePairingCredential({ ...input, role: "client" })),
+            ),
+            "Failed to create pairing credential",
+          ),
+        [WS_METHODS.serverRevokeAuthPairingLink]: (input) =>
+          rpcEffect(
+            requireOwnerRole.pipe(
+              Effect.andThen(serverAuth.revokePairingLink(input.id)),
+              Effect.map((revoked) => ({ revoked })),
+            ),
+            "Failed to revoke pairing link",
+          ),
+        [WS_METHODS.serverRevokeAuthClientSession]: (input) =>
+          rpcEffect(
+            requireOwnerRole.pipe(
+              Effect.andThen(currentAuthSessionId),
+              Effect.flatMap((sessionId) =>
+                serverAuth.revokeClientSession(sessionId, input.sessionId),
+              ),
+              Effect.map((revoked) => ({ revoked })),
+            ),
+            "Failed to revoke client session",
+          ),
         [WS_METHODS.serverListWorktrees]: () =>
           rpcEffect(
             pruneManagedWorktrees.pipe(Effect.map((worktrees) => ({ worktrees }))),
@@ -1701,21 +1624,6 @@ const makeBootstrapWebSocketHttpEffect = RpcServer.toHttpEffectWebsocket(WsBoots
   ),
 );
 
-function trustedWebSocketRequestUrl(
-  request: HttpServerRequest.HttpServerRequest,
-  config: ServerConfigShape,
-): URL | null {
-  const url = HttpServerRequest.toURL(request);
-  return url &&
-    !shouldRejectUntrustedRequestOrigin({
-      rawOrigin: request.headers.origin,
-      requestOrigin: url.origin,
-      config,
-    })
-    ? url
-    : null;
-}
-
 export function authenticateRpcWebSocketUpgrade(input: {
   readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">;
   readonly legacyToken: string | null;
@@ -1730,7 +1638,12 @@ export function authenticateRpcWebSocketUpgrade(input: {
   ) {
     return Effect.succeed(null);
   }
-  return input.serverAuth.authenticateWebSocketUpgrade(input.request);
+  // The browser feature socket and the desktop renderer both land here, so the
+  // interactive audience is enforced once: a mobile credential can never open an
+  // RPC socket with full NativeApi dispatch.
+  return input.serverAuth.authenticateWebSocketUpgrade(input.request, {
+    requiredAudience: INTERACTIVE_AUTH_AUDIENCE,
+  });
 }
 
 export function makeWebsocketRpcRouteLayer<R>(
@@ -1809,6 +1722,7 @@ export function makeWebsocketRpcRouteLayer<R>(
             runWithConnectionSession(request, {
               role: authenticatedSession.role,
               attachmentPrincipal: attachmentPrincipalForSession(authenticatedSession.sessionId),
+              authSessionId: authenticatedSession.sessionId,
             }),
           );
         }).pipe(

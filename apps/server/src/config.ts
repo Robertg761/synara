@@ -6,6 +6,14 @@
  *
  * @module ServerConfig
  */
+import type { MobileAccessConfig, MobileApprovedRoot } from "@synara/contracts";
+import {
+  DEFAULT_MOBILE_ACCESS_CONFIG,
+  parseMobileAccessConfig,
+  resolveMobileAccess,
+  toMobileApprovedRoot,
+  type MobileAccessResolution,
+} from "@synara/shared/mobileAccess";
 import { Effect, FileSystem, Layer, Path, ServiceMap } from "effect";
 import { existsSync } from "node:fs";
 import OS from "node:os";
@@ -88,6 +96,66 @@ export interface ServerDerivedPaths {
 }
 
 /**
+ * Effective mobile-access policy for this process. The owner-approved roots are
+ * canonicalized at startup and never leave the owner surface: they must not be
+ * serialized into a public URL or a process log.
+ */
+export interface ServerMobileAccessConfig {
+  readonly config: MobileAccessConfig;
+  readonly resolution: MobileAccessResolution;
+  readonly approvedRoots: ReadonlyArray<MobileApprovedRoot>;
+  /** True only when a desktop shell supplied the config file it also manages. */
+  readonly desktopManaged: boolean;
+  readonly privateLanAvailable: boolean;
+}
+
+export const DISABLED_MOBILE_ACCESS: ServerMobileAccessConfig = {
+  config: DEFAULT_MOBILE_ACCESS_CONFIG,
+  resolution: resolveMobileAccess({
+    config: DEFAULT_MOBILE_ACCESS_CONFIG,
+    allowPrivateLan: false,
+    port: DEFAULT_PORT,
+  }),
+  approvedRoots: [],
+  desktopManaged: false,
+  privateLanAvailable: false,
+};
+
+/**
+ * Loads the owner-managed mobile access policy. A missing or unreadable file is
+ * not fatal: it degrades to the disabled, loopback-only policy. Nothing read
+ * here is logged, because the file names the owner's approved directories.
+ */
+export const loadServerMobileAccess = Effect.fn(function* (input: {
+  readonly configPath: string | undefined;
+  readonly allowPrivateLan: boolean;
+  readonly port: number;
+}): Effect.fn.Return<ServerMobileAccessConfig, never, FileSystem.FileSystem | Path.Path> {
+  if (input.configPath === undefined) return DISABLED_MOBILE_ACCESS;
+  const fs = yield* FileSystem.FileSystem;
+  const text = yield* fs
+    .readFileString(input.configPath)
+    .pipe(Effect.orElseSucceed(() => undefined));
+  const config = text === undefined ? DEFAULT_MOBILE_ACCESS_CONFIG : parseMobileAccessConfig(text);
+
+  const canonicalRoots = new Set<string>();
+  for (const rootPath of config.approvedRoots) {
+    canonicalRoots.add(yield* realpathNearestExisting(rootPath));
+  }
+  return {
+    config,
+    resolution: resolveMobileAccess({
+      config,
+      allowPrivateLan: input.allowPrivateLan,
+      port: input.port,
+    }),
+    approvedRoots: Array.from(canonicalRoots, toMobileApprovedRoot),
+    desktopManaged: true,
+    privateLanAvailable: input.allowPrivateLan,
+  };
+});
+
+/**
  * ServerConfigShape - Process/runtime configuration required by the server.
  */
 export interface ServerConfigShape extends ServerDerivedPaths {
@@ -109,6 +177,7 @@ export interface ServerConfigShape extends ServerDerivedPaths {
   readonly autoBootstrapProjectFromCwd: boolean;
   readonly logProviderEvents: boolean;
   readonly logWebSocketEvents: boolean;
+  readonly mobileAccess: ServerMobileAccessConfig;
 }
 
 export function preparePrivateServerPaths(
@@ -268,6 +337,7 @@ export class ServerConfig extends ServiceMap.Service<ServerConfig, ServerConfigS
           publicUrl: undefined,
           allowInsecureRemote: false,
           noBrowser: false,
+          mobileAccess: DISABLED_MOBILE_ACCESS,
         } satisfies ServerConfigShape;
       }),
     );

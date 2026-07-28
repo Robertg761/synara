@@ -1,6 +1,12 @@
-import { createHash } from "node:crypto";
-
 import { CommandId, MessageId, ThreadId } from "@synara/contracts";
+
+import {
+  canonicalJson,
+  operationIsoNow,
+  stableOperationDigest,
+} from "../durableOperations/identity.ts";
+
+export { canonicalJson };
 
 export function slugifyAgentTask(value: string): string {
   return (
@@ -13,22 +19,11 @@ export function slugifyAgentTask(value: string): string {
 }
 
 export function gatewayIsoNow(): string {
-  return new Date().toISOString();
-}
-
-export function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, entry]) => entry !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right));
-    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
+  return operationIsoNow();
 }
 
 export function stableGatewayDigest(value: unknown, length = 32): string {
-  return createHash("sha256").update(canonicalJson(value)).digest("hex").slice(0, length);
+  return stableOperationDigest(value, length);
 }
 
 export function makeAgentCreationIds(operationId: string, index: number) {

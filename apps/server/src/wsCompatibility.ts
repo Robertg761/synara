@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto";
-
 import {
   WS_COMPATIBILITY_QUERY,
   WS_PROTOCOL_EPOCH,
@@ -14,8 +12,7 @@ import {
 import { Effect } from "effect";
 
 import { version as serverBuild } from "../package.json" with { type: "json" };
-
-const serverInstanceId = randomUUID();
+import { SERVER_INSTANCE_ID as serverInstanceId } from "./server/Layers/ServerInstanceIdentity";
 
 function incompatibility(
   action: WsCompatibilityAction,

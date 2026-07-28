@@ -1,4 +1,5 @@
 import type {
+  AuthAudience,
   AuthClientMetadata,
   AuthClientSession,
   AuthPairingLink,
@@ -11,7 +12,10 @@ export const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 
 export interface IssuedPairingLink {
   readonly id: string;
+  /** Returned exactly once, at creation. Never persisted and never logged. */
   readonly credential: string;
+  readonly credentialHint: string;
+  readonly audience: AuthAudience;
   readonly role: SessionRole;
   readonly subject: string;
   readonly label?: string;
@@ -40,6 +44,7 @@ export interface AuthControlPlaneShape {
     readonly label?: string;
     readonly role?: SessionRole;
     readonly subject?: string;
+    readonly audience?: AuthAudience;
   }) => Effect.Effect<IssuedPairingLink, AuthControlPlaneError>;
   readonly listPairingLinks: (input?: {
     readonly role?: SessionRole;
@@ -51,6 +56,7 @@ export interface AuthControlPlaneShape {
     readonly subject?: string;
     readonly role?: SessionRole;
     readonly label?: string;
+    readonly audience?: AuthAudience;
   }) => Effect.Effect<IssuedBearerSession, AuthControlPlaneError>;
   readonly listSessions: () => Effect.Effect<
     ReadonlyArray<AuthClientSession>,

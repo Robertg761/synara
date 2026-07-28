@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { MOBILE_AUTH_AUDIENCE } from "@synara/contracts";
 import { Effect, Layer } from "effect";
 import { describe, expect, it } from "vitest";
 
@@ -316,6 +317,117 @@ describe("ServerAuthLive", () => {
 
         expect(upgraded?.role).toBe("owner");
         expect(upgraded?.subject).toBe("owner-bootstrap");
+      }),
+    );
+  });
+
+  it("carries the pairing audience into the session and admits it only on the mobile route", async () => {
+    await runServerAuthTest(
+      Effect.gen(function* () {
+        const serverAuth = yield* ServerAuth;
+        const pairing = yield* serverAuth.issuePairingCredential({
+          audience: MOBILE_AUTH_AUDIENCE,
+          label: "iPhone",
+        });
+        const exchanged = yield* serverAuth.exchangeBootstrapCredential(
+          pairing.credential,
+          requestMetadata,
+        );
+        const session = yield* serverAuth.authenticateHttpRequest(
+          makeCookieRequest(exchanged.sessionToken),
+        );
+        expect(session.audience).toBe(MOBILE_AUTH_AUDIENCE);
+
+        const ticket = yield* serverAuth.issueWebSocketToken(session);
+        const upgraded = yield* serverAuth.authenticateWebSocketUpgrade(
+          // The ticket rides in the header, never in the URL, so it cannot leak
+          // through access logs or a Referer.
+          { headers: { authorization: `SynaraTicket ${ticket.token}` }, cookies: {} },
+          { requiredAudience: MOBILE_AUTH_AUDIENCE },
+        );
+        expect(upgraded.sessionId).toBe(session.sessionId);
+
+        const rpcError = yield* authenticateRpcWebSocketUpgrade({
+          config: { host: "0.0.0.0", authToken: "remote-startup-secret", publicUrl: undefined },
+          legacyToken: null,
+          request: makeCookieRequest(exchanged.sessionToken),
+          serverAuth,
+        }).pipe(Effect.flip, Effect.orDie);
+        expect(rpcError.status).toBe(403);
+      }),
+    );
+  });
+
+  it("rejects an interactive credential on the mobile audience", async () => {
+    await runServerAuthTest(
+      Effect.gen(function* () {
+        const serverAuth = yield* ServerAuth;
+        const pairing = yield* serverAuth.issuePairingCredential();
+        const exchanged = yield* serverAuth.exchangeBootstrapCredential(
+          pairing.credential,
+          requestMetadata,
+        );
+        const session = yield* serverAuth.authenticateHttpRequest(
+          makeCookieRequest(exchanged.sessionToken),
+        );
+        expect(session.audience).toBe("interactive");
+
+        const ticket = yield* serverAuth.issueWebSocketToken(session);
+        const error = yield* serverAuth
+          .authenticateWebSocketUpgrade(
+            { headers: { authorization: `SynaraTicket ${ticket.token}` }, cookies: {} },
+            { requiredAudience: MOBILE_AUTH_AUDIENCE },
+          )
+          .pipe(Effect.flip, Effect.orDie);
+
+        expect(error.status).toBe(403);
+      }),
+    );
+  });
+
+  it("burns a websocket ticket on its first upgrade", async () => {
+    await runServerAuthTest(
+      Effect.gen(function* () {
+        const serverAuth = yield* ServerAuth;
+        const pairing = yield* serverAuth.issuePairingCredential({
+          audience: MOBILE_AUTH_AUDIENCE,
+        });
+        const exchanged = yield* serverAuth.exchangeBootstrapCredential(
+          pairing.credential,
+          requestMetadata,
+        );
+        const session = yield* serverAuth.authenticateHttpRequest(
+          makeCookieRequest(exchanged.sessionToken),
+        );
+        const ticket = yield* serverAuth.issueWebSocketToken(session);
+        const request = {
+          headers: { authorization: `SynaraTicket ${ticket.token}` },
+          cookies: {},
+        };
+
+        yield* serverAuth.authenticateWebSocketUpgrade(request, {
+          requiredAudience: MOBILE_AUTH_AUDIENCE,
+        });
+        const replay = yield* serverAuth
+          .authenticateWebSocketUpgrade(request, { requiredAudience: MOBILE_AUTH_AUDIENCE })
+          .pipe(Effect.flip, Effect.orDie);
+
+        expect(replay.status).toBe(401);
+      }),
+    );
+  });
+
+  it("never exposes a pairing credential after it is created", async () => {
+    await runServerAuthTest(
+      Effect.gen(function* () {
+        const serverAuth = yield* ServerAuth;
+        const pairing = yield* serverAuth.issuePairingCredential({ label: "Listed device" });
+        const listed = yield* serverAuth.listPairingLinks();
+        const link = listed.find((entry) => entry.id === pairing.id);
+
+        expect(link).toBeDefined();
+        expect(JSON.stringify(listed)).not.toContain(pairing.credential);
+        expect(link?.credentialHint).toBe(pairing.credentialHint);
       }),
     );
   });

@@ -20,6 +20,8 @@ import { resolveListeningPort } from "./startupAccess";
 import { patchBunWebSocketCloseEventCompatibility } from "./bunWebSocketCompatibility";
 import { makeEffectHttpRouteLayer } from "./http";
 import { Keybindings } from "./keybindings";
+import { mobileWebSocketRouteLayer } from "./mobile/mobileWebSocketRoute";
+import { MobileGateway } from "./mobile/Services/MobileGateway";
 import {
   ManagedAttachmentCleanup,
   type ManagedAttachmentCleanupShape,
@@ -60,6 +62,7 @@ export interface ServerShape {
     | Path.Path
     | Keybindings
     | ManagedAttachmentCleanup
+    | MobileGateway
     | AutomationRunReactor
     | AutomationScheduler
     | AutomationService
@@ -163,6 +166,7 @@ export const createEffectServer = Effect.fn(function* (
   const routesLayer = Layer.mergeAll(
     makeEffectHttpRouteLayer(readiness, shutdownController),
     websocketRpcRouteLayer,
+    mobileWebSocketRouteLayer,
     agentGatewayRouteLayer,
     externalMcpRouteLayer,
   );

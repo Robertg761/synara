@@ -1,4 +1,4 @@
-import { AuthClientMetadataDeviceType, AuthSessionId } from "@synara/contracts";
+import { AuthAudience, AuthClientMetadataDeviceType, AuthSessionId } from "@synara/contracts";
 import { Option, Schema, ServiceMap } from "effect";
 import type { Effect } from "effect";
 
@@ -18,6 +18,7 @@ export const AuthSessionRecord = Schema.Struct({
   sessionId: AuthSessionId,
   subject: Schema.String,
   role: Schema.Literals(["owner", "client"]),
+  audience: AuthAudience,
   method: Schema.Literals(["browser-session-cookie", "bearer-session-token"]),
   client: AuthSessionClientMetadataRecord,
   issuedAt: Schema.DateTimeUtcFromString,
@@ -31,6 +32,7 @@ export const CreateAuthSessionInput = Schema.Struct({
   sessionId: AuthSessionId,
   subject: Schema.String,
   role: Schema.Literals(["owner", "client"]),
+  audience: AuthAudience,
   method: Schema.Literals(["browser-session-cookie", "bearer-session-token"]),
   client: AuthSessionClientMetadataRecord,
   issuedAt: Schema.DateTimeUtcFromString,

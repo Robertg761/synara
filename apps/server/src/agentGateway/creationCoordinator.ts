@@ -18,8 +18,9 @@ import {
 import { buildPromptThreadTitleFallback } from "@synara/shared/chatThreads";
 import { parseGitHubRepositoryNameWithOwnerFromPullRequestUrl } from "@synara/shared/githubRepository";
 import { runtimeModeEscalatesPrivilege } from "@synara/shared/runtimeMode";
-import { Cause, Effect, Option, Semaphore } from "effect";
+import { Cause, Effect, Option } from "effect";
 
+import { makeKeyedLock } from "../concurrency/keyedLock.ts";
 import type { ServerConfigShape } from "../config.ts";
 import type { GitCoreShape } from "../git/Services/GitCore.ts";
 import type { OrchestrationEngineShape } from "../orchestration/Services/OrchestrationEngine.ts";
@@ -183,32 +184,8 @@ export const makeCreateThreadsHandler = Effect.fn(function* (
     loadProviderAvailabilities,
     requireThreadShell,
   } = dependencies;
-  const lockIndex = yield* Semaphore.make(1);
-  const locks = new Map<string, { readonly lock: Semaphore.Semaphore; users: number }>();
-
-  const withCreationPlanLock = <A, E, R>(key: string, effect: Effect.Effect<A, E, R>) =>
-    Effect.acquireUseRelease(
-      lockIndex.withPermits(1)(
-        Effect.gen(function* () {
-          const existing = locks.get(key);
-          if (existing) {
-            existing.users += 1;
-            return existing;
-          }
-          const entry = { lock: yield* Semaphore.make(1), users: 1 };
-          locks.set(key, entry);
-          return entry;
-        }),
-      ),
-      (entry) => entry.lock.withPermits(1)(effect),
-      (entry) =>
-        lockIndex.withPermits(1)(
-          Effect.sync(() => {
-            entry.users -= 1;
-            if (entry.users === 0 && locks.get(key) === entry) locks.delete(key);
-          }),
-        ),
-    );
+  const creationPlanLock = yield* makeKeyedLock;
+  const withCreationPlanLock = creationPlanLock.withLock;
 
   const awaitCreationReplay = (
     operationStore: CreationOperationStore,

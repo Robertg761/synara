@@ -41,6 +41,9 @@ import { ExternalMcpRepositoryLive } from "./externalMcp/Layers/ExternalMcpRepos
 import { ExternalMcpServiceLive } from "./externalMcp/Layers/ExternalMcpService";
 import { ExternalMcpGatewayLive } from "./externalMcp/Layers/ExternalMcpGateway";
 import { ServerEnvironmentLive } from "./environment/Layers/ServerEnvironment";
+import { MobileGatewayLive } from "./mobile/Layers/MobileGateway";
+import { MobileWorkspaceAccessLive } from "./mobile/Layers/MobileWorkspaceAccess";
+import { ServerInstanceIdentityLive } from "./server/Layers/ServerInstanceIdentity";
 import { AutomationRepositoryLive } from "./persistence/Layers/AutomationRepository";
 import { ProjectPullRequestPinsLive } from "./persistence/Layers/ProjectPullRequestPins";
 import { ProjectionTurnRepositoryLive } from "./persistence/Layers/ProjectionTurns";
@@ -51,6 +54,8 @@ import { ManagedAttachmentCleanupLive } from "./managedAttachmentCleanup";
 import { PullRequestServiceLive } from "./pullRequests/Layers/PullRequestService";
 import { ProviderHealthLive } from "./provider/Layers/ProviderHealth";
 import { makeServerProviderLayer } from "./provider/runtimeLayer";
+import { ThreadCreationCoordinatorLive } from "./threadCreation/Layers/ThreadCreationCoordinator";
+import { ThreadCreationOperationRepositoryLive } from "./threadCreation/Layers/ThreadCreationOperationRepository";
 
 export { makeServerProviderLayer } from "./provider/runtimeLayer";
 
@@ -115,20 +120,25 @@ export function makeServerRuntimeServicesLayer(
   const sessionCredentialLayer = SessionCredentialServiceLive.pipe(
     Layer.provide(ServerSecretStoreLive),
   );
+  // Pairing credentials are stored as keyed digests, so bootstrap credentials
+  // now need the same secret material the session credentials use.
+  const bootstrapCredentialLayer = BootstrapCredentialServiceLive.pipe(
+    Layer.provide(ServerSecretStoreLive),
+  );
   const authControlPlaneLayer = AuthControlPlaneLive.pipe(
-    Layer.provide(BootstrapCredentialServiceLive),
+    Layer.provide(bootstrapCredentialLayer),
     Layer.provide(sessionCredentialLayer),
   );
   const serverAuthLayer = ServerAuthLive.pipe(
     Layer.provide(ServerAuthPolicyLive),
-    Layer.provide(BootstrapCredentialServiceLive),
+    Layer.provide(bootstrapCredentialLayer),
     Layer.provide(sessionCredentialLayer),
     Layer.provide(authControlPlaneLayer),
   );
   const authServicesLayer = Layer.mergeAll(
     ServerAuthPolicyLive,
     ServerSecretStoreLive,
-    BootstrapCredentialServiceLive,
+    bootstrapCredentialLayer,
     sessionCredentialLayer,
     authControlPlaneLayer,
     serverAuthLayer,
@@ -175,6 +185,28 @@ export function makeServerRuntimeServicesLayer(
     Layer.provideMerge(ServerSettingsLive),
     Layer.provideMerge(providerHealthLayer),
   );
+  const threadCreationCoordinatorLayer = ThreadCreationCoordinatorLive.pipe(
+    Layer.provideMerge(ThreadCreationOperationRepositoryLive),
+    Layer.provideMerge(runtimeServicesLayer),
+    Layer.provideMerge(GitCoreLive),
+    Layer.provideMerge(ServerSettingsLive),
+    Layer.provideMerge(providerHealthLayer),
+  );
+  const mobileWorkspaceAccessLayer = MobileWorkspaceAccessLive.pipe(
+    Layer.provide(WorkspaceLayerLive),
+  );
+  const mobileGatewayLayer = MobileGatewayLive.pipe(
+    Layer.provide(ServerInstanceIdentityLive),
+    Layer.provide(ServerEnvironmentLive),
+    Layer.provide(runtimeServicesLayer),
+    Layer.provide(providerHealthLayer),
+    Layer.provide(mobileWorkspaceAccessLayer),
+    Layer.provide(GitCoreLive),
+    Layer.provide(ServerSettingsLive),
+    // Constructing the coordinator here runs its startup recovery before any
+    // mobile command can be served.
+    Layer.provide(threadCreationCoordinatorLayer),
+  );
   const pullRequestServiceLayer = PullRequestServiceLive.pipe(
     Layer.provideMerge(GitLayerLive),
     Layer.provideMerge(ProjectPullRequestPinsLive),
@@ -190,6 +222,8 @@ export function makeServerRuntimeServicesLayer(
     managedAttachmentCleanupLayer,
     AutomationRepositoryLive,
     AgentGatewayOperationRepositoryLive,
+    ThreadCreationOperationRepositoryLive,
+    threadCreationCoordinatorLayer,
     ExternalMcpRepositoryLive,
     externalMcpServiceLayer,
     externalMcpGatewayLayer,
@@ -206,6 +240,8 @@ export function makeServerRuntimeServicesLayer(
     KeybindingsLive,
     ServerSettingsLive,
     ServerEnvironmentLive,
+    ServerInstanceIdentityLive,
+    mobileGatewayLayer,
     ProfileStatsQueryLive,
     authServicesLayer,
     ServerLifecycleEventsLive,

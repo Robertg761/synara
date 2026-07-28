@@ -71,6 +71,7 @@ it.effect("accepts an authenticated session on a non-loopback bind", () =>
       subject: "owner-bootstrap",
       method: "browser-session-cookie" as const,
       role: "owner" as const,
+      audience: "interactive" as const,
     };
     const authenticateWebSocketUpgrade = vi.fn(() => Effect.succeed(authenticatedSession));
 
@@ -121,6 +122,7 @@ it.effect(
         subject: "owner-bootstrap",
         method: "browser-session-cookie" as const,
         role: "owner" as const,
+        audience: "interactive" as const,
       };
       const authenticateWebSocketUpgrade = vi.fn(() => Effect.succeed(authenticatedSession));
 

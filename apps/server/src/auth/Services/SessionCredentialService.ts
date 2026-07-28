@@ -1,4 +1,5 @@
 import type {
+  AuthAudience,
   AuthClientMetadata,
   AuthClientSession,
   AuthSessionId,
@@ -12,6 +13,7 @@ export type SessionRole = "owner" | "client";
 export interface IssuedSession {
   readonly sessionId: AuthSessionId;
   readonly token: string;
+  readonly audience: AuthAudience;
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
   readonly expiresAt: DateTime.DateTime;
@@ -21,6 +23,7 @@ export interface IssuedSession {
 export interface VerifiedSession {
   readonly sessionId: AuthSessionId;
   readonly token: string;
+  readonly audience: AuthAudience;
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
   readonly expiresAt?: DateTime.DateTime;
@@ -58,6 +61,7 @@ export interface SessionCredentialServiceShape {
     readonly subject?: string;
     readonly method?: ServerAuthSessionMethod;
     readonly role?: SessionRole;
+    readonly audience?: AuthAudience;
     readonly client?: AuthClientMetadata;
   }) => Effect.Effect<IssuedSession, SessionCredentialError>;
   readonly verify: (token: string) => Effect.Effect<VerifiedSession, SessionCredentialError>;

@@ -22,6 +22,7 @@ import {
   normalizeHttpsPublicOrigin,
   preparePrivateServerPaths,
   remoteAccessPolicyError,
+  loadServerMobileAccess,
   resolveCanonicalWorkspaceRoots,
   resolveStaticDir,
   ServerConfig,
@@ -165,6 +166,15 @@ const CliEnvConfig = Config.all({
   ),
   logProviderEvents: optionalBooleanEnvironmentConfig("SYNARA_LOG_PROVIDER_EVENTS"),
   logWebSocketEvents: optionalBooleanEnvironmentConfig("SYNARA_LOG_WS_EVENTS"),
+  // Explicit handoff from the desktop shell, which owns this file. Absent for
+  // standalone servers, which stay loopback-only unless configured by flag.
+  mobileAccessConfigPath: Config.string("SYNARA_MOBILE_ACCESS_CONFIG").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  mobileAccessAllowPrivateLan: optionalBooleanEnvironmentConfig(
+    "SYNARA_MOBILE_ACCESS_ALLOW_PRIVATE_LAN",
+  ),
 });
 
 const ServerConfigLive = (input: CliInput) =>
@@ -246,16 +256,30 @@ const ServerConfigLive = (input: CliInput) =>
         false,
       );
       const staticDir = devUrl ? undefined : yield* cliConfig.resolveStaticDir;
+      // Only a development build may hand the plaintext listener a private-LAN
+      // interface; a Release desktop never sets this flag, so its private-LAN
+      // policy resolves back to loopback-only.
+      const mobileAccess = yield* loadServerMobileAccess({
+        configPath: env.mobileAccessConfigPath,
+        allowPrivateLan: env.mobileAccessAllowPrivateLan ?? false,
+        port,
+      });
+      const mobileAccessBindsPrivateLan =
+        mobileAccess.resolution.reachability === "private-lan-insecure";
       // Omitting Node's host listens on an unspecified address, which exposes
       // the server beyond the local machine on common platforms. Keep every
       // mode loopback-only unless remote access is explicit and authenticated.
-      const host = Option.getOrUndefined(input.host) ?? env.host ?? "127.0.0.1";
+      const host = mobileAccessBindsPrivateLan
+        ? mobileAccess.resolution.bindHost
+        : (Option.getOrUndefined(input.host) ?? env.host ?? "127.0.0.1");
       const remotePolicyError = remoteAccessPolicyError({
         host,
         authToken,
         devUrl,
         publicUrl,
-        allowInsecureRemote,
+        // A development private-LAN bind is an explicit operator choice made in
+        // the Mobile Access settings, so it carries its own insecure-remote consent.
+        allowInsecureRemote: allowInsecureRemote || mobileAccessBindsPrivateLan,
       });
       if (remotePolicyError) {
         return yield* new StartupError({
@@ -279,13 +303,14 @@ const ServerConfigLive = (input: CliInput) =>
         staticDir,
         devUrl,
         publicUrl,
-        allowInsecureRemote,
+        allowInsecureRemote: allowInsecureRemote || mobileAccessBindsPrivateLan,
         noBrowser,
         authToken,
         desktopShutdownToken,
         autoBootstrapProjectFromCwd,
         logProviderEvents,
         logWebSocketEvents,
+        mobileAccess,
       } satisfies ServerConfigShape;
 
       return config;

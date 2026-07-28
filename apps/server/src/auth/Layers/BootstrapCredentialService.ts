@@ -1,9 +1,15 @@
-import type { AuthPairingLink } from "@synara/contracts";
+import {
+  INTERACTIVE_AUTH_AUDIENCE,
+  type AuthAudience,
+  type AuthPairingLink,
+} from "@synara/contracts";
 import * as Crypto from "node:crypto";
 import { DateTime, Duration, Effect, Layer, Option, PubSub, Ref, Stream } from "effect";
 
 import { AuthPairingLinkRepositoryLive } from "../../persistence/Layers/AuthPairingLinks";
 import { AuthPairingLinkRepository } from "../../persistence/Services/AuthPairingLinks";
+import { derivePairingCredentialDigest, derivePairingCredentialHint } from "../credentialDigest";
+import { ServerSecretStore } from "../Services/ServerSecretStore";
 import {
   BootstrapCredentialError,
   BootstrapCredentialService,
@@ -17,9 +23,14 @@ interface StoredBootstrapGrant extends BootstrapGrant {
   readonly remainingUses: number | "unbounded";
 }
 
+const PAIRING_DIGEST_SECRET_NAME = "pairing-credential-digest-key";
 const DEFAULT_ONE_TIME_TOKEN_TTL = Duration.minutes(5);
 const PAIRING_TOKEN_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const PAIRING_TOKEN_LENGTH = 12;
+
+// One message for every rejected credential. Distinguishing "unknown" from
+// "revoked" or "expired" would tell a guesser that its token matched a row.
+const UNAVAILABLE_CREDENTIAL_MESSAGE = "Bootstrap credential is not valid.";
 
 const generatePairingToken = (): string => {
   const randomBytes = Crypto.randomBytes(PAIRING_TOKEN_LENGTH);
@@ -35,7 +46,8 @@ const toBootstrapCredentialError = (message: string, status: 401 | 500, cause?: 
 
 const toPairingLink = (row: {
   readonly id: string;
-  readonly credential: string;
+  readonly credentialHint: string;
+  readonly audience: AuthAudience;
   readonly role: "owner" | "client";
   readonly subject: string;
   readonly label: string | null;
@@ -43,7 +55,8 @@ const toPairingLink = (row: {
   readonly expiresAt: DateTime.Utc;
 }): AuthPairingLink => ({
   id: row.id,
-  credential: row.credential,
+  credentialHint: row.credentialHint,
+  audience: row.audience,
   role: row.role,
   subject: row.subject,
   ...(row.label ? { label: row.label } : {}),
@@ -53,6 +66,8 @@ const toPairingLink = (row: {
 
 export const makeBootstrapCredentialService = Effect.gen(function* () {
   const pairingLinks = yield* AuthPairingLinkRepository;
+  const secretStore = yield* ServerSecretStore;
+  const digestSecret = yield* secretStore.getOrCreateRandom(PAIRING_DIGEST_SECRET_NAME, 32);
   const seededGrantsRef = yield* Ref.make(new Map<string, StoredBootstrapGrant>());
   const changesPubSub = yield* PubSub.unbounded<BootstrapCredentialChange>();
 
@@ -95,16 +110,20 @@ export const makeBootstrapCredentialService = Effect.gen(function* () {
     Effect.gen(function* () {
       const id = Crypto.randomUUID();
       const credential = generatePairingToken();
+      const credentialHint = derivePairingCredentialHint(credential);
       const now = yield* DateTime.now;
       const ttl = input?.ttl ?? DEFAULT_ONE_TIME_TOKEN_TTL;
       const expiresAt = DateTime.addDuration(now, ttl);
       const role = input?.role ?? "client";
       const subject = input?.subject ?? "one-time-token";
+      const audience = input?.audience ?? INTERACTIVE_AUTH_AUDIENCE;
       const label = input?.label;
 
       yield* pairingLinks.create({
         id,
-        credential,
+        credentialDigest: derivePairingCredentialDigest(credential, digestSecret),
+        credentialHint,
+        audience,
         method: "one-time-token",
         role,
         subject,
@@ -115,7 +134,8 @@ export const makeBootstrapCredentialService = Effect.gen(function* () {
 
       const pairingLink = toPairingLink({
         id,
-        credential,
+        credentialHint,
+        audience,
         role,
         subject,
         label: label ?? null,
@@ -127,6 +147,8 @@ export const makeBootstrapCredentialService = Effect.gen(function* () {
       return {
         id,
         credential,
+        credentialHint,
+        audience,
         ...(label ? { label } : {}),
         expiresAt,
       } satisfies IssuedBootstrapCredential;
@@ -169,20 +191,24 @@ export const makeBootstrapCredentialService = Effect.gen(function* () {
       const now = yield* DateTime.now;
       const seeded = yield* consumeSeededGrant(credential, now);
       if (seeded === "expired") {
-        return yield* toBootstrapCredentialError("Bootstrap credential expired.", 401);
+        return yield* toBootstrapCredentialError(UNAVAILABLE_CREDENTIAL_MESSAGE, 401);
       }
       if (seeded) {
         return {
           method: seeded.method,
           role: seeded.role,
+          audience: seeded.audience,
           subject: seeded.subject,
           ...(seeded.label ? { label: seeded.label } : {}),
           expiresAt: seeded.expiresAt,
         } satisfies BootstrapGrant;
       }
 
+      // The digest is derived before the atomic consume so the redemption stays
+      // a single conditional UPDATE ... RETURNING against the stored digest.
+      const credentialDigest = derivePairingCredentialDigest(credential, digestSecret);
       const consumed = yield* pairingLinks.consumeAvailable({
-        credential,
+        credentialDigest,
         consumedAt: now,
         now,
       });
@@ -192,27 +218,29 @@ export const makeBootstrapCredentialService = Effect.gen(function* () {
         return {
           method: consumed.value.method,
           role: consumed.value.role,
+          audience: consumed.value.audience,
           subject: consumed.value.subject,
           ...(consumed.value.label ? { label: consumed.value.label } : {}),
           expiresAt: consumed.value.expiresAt,
         } satisfies BootstrapGrant;
       }
 
-      const matching = yield* pairingLinks.getByCredential({ credential });
-      if (Option.isNone(matching)) {
-        return yield* toBootstrapCredentialError("Unknown bootstrap credential.", 401);
-      }
-      if (matching.value.revokedAt !== null || matching.value.consumedAt !== null) {
-        return yield* toBootstrapCredentialError(
-          "Bootstrap credential is no longer available.",
-          401,
-        );
-      }
-      if (DateTime.isGreaterThanOrEqualTo(now, matching.value.expiresAt)) {
-        return yield* toBootstrapCredentialError("Bootstrap credential expired.", 401);
-      }
-
-      return yield* toBootstrapCredentialError("Bootstrap credential is no longer available.", 401);
+      // Classify server-side only: every failure branch below runs the same
+      // lookup and returns the same error, so neither the response nor the
+      // work performed distinguishes a matched row from a guess.
+      const matching = yield* pairingLinks.getByCredentialDigest({ credentialDigest });
+      yield* Effect.logWarning("Rejected bootstrap credential.").pipe(
+        Effect.annotateLogs({
+          reason: Option.isNone(matching)
+            ? "unknown"
+            : matching.value.revokedAt !== null
+              ? "revoked"
+              : matching.value.consumedAt !== null
+                ? "consumed"
+                : "expired",
+        }),
+      );
+      return yield* toBootstrapCredentialError(UNAVAILABLE_CREDENTIAL_MESSAGE, 401);
     }).pipe(
       Effect.mapError((cause) =>
         cause instanceof BootstrapCredentialError

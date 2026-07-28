@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   deriveServerPaths,
+  DISABLED_MOBILE_ACCESS,
   resolveDefaultChatWorkspaceRoot,
   resolveDefaultStudioWorkspaceRoot,
   ServerConfig,
@@ -72,6 +73,7 @@ const makeConfigLayer = () =>
         autoBootstrapProjectFromCwd: false,
         logProviderEvents: false,
         logWebSocketEvents: false,
+        mobileAccess: DISABLED_MOBILE_ACCESS,
       } satisfies ServerConfigShape;
     }),
   );

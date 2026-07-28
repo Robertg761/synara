@@ -1,4 +1,4 @@
-import type { AuthPairingLink, ServerAuthBootstrapMethod } from "@synara/contracts";
+import type { AuthAudience, AuthPairingLink, ServerAuthBootstrapMethod } from "@synara/contracts";
 import { Data, DateTime, Duration, ServiceMap } from "effect";
 import type { Effect, Stream } from "effect";
 
@@ -7,6 +7,7 @@ export type BootstrapCredentialRole = "owner" | "client";
 export interface BootstrapGrant {
   readonly method: ServerAuthBootstrapMethod;
   readonly role: BootstrapCredentialRole;
+  readonly audience: AuthAudience;
   readonly subject: string;
   readonly label?: string;
   readonly expiresAt: DateTime.DateTime;
@@ -20,7 +21,10 @@ export class BootstrapCredentialError extends Data.TaggedError("BootstrapCredent
 
 export interface IssuedBootstrapCredential {
   readonly id: string;
+  /** Returned exactly once, at creation. Never persisted and never logged. */
   readonly credential: string;
+  readonly credentialHint: string;
+  readonly audience: AuthAudience;
   readonly label?: string;
   readonly expiresAt: DateTime.Utc;
 }
@@ -41,6 +45,7 @@ export interface BootstrapCredentialServiceShape {
     readonly role?: BootstrapCredentialRole;
     readonly subject?: string;
     readonly label?: string;
+    readonly audience?: AuthAudience;
   }) => Effect.Effect<IssuedBootstrapCredential, BootstrapCredentialError>;
   readonly listActive: () => Effect.Effect<
     ReadonlyArray<AuthPairingLink>,

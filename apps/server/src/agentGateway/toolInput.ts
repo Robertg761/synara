@@ -7,6 +7,7 @@ import {
 } from "@synara/contracts";
 import { Schema } from "effect";
 
+import { describeError } from "../durableOperations/errors.ts";
 import { AGENT_GATEWAY_TARGET_OPTIONS_DESCRIPTION } from "./targetResolver.ts";
 
 export const PROVIDER_KINDS: ReadonlyArray<ProviderKind> = [
@@ -41,8 +42,7 @@ export const MODEL_SELECTION_INPUT_SCHEMA = {
 
 export class ToolInputError extends Error {}
 
-export const errorText = (error: unknown): string =>
-  error instanceof Error ? error.message : String(error);
+export const errorText = describeError;
 
 export function readStringArg(
   args: Record<string, unknown>,

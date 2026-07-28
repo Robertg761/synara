@@ -60,7 +60,38 @@ describe("makeCursorSafeSnapshotLiveStream", () => {
                 Stream.fromEffect(PubSub.publish(live, newerLive)).pipe(Stream.drain),
                 Stream.succeed(replayed),
               ),
-          }).pipe(Stream.take(3), Stream.runCollect);
+          }).pipe(Stream.take(4), Stream.runCollect);
+        }),
+      ),
+    );
+
+    expect(Array.from(items)).toEqual([
+      { kind: "snapshot", snapshot: { snapshotSequence: 1 } },
+      { kind: "event", event: event(2) },
+      { kind: "synchronized", sequence: 2 },
+      { kind: "event", event: event(3) },
+    ]);
+  });
+
+  it("emits the synchronized marker after the fenced replay even when live events are already buffered", async () => {
+    const items = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const live = yield* PubSub.unbounded<OrchestrationEvent>();
+          return yield* makeCursorSafeSnapshotLiveStream({
+            subscribeLive: PubSub.subscribe(live).pipe(
+              Effect.map((subscription) => Stream.fromEffectRepeat(PubSub.take(subscription))),
+            ),
+            // Two live events land before the snapshot is even taken, so the
+            // marker must still wait for the durable replay to drain.
+            snapshot: PubSub.publish(live, event(2)).pipe(
+              Effect.andThen(PubSub.publish(live, event(5))),
+              Effect.as({ snapshotSequence: 1 }),
+            ),
+            snapshotSequence: (snapshot) => snapshot.snapshotSequence,
+            getHighWaterSequence: Effect.succeed(4),
+            replay: () => Stream.make(event(2), event(3), event(4)),
+          }).pipe(Stream.take(6), Stream.runCollect);
         }),
       ),
     );
@@ -69,6 +100,9 @@ describe("makeCursorSafeSnapshotLiveStream", () => {
       { kind: "snapshot", snapshot: { snapshotSequence: 1 } },
       { kind: "event", event: event(2) },
       { kind: "event", event: event(3) },
+      { kind: "event", event: event(4) },
+      { kind: "synchronized", sequence: 4 },
+      { kind: "event", event: event(5) },
     ]);
   });
 

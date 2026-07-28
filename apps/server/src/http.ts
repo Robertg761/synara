@@ -6,6 +6,7 @@ import {
   AuthCreatePairingCredentialInput,
   AuthRevokeClientSessionInput,
   AuthRevokePairingLinkInput,
+  MOBILE_DESCRIPTOR_PATH,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   SERVER_VOICE_TRANSCRIPTION_MAX_AUDIO_BYTES,
@@ -34,6 +35,7 @@ import { deriveAuthClientMetadata } from "./auth/utils";
 import { ServerConfig, type ServerConfigShape } from "./config";
 import { resolveCachedEditorIcon } from "./editorAppIcons";
 import { LOCAL_IMAGE_ROUTE_PATH, resolveAllowedLocalPreviewFile } from "./localImageFiles.ts";
+import { MobileGateway } from "./mobile/Services/MobileGateway";
 import { ProjectFaviconResolver } from "./project/Services/ProjectFaviconResolver";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegistry";
@@ -184,6 +186,7 @@ export function makeEffectHttpRouteLayer(
     makeHealthEffectRouteLayer(readiness),
     makeDesktopShutdownEffectRouteLayer(shutdownController),
     authEffectRouteLayer,
+    mobileDescriptorEffectRouteLayer,
     projectFaviconEffectRouteLayer,
     threadExportEffectRouteLayer,
     siteFaviconEffectRouteLayer,
@@ -194,6 +197,24 @@ export function makeEffectHttpRouteLayer(
     staticAndDevEffectRouteLayer,
   );
 }
+
+/**
+ * Pre-pairing bootstrap: a phone reads this before it holds any credential, so
+ * it is unauthenticated by design and must never carry a secret. `no-store`
+ * keeps a restarted server's new instance id from being served from a cache.
+ */
+export const mobileDescriptorEffectRouteLayer = HttpRouter.add(
+  "GET",
+  MOBILE_DESCRIPTOR_PATH,
+  Effect.gen(function* () {
+    const gateway = yield* MobileGateway;
+    const descriptor = yield* gateway.getDescriptor;
+    return HttpServerResponse.jsonUnsafe(descriptor, {
+      status: 200,
+      headers: { "Cache-Control": "no-store" },
+    });
+  }),
+);
 
 export function makeDesktopShutdownEffectRouteLayer(shutdownController: ServerShutdownController) {
   return HttpRouter.add(

@@ -73,7 +73,13 @@ function makeServerAuth(sideEffects: { count: number }): ServerAuthShape {
         sessionToken: "bearer-token",
       }),
     issuePairingCredential: () =>
-      mutate({ id: "pairing-id", credential: "PAIRINGTOKEN", expiresAt }),
+      mutate({
+        id: "pairing-id",
+        credential: "PAIRINGTOKEN",
+        credentialHint: "PAIR",
+        audience: "interactive" as const,
+        expiresAt,
+      }),
     listPairingLinks: () => Effect.succeed([]),
     revokePairingLink: () => mutate(true),
     listClientSessions: () => Effect.succeed([]),
@@ -91,6 +97,7 @@ function makeServerAuth(sideEffects: { count: number }): ServerAuthShape {
         subject: "owner",
         method: bearer ? "bearer-session-token" : "browser-session-cookie",
         role: "owner",
+        audience: "interactive" as const,
         expiresAt,
         credentialSource: bearer ? "bearer" : "cookie",
       });

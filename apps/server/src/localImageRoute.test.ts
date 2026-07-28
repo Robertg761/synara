@@ -77,6 +77,7 @@ function makeFakeServerAuth(): ServerAuthShape {
     subject: "owner",
     method: "browser-session-cookie" as const,
     role: "owner" as const,
+    audience: "interactive" as const,
     expiresAt,
   };
   return {
@@ -101,7 +102,13 @@ function makeFakeServerAuth(): ServerAuthShape {
         sessionToken: "bearer-session-token",
       }),
     issuePairingCredential: () =>
-      Effect.succeed({ id: "pairing-id", credential: "PAIRINGTOKEN", expiresAt }),
+      Effect.succeed({
+        id: "pairing-id",
+        credential: "PAIRINGTOKEN",
+        credentialHint: "PAIR",
+        audience: "interactive" as const,
+        expiresAt,
+      }),
     listPairingLinks: () => Effect.succeed([]),
     revokePairingLink: () => Effect.succeed(true),
     listClientSessions: () => Effect.succeed([]),

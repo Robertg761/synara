@@ -9,6 +9,7 @@
 // admission middleware resolves it back into handler-scoped services.
 import { randomUUID } from "node:crypto";
 
+import type { AuthSessionId } from "@synara/contracts";
 import { Effect, Layer, Scope, ServiceMap } from "effect";
 
 import {
@@ -23,9 +24,20 @@ export const CurrentWsSessionRole = ServiceMap.Reference<WsSessionRole>(
   { defaultValue: () => "client" },
 );
 
+/**
+ * Identifies the authenticated session behind the connection. Absent for the
+ * unauthenticated loopback owner, which has no auth-session row to compare
+ * against, so control-plane listings simply flag nothing as "current".
+ */
+export const CurrentWsAuthSessionId = ServiceMap.Reference<AuthSessionId | undefined>(
+  "synara/ws/CurrentAuthSessionId",
+  { defaultValue: () => undefined },
+);
+
 export interface WsConnectionSession {
   readonly role: WsSessionRole;
   readonly attachmentPrincipal: ManagedAttachmentPrincipal;
+  readonly authSessionId?: AuthSessionId | undefined;
 }
 
 /**
@@ -78,6 +90,7 @@ export function provideWsConnectionSession<A, E, R>(
     ? effect.pipe(
         Effect.provideService(CurrentWsSessionRole, session.role),
         Effect.provideService(CurrentManagedAttachmentPrincipal, session.attachmentPrincipal),
+        Effect.provideService(CurrentWsAuthSessionId, session.authSessionId),
       )
     : effect;
 }

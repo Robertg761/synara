@@ -1,4 +1,4 @@
-import type { AuthClientSession, AuthPairingLink } from "@synara/contracts";
+import { INTERACTIVE_AUTH_AUDIENCE, type AuthClientSession } from "@synara/contracts";
 import { DateTime, Effect, Layer } from "effect";
 
 import { BootstrapCredentialService } from "../Services/BootstrapCredentialService";
@@ -35,15 +35,19 @@ export const makeAuthControlPlane = Effect.gen(function* () {
       const createdAt = yield* DateTime.now;
       const role = input?.role ?? "client";
       const subject = input?.subject ?? "one-time-token";
+      const audience = input?.audience ?? INTERACTIVE_AUTH_AUDIENCE;
       const issued = yield* bootstrapCredentials.issueOneTimeToken({
         role,
         subject,
+        audience,
         ...(input?.ttl ? { ttl: input.ttl } : {}),
         ...(input?.label ? { label: input.label } : {}),
       });
       return {
         id: issued.id,
         credential: issued.credential,
+        credentialHint: issued.credentialHint,
+        audience: issued.audience,
         role,
         subject,
         ...(issued.label ? { label: issued.label } : {}),
@@ -58,18 +62,6 @@ export const makeAuthControlPlane = Effect.gen(function* () {
         pairingLinks
           .filter((pairingLink) => (input?.role ? pairingLink.role === input.role : true))
           .filter((pairingLink) => !input?.excludeSubjects?.includes(pairingLink.subject))
-          .map((pairingLink) =>
-            pairingLink.label
-              ? ({ ...pairingLink, label: pairingLink.label } satisfies AuthPairingLink)
-              : ({
-                  id: pairingLink.id,
-                  credential: pairingLink.credential,
-                  role: pairingLink.role,
-                  subject: pairingLink.subject,
-                  createdAt: pairingLink.createdAt,
-                  expiresAt: pairingLink.expiresAt,
-                } satisfies AuthPairingLink),
-          )
           .sort(
             (left, right) =>
               DateTime.toEpochMillis(right.createdAt) - DateTime.toEpochMillis(left.createdAt),
@@ -89,6 +81,7 @@ export const makeAuthControlPlane = Effect.gen(function* () {
         subject: input?.subject ?? DEFAULT_SESSION_SUBJECT,
         method: "bearer-session-token",
         role: input?.role ?? "owner",
+        ...(input?.audience ? { audience: input.audience } : {}),
         client: {
           ...(input?.label ? { label: input.label } : {}),
           deviceType: "bot",
@@ -149,5 +142,5 @@ export const AuthControlPlaneLive = Layer.effect(AuthControlPlane, makeAuthContr
 
 export const AuthCoreLive = Layer.mergeAll(
   BootstrapCredentialServiceLive,
-  SessionCredentialServiceLive.pipe(Layer.provide(ServerSecretStoreLive)),
-);
+  SessionCredentialServiceLive,
+).pipe(Layer.provide(ServerSecretStoreLive));

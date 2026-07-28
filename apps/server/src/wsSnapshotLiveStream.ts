@@ -5,7 +5,13 @@ export const ORCHESTRATION_SNAPSHOT_REPLAY_LIMIT = 4_096;
 
 export type SnapshotLiveStreamItem<Snapshot> =
   | { readonly kind: "snapshot"; readonly snapshot: Snapshot }
-  | { readonly kind: "event"; readonly event: OrchestrationEvent };
+  | { readonly kind: "event"; readonly event: OrchestrationEvent }
+  /**
+   * Emitted once, after the bounded durable replay has drained and before any
+   * live event is forwarded. `sequence` is the high-water fence, so a consumer
+   * that has seen this marker has every event through that sequence.
+   */
+  | { readonly kind: "synchronized"; readonly sequence: number };
 
 /**
  * Attach live delivery first, capture a snapshot and durable high-water fence,
@@ -66,9 +72,18 @@ export function makeCursorSafeSnapshotLiveStream<Snapshot, E>(input: {
         Stream.map((event): SnapshotLiveStreamItem<Snapshot> => ({ kind: "event", event })),
       );
 
+      // The marker sits between the two concatenated stages rather than in the
+      // live handoff queue: the fence already guarantees replay covers exactly
+      // (snapshotSequence, highWaterSequence], so this position is the first
+      // instant at which the consumer is provably caught up.
+      const synchronized = Stream.succeed<SnapshotLiveStreamItem<Snapshot>>({
+        kind: "synchronized",
+        sequence: highWaterSequence,
+      });
+
       return Stream.concat(
         Stream.succeed<SnapshotLiveStreamItem<Snapshot>>({ kind: "snapshot", snapshot }),
-        Stream.concat(replay, liveAfterFence),
+        Stream.concat(replay, Stream.concat(synchronized, liveAfterFence)),
       );
     }),
   );

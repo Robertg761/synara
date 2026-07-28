@@ -8,8 +8,6 @@ import {
   ProjectId,
   ThreadId,
   type ExternalMcpCapability,
-  type ProviderKind,
-  type ServerProviderStatus,
 } from "@synara/contracts";
 import { Effect, Layer, Option, Schema } from "effect";
 
@@ -20,6 +18,7 @@ import { ProjectionSnapshotQuery } from "../../orchestration/Services/Projection
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProviderDiscoveryService } from "../../provider/Services/ProviderDiscoveryService.ts";
 import { ProviderHealth } from "../../provider/Services/ProviderHealth.ts";
+import { loadProviderAvailabilities as loadProviderAvailabilitiesFor } from "../../provider/providerAvailability.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { AgentGatewayOperationRepository } from "../../agentGateway/Services/AgentGatewayOperationRepository.ts";
 import { makeCreateThreadsHandler } from "../../agentGateway/creationCoordinator.ts";
@@ -49,7 +48,6 @@ import {
   AGENT_GATEWAY_TARGET_OPTIONS_DESCRIPTION,
   agentGatewayTargetOptionGuidance,
   loadAgentGatewayProviderCatalog,
-  type AgentGatewayProviderAvailability,
 } from "../../agentGateway/targetResolver.ts";
 import {
   decodeCreateThreadsInput,
@@ -172,33 +170,7 @@ export const makeExternalMcpGateway = Effect.gen(function* () {
     git,
   });
 
-  const loadProviderAvailabilities = Effect.gen(function* () {
-    const [serverSettings, statuses] = yield* Effect.all([
-      settings.getSettings,
-      providerHealth.getStatuses,
-    ]);
-    const statusByProvider = new Map<ProviderKind, ServerProviderStatus>(
-      statuses.map((status) => [status.provider, status]),
-    );
-    return new Map<ProviderKind, AgentGatewayProviderAvailability>(
-      PROVIDER_KINDS.map((provider) => {
-        const status = statusByProvider.get(provider);
-        return [
-          provider,
-          {
-            enabled: serverSettings.providers[provider].enabled,
-            ...(status
-              ? {
-                  available: status.available,
-                  authStatus: status.authStatus,
-                  ...(status.message ? { message: status.message } : {}),
-                }
-              : {}),
-          },
-        ];
-      }),
-    );
-  });
+  const loadProviderAvailabilities = loadProviderAvailabilitiesFor({ settings, providerHealth });
 
   const requireThreadShell = (threadId: string) =>
     snapshotQuery.getThreadShellById(ThreadId.makeUnsafe(threadId)).pipe(
