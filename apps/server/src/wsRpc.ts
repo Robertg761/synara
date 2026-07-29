@@ -1625,7 +1625,8 @@ const makeBootstrapWebSocketHttpEffect = RpcServer.toHttpEffectWebsocket(WsBoots
 );
 
 export function authenticateRpcWebSocketUpgrade(input: {
-  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">;
+  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl"> &
+    Partial<Pick<ServerConfigShape, "mode" | "allowInsecureRemote">>;
   readonly legacyToken: string | null;
   readonly request: AuthRequest;
   readonly serverAuth: Pick<ServerAuthShape, "authenticateWebSocketUpgrade">;
@@ -1633,6 +1634,14 @@ export function authenticateRpcWebSocketUpgrade(input: {
   if (
     !requiresWebSocketAuthentication(input.config) ||
     (isLoopbackHost(input.config.host) &&
+      !input.config.publicUrl &&
+      input.legacyToken === input.config.authToken) ||
+    // An unpackaged desktop private-LAN session still uses the shell's
+    // per-process bootstrap token. Keep this exception narrower than generic
+    // remote access: trusted proxies and standalone web servers must exchange
+    // a real session credential.
+    (input.config.mode === "desktop" &&
+      input.config.allowInsecureRemote === true &&
       !input.config.publicUrl &&
       input.legacyToken === input.config.authToken)
   ) {

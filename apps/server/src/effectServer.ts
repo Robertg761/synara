@@ -15,7 +15,11 @@ import {
   makePersistedServerRuntimeState,
   persistServerRuntimeState,
 } from "./serverRuntimeState";
-import { remoteAccessPolicyError, ServerConfig } from "./config";
+import {
+  devUrlForRemoteAccessPolicy,
+  remoteAccessPolicyError,
+  ServerConfig,
+} from "./config";
 import { resolveListeningPort } from "./startupAccess";
 import { patchBunWebSocketCloseEventCompatibility } from "./bunWebSocketCompatibility";
 import { makeEffectHttpRouteLayer } from "./http";
@@ -115,7 +119,17 @@ export const createEffectServer = Effect.fn(function* (
   shutdownController: ServerShutdownController,
 ) {
   const config = yield* ServerConfig;
-  const remotePolicyError = remoteAccessPolicyError(config);
+  const remotePolicyError = remoteAccessPolicyError({
+    ...config,
+    // The desktop renderer reaches Vite over loopback; mobile clients only
+    // reach the authenticated gateway on this Debug-only private-LAN bind.
+    devUrl: devUrlForRemoteAccessPolicy({
+      mode: config.mode,
+      devUrl: config.devUrl,
+      mobileAccessBindsPrivateLan:
+        config.mobileAccess?.resolution.reachability === "private-lan-insecure",
+    }),
+  });
   if (remotePolicyError) {
     return yield* new ServerLifecycleError({
       operation: "validateRemoteAccessPolicy",

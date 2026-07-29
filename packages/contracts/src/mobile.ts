@@ -113,6 +113,7 @@ export const MOBILE_METHODS = [
   "clientTurn.interrupt",
   "clientTurn.respondApproval",
   "clientTurn.respondUserInput",
+  "clientThread.update",
 ] as const;
 
 export const MobileMethod = Schema.Literals(MOBILE_METHODS);
@@ -561,6 +562,24 @@ export const MobileRespondUserInputInput = Schema.Struct({
 });
 export type MobileRespondUserInputInput = typeof MobileRespondUserInputInput.Type;
 
+export const MobileThreadUpdateOperation = Schema.Literals([
+  "rename",
+  "pin",
+  "archive",
+  "delete",
+]);
+export type MobileThreadUpdateOperation = typeof MobileThreadUpdateOperation.Type;
+
+export const MobileUpdateThreadInput = Schema.Struct({
+  threadId: ThreadId,
+  commandId: CommandId,
+  operation: MobileThreadUpdateOperation,
+  title: Schema.optional(TrimmedNonEmptyString),
+  isPinned: Schema.optional(Schema.Boolean),
+  isArchived: Schema.optional(Schema.Boolean),
+});
+export type MobileUpdateThreadInput = typeof MobileUpdateThreadInput.Type;
+
 export const MobileCommandAccepted = Schema.Struct({
   commandId: CommandId,
   acceptedSequence: NonNegativeInt,
@@ -634,6 +653,7 @@ export const MobileRequest = Schema.Union([
   requestFrame("clientTurn.interrupt", MobileInterruptTurnInput),
   requestFrame("clientTurn.respondApproval", MobileRespondApprovalInput),
   requestFrame("clientTurn.respondUserInput", MobileRespondUserInputInput),
+  requestFrame("clientThread.update", MobileUpdateThreadInput),
 ]);
 export type MobileRequest = typeof MobileRequest.Type;
 
@@ -720,6 +740,7 @@ export const MobileSuccess = Schema.Union([
   successFrame("clientTurn.interrupt", MobileCommandAccepted),
   successFrame("clientTurn.respondApproval", MobileCommandAccepted),
   successFrame("clientTurn.respondUserInput", MobileCommandAccepted),
+  successFrame("clientThread.update", MobileCommandAccepted),
 ]);
 export type MobileSuccess = typeof MobileSuccess.Type;
 

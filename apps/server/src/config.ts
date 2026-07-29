@@ -34,6 +34,16 @@ export const PRIVATE_STATE_REPAIR_MARKER = ".permissions-v1";
 
 export type RuntimeMode = "web" | "desktop";
 
+export function devUrlForRemoteAccessPolicy(input: {
+  readonly mode: RuntimeMode;
+  readonly devUrl: URL | undefined;
+  readonly mobileAccessBindsPrivateLan: boolean;
+}): URL | undefined {
+  return input.mode === "desktop" && input.mobileAccessBindsPrivateLan
+    ? undefined
+    : input.devUrl;
+}
+
 export function normalizeHttpsPublicOrigin(publicUrl: URL): URL | null {
   if (
     publicUrl.protocol !== "https:" ||

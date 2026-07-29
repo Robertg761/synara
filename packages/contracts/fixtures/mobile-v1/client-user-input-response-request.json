@@ -9,7 +9,10 @@
     "lifecycleGeneration": "gen-1",
     "answers": {
       "environment": "staging",
-      "regions": ["us-east", "eu-west"],
+      "regions": [
+        "us-east",
+        "eu-west"
+      ],
       "notes": null
     }
   }

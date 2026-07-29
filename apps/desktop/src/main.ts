@@ -108,6 +108,7 @@ import {
   isMobileAccessConfigInput,
   mobileAccessBackendEnv,
   readMobileAccessConfig,
+  resolveDesktopBackendHost,
   resolveMobileAccessConfigPath,
   writeMobileAccessConfig,
 } from "./mobileAccessConfig";
@@ -576,10 +577,17 @@ async function reserveBackendEndpoint(reason: string): Promise<void> {
     Effect.provide(NetService.layer),
     Effect.runPromise,
   );
-  backendHttpUrl = `http://127.0.0.1:${backendPort}`;
-  backendWsUrl = `ws://127.0.0.1:${backendPort}/?token=${encodeURIComponent(backendAuthToken)}`;
+  const backendHost = resolveDesktopBackendHost(
+    readMobileAccessConfig(mobileAccessConfigPath()),
+    { privateLanAvailable: isPrivateLanModeAvailable() },
+  );
+  const backendHostForUrl = backendHost.includes(":") ? `[${backendHost}]` : backendHost;
+  backendHttpUrl = `http://${backendHostForUrl}:${backendPort}`;
+  backendWsUrl = `ws://${backendHostForUrl}:${backendPort}/?token=${encodeURIComponent(backendAuthToken)}`;
   process.env.SYNARA_DESKTOP_WS_URL = backendWsUrl;
-  writeDesktopLogHeader(`${reason} resolved backend endpoint port=${backendPort}`);
+  writeDesktopLogHeader(
+    `${reason} resolved backend endpoint host=${backendHostForUrl} port=${backendPort}`,
+  );
 }
 
 async function waitForBackendWindowReady(baseUrl: string): Promise<"listening" | "http"> {

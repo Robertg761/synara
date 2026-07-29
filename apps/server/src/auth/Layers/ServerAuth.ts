@@ -1,5 +1,6 @@
 import {
   INTERACTIVE_AUTH_AUDIENCE,
+  MOBILE_AUTH_AUDIENCE,
   type AuthAudience,
   type AuthBearerBootstrapResult,
   type AuthBootstrapResult,
@@ -422,8 +423,18 @@ export const makeServerAuth = Effect.gen(function* () {
   ) => {
     const queryTicket = request.url?.searchParams.get(WEBSOCKET_TOKEN_QUERY_PARAM)?.trim();
     const headerTicket = parseWebSocketTicketHeader(request.headers);
+    // Synara iOS versions released before the dedicated `SynaraTicket` scheme
+    // carried their single-use mobile ticket as a Bearer credential. On the
+    // mobile-only route the required audience makes that shape unambiguous, so
+    // accept it as a ticket without widening interactive WebSocket auth.
+    const legacyMobileHeaderTicket =
+      options?.requiredAudience === MOBILE_AUTH_AUDIENCE
+        ? parseBearerToken(request.headers)
+        : null;
     const websocketTicket =
-      queryTicket && queryTicket.length > 0 ? queryTicket : (headerTicket ?? null);
+      queryTicket && queryTicket.length > 0
+        ? queryTicket
+        : (headerTicket ?? legacyMobileHeaderTicket);
     const authenticated = websocketTicket
       ? sessions.verifyWebSocketToken(websocketTicket).pipe(
           Effect.map(toAuthenticatedSession),

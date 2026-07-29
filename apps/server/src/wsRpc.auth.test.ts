@@ -113,6 +113,34 @@ it.effect("preserves the legacy query token for loopback desktop sessions", () =
   }),
 );
 
+it.effect("preserves the desktop token for an explicitly enabled private-LAN dev session", () =>
+  Effect.gen(function* () {
+    const authenticateWebSocketUpgrade = vi.fn(() =>
+      Effect.fail(new AuthError({ message: "Unexpected authentication call.", status: 500 })),
+    );
+
+    const session = yield* authenticateRpcWebSocketUpgrade({
+      config: {
+        mode: "desktop",
+        host: "192.168.1.50",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        allowInsecureRemote: true,
+      },
+      legacyToken: "desktop-secret",
+      request: {
+        headers: {},
+        cookies: {},
+        url: new URL("http://192.168.1.50:3773/ws?token=desktop-secret"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    });
+
+    assert.equal(session, null);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 0);
+  }),
+);
+
 it.effect(
   "disables the legacy loopback query token when an HTTPS public origin is configured",
   () =>

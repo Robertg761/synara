@@ -18,6 +18,7 @@ import {
 } from "@synara/shared/cli";
 import {
   DEFAULT_PORT,
+  devUrlForRemoteAccessPolicy,
   deriveServerPaths,
   normalizeHttpsPublicOrigin,
   preparePrivateServerPaths,
@@ -275,7 +276,11 @@ const ServerConfigLive = (input: CliInput) =>
       const remotePolicyError = remoteAccessPolicyError({
         host,
         authToken,
-        devUrl,
+        devUrl: devUrlForRemoteAccessPolicy({
+          mode,
+          devUrl,
+          mobileAccessBindsPrivateLan,
+        }),
         publicUrl,
         // A development private-LAN bind is an explicit operator choice made in
         // the Mobile Access settings, so it carries its own insecure-remote consent.

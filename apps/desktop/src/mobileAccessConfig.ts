@@ -19,6 +19,7 @@ import {
   DEFAULT_MOBILE_ACCESS_CONFIG,
   normalizeMobileAccessConfig,
   parseMobileAccessConfig,
+  resolveMobileAccess,
   serializeMobileAccessConfig,
 } from "@synara/shared/mobileAccess";
 
@@ -36,6 +37,22 @@ export function readMobileAccessConfig(configPath: string): MobileAccessConfig {
     return DEFAULT_MOBILE_ACCESS_CONFIG;
   }
   return parseMobileAccessConfig(text);
+}
+
+/**
+ * The desktop renderer must dial the same concrete interface as the backend.
+ * A private-LAN listener is not reachable through 127.0.0.1 even from the same
+ * Mac, while trusted-proxy and disabled modes remain loopback-only.
+ */
+export function resolveDesktopBackendHost(
+  config: MobileAccessConfig,
+  options: { readonly privateLanAvailable: boolean },
+): string {
+  return resolveMobileAccess({
+    config: gateMobileAccessConfig(config, options),
+    allowPrivateLan: options.privateLanAvailable,
+    port: 0,
+  }).bindHost;
 }
 
 /**

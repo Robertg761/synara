@@ -358,6 +358,33 @@ describe("ServerAuthLive", () => {
     );
   });
 
+  it("accepts the legacy Bearer ticket scheme only on the mobile route", async () => {
+    await runServerAuthTest(
+      Effect.gen(function* () {
+        const serverAuth = yield* ServerAuth;
+        const pairing = yield* serverAuth.issuePairingCredential({
+          audience: MOBILE_AUTH_AUDIENCE,
+          label: "Legacy iPhone",
+        });
+        const exchanged = yield* serverAuth.exchangeBootstrapCredential(
+          pairing.credential,
+          requestMetadata,
+        );
+        const session = yield* serverAuth.authenticateHttpRequest(
+          makeCookieRequest(exchanged.sessionToken),
+        );
+        const ticket = yield* serverAuth.issueWebSocketToken(session);
+
+        const upgraded = yield* serverAuth.authenticateWebSocketUpgrade(
+          { headers: { authorization: `Bearer ${ticket.token}` }, cookies: {} },
+          { requiredAudience: MOBILE_AUTH_AUDIENCE },
+        );
+
+        expect(upgraded.sessionId).toBe(session.sessionId);
+      }),
+    );
+  });
+
   it("rejects an interactive credential on the mobile audience", async () => {
     await runServerAuthTest(
       Effect.gen(function* () {

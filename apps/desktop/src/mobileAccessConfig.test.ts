@@ -11,6 +11,7 @@ import {
   isMobileAccessMode,
   mobileAccessBackendEnv,
   readMobileAccessConfig,
+  resolveDesktopBackendHost,
   resolveMobileAccessConfigPath,
   writeMobileAccessConfig,
 } from "./mobileAccessConfig";
@@ -89,6 +90,21 @@ describe("mobile access mode gating", () => {
 
   it("keeps private-lan in a development build", () => {
     expect(gateMobileAccessConfig(privateLan, { privateLanAvailable: true })).toEqual(privateLan);
+  });
+
+  it("uses the private interface for the desktop backend URL in development", () => {
+    expect(
+      resolveDesktopBackendHost(privateLan, { privateLanAvailable: true }),
+    ).toBe("192.168.1.24");
+    expect(
+      resolveDesktopBackendHost(privateLan, { privateLanAvailable: false }),
+    ).toBe("127.0.0.1");
+    expect(
+      resolveDesktopBackendHost(
+        { ...privateLan, enabled: false },
+        { privateLanAvailable: true },
+      ),
+    ).toBe("127.0.0.1");
   });
 
   it("strips the private bind and disables access in a packaged build", () => {

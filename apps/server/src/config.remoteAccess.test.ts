@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeHttpsPublicOrigin, remoteAccessPolicyError } from "./config";
+import {
+  devUrlForRemoteAccessPolicy,
+  normalizeHttpsPublicOrigin,
+  remoteAccessPolicyError,
+} from "./config";
 
 const remoteBase = {
   host: "0.0.0.0",
@@ -60,6 +64,31 @@ describe("remote access policy", () => {
         publicUrl: new URL("https://synara.example.test/"),
       }),
     ).toContain("cannot be combined with VITE_DEV_SERVER_URL");
+  });
+
+  it("suppresses the dev URL only for a desktop-managed private-LAN gateway", () => {
+    const devUrl = new URL("http://localhost:5173/");
+    expect(
+      devUrlForRemoteAccessPolicy({
+        mode: "desktop",
+        devUrl,
+        mobileAccessBindsPrivateLan: true,
+      }),
+    ).toBeUndefined();
+    expect(
+      devUrlForRemoteAccessPolicy({
+        mode: "web",
+        devUrl,
+        mobileAccessBindsPrivateLan: true,
+      }),
+    ).toBe(devUrl);
+    expect(
+      devUrlForRemoteAccessPolicy({
+        mode: "desktop",
+        devUrl,
+        mobileAccessBindsPrivateLan: false,
+      }),
+    ).toBe(devUrl);
   });
 
   it("accepts only credential-free HTTPS root origins", () => {

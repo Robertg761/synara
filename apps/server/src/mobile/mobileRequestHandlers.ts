@@ -424,6 +424,62 @@ export const makeMobileRequestHandlers = (dependencies: MobileRequestHandlerDepe
     return { commandId: params.commandId, acceptedSequence };
   });
 
+  const updateThread = Effect.fn(function* (
+    request: Extract<BoundRequest, { readonly method: "clientThread.update" }>,
+  ) {
+    const { params } = request;
+    yield* requireThreadContext(params.threadId);
+    const command =
+      params.operation === "rename"
+        ? params.title === undefined
+          ? yield* MobileGatewayError.of(
+              "invalid_request",
+              "A title is required to rename a thread.",
+            )
+          : {
+              type: "thread.meta.update" as const,
+              commandId: params.commandId,
+              threadId: params.threadId,
+              title: params.title,
+            }
+        : params.operation === "pin"
+          ? params.isPinned === undefined
+            ? yield* MobileGatewayError.of(
+                "invalid_request",
+                "A pinned state is required to update a thread.",
+              )
+            : {
+                type: "thread.meta.update" as const,
+                commandId: params.commandId,
+                threadId: params.threadId,
+                isPinned: params.isPinned,
+              }
+          : params.operation === "archive"
+            ? params.isArchived === undefined
+              ? yield* MobileGatewayError.of(
+                  "invalid_request",
+                  "An archived state is required to update a thread.",
+              )
+              : {
+                  type: params.isArchived
+                    ? ("thread.archive" as const)
+                    : ("thread.unarchive" as const),
+                  commandId: params.commandId,
+                  threadId: params.threadId,
+                }
+            : {
+                type: "thread.delete" as const,
+                commandId: params.commandId,
+                threadId: params.threadId,
+              };
+    const acceptedSequence = yield* dispatchClientCommand({
+      commandId: params.commandId,
+      aggregateId: params.threadId,
+      command,
+    });
+    return { commandId: params.commandId, acceptedSequence };
+  });
+
   return (request: BoundRequest): Effect.Effect<MobileSuccess, MobileGatewayError> => {
     const { requestId } = request;
     switch (request.method) {
@@ -556,6 +612,17 @@ export const makeMobileRequestHandlers = (dependencies: MobileRequestHandlerDepe
               type: "success",
               requestId,
               method: "clientTurn.respondUserInput",
+              result,
+            }),
+          ),
+        );
+      case "clientThread.update":
+        return updateThread(request).pipe(
+          Effect.map(
+            (result): MobileSuccess => ({
+              type: "success",
+              requestId,
+              method: "clientThread.update",
               result,
             }),
           ),
