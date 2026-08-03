@@ -32,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.CreateNewFolder
+import androidx.compose.material.icons.outlined.EventRepeat
 import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
@@ -306,6 +307,20 @@ private fun WorkspaceOverflowMenu(state: SynaraUiState, viewModel: SynaraViewMod
                 onClick = {
                     viewModel.setShowArchived(!state.showArchived)
                     expanded = false
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Automations", style = MaterialTheme.typography.bodyMedium) },
+                leadingIcon = {
+                    Icon(
+                        Icons.Outlined.EventRepeat,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                },
+                onClick = {
+                    expanded = false
+                    viewModel.openAutomations()
                 },
             )
             DropdownMenuItem(

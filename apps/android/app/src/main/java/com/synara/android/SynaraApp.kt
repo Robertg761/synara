@@ -23,6 +23,7 @@ import com.synara.android.data.AppScreen
 import com.synara.android.data.ConnectionState
 import com.synara.android.data.SynaraViewModel
 import com.synara.android.ui.components.SynaraWordmark
+import com.synara.android.ui.screens.AutomationsScreen
 import com.synara.android.ui.screens.ChatScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
@@ -63,6 +64,7 @@ fun SynaraApp(viewModel: SynaraViewModel) {
                         AppScreen.SETTINGS -> SettingsScreen(state, viewModel)
                         AppScreen.DIFF -> DiffScreen(state, viewModel)
                         AppScreen.SOURCE_CONTROL -> SourceControlScreen(state, viewModel)
+                        AppScreen.AUTOMATIONS -> AutomationsScreen(state, viewModel)
                     }
                 }
             }

@@ -15,6 +15,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.synara.android.data.ActivityItem
 import com.synara.android.data.AppScreen
 import com.synara.android.data.ConnectionState
+import com.synara.android.data.Automation
+import com.synara.android.data.AutomationList
+import com.synara.android.data.AutomationMode
+import com.synara.android.data.AutomationRun
+import com.synara.android.data.AutomationSchedule
+import com.synara.android.data.AutomationsState
 import com.synara.android.data.DiffScope
 import com.synara.android.data.GitBranchItem
 import com.synara.android.data.GitBranches
@@ -33,6 +39,7 @@ import com.synara.android.data.SynaraUiState
 import com.synara.android.data.SynaraViewModel
 import com.synara.android.data.ThreadDetail
 import com.synara.android.data.ThreadItem
+import com.synara.android.ui.screens.AutomationsScreen
 import com.synara.android.ui.screens.ChatScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
@@ -98,6 +105,8 @@ class GalleryActivity : ComponentActivity() {
                         "diff-empty" -> DiffScreen(Fixtures.diffEmpty(), vm)
                         "git" -> SourceControlScreen(Fixtures.sourceControl(), vm)
                         "git-branches" -> SourceControlScreen(Fixtures.sourceControlBranches(), vm)
+                        "automations" -> AutomationsScreen(Fixtures.automations(), vm)
+                        "automation-detail" -> AutomationsScreen(Fixtures.automationDetail(), vm)
                         "settings" -> SettingsScreen(Fixtures.settings(), vm)
                         else -> WorkspaceScreen(Fixtures.workspace(), vm)
                     }
@@ -372,6 +381,88 @@ private object Fixtures {
     }
 
     fun settings() = base().copy(screen = AppScreen.SETTINGS)
+
+    private fun automation(
+        id: String,
+        name: String,
+        scheduleType: String,
+        everySeconds: Int? = null,
+        timeOfDay: String? = null,
+        enabled: Boolean = true,
+        mode: AutomationMode = AutomationMode.STANDALONE,
+        proposal: Boolean = false,
+        iterations: Int = 12,
+        maxIterations: Int? = null,
+    ) = Automation(
+        id = id,
+        projectId = "p1",
+        name = name,
+        prompt = "Check the open pull requests for failing CI and summarise anything that needs a human.",
+        schedule = AutomationSchedule(scheduleType, everySeconds, timeOfDay, 1, null, null, null),
+        enabled = enabled,
+        nextRunAt = ago(-30, ChronoUnit.MINUTES),
+        mode = mode,
+        provider = "codex",
+        model = "gpt-5.6-sol",
+        runtimeMode = "approval-required",
+        maxIterations = maxIterations,
+        iterationCount = iterations,
+        stopOnError = true,
+        proposalState = if (proposal) "pending" else null,
+        archivedAt = null,
+        updatedAt = ago(20, ChronoUnit.MINUTES),
+    )
+
+    private fun run(
+        id: String,
+        automationId: String,
+        status: String,
+        outcome: String? = null,
+        title: String? = null,
+        unread: Boolean = false,
+        agoMinutes: Long = 30,
+        error: String? = null,
+    ) = AutomationRun(
+        id = id,
+        automationId = automationId,
+        threadId = "t-1",
+        status = status,
+        trigger = "scheduled",
+        scheduledFor = ago(agoMinutes, ChronoUnit.MINUTES),
+        startedAt = ago(agoMinutes, ChronoUnit.MINUTES),
+        finishedAt = if (status == "running") null else ago(agoMinutes - 2, ChronoUnit.MINUTES),
+        outcome = outcome,
+        title = title,
+        summary = title,
+        severity = if (status == "failed") "error" else null,
+        unread = unread,
+        error = error,
+    )
+
+    private fun automationList() = AutomationList(
+        definitions = listOf(
+            automation("a-pr", "Watch PR 512 CI", "interval", everySeconds = 1800),
+            automation("a-sweep", "Morning dependency sweep", "daily", timeOfDay = "06:00", mode = AutomationMode.DEDICATED, maxIterations = 30),
+            automation("a-paused", "Weekly changelog draft", "weekly", timeOfDay = "09:00", enabled = false, iterations = 4),
+            automation("a-prop", "Triage new issues hourly", "interval", everySeconds = 3600, proposal = true, enabled = false, iterations = 0),
+        ),
+        runs = listOf(
+            run("r1", "a-pr", "running", agoMinutes = 3),
+            run("r2", "a-pr", "succeeded", outcome = "findings", title = "2 checks failing on PR 512", unread = true, agoMinutes = 33),
+            run("r3", "a-sweep", "succeeded", outcome = "no-findings", title = "No outdated dependencies", agoMinutes = 400),
+            run("r4", "a-paused", "failed", title = "Could not reach the changelog service", agoMinutes = 2000, error = "ECONNREFUSED api.internal:443"),
+        ),
+    )
+
+    fun automations() = base().copy(
+        screen = AppScreen.AUTOMATIONS,
+        automations = AutomationsState(list = automationList()),
+    )
+
+    fun automationDetail() = base().copy(
+        screen = AppScreen.AUTOMATIONS,
+        automations = AutomationsState(list = automationList(), selectedId = "a-pr"),
+    )
 
     private val samplePatch = """
         diff --git a/apps/web/src/components/TranscriptList.tsx b/apps/web/src/components/TranscriptList.tsx
