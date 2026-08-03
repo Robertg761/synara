@@ -3,6 +3,8 @@
 package com.synara.android.ui.components
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -82,7 +84,12 @@ fun SynaraActionSheet(
                 }
             }
             SynaraDivider()
-            content()
+            // The thread menu has grown past a screen; without this the last entries are simply
+            // unreachable, which is worse than the sheet being tall.
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                content = content,
+            )
         }
     }
 }

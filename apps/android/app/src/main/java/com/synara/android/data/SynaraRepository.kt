@@ -380,6 +380,143 @@ class SynaraRepository(context: Context) {
         }
     }
 
+    // ── Thread history and lifecycle ─────────────────────────────────────────────────────────
+
+    /**
+     * Undoes the *files* a turn changed, leaving the conversation intact.
+     *
+     * Distinct from a conversation rollback, and the pair is easy to confuse: this restores the
+     * checkout to the checkpoint, while a rollback rewinds the transcript. Keeping them as
+     * separate calls means the UI has to name which one it means.
+     */
+    suspend fun revertToCheckpoint(threadId: String, turnCount: Int, filesOnly: Boolean = false) {
+        dispatch("thread.checkpoint.revert") {
+            put("threadId", threadId)
+            put("turnCount", turnCount)
+            put("scope", if (filesOnly) "files" else "thread")
+            put("createdAt", nowIso())
+        }
+    }
+
+    /** Rewinds the conversation to just before [messageId], dropping [numTurns] turns. */
+    suspend fun rollbackConversation(threadId: String, messageId: String, numTurns: Int) {
+        dispatch("thread.conversation.rollback") {
+            put("threadId", threadId)
+            put("messageId", messageId)
+            put("numTurns", numTurns)
+            put("createdAt", nowIso())
+        }
+    }
+
+    /** Replaces a sent message and re-runs from there. */
+    suspend fun editAndResend(thread: ThreadItem, messageId: String, text: String) {
+        dispatch("thread.message.edit-and-resend") {
+            put("threadId", thread.id)
+            put("messageId", messageId)
+            put("text", text)
+            put("runtimeMode", thread.runtimeMode)
+            put("interactionMode", thread.interactionMode)
+            put("createdAt", nowIso())
+        }
+    }
+
+    /**
+     * Ends the provider process behind a thread. Heavier than interrupting a turn: the next
+     * message starts a cold session, which is the point when a provider has wedged.
+     */
+    suspend fun stopSession(threadId: String) {
+        dispatch("thread.session.stop") {
+            put("threadId", threadId)
+            put("createdAt", nowIso())
+        }
+    }
+
+    suspend fun backgroundTask(threadId: String, toolUseId: String) {
+        dispatch("thread.task.background") {
+            put("threadId", threadId)
+            put("toolUseId", toolUseId)
+            put("createdAt", nowIso())
+        }
+    }
+
+    suspend fun stopTask(threadId: String, taskId: String) {
+        dispatch("thread.task.stop") {
+            put("threadId", threadId)
+            put("taskId", taskId)
+            put("createdAt", nowIso())
+        }
+    }
+
+    /**
+     * Forks a thread: a new thread seeded with the source's history, same provider.
+     *
+     * Fork and handoff share a payload but differ in intent — a fork explores an alternative with
+     * the same agent, a handoff moves the work to a different one — so the model selection is the
+     * caller's choice and the two are separate entry points rather than one call with a flag.
+     */
+    suspend fun forkThread(source: ThreadItem, title: String, model: ModelOption): String =
+        branchThread("thread.fork.create", source, title, model)
+
+    suspend fun handoffThread(source: ThreadItem, title: String, model: ModelOption): String =
+        branchThread("thread.handoff.create", source, title, model)
+
+    private suspend fun branchThread(
+        type: String,
+        source: ThreadItem,
+        title: String,
+        model: ModelOption,
+    ): String {
+        val threadId = newId()
+        dispatch(type) {
+            put("threadId", threadId)
+            put("sourceThreadId", source.id)
+            put("projectId", source.projectId)
+            put("title", title)
+            put("modelSelection", modelSelectionJson(model))
+            put("runtimeMode", source.runtimeMode)
+            put("interactionMode", source.interactionMode)
+            put("envMode", "local")
+            put("branch", source.branch ?: JSONObject.NULL)
+            put("worktreePath", source.worktreePath ?: JSONObject.NULL)
+            put("workingDirectory", source.workingDirectory ?: JSONObject.NULL)
+            // The server copies the transcript across; the phone does not have to ship it.
+            put("importedMessages", JSONArray())
+            put("createdAt", nowIso())
+        }
+        return threadId
+    }
+
+    // ── Pinned messages ──────────────────────────────────────────────────────────────────────
+
+    suspend fun pinMessage(threadId: String, messageId: String) {
+        dispatch("thread.pinned-message.add") {
+            put("threadId", threadId)
+            put("messageId", messageId)
+        }
+    }
+
+    suspend fun unpinMessage(threadId: String, messageId: String) {
+        dispatch("thread.pinned-message.remove") {
+            put("threadId", threadId)
+            put("messageId", messageId)
+        }
+    }
+
+    suspend fun setPinnedMessageDone(threadId: String, messageId: String, done: Boolean) {
+        dispatch("thread.pinned-message.done.set") {
+            put("threadId", threadId)
+            put("messageId", messageId)
+            put("done", done)
+        }
+    }
+
+    suspend fun reorderSpaces(spaceId: String, orderedSpaceIds: List<String>) {
+        dispatch("space.reorder") {
+            put("spaceId", spaceId)
+            put("orderedSpaceIds", JSONArray(orderedSpaceIds))
+        }
+    }
+
     // ── Diffs ────────────────────────────────────────────────────────────────────────────────
 
     /**

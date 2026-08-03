@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
 package com.synara.android.ui.screens
 
 import android.provider.OpenableColumns
@@ -9,6 +11,14 @@ import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.ui.platform.LocalContext
 import com.synara.android.data.PendingAttachment
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.PushPin
+import androidx.compose.material.icons.automirrored.outlined.Undo
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import com.synara.android.ui.components.ActionSheetItem
+import com.synara.android.ui.components.SynaraActionSheet
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyRow
@@ -151,6 +161,8 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
     val hasPending = pendingKey.isNotEmpty()
 
     // Opening a thread should land at the newest message immediately; only later updates animate.
+    var messageActionsFor by remember(state.selectedThreadId) { mutableStateOf<MessageItem?>(null) }
+    var editing by remember(state.selectedThreadId) { mutableStateOf<MessageItem?>(null) }
     var hasLanded by remember(state.selectedThreadId) { mutableStateOf(false) }
     LaunchedEffect(lastMessage?.id, lastMessage?.text?.length, lastMessage?.streaming) {
         if (lastMessage == null) return@LaunchedEffect
@@ -285,7 +297,9 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                     if (detail.messages.isEmpty()) {
                         item(key = "empty") { EmptyThreadCard(thread) }
                     } else {
-                        items(detail.messages, key = { it.id }) { message -> Message(message) }
+                        items(detail.messages, key = { it.id }) { message ->
+                            Message(message) { messageActionsFor = message }
+                        }
                     }
 
                     // Pending work sits *after* the transcript, not above it. It is the newest
@@ -314,6 +328,137 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
 
     ThreadActionsSheet(state, viewModel)
     StudioOutputsSheet(state, viewModel)
+
+    messageActionsFor?.let { message ->
+        MessageActionsSheet(
+            message = message,
+            pinned = detail?.pinnedMessageIds?.contains(message.id) == true,
+            onDismiss = { messageActionsFor = null },
+            onEdit = { editing = message; messageActionsFor = null },
+            onTogglePin = {
+                viewModel.setMessagePinned(message.id, it)
+                messageActionsFor = null
+            },
+            onRollback = {
+                detail?.thread?.id?.let { viewModel.rollbackConversation(it, message.id, 1) }
+                messageActionsFor = null
+            },
+        )
+    }
+
+    editing?.let { message ->
+        EditMessageDialog(
+            initial = message.text,
+            onDismiss = { editing = null },
+            onConfirm = { text ->
+                viewModel.editAndResend(message.id, text)
+                editing = null
+            },
+        )
+    }
+}
+
+/**
+ * Per-message actions, opened by long press.
+ *
+ * Rollback and edit-and-resend both discard work, so they are one level in rather than sitting on
+ * the message where a mis-tap reaches them. Only user messages can be edited: rewriting what an
+ * agent said would make the transcript a record of something that never happened.
+ */
+@Composable
+private fun MessageActionsSheet(
+    message: MessageItem,
+    pinned: Boolean,
+    onDismiss: () -> Unit,
+    onEdit: () -> Unit,
+    onTogglePin: (Boolean) -> Unit,
+    onRollback: () -> Unit,
+) {
+    val clipboard = LocalClipboardManager.current
+    var confirmingRollback by remember(message.id) { mutableStateOf(false) }
+
+    if (!confirmingRollback) {
+        SynaraActionSheet(
+            title = if (message.isUser) "Your message" else "Agent message",
+            subtitle = message.text.take(80).replace('\n', ' '),
+            onDismiss = onDismiss,
+        ) {
+            ActionSheetItem(
+                icon = Icons.Outlined.ContentCopy,
+                label = "Copy text",
+                onClick = {
+                    clipboard.setText(AnnotatedString(message.text))
+                    onDismiss()
+                },
+            )
+            ActionSheetItem(
+                icon = Icons.Outlined.PushPin,
+                label = if (pinned) "Unpin" else "Pin this message",
+                onClick = { onTogglePin(!pinned) },
+            )
+            if (message.isUser) {
+                ActionSheetItem(
+                    icon = Icons.Outlined.Edit,
+                    label = "Edit and resend",
+                    supporting = "Replaces this message and re-runs from here",
+                    onClick = onEdit,
+                )
+            }
+            ActionSheetItem(
+                icon = Icons.AutoMirrored.Outlined.Undo,
+                label = "Rewind to before this",
+                destructive = true,
+                onClick = { confirmingRollback = true },
+            )
+        }
+    }
+
+    if (confirmingRollback) {
+        DestructiveConfirmDialog(
+            title = "Rewind the conversation?",
+            body = "This message and everything after it are removed from the transcript. Files " +
+                "the agent already changed are left as they are.",
+            confirmLabel = "Rewind",
+            onDismiss = { confirmingRollback = false },
+            onConfirm = { confirmingRollback = false; onRollback() },
+        )
+    }
+}
+
+@Composable
+private fun EditMessageDialog(
+    initial: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var text by remember { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Edit and resend", style = MaterialTheme.typography.titleMedium) },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                modifier = Modifier.fillMaxWidth(),
+                textStyle = MaterialTheme.typography.bodyMedium,
+                maxLines = 8,
+                shape = MaterialTheme.shapes.medium,
+                colors = synaraTextFieldColors(),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(text) }, enabled = text.isNotBlank()) {
+                Text("Resend", style = MaterialTheme.typography.labelLarge)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", style = MaterialTheme.typography.labelLarge)
+            }
+        },
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = MaterialTheme.shapes.extraLarge,
+    )
 }
 
 /**
@@ -366,8 +511,8 @@ private fun ThreadStatusStrip(detail: ThreadDetail) {
 // ── Messages ─────────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun Message(message: MessageItem) {
-    if (message.isUser) UserMessage(message) else AssistantMessage(message)
+private fun Message(message: MessageItem, onLongClick: () -> Unit) {
+    if (message.isUser) UserMessage(message, onLongClick) else AssistantMessage(message, onLongClick)
 }
 
 /**
@@ -379,13 +524,14 @@ private fun Message(message: MessageItem) {
  * room its code blocks and lists need.
  */
 @Composable
-private fun UserMessage(message: MessageItem) {
+private fun UserMessage(message: MessageItem, onLongClick: () -> Unit) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         Column(
             modifier = Modifier
                 .widthIn(max = 320.dp)
                 .clip(SynaraTheme.corners.userMessage)
                 .background(MaterialTheme.colorScheme.secondaryContainer, SynaraTheme.corners.userMessage)
+                .combinedClickable(onClick = {}, onLongClick = onLongClick)
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             horizontalAlignment = Alignment.End,
         ) {
@@ -410,12 +556,14 @@ private fun UserMessage(message: MessageItem) {
 }
 
 @Composable
-private fun AssistantMessage(message: MessageItem) {
+private fun AssistantMessage(message: MessageItem, onLongClick: () -> Unit) {
     val clipboard = LocalClipboardManager.current
     var copied by remember(message.id) { mutableStateOf(false) }
 
     Column(
-        Modifier.fillMaxWidth(),
+        Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = {}, onLongClick = onLongClick),
         verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
     ) {
         Row(

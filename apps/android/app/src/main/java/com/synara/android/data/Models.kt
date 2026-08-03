@@ -292,6 +292,8 @@ data class ThreadDetail(
      * checkpoint list is the only place that count is exposed to a client.
      */
     val checkpoints: List<Checkpoint> = emptyList(),
+    /** Ids of messages the user pinned, so the transcript can mark them. */
+    val pinnedMessageIds: Set<String> = emptySet(),
 ) {
     /** Highest checkpoint turn count, i.e. the `toTurnCount` for a whole-thread diff. */
     val latestTurnCount: Int?
@@ -327,6 +329,10 @@ data class ThreadDetail(
                 .lastOrNull()
                 ?.stringOrNull("planMarkdown"),
             sequence = sequence,
+            pinnedMessageIds = json.arrayOrEmpty("pinnedMessages")
+                .objects()
+                .mapNotNull { it.stringOrNull("messageId") }
+                .toSet(),
             checkpoints = json.arrayOrEmpty("checkpoints")
                 .objects()
                 .map(Checkpoint::fromJson)

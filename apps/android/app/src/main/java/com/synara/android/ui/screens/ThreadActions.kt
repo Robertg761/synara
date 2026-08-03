@@ -1,5 +1,10 @@
 package com.synara.android.ui.screens
 
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.material.icons.automirrored.outlined.CallMade
+import androidx.compose.material.icons.automirrored.outlined.CallSplit
+import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -47,6 +52,12 @@ import com.synara.android.ui.components.ActionSheetSection
 import com.synara.android.ui.components.SynaraActionSheet
 import com.synara.android.ui.components.SynaraField
 
+/** Fork keeps the same agent; handoff moves the work to a different one. */
+enum class BranchMode(val title: String, val confirm: String) {
+    FORK("Fork thread", "Fork"),
+    HANDOFF("Hand off thread", "Hand off"),
+}
+
 /** Which nested picker, if any, is layered over the main action sheet. */
 private enum class ThreadSubSheet { MODEL, RUNTIME, INTERACTION }
 
@@ -64,8 +75,13 @@ fun ThreadActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
     var subSheet by remember(threadId) { mutableStateOf<ThreadSubSheet?>(null) }
     var renaming by remember(threadId) { mutableStateOf(false) }
     var confirmingDelete by remember(threadId) { mutableStateOf(false) }
+    var confirmingRevert by remember(threadId) { mutableStateOf(false) }
+    var branching by remember(threadId) { mutableStateOf<BranchMode?>(null) }
+    // Reverting addresses a turn by count, and the checkpoint list is the only place that count
+    // is exposed, so the action is unavailable until the thread detail has loaded.
+    val latestTurnCount = state.detail?.takeIf { it.thread.id == threadId }?.latestTurnCount
 
-    if (subSheet == null && !renaming && !confirmingDelete) {
+    if (subSheet == null && !renaming && !confirmingDelete && !confirmingRevert && branching == null) {
         SynaraActionSheet(
             title = thread.title,
             subtitle = "${thread.providerLabel} · ${thread.model}",
@@ -157,6 +173,36 @@ fun ThreadActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
                 onClick = { subSheet = ThreadSubSheet.INTERACTION },
             )
 
+            ActionSheetSection("History")
+            ActionSheetItem(
+                icon = Icons.AutoMirrored.Outlined.CallSplit,
+                label = "Fork this thread",
+                supporting = "Continue from here in a copy, same agent",
+                onClick = { branching = BranchMode.FORK },
+            )
+            ActionSheetItem(
+                icon = Icons.AutoMirrored.Outlined.CallMade,
+                label = "Hand off to another agent",
+                supporting = "Same history, different provider",
+                onClick = { branching = BranchMode.HANDOFF },
+            )
+            ActionSheetItem(
+                icon = Icons.Outlined.History,
+                label = "Undo file changes",
+                supporting = "Restore the checkout to an earlier turn",
+                enabled = latestTurnCount != null,
+                onClick = { confirmingRevert = true },
+            )
+            ActionSheetItem(
+                icon = Icons.Outlined.PowerSettingsNew,
+                label = "Stop the agent session",
+                supporting = "The next message starts a fresh one",
+                onClick = {
+                    viewModel.stopSession(thread.id)
+                    viewModel.closeThreadActions()
+                },
+            )
+
             ActionSheetSection("Lifecycle")
             ActionSheetItem(
                 icon = if (thread.isArchived) Icons.Outlined.Unarchive else Icons.Outlined.Archive,
@@ -224,6 +270,36 @@ fun ThreadActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
             onConfirm = { value ->
                 viewModel.renameThread(thread.id, value)
                 renaming = false
+                viewModel.closeThreadActions()
+            },
+        )
+    }
+
+    if (confirmingRevert && latestTurnCount != null) {
+        DestructiveConfirmDialog(
+            title = "Undo file changes?",
+            body = "Files in the checkout are restored to how they were before turn " +
+                "$latestTurnCount. The conversation is kept, and uncommitted work not made by " +
+                "this thread may be lost.",
+            confirmLabel = "Undo changes",
+            onDismiss = { confirmingRevert = false },
+            onConfirm = {
+                viewModel.revertToCheckpoint(thread.id, latestTurnCount, filesOnly = true)
+                confirmingRevert = false
+                viewModel.closeThreadActions()
+            },
+        )
+    }
+
+    branching?.let { mode ->
+        BranchThreadDialog(
+            mode = mode,
+            thread = thread,
+            models = state.models,
+            onDismiss = { branching = null },
+            onConfirm = { title, model ->
+                viewModel.branchThread(mode == BranchMode.HANDOFF, title, model)
+                branching = null
                 viewModel.closeThreadActions()
             },
         )
@@ -640,4 +716,82 @@ fun StudioOutputsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
             }
         }
     }
+}
+
+/**
+ * Names the new thread and picks its model. Handoff defaults to a *different* provider where one
+ * is available, since moving to the same agent is what a fork is for.
+ */
+@Composable
+private fun BranchThreadDialog(
+    mode: BranchMode,
+    thread: ThreadItem,
+    models: List<ModelOption>,
+    onDismiss: () -> Unit,
+    onConfirm: (String, ModelOption) -> Unit,
+) {
+    var title by remember { mutableStateOf(thread.title) }
+    var model by remember {
+        mutableStateOf(
+            if (mode == BranchMode.HANDOFF) {
+                models.firstOrNull { it.provider != thread.provider } ?: models.firstOrNull()
+            } else {
+                models.firstOrNull { it.slug == thread.model && it.provider == thread.provider }
+                    ?: models.firstOrNull()
+            },
+        )
+    }
+    var pickingModel by remember { mutableStateOf(false) }
+
+    if (pickingModel) {
+        ModelPickerSheet(
+            models = models,
+            selectedSlug = model?.slug,
+            selectedProvider = model?.provider,
+            onDismiss = { pickingModel = false },
+            onSelect = { model = it; pickingModel = false },
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(mode.title, style = MaterialTheme.typography.titleMedium) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    if (mode == BranchMode.HANDOFF) {
+                        "A new thread with this one's history, run by a different agent."
+                    } else {
+                        "A new thread with this one's history, so you can try another approach " +
+                            "without losing this one."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                SynaraField(label = "Title", value = title, onValueChange = { title = it })
+                ActionSheetChoice(
+                    label = model?.label ?: "Choose a model",
+                    description = model?.providerLabel,
+                    selected = false,
+                    onClick = { pickingModel = true },
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { model?.let { onConfirm(title, it) } },
+                enabled = title.isNotBlank() && model != null,
+            ) {
+                Text(mode.confirm, style = MaterialTheme.typography.labelLarge)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", style = MaterialTheme.typography.labelLarge)
+            }
+        },
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = MaterialTheme.shapes.extraLarge,
+    )
 }
