@@ -336,6 +336,44 @@ class SynaraRepository(context: Context) {
         }
     }
 
+    // ── Diffs ────────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Everything the agent changed across the whole thread, up to [toTurnCount].
+     *
+     * The diff RPCs address turns by *count*, not id, and the only place a client can read that
+     * count is the checkpoint list on the thread snapshot — see [ThreadDetail.latestTurnCount].
+     */
+    suspend fun getFullThreadDiff(threadId: String, toTurnCount: Int): String =
+        rpc(
+            "orchestration.getFullThreadDiff",
+            JSONObject()
+                .put("threadId", threadId)
+                .put("toTurnCount", toTurnCount)
+                .put("ignoreWhitespace", false),
+        )?.stringOrNull("diff").orEmpty()
+
+    /** What changed in a single turn: the span between its checkpoint and the one before it. */
+    suspend fun getTurnDiff(threadId: String, fromTurnCount: Int, toTurnCount: Int): String =
+        rpc(
+            "orchestration.getTurnDiff",
+            JSONObject()
+                .put("threadId", threadId)
+                .put("fromTurnCount", fromTurnCount)
+                .put("toTurnCount", toTurnCount)
+                .put("ignoreWhitespace", false),
+        )?.stringOrNull("diff").orEmpty()
+
+    /**
+     * Uncommitted changes in a checkout. Scope maps to git's own staging distinction:
+     * `workingTree` (everything), `staged`, `unstaged`, or `branch` (versus the merge base).
+     */
+    suspend fun readWorkingTreeDiff(cwd: String, scope: String = "workingTree"): String =
+        rpc(
+            "git.readWorkingTreeDiff",
+            JSONObject().put("cwd", cwd).put("scope", scope),
+        )?.stringOrNull("patch").orEmpty()
+
     suspend fun listModels(provider: String = Provider.CODEX.kind): List<ModelOption> {
         val response = rpc(
             "provider.listModels",
