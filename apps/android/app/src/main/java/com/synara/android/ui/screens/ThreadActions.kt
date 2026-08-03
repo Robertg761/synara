@@ -16,6 +16,7 @@ import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Archive
 import androidx.compose.material.icons.outlined.Difference
+import androidx.compose.material.icons.outlined.Compress
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.FolderOpen
@@ -192,6 +193,15 @@ fun ThreadActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
                 supporting = "Restore the checkout to an earlier turn",
                 enabled = latestTurnCount != null,
                 onClick = { confirmingRevert = true },
+            )
+            ActionSheetItem(
+                icon = Icons.Outlined.Compress,
+                label = "Compact context",
+                supporting = "Summarise the history so the agent has room to keep going",
+                onClick = {
+                    viewModel.compactThread(thread.id)
+                    viewModel.closeThreadActions()
+                },
             )
             ActionSheetItem(
                 icon = Icons.Outlined.PowerSettingsNew,

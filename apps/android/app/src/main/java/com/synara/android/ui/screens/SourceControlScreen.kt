@@ -34,6 +34,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -264,11 +265,22 @@ private fun CommitCard(state: SynaraUiState, viewModel: SynaraViewModel) {
     val canCommit = status.hasWorkingTreeChanges && git.commitMessage.isNotBlank() && !busy
 
     SynaraCard(contentSpacing = SynaraTheme.spacing.md) {
-        Text(
-            "Commit",
-            style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.onSurface,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Commit",
+                Modifier.weight(1f),
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            // Writing a commit message on a phone keyboard is the worst part of committing from
+            // one, so the server's diff summary is offered as a starting point.
+            TextButton(
+                onClick = viewModel::suggestCommitMessage,
+                enabled = !busy && status.hasWorkingTreeChanges,
+            ) {
+                Text("Suggest", style = MaterialTheme.typography.labelMedium)
+            }
+        }
         OutlinedTextField(
             value = git.commitMessage,
             onValueChange = viewModel::setCommitMessage,

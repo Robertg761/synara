@@ -35,6 +35,14 @@ data class PendingAttachment(
     val isImage: Boolean get() = mimeType.startsWith("image/", ignoreCase = true)
 }
 
+data class MachineState(
+    val worktrees: List<ManagedWorktree> = emptyList(),
+    val localServers: List<LocalServerProcess> = emptyList(),
+    val integrations: List<ExternalMcpIntegration> = emptyList(),
+    val isLoading: Boolean = false,
+    val busyId: String? = null,
+)
+
 data class ServerSettingsState(
     val settings: ServerSettings? = null,
     val statuses: List<ProviderStatus> = emptyList(),
@@ -157,6 +165,7 @@ data class SynaraUiState(
     val studioOutputs: List<StudioOutput>? = null,
     val studioOpen: Boolean = false,
     val serverSettings: ServerSettingsState = ServerSettingsState(),
+    val machine: MachineState = MachineState(),
     /** Attachments staged for the next turn, in the order they were added. */
     val pendingAttachments: List<PendingAttachment> = emptyList(),
 ) {
@@ -248,6 +257,79 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
     fun openSettings() {
         update { it.copy(screen = AppScreen.SETTINGS) }
         if (_ui.value.serverSettings.settings == null) loadServerSettings()
+        loadMachineState()
+    }
+
+    /**
+     * Worktrees, listening dev servers and paired MCP clients. Read together because they are all
+     * "what is this machine currently holding", and each read is contained so one unsupported
+     * endpoint does not blank the others.
+     */
+    fun loadMachineState() {
+        if (_ui.value.connection != ConnectionState.CONNECTED) return
+        update { it.copy(machine = it.machine.copy(isLoading = true)) }
+        viewModelScope.launch {
+            val worktrees = async { runCatching { repository.listWorktrees() }.getOrDefault(emptyList()) }
+            val servers = async { runCatching { repository.listLocalServers() }.getOrDefault(emptyList()) }
+            val integrations = async {
+                runCatching { repository.listExternalMcpIntegrations() }.getOrDefault(emptyList())
+            }
+            val w = worktrees.await()
+            val s = servers.await()
+            val i = integrations.await()
+            update { state ->
+                state.copy(
+                    machine = state.machine.copy(
+                        worktrees = w,
+                        localServers = s,
+                        integrations = i,
+                        isLoading = false,
+                    ),
+                )
+            }
+        }
+    }
+
+    fun stopLocalServer(id: String) {
+        update { it.copy(machine = it.machine.copy(busyId = id)) }
+        viewModelScope.launch {
+            runCatching { repository.stopLocalServer(id) }
+                .onFailure { error -> update { it.copy(error = readableError(error)) } }
+            update { it.copy(machine = it.machine.copy(busyId = null)) }
+            loadMachineState()
+        }
+    }
+
+    fun revokeIntegration(id: String) {
+        update { it.copy(machine = it.machine.copy(busyId = id)) }
+        viewModelScope.launch {
+            runCatching { repository.revokeExternalMcpIntegration(id) }
+                .onFailure { error -> update { it.copy(error = readableError(error)) } }
+            update { it.copy(machine = it.machine.copy(busyId = null)) }
+            loadMachineState()
+        }
+    }
+
+    fun compactThread(threadId: String) = mutate {
+        repository.compactThread(threadId)
+        repository.loadThread(threadId)
+    }
+
+    /** Writes a model-generated commit message into the commit box. */
+    fun suggestCommitMessage() {
+        val cwd = _ui.value.git.cwd ?: return
+        update { it.copy(git = it.git.copy(busyLabel = "Summarising")) }
+        viewModelScope.launch {
+            runCatching { repository.summarizeDiff(cwd) }
+                .onSuccess { summary ->
+                    update { it.copy(git = it.git.copy(commitMessage = summary, busyLabel = null)) }
+                }
+                .onFailure { error ->
+                    update {
+                        it.copy(git = it.git.copy(busyLabel = null, error = readableError(error)))
+                    }
+                }
+        }
     }
 
     /**
