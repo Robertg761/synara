@@ -374,6 +374,89 @@ class SynaraRepository(context: Context) {
             JSONObject().put("cwd", cwd).put("scope", scope),
         )?.stringOrNull("patch").orEmpty()
 
+    // ── Terminal ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Opens (or re-attaches to) a PTY for a thread and returns its snapshot, whose `history` field
+     * holds the scrollback produced before this client connected — without replaying it the phone
+     * would show a blank terminal for a session that has been running for an hour.
+     */
+    suspend fun openTerminal(
+        threadId: String,
+        cwd: String,
+        terminalId: String = DEFAULT_TERMINAL_ID,
+        cols: Int = 80,
+        rows: Int = 24,
+    ): TerminalSnapshot = TerminalSnapshot.fromJson(
+        rpc(
+            "terminal.open",
+            JSONObject()
+                .put("threadId", threadId)
+                .put("terminalId", terminalId)
+                .put("cwd", cwd)
+                .put("cols", cols)
+                .put("rows", rows)
+                .put("streamOutput", true),
+        ) ?: JSONObject(),
+    )
+
+    suspend fun writeTerminal(threadId: String, data: String, terminalId: String = DEFAULT_TERMINAL_ID) {
+        if (data.isEmpty()) return
+        rpc(
+            "terminal.write",
+            JSONObject().put("threadId", threadId).put("terminalId", terminalId).put("data", data),
+        )
+    }
+
+    suspend fun resizeTerminal(
+        threadId: String,
+        cols: Int,
+        rows: Int,
+        terminalId: String = DEFAULT_TERMINAL_ID,
+    ) {
+        rpc(
+            "terminal.resize",
+            JSONObject()
+                .put("threadId", threadId)
+                .put("terminalId", terminalId)
+                .put("cols", cols.coerceIn(TERMINAL_MIN_COLS, TERMINAL_MAX_COLS))
+                .put("rows", rows.coerceIn(TERMINAL_MIN_ROWS, TERMINAL_MAX_ROWS)),
+        )
+    }
+
+    suspend fun clearTerminal(threadId: String, terminalId: String = DEFAULT_TERMINAL_ID) {
+        rpc("terminal.clear", JSONObject().put("threadId", threadId).put("terminalId", terminalId))
+    }
+
+    suspend fun restartTerminal(
+        threadId: String,
+        cwd: String,
+        cols: Int = 80,
+        rows: Int = 24,
+        terminalId: String = DEFAULT_TERMINAL_ID,
+    ) {
+        rpc(
+            "terminal.restart",
+            JSONObject()
+                .put("threadId", threadId)
+                .put("terminalId", terminalId)
+                .put("cwd", cwd)
+                .put("cols", cols)
+                .put("rows", rows),
+        )
+    }
+
+    suspend fun closeTerminal(threadId: String, terminalId: String = DEFAULT_TERMINAL_ID) {
+        rpc(
+            "terminal.close",
+            JSONObject().put("threadId", threadId).put("terminalId", terminalId),
+        )
+    }
+
+    /** Streams every terminal event; callers filter to the session they are showing. */
+    suspend fun subscribeTerminalEvents(onEvent: (JSONObject) -> Unit): String =
+        streamRpc("terminal.subscribeEvents", JSONObject(), onEvent)
+
     // ── Automations ──────────────────────────────────────────────────────────────────────────
 
     suspend fun listAutomations(projectId: String? = null, includeArchived: Boolean = false): AutomationList {

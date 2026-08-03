@@ -28,6 +28,7 @@ import com.synara.android.ui.screens.ChatScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
 import com.synara.android.ui.screens.SourceControlScreen
+import com.synara.android.ui.screens.TerminalScreen
 import com.synara.android.ui.screens.SetupScreen
 import com.synara.android.ui.screens.WorkspaceScreen
 import com.synara.android.ui.theme.SynaraMotion
@@ -65,6 +66,7 @@ fun SynaraApp(viewModel: SynaraViewModel) {
                         AppScreen.DIFF -> DiffScreen(state, viewModel)
                         AppScreen.SOURCE_CONTROL -> SourceControlScreen(state, viewModel)
                         AppScreen.AUTOMATIONS -> AutomationsScreen(state, viewModel)
+                        AppScreen.TERMINAL -> TerminalScreen(state, viewModel)
                     }
                 }
             }

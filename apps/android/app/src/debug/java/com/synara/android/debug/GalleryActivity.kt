@@ -10,6 +10,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.synara.android.data.ActivityItem
@@ -28,6 +29,8 @@ import com.synara.android.data.GitFileChange
 import com.synara.android.data.GitPullRequestInfo
 import com.synara.android.data.GitStatus
 import com.synara.android.data.SourceControlState
+import com.synara.android.data.TerminalSnapshot
+import com.synara.android.data.TerminalState
 import com.synara.android.data.DiffState
 import com.synara.android.data.parseUnifiedDiff
 import com.synara.android.data.MessageItem
@@ -44,6 +47,7 @@ import com.synara.android.ui.screens.ChatScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
 import com.synara.android.ui.screens.SourceControlScreen
+import com.synara.android.ui.screens.TerminalScreen
 import com.synara.android.ui.screens.SetupScreen
 import com.synara.android.ui.screens.WorkspaceScreen
 import com.synara.android.ui.theme.SynaraTheme
@@ -107,6 +111,11 @@ class GalleryActivity : ComponentActivity() {
                         "git-branches" -> SourceControlScreen(Fixtures.sourceControlBranches(), vm)
                         "automations" -> AutomationsScreen(Fixtures.automations(), vm)
                         "automation-detail" -> AutomationsScreen(Fixtures.automationDetail(), vm)
+                        "terminal" -> {
+                            // The buffer lives on the view model, so the fixture feeds it directly.
+                            remember { vm.terminalBuffer.append(Fixtures.TERMINAL_OUTPUT) }
+                            TerminalScreen(Fixtures.terminal(), vm)
+                        }
                         "settings" -> SettingsScreen(Fixtures.settings(), vm)
                         else -> WorkspaceScreen(Fixtures.workspace(), vm)
                     }
@@ -381,6 +390,38 @@ private object Fixtures {
     }
 
     fun settings() = base().copy(screen = AppScreen.SETTINGS)
+
+    private const val E = "\u001B"
+
+    val TERMINAL_OUTPUT: String = buildString {
+        append("${'$'} bun run test\n")
+        append("$E[2m\u0024 vitest run --reporter=dot$E[0m\n")
+        append("\n")
+        append("$E[32m ✓ $E[0mpackages/shared/src/model.test.ts $E[2m(24 tests) 118ms$E[0m\n")
+        append("$E[32m ✓ $E[0mapps/server/src/providerManager.test.ts $E[2m(61 tests) 942ms$E[0m\n")
+        append("$E[31m ✗ $E[0mapps/web/src/components/DiffPanel.logic.test.ts\n")
+        append("   $E[31m→ expected 3 files, received 2$E[0m\n")
+        append("\n")
+        append("$E[1mTest Files$E[0m  $E[31m1 failed$E[0m | $E[32m42 passed$E[0m (43)\n")
+        append("$E[1m     Tests$E[0m  $E[31m1 failed$E[0m | $E[32m téléchargement 1204 passed$E[0m\n")
+        append("Downloading 10%\rDownloading 64%\rDownloading 100%$E[K\n")
+        append("${'$'} ")
+    }
+
+    fun terminal(): SynaraUiState {
+        val t = thread("t-run", "Rewrite the transcript virtualiser")
+        return base().copy(
+            screen = AppScreen.TERMINAL,
+            selectedThreadId = t.id,
+            detail = detail(t),
+            terminal = TerminalState(
+                threadId = t.id,
+                cwd = "/home/me/projects/synara",
+                snapshot = TerminalSnapshot(t.id, "default", "/home/me/projects/synara", "running", 4821, "", null),
+                revision = 1,
+            ),
+        )
+    }
 
     private fun automation(
         id: String,
