@@ -57,6 +57,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.synara.android.BuildConfig
 import com.synara.android.data.AppScreen
@@ -157,6 +158,8 @@ fun SettingsScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                 NotificationSection()
 
                 ServerSettingsSections(state, viewModel)
+
+                MachineSections(state, viewModel)
 
                 SectionLabel("What this app does", Modifier.padding(top = SynaraTheme.spacing.md))
                 SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
@@ -666,5 +669,113 @@ private fun NotificationSection() {
             contentColor = SynaraTheme.accents.warningForeground,
             container = SynaraTheme.accents.warningSurface,
         )
+    }
+}
+
+/**
+ * What the machine is currently holding: worktrees, listening dev servers, paired MCP clients.
+ *
+ * Sections are omitted entirely when empty rather than rendered as "None". On a phone an empty
+ * heading is pure noise, and these are all normally empty.
+ */
+@Composable
+private fun MachineSections(state: SynaraUiState, viewModel: SynaraViewModel) {
+    val machine = state.machine
+
+    if (machine.worktrees.isNotEmpty()) {
+        SectionLabel("Worktrees", Modifier.padding(top = SynaraTheme.spacing.md))
+        SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
+            machine.worktrees.forEachIndexed { index, worktree ->
+                if (index > 0) SynaraDivider(startIndent = SynaraTheme.spacing.lg)
+                Column(Modifier.fillMaxWidth().padding(SynaraTheme.spacing.lg)) {
+                    Text(
+                        worktree.branch ?: worktree.name,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        worktree.path,
+                        style = SynaraTheme.textStyles.monoSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+
+    if (machine.localServers.isNotEmpty()) {
+        SectionLabel("Dev servers", Modifier.padding(top = SynaraTheme.spacing.md))
+        SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
+            machine.localServers.forEachIndexed { index, server ->
+                if (index > 0) SynaraDivider(startIndent = SynaraTheme.spacing.lg)
+                Row(
+                    Modifier.fillMaxWidth().padding(SynaraTheme.spacing.lg),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.md),
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            server.displayName,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            buildString {
+                                append("pid ${server.pid}")
+                                if (server.ports.isNotEmpty()) {
+                                    append(" · port ${server.ports.joinToString(", ")}")
+                                }
+                            },
+                            style = SynaraTheme.textStyles.monoSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(
+                        onClick = { viewModel.stopLocalServer(server.id) },
+                        enabled = machine.busyId != server.id,
+                    ) {
+                        Text(
+                            "Stop",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    if (machine.integrations.isNotEmpty()) {
+        SectionLabel("External MCP clients", Modifier.padding(top = SynaraTheme.spacing.md))
+        SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
+            machine.integrations.forEachIndexed { index, integration ->
+                if (index > 0) SynaraDivider(startIndent = SynaraTheme.spacing.lg)
+                Row(
+                    Modifier.fillMaxWidth().padding(SynaraTheme.spacing.lg),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        integration.name,
+                        Modifier.weight(1f),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    TextButton(
+                        onClick = { viewModel.revokeIntegration(integration.id) },
+                        enabled = machine.busyId != integration.id,
+                    ) {
+                        Text(
+                            "Revoke",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+        }
     }
 }

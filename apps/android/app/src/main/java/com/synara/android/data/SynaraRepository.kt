@@ -517,6 +517,90 @@ class SynaraRepository(context: Context) {
         }
     }
 
+    // ── Machine state ────────────────────────────────────────────────────────────────────────
+
+    /** Worktrees Synara manages, across every project. */
+    suspend fun listWorktrees(): List<ManagedWorktree> =
+        rpc("server.listWorktrees", JSONObject())
+            ?.arrayOrEmpty("worktrees")?.objects()?.map(ManagedWorktree::fromJson).orEmpty()
+
+    /** Dev servers currently listening on the machine, whether Synara started them or not. */
+    suspend fun listLocalServers(): List<LocalServerProcess> =
+        rpc("server.listLocalServers", JSONObject())
+            ?.arrayOrEmpty("servers")?.objects()?.map(LocalServerProcess::fromJson).orEmpty()
+
+    suspend fun stopLocalServer(id: String): Boolean =
+        rpc("server.stopLocalServer", JSONObject().put("id", id))?.optBoolean("stopped", false) ?: false
+
+    suspend fun getDiagnostics(): String =
+        rpc("server.getDiagnostics", JSONObject())?.toString(2).orEmpty()
+
+    suspend fun listExternalMcpIntegrations(): List<ExternalMcpIntegration> =
+        rpc("server.listExternalMcpIntegrations", JSONObject())
+            ?.arrayOrEmpty("value")?.objects()?.map(ExternalMcpIntegration::fromJson)
+            ?.ifEmpty { null }
+            ?: rpc("server.listExternalMcpIntegrations", JSONObject())
+                ?.arrayOrEmpty("integrations")?.objects()?.map(ExternalMcpIntegration::fromJson)
+                .orEmpty()
+
+    suspend fun revokeExternalMcpIntegration(id: String) {
+        rpc("server.revokeExternalMcpIntegration", JSONObject().put("id", id))
+    }
+
+    /**
+     * Compacts a thread's context in the provider. Long threads eventually exhaust the model's
+     * window; compacting is the provider's own summarise-and-continue rather than a Synara
+     * operation, so it is a provider call and not an orchestration command.
+     */
+    suspend fun compactThread(threadId: String) {
+        rpc("provider.compactThread", JSONObject().put("threadId", threadId))
+    }
+
+    /** Portable skills across every provider, unlike listSkills which is scoped to one. */
+    suspend fun listSkillsCatalogue(cwd: String?): List<CatalogueEntry> =
+        rpc("provider.listSkillsCatalog", JSONObject().apply { cwd?.let { put("cwd", it) } })
+            ?.arrayOrEmpty("skills")?.objects()?.map(CatalogueEntry::skill).orEmpty()
+
+    // ── Git extras ───────────────────────────────────────────────────────────────────────────
+
+    suspend fun stashInfo(cwd: String): GitStashInfo? =
+        rpc("git.stashInfo", JSONObject().put("cwd", cwd))?.let(GitStashInfo::fromJson)
+
+    suspend fun dropStash(cwd: String, stashRef: String) {
+        rpc("git.stashDrop", JSONObject().put("cwd", cwd).put("stashRef", stashRef))
+    }
+
+    suspend fun initRepository(cwd: String) {
+        rpc("git.init", JSONObject().put("cwd", cwd))
+    }
+
+    /**
+     * Clears a stale `index.lock`. Only ever correct when no git process is actually running —
+     * an agent killed mid-write leaves one behind and every later command fails until it is gone.
+     */
+    suspend fun removeIndexLock(cwd: String) {
+        rpc("git.removeIndexLock", JSONObject().put("cwd", cwd))
+    }
+
+    /** A model-written summary of a diff, for a commit message. */
+    suspend fun summarizeDiff(cwd: String, scope: String = "workingTree"): String =
+        rpc("git.summarizeDiff", JSONObject().put("cwd", cwd).put("scope", scope))
+            ?.stringOrNull("summary").orEmpty()
+
+    suspend fun createWorktree(cwd: String, branch: String, newBranch: String? = null): String? =
+        rpc(
+            "git.createWorktree",
+            JSONObject()
+                .put("cwd", cwd)
+                .put("branch", branch)
+                .put("path", JSONObject.NULL)
+                .apply { newBranch?.let { put("newBranch", it) } },
+        )?.objectOrNull("worktree")?.stringOrNull("path")
+
+    suspend fun removeWorktree(cwd: String, path: String) {
+        rpc("git.removeWorktree", JSONObject().put("cwd", cwd).put("path", path))
+    }
+
     // ── Diffs ────────────────────────────────────────────────────────────────────────────────
 
     /**
