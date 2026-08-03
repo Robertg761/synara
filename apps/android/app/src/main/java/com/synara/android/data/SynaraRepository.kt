@@ -374,6 +374,78 @@ class SynaraRepository(context: Context) {
             JSONObject().put("cwd", cwd).put("scope", scope),
         )?.stringOrNull("patch").orEmpty()
 
+    // ── Automations ──────────────────────────────────────────────────────────────────────────
+
+    suspend fun listAutomations(projectId: String? = null, includeArchived: Boolean = false): AutomationList {
+        val payload = JSONObject().put("includeArchived", includeArchived)
+        projectId?.let { payload.put("projectId", it) }
+        return AutomationList.fromJson(rpc("automation.list", payload) ?: JSONObject())
+    }
+
+    suspend fun runAutomationNow(automationId: String) {
+        rpc("automation.runNow", JSONObject().put("automationId", automationId))
+    }
+
+    suspend fun cancelAutomationRun(runId: String) {
+        rpc("automation.cancelRun", JSONObject().put("runId", runId))
+    }
+
+    suspend fun markAutomationRunRead(runId: String, unread: Boolean) {
+        rpc("automation.markRunRead", JSONObject().put("runId", runId).put("unread", unread))
+    }
+
+    suspend fun archiveAutomationRun(runId: String, archived: Boolean) {
+        rpc("automation.archiveRun", JSONObject().put("runId", runId).put("archived", archived))
+    }
+
+    suspend fun setAutomationEnabled(automationId: String, enabled: Boolean) {
+        rpc("automation.update", JSONObject().put("id", automationId).put("enabled", enabled))
+    }
+
+    suspend fun deleteAutomation(automationId: String) {
+        rpc("automation.delete", JSONObject().put("id", automationId))
+    }
+
+    /**
+     * Accepting or dismissing an agent-proposed automation. Proposals stay disabled until
+     * resolved, so this is the only path that turns one into a live schedule.
+     */
+    suspend fun resolveAutomationProposal(automationId: String, accept: Boolean) {
+        rpc(
+            "automation.resolveProposal",
+            JSONObject()
+                .put("automationId", automationId)
+                .put("state", if (accept) "accepted" else "dismissed"),
+        )
+    }
+
+    suspend fun getAutomationMemory(automationId: String): String? =
+        rpc("automation.getMemory", JSONObject().put("automationId", automationId))
+            ?.let { it.stringOrNull("memory") ?: it.objectOrNull("memory")?.stringOrNull("memory") }
+
+    suspend fun createAutomation(
+        projectId: String,
+        name: String,
+        prompt: String,
+        schedule: JSONObject,
+        model: ModelOption,
+        mode: AutomationMode,
+        runtimeMode: RuntimeMode,
+        maxIterations: Int?,
+    ) {
+        val payload = JSONObject()
+            .put("projectId", projectId)
+            .put("name", name)
+            .put("prompt", prompt)
+            .put("schedule", schedule)
+            .put("modelSelection", modelSelectionJson(model))
+            .put("mode", mode.wire)
+            .put("runtimeMode", runtimeMode.wire)
+            .put("enabled", true)
+        maxIterations?.let { payload.put("maxIterations", it) }
+        rpc("automation.create", payload)
+    }
+
     // ── Git ──────────────────────────────────────────────────────────────────────────────────
 
     suspend fun gitStatus(cwd: String): GitStatus =

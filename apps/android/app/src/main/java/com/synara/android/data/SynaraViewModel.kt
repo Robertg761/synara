@@ -17,7 +17,19 @@ enum class AppScreen {
     SETTINGS,
     DIFF,
     SOURCE_CONTROL,
+    AUTOMATIONS,
 }
+
+data class AutomationsState(
+    val list: AutomationList? = null,
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    val notice: String? = null,
+    /** Automation whose detail sheet is open. */
+    val selectedId: String? = null,
+    val busyId: String? = null,
+    val createOpen: Boolean = false,
+)
 
 data class SourceControlState(
     val cwd: String? = null,
@@ -77,6 +89,7 @@ data class SynaraUiState(
     val showArchived: Boolean = false,
     val diff: DiffState = DiffState(),
     val git: SourceControlState = SourceControlState(),
+    val automations: AutomationsState = AutomationsState(),
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -503,6 +516,130 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
                     it.copy(diff = it.diff.copy(isLoading = false, error = readableError(error)))
                 }
             }
+        }
+    }
+
+    // ── Automations ──────────────────────────────────────────────────────────────────────────
+
+    fun openAutomations() {
+        update { it.copy(screen = AppScreen.AUTOMATIONS, automations = AutomationsState(isLoading = true)) }
+        refreshAutomations()
+    }
+
+    fun closeAutomations() {
+        update { it.copy(screen = AppScreen.WORKSPACE, automations = AutomationsState()) }
+    }
+
+    fun refreshAutomations() {
+        update { it.copy(automations = it.automations.copy(isLoading = true, error = null)) }
+        viewModelScope.launch {
+            runCatching { repository.listAutomations(_ui.value.selectedProjectId) }
+                .onSuccess { list ->
+                    update { it.copy(automations = it.automations.copy(list = list, isLoading = false)) }
+                }
+                .onFailure { error ->
+                    update {
+                        it.copy(
+                            automations = it.automations.copy(isLoading = false, error = readableError(error)),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun selectAutomation(id: String?) {
+        update { it.copy(automations = it.automations.copy(selectedId = id)) }
+    }
+
+    fun setAutomationCreateOpen(open: Boolean) {
+        update { it.copy(automations = it.automations.copy(createOpen = open)) }
+    }
+
+    fun dismissAutomationNotice() {
+        update { it.copy(automations = it.automations.copy(notice = null, error = null)) }
+    }
+
+    fun setAutomationEnabled(id: String, enabled: Boolean) = automationOperation(id) {
+        repository.setAutomationEnabled(id, enabled)
+        update {
+            it.copy(automations = it.automations.copy(notice = if (enabled) "Enabled." else "Paused."))
+        }
+    }
+
+    fun runAutomationNow(id: String) = automationOperation(id) {
+        repository.runAutomationNow(id)
+        update { it.copy(automations = it.automations.copy(notice = "Run queued.")) }
+    }
+
+    fun cancelAutomationRun(runId: String, automationId: String) = automationOperation(automationId) {
+        repository.cancelAutomationRun(runId)
+        update { it.copy(automations = it.automations.copy(notice = "Run cancelled.")) }
+    }
+
+    fun deleteAutomation(id: String) = automationOperation(id) {
+        repository.deleteAutomation(id)
+        update { it.copy(automations = it.automations.copy(selectedId = null, notice = "Deleted.")) }
+    }
+
+    fun resolveAutomationProposal(id: String, accept: Boolean) = automationOperation(id) {
+        repository.resolveAutomationProposal(id, accept)
+        update {
+            it.copy(
+                automations = it.automations.copy(
+                    selectedId = null,
+                    notice = if (accept) "Automation accepted." else "Proposal dismissed.",
+                ),
+            )
+        }
+    }
+
+    fun markAutomationRunRead(runId: String, automationId: String) = automationOperation(automationId) {
+        repository.markAutomationRunRead(runId, unread = false)
+    }
+
+    fun createAutomation(
+        name: String,
+        prompt: String,
+        schedule: JSONObject,
+        model: ModelOption,
+        mode: AutomationMode,
+        runtimeMode: RuntimeMode,
+        maxIterations: Int?,
+    ) {
+        val projectId = _ui.value.selectedProjectId ?: _ui.value.projects.firstOrNull()?.id ?: return
+        update { it.copy(automations = it.automations.copy(createOpen = false, busyId = "new")) }
+        viewModelScope.launch {
+            runCatching {
+                repository.createAutomation(
+                    projectId, name.trim(), prompt.trim(), schedule, model, mode, runtimeMode, maxIterations,
+                )
+            }
+                .onSuccess {
+                    update { it.copy(automations = it.automations.copy(notice = "Automation created.")) }
+                }
+                .onFailure { error ->
+                    update { it.copy(automations = it.automations.copy(error = readableError(error))) }
+                }
+            update { it.copy(automations = it.automations.copy(busyId = null)) }
+            refreshAutomations()
+        }
+    }
+
+    /**
+     * Automation mutations all re-read the list afterwards: enabling, running and deleting each
+     * change fields the server owns (nextRunAt, iterationCount, run rows), and guessing at them
+     * locally would show a schedule that does not match what will actually happen.
+     */
+    private fun automationOperation(id: String, block: suspend () -> Unit) {
+        if (_ui.value.automations.busyId != null) return
+        update { it.copy(automations = it.automations.copy(busyId = id, error = null, notice = null)) }
+        viewModelScope.launch {
+            runCatching { block() }
+                .onFailure { error ->
+                    update { it.copy(automations = it.automations.copy(error = readableError(error))) }
+                }
+            update { it.copy(automations = it.automations.copy(busyId = null)) }
+            refreshAutomations()
         }
     }
 
