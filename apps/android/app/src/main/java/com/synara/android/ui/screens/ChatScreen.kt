@@ -1,5 +1,20 @@
 package com.synara.android.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.material.icons.outlined.Build
+import androidx.compose.material.icons.outlined.Checklist
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import com.synara.android.data.CatalogueEntry
+import com.synara.android.data.ComposerSuggestions
+import com.synara.android.data.ProviderCatalogue
+import com.synara.android.data.SuggestionKind
+import com.synara.android.data.applySuggestion
+import com.synara.android.data.composerSuggestionsFor
+import com.synara.android.ui.theme.disclosureEnter
+import com.synara.android.ui.theme.disclosureExit
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -99,7 +114,11 @@ import org.json.JSONObject
 fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
     val detail = state.detail
     val thread = detail?.thread ?: state.selectedThread
-    var draft by rememberSaveable(state.selectedThreadId) { mutableStateOf("") }
+    // TextFieldValue rather than String: composer suggestions need the caret position to know
+    // which token is being typed, and a plain String throws that away.
+    var draft by rememberSaveable(state.selectedThreadId, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue())
+    }
     val listState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
 
@@ -190,9 +209,23 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
             Composer(
                 draft = draft,
                 onDraftChange = { draft = it },
+                catalogue = state.catalogue.catalogue,
+                interactionMode = thread?.interactionMode,
+                onToggleInteractionMode = {
+                    thread?.let {
+                        viewModel.setInteractionMode(
+                            it.id,
+                            if (it.interactionMode == InteractionMode.PLAN.wire) {
+                                InteractionMode.DEFAULT
+                            } else {
+                                InteractionMode.PLAN
+                            },
+                        )
+                    }
+                },
                 onSend = {
-                    viewModel.sendMessage(draft)
-                    draft = ""
+                    viewModel.sendMessage(draft.text)
+                    draft = TextFieldValue()
                     focusManager.clearFocus()
                 },
                 onStop = viewModel::interruptThread,
@@ -774,14 +807,20 @@ private fun ActivitySection(activities: List<ActivityItem>) {
 
 @Composable
 private fun Composer(
-    draft: String,
-    onDraftChange: (String) -> Unit,
+    draft: TextFieldValue,
+    onDraftChange: (TextFieldValue) -> Unit,
+    catalogue: ProviderCatalogue?,
+    interactionMode: String?,
+    onToggleInteractionMode: () -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
     enabled: Boolean,
     isSending: Boolean,
     isRunning: Boolean,
 ) {
+    val suggestions = remember(draft.text, draft.selection.end, catalogue) {
+        composerSuggestionsFor(draft.text, draft.selection.end, catalogue)
+    }
     Column(
         Modifier
             .fillMaxWidth()
@@ -790,6 +829,19 @@ private fun Composer(
             .navigationBarsPadding(),
     ) {
         SynaraDivider()
+        AnimatedVisibility(
+            visible = suggestions != null,
+            enter = disclosureEnter(),
+            exit = disclosureExit(),
+        ) {
+            suggestions?.let { active ->
+                SuggestionRow(active) { entry ->
+                    val (text, caret) = applySuggestion(draft.text, active, entry)
+                    onDraftChange(TextFieldValue(text, TextRange(caret)))
+                }
+            }
+        }
+        PlanModeToggle(interactionMode, enabled, onToggleInteractionMode)
         Row(
             Modifier
                 .fillMaxWidth()
@@ -817,7 +869,7 @@ private fun Composer(
                 colors = synaraTextFieldColors(),
             )
 
-            val canSend = enabled && draft.isNotBlank() && !isSending
+            val canSend = enabled && draft.text.isNotBlank() && !isSending
             if (isRunning) {
                 ComposerAction(
                     onClick = onStop,
@@ -845,6 +897,95 @@ private fun Composer(
                     description = "Send message",
                 )
             }
+        }
+    }
+}
+
+/**
+ * Slash commands and skill mentions, offered as the token is typed. Horizontal rather than a
+ * popup list: a popup over a soft keyboard covers the very text being edited.
+ */
+@Composable
+private fun SuggestionRow(
+    suggestions: ComposerSuggestions,
+    onSelect: (CatalogueEntry) -> Unit,
+) {
+    LazyRow(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = SynaraTheme.spacing.md, vertical = SynaraTheme.spacing.xs),
+        horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
+    ) {
+        items(suggestions.entries, key = { it.name }) { entry ->
+            val shape = MaterialTheme.shapes.small
+            Column(
+                Modifier
+                    .widthIn(max = 240.dp)
+                    .clip(shape)
+                    .background(SynaraTheme.accents.mutedSurface, shape)
+                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+                    .clickable { onSelect(entry) }
+                    .padding(horizontal = SynaraTheme.spacing.md, vertical = SynaraTheme.spacing.sm),
+            ) {
+                Text(
+                    (if (suggestions.kind == SuggestionKind.COMMAND) "/" else "@") + entry.name,
+                    style = SynaraTheme.textStyles.monoSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                )
+                entry.description?.takeIf { it.isNotBlank() }?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Plan mode is switchable from the composer, not just the thread menu: it decides whether the
+ * turn about to be sent will change files, which is a per-message decision in practice.
+ */
+@Composable
+private fun PlanModeToggle(interactionMode: String?, enabled: Boolean, onToggle: () -> Unit) {
+    if (interactionMode == null) return
+    val planning = interactionMode == InteractionMode.PLAN.wire
+    val accents = SynaraTheme.accents
+    val shape = MaterialTheme.shapes.extraSmall
+    Row(
+        Modifier.padding(start = SynaraTheme.spacing.md, top = SynaraTheme.spacing.xs),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            Modifier
+                .clip(shape)
+                .background(if (planning) accents.infoSurface else SynaraTheme.accents.mutedSurface, shape)
+                .border(
+                    1.dp,
+                    if (planning) accents.info.copy(alpha = 0.4f) else MaterialTheme.colorScheme.outlineVariant,
+                    shape,
+                )
+                .clickable(enabled = enabled, onClick = onToggle)
+                .padding(horizontal = 9.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Icon(
+                if (planning) Icons.Outlined.Checklist else Icons.Outlined.Build,
+                contentDescription = null,
+                modifier = Modifier.size(13.dp),
+                tint = if (planning) accents.infoForeground else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                if (planning) "Plan mode" else "Build mode",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (planning) accents.infoForeground else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

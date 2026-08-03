@@ -28,6 +28,8 @@ data class CatalogueState(
     val isLoading: Boolean = false,
     val error: String? = null,
     val providerLabel: String? = null,
+    /** Thread the loaded catalogue belongs to; it is per-checkout, so it cannot be shared. */
+    val loadedForThreadId: String? = null,
 )
 
 data class TerminalState(
@@ -233,6 +235,9 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
             }.onSuccess { streamId ->
                 activeThreadStream = streamId
                 update { it.copy(isLoading = false) }
+                // Warm the catalogue so the composer can offer slash commands and skills the
+                // moment they are typed, rather than showing an empty list while it fetches.
+                prefetchCatalogue(threadId)
             }.onFailure { error ->
                 update { it.copy(isLoading = false, error = readableError(error)) }
             }
@@ -567,13 +572,24 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         update {
             it.copy(
                 screen = AppScreen.CATALOGUE,
-                catalogue = CatalogueState(isLoading = true, providerLabel = thread.providerLabel),
+                catalogue = it.catalogue.copy(
+                    isLoading = it.catalogue.loadedForThreadId != thread.id,
+                    providerLabel = thread.providerLabel,
+                ),
             )
         }
         viewModelScope.launch {
             runCatching { repository.loadCatalogue(thread.provider, cwd, thread.id) }
                 .onSuccess { catalogue ->
-                    update { it.copy(catalogue = it.catalogue.copy(catalogue = catalogue, isLoading = false)) }
+                    update {
+                        it.copy(
+                            catalogue = it.catalogue.copy(
+                                catalogue = catalogue,
+                                isLoading = false,
+                                loadedForThreadId = thread.id,
+                            ),
+                        )
+                    }
                 }
                 .onFailure { error ->
                     update {
@@ -585,11 +601,33 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         }
     }
 
+    private fun prefetchCatalogue(threadId: String) {
+        if (_ui.value.catalogue.loadedForThreadId == threadId) return
+        val thread = _ui.value.threads.firstOrNull { it.id == threadId } ?: _ui.value.detail?.thread
+        val cwd = thread?.gitCwd ?: return
+        viewModelScope.launch {
+            runCatching { repository.loadCatalogue(thread.provider, cwd, threadId) }
+                .onSuccess { catalogue ->
+                    update {
+                        it.copy(
+                            catalogue = it.catalogue.copy(
+                                catalogue = catalogue,
+                                providerLabel = thread.providerLabel,
+                                loadedForThreadId = threadId,
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
     fun closeCatalogue() {
+        // The loaded catalogue is kept: it still backs the composer's suggestions after the
+        // screen closes, and refetching it on every visit would stall typing.
         update {
             it.copy(
                 screen = if (it.selectedThreadId != null) AppScreen.CHAT else AppScreen.WORKSPACE,
-                catalogue = CatalogueState(),
+                catalogue = it.catalogue.copy(isLoading = false, error = null),
             )
         }
     }
