@@ -6,7 +6,9 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.util.UUID
@@ -1017,6 +1019,8 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
     val terminalBuffer = AnsiTerminalBuffer()
 
     private var terminalStream: String? = null
+    private var pendingTerminalAckBytes = 0
+    private var terminalAckJob: Job? = null
 
     fun openTerminal() {
         val thread = _ui.value.detail?.thread ?: _ui.value.selectedThread
@@ -1108,6 +1112,23 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         }
     }
 
+    /**
+     * Acks are debounced rather than sent per event: a build emits hundreds of small chunks a
+     * second, and one RPC each would compete with the output it is acknowledging for the socket.
+     */
+    private fun scheduleTerminalAck(bytes: Int) {
+        if (bytes <= 0) return
+        pendingTerminalAckBytes += bytes
+        if (terminalAckJob?.isActive == true) return
+        terminalAckJob = viewModelScope.launch {
+            delay(TERMINAL_ACK_DEBOUNCE_MS)
+            val total = pendingTerminalAckBytes
+            pendingTerminalAckBytes = 0
+            val threadId = _ui.value.terminal.threadId ?: return@launch
+            repository.ackTerminalOutput(threadId, total)
+        }
+    }
+
     private fun onTerminalEvent(event: JSONObject) {
         val threadId = _ui.value.terminal.threadId ?: return
         // One subscription carries every session's events, so anything for another thread or a
@@ -1116,7 +1137,19 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         if (event.stringOrNull("terminalId") != (_ui.value.terminal.snapshot?.terminalId ?: DEFAULT_TERMINAL_ID)) return
 
         when (event.stringOrNull("type")) {
-            "output" -> terminalBuffer.append(event.stringOrNull("data").orEmpty())
+            "output" -> {
+                val data = event.stringOrNull("data").orEmpty()
+                terminalBuffer.append(data)
+                // The event carries a byte length when the server computed one; otherwise the
+                // UTF-8 size of the payload is the same number, and acking the string's *char*
+                // count would under-report on any non-ASCII output.
+                val bytes = if (event.has("byteLength") && !event.isNull("byteLength")) {
+                    event.optInt("byteLength")
+                } else {
+                    data.toByteArray(Charsets.UTF_8).size
+                }
+                scheduleTerminalAck(bytes)
+            }
             "cleared" -> terminalBuffer.clear()
             "started", "restarted" -> {
                 terminalBuffer.clear()
@@ -1714,6 +1747,8 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
     }
 
     companion object {
+        private const val TERMINAL_ACK_DEBOUNCE_MS = 250L
+
         fun factory(repository: SynaraRepository): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
