@@ -14,6 +14,7 @@ import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.Unarchive
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
@@ -95,6 +96,17 @@ fun ThreadActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
                 onClick = {
                     viewModel.closeThreadActions()
                     viewModel.openSourceControl()
+                },
+            )
+
+            ActionSheetItem(
+                icon = Icons.Outlined.Terminal,
+                label = "Terminal",
+                supporting = "Shell in this thread's checkout",
+                enabled = thread.gitCwd != null,
+                onClick = {
+                    viewModel.closeThreadActions()
+                    viewModel.openTerminal()
                 },
             )
 

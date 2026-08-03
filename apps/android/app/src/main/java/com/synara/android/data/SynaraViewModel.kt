@@ -18,6 +18,23 @@ enum class AppScreen {
     DIFF,
     SOURCE_CONTROL,
     AUTOMATIONS,
+    TERMINAL,
+}
+
+data class TerminalState(
+    val threadId: String? = null,
+    val cwd: String? = null,
+    val snapshot: TerminalSnapshot? = null,
+    /**
+     * Bumped on every output event. The buffer itself is mutable and identity-stable, so Compose
+     * needs a changing value to know a redraw is due; re-parsing a whole scrollback into an
+     * immutable list on every PTY flush would drop frames on a busy build.
+     */
+    val revision: Int = 0,
+    val isConnecting: Boolean = false,
+    val error: String? = null,
+) {
+    val isRunning: Boolean get() = snapshot?.isRunning == true
 }
 
 data class AutomationsState(
@@ -90,6 +107,7 @@ data class SynaraUiState(
     val diff: DiffState = DiffState(),
     val git: SourceControlState = SourceControlState(),
     val automations: AutomationsState = AutomationsState(),
+    val terminal: TerminalState = TerminalState(),
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -519,6 +537,147 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         }
     }
 
+    // ── Terminal ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * The rendered scrollback. Held outside [SynaraUiState] because it is a mutable emulator that
+     * output is streamed into; copying its contents into immutable state on every PTY flush would
+     * cost more than drawing them.
+     */
+    val terminalBuffer = AnsiTerminalBuffer()
+
+    private var terminalStream: String? = null
+
+    fun openTerminal() {
+        val thread = _ui.value.detail?.thread ?: _ui.value.selectedThread
+        val cwd = thread?.gitCwd
+        if (thread == null || cwd == null) {
+            update { it.copy(error = "This thread has no working directory to open a shell in.") }
+            return
+        }
+        terminalBuffer.clear()
+        update {
+            it.copy(
+                screen = AppScreen.TERMINAL,
+                terminal = TerminalState(threadId = thread.id, cwd = cwd, isConnecting = true),
+            )
+        }
+        viewModelScope.launch {
+            runCatching {
+                // Subscribe before opening, so output produced between the two is not missed.
+                if (terminalStream == null) {
+                    terminalStream = repository.subscribeTerminalEvents(::onTerminalEvent)
+                }
+                repository.openTerminal(thread.id, cwd)
+            }.onSuccess { snapshot ->
+                if (snapshot.history.isNotEmpty()) terminalBuffer.append(snapshot.history)
+                update {
+                    it.copy(
+                        terminal = it.terminal.copy(
+                            snapshot = snapshot,
+                            isConnecting = false,
+                            revision = it.terminal.revision + 1,
+                        ),
+                    )
+                }
+            }.onFailure { error ->
+                update {
+                    it.copy(
+                        terminal = it.terminal.copy(isConnecting = false, error = readableError(error)),
+                    )
+                }
+            }
+        }
+    }
+
+    fun closeTerminalScreen() {
+        // The PTY deliberately keeps running: leaving the screen is not the same as ending a
+        // session, and a build killed by backing out would be a nasty surprise.
+        update {
+            it.copy(
+                screen = if (it.selectedThreadId != null) AppScreen.CHAT else AppScreen.WORKSPACE,
+            )
+        }
+    }
+
+    fun sendTerminalInput(text: String) {
+        val threadId = _ui.value.terminal.threadId ?: return
+        viewModelScope.launch {
+            runCatching { repository.writeTerminal(threadId, text) }
+                .onFailure { error ->
+                    update { it.copy(terminal = it.terminal.copy(error = readableError(error))) }
+                }
+        }
+    }
+
+    fun sendTerminalKey(key: TerminalKey) = sendTerminalInput(key.sequence)
+
+    fun resizeTerminal(cols: Int, rows: Int) {
+        val threadId = _ui.value.terminal.threadId ?: return
+        viewModelScope.launch { runCatching { repository.resizeTerminal(threadId, cols, rows) } }
+    }
+
+    fun clearTerminal() {
+        val threadId = _ui.value.terminal.threadId ?: return
+        terminalBuffer.clear()
+        update { it.copy(terminal = it.terminal.copy(revision = it.terminal.revision + 1)) }
+        viewModelScope.launch { runCatching { repository.clearTerminal(threadId) } }
+    }
+
+    fun restartTerminal() {
+        val terminal = _ui.value.terminal
+        val threadId = terminal.threadId ?: return
+        val cwd = terminal.cwd ?: return
+        terminalBuffer.clear()
+        update { it.copy(terminal = it.terminal.copy(revision = it.terminal.revision + 1, error = null)) }
+        viewModelScope.launch {
+            runCatching { repository.restartTerminal(threadId, cwd) }
+                .onFailure { error ->
+                    update { it.copy(terminal = it.terminal.copy(error = readableError(error))) }
+                }
+        }
+    }
+
+    private fun onTerminalEvent(event: JSONObject) {
+        val threadId = _ui.value.terminal.threadId ?: return
+        // One subscription carries every session's events, so anything for another thread or a
+        // second terminal in this one has to be ignored rather than rendered here.
+        if (event.stringOrNull("threadId") != threadId) return
+        if (event.stringOrNull("terminalId") != (_ui.value.terminal.snapshot?.terminalId ?: DEFAULT_TERMINAL_ID)) return
+
+        when (event.stringOrNull("type")) {
+            "output" -> terminalBuffer.append(event.stringOrNull("data").orEmpty())
+            "cleared" -> terminalBuffer.clear()
+            "started", "restarted" -> {
+                terminalBuffer.clear()
+                event.objectOrNull("snapshot")?.let { snapshotJson ->
+                    val snapshot = TerminalSnapshot.fromJson(snapshotJson)
+                    if (snapshot.history.isNotEmpty()) terminalBuffer.append(snapshot.history)
+                    update { it.copy(terminal = it.terminal.copy(snapshot = snapshot)) }
+                }
+            }
+
+            "exited" -> {
+                val code = event.optIntOrNull("exitCode")
+                terminalBuffer.append("\n[process exited${code?.let { " with code $it" } ?: ""}]\n")
+                update {
+                    it.copy(
+                        terminal = it.terminal.copy(
+                            snapshot = it.terminal.snapshot?.copy(status = "exited", exitCode = code),
+                        ),
+                    )
+                }
+            }
+
+            "error" -> update {
+                it.copy(terminal = it.terminal.copy(error = event.stringOrNull("message")))
+            }
+
+            else -> return
+        }
+        update { it.copy(terminal = it.terminal.copy(revision = it.terminal.revision + 1)) }
+    }
+
     // ── Automations ──────────────────────────────────────────────────────────────────────────
 
     fun openAutomations() {
@@ -793,6 +952,11 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         stopActiveThreadStream()
         activeShellStream?.let(repository::stopStream)
         activeShellStream = null
+        // The terminal subscription outlives individual screens, so it is torn down with the
+        // connection rather than when the terminal view is left.
+        terminalStream?.let(repository::stopStream)
+        terminalStream = null
+        terminalBuffer.clear()
         repository.disconnect(clearCredentials = true)
         update {
             SynaraUiState(
@@ -805,6 +969,7 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
 
     override fun onCleared() {
         stopActiveThreadStream()
+        terminalStream?.let(repository::stopStream)
         activeShellStream?.let(repository::stopStream)
         repository.disconnect()
         super.onCleared()
