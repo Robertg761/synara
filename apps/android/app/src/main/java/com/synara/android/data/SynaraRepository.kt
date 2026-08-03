@@ -374,6 +374,58 @@ class SynaraRepository(context: Context) {
             JSONObject().put("cwd", cwd).put("scope", scope),
         )?.stringOrNull("patch").orEmpty()
 
+    // ── Spaces ───────────────────────────────────────────────────────────────────────────────
+
+    suspend fun createSpace(name: String, icon: String = "folder") {
+        dispatch("space.create") {
+            put("spaceId", newId())
+            put("name", name)
+            put("icon", icon)
+            put("createdAt", nowIso())
+        }
+    }
+
+    suspend fun renameSpace(spaceId: String, name: String) {
+        dispatch("space.meta.update") {
+            put("spaceId", spaceId)
+            put("name", name)
+        }
+    }
+
+    suspend fun deleteSpace(spaceId: String) {
+        dispatch("space.delete") { put("spaceId", spaceId) }
+    }
+
+    /**
+     * Bulk-files projects into a space in one transaction. Moving a project *out* of a space is
+     * deliberately not this call — the contract routes that through `project.meta.update` with a
+     * null space, and mirroring that split keeps the atomic bulk path meaning exactly one thing.
+     */
+    suspend fun assignProjectsToSpace(spaceId: String, projectIds: List<String>) {
+        if (projectIds.isEmpty()) return
+        dispatch("space.projects.assign") {
+            put("spaceId", spaceId)
+            put("projectIds", JSONArray(projectIds))
+        }
+    }
+
+    suspend fun moveProjectToVoid(projectId: String) {
+        dispatch("project.meta.update") {
+            put("projectId", projectId)
+            put("spaceId", JSONObject.NULL)
+        }
+    }
+
+    // ── Studio ───────────────────────────────────────────────────────────────────────────────
+
+    /** Files a thread produced into the Studio workspace. */
+    suspend fun listStudioOutputs(threadId: String): List<StudioOutput> =
+        rpc("studio.listThreadOutputs", JSONObject().put("threadId", threadId))
+            ?.arrayOrEmpty("entries")
+            ?.objects()
+            ?.map(StudioOutput::fromJson)
+            .orEmpty()
+
     // ── Provider catalogue ───────────────────────────────────────────────────────────────────
 
     /**

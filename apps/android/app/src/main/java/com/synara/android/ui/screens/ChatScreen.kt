@@ -301,6 +301,7 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
     }
 
     ThreadActionsSheet(state, viewModel)
+    StudioOutputsSheet(state, viewModel)
 }
 
 /**

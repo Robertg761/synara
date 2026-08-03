@@ -356,7 +356,45 @@ data class Checkpoint(
     }
 }
 
+/**
+ * A space groups projects. Projects with no space live in "Void" — the desktop's term for the
+ * ungrouped default, which is a real state rather than an absence, so it is modelled explicitly.
+ */
+data class SpaceItem(
+    val id: String,
+    val name: String,
+    val icon: String,
+    val sortOrder: Int,
+) {
+    companion object {
+        fun fromJson(json: JSONObject) = SpaceItem(
+            id = json.stringOrNull("id") ?: "",
+            name = json.stringOrNull("name") ?: "Space",
+            icon = json.stringOrNull("icon") ?: "folder",
+            sortOrder = json.optInt("sortOrder", 0),
+        )
+    }
+}
+
+/** Files a thread produced into the Studio workspace. */
+data class StudioOutput(
+    val name: String,
+    val relativePath: String,
+    val fullPath: String,
+    val modifiedAt: String,
+) {
+    companion object {
+        fun fromJson(json: JSONObject) = StudioOutput(
+            name = json.stringOrNull("name") ?: "",
+            relativePath = json.stringOrNull("relativePath") ?: "",
+            fullPath = json.stringOrNull("fullPath") ?: "",
+            modifiedAt = json.stringOrNull("modifiedAt") ?: "",
+        )
+    }
+}
+
 data class WorkspaceSnapshot(
+    val spaces: List<SpaceItem>,
     val projects: List<ProjectItem>,
     val threads: List<ThreadItem>,
     val updatedAt: String,
@@ -370,6 +408,10 @@ data class WorkspaceSnapshot(
                 ProjectItem.fromJson(it, counts[it.stringOrNull("id")] ?: 0)
             }
             return WorkspaceSnapshot(
+                spaces = json.arrayOrEmpty("spaces")
+                    .objects()
+                    .map(SpaceItem::fromJson)
+                    .sortedBy { it.sortOrder },
                 projects = projects,
                 threads = threads,
                 updatedAt = json.stringOrNull("updatedAt") ?: "",

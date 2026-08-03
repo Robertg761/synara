@@ -1,6 +1,8 @@
 package com.synara.android.ui.screens
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -11,6 +13,7 @@ import androidx.compose.material.icons.outlined.Archive
 import androidx.compose.material.icons.outlined.Difference
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Extension
+import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.PushPin
@@ -27,7 +30,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.synara.android.ui.format.formatRelativeTimestamp
+import com.synara.android.ui.theme.SynaraTheme
 import com.synara.android.data.InteractionMode
 import com.synara.android.data.ModelOption
 import com.synara.android.data.Provider
@@ -111,6 +117,15 @@ fun ThreadActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
                 },
             )
 
+            ActionSheetItem(
+                icon = Icons.Outlined.FolderOpen,
+                label = "Produced files",
+                supporting = "Files this thread wrote to the Studio workspace",
+                onClick = {
+                    viewModel.closeThreadActions()
+                    viewModel.openStudioOutputs()
+                },
+            )
             ActionSheetItem(
                 icon = Icons.Outlined.Extension,
                 label = "Skills & commands",
@@ -263,6 +278,31 @@ fun ProjectActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
                     viewModel.closeProjectActions()
                 },
             )
+            if (state.spaces.isNotEmpty()) {
+                ActionSheetSection("Space")
+                ActionSheetChoice(
+                    label = "No space",
+                    description = "Sits outside every space",
+                    selected = project.spaceId == null,
+                    onClick = {
+                        viewModel.moveProjectToSpace(project.id, null)
+                        viewModel.closeProjectActions()
+                    },
+                )
+                state.spaces.forEach { space ->
+                    ActionSheetChoice(
+                        label = space.name,
+                        description = null,
+                        selected = project.spaceId == space.id,
+                        onClick = {
+                            viewModel.moveProjectToSpace(project.id, space.id)
+                            viewModel.closeProjectActions()
+                        },
+                    )
+                }
+            }
+
+            ActionSheetSection("Danger")
             ActionSheetItem(
                 icon = Icons.Outlined.Delete,
                 label = "Delete project",
@@ -469,4 +509,135 @@ fun DestructiveConfirmDialog(
         containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
         shape = MaterialTheme.shapes.extraLarge,
     )
+}
+
+/** Space menu: rename or delete. Projects inside a deleted space fall back to no space. */
+@Composable
+fun SpaceActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
+    val spaceId = state.spaceActionsFor ?: return
+    val space = remember(spaceId, state.spaces) { state.spaces.firstOrNull { it.id == spaceId } } ?: return
+    val projectCount = remember(spaceId, state.projects) {
+        state.projects.count { it.spaceId == spaceId }
+    }
+
+    var renaming by remember(spaceId) { mutableStateOf(false) }
+    var confirmingDelete by remember(spaceId) { mutableStateOf(false) }
+
+    if (!renaming && !confirmingDelete) {
+        SynaraActionSheet(
+            title = space.name,
+            subtitle = "$projectCount project${if (projectCount == 1) "" else "s"}",
+            onDismiss = viewModel::closeSpaceActions,
+        ) {
+            ActionSheetItem(
+                icon = Icons.Outlined.DriveFileRenameOutline,
+                label = "Rename",
+                onClick = { renaming = true },
+            )
+            ActionSheetItem(
+                icon = Icons.Outlined.Delete,
+                label = "Delete space",
+                destructive = true,
+                onClick = { confirmingDelete = true },
+            )
+        }
+    }
+
+    if (renaming) {
+        RenameDialog(
+            title = "Rename space",
+            initial = space.name,
+            label = "Space name",
+            onDismiss = { renaming = false },
+            onConfirm = { value ->
+                viewModel.renameSpace(space.id, value)
+                renaming = false
+                viewModel.closeSpaceActions()
+            },
+        )
+    }
+
+    if (confirmingDelete) {
+        DestructiveConfirmDialog(
+            title = "Delete this space?",
+            body = if (projectCount > 0) {
+                "$projectCount project${if (projectCount == 1) "" else "s"} will move out of it. " +
+                    "The projects and their threads are not deleted."
+            } else {
+                "The space is removed. Nothing else changes."
+            },
+            confirmLabel = "Delete",
+            onDismiss = { confirmingDelete = false },
+            onConfirm = {
+                confirmingDelete = false
+                viewModel.deleteSpace(space.id)
+                viewModel.closeSpaceActions()
+            },
+        )
+    }
+}
+
+/** Prompts for a new space name. */
+@Composable
+fun CreateSpaceDialog(onDismiss: () -> Unit, onCreate: (String) -> Unit) {
+    RenameDialog(
+        title = "New space",
+        initial = "",
+        label = "Space name",
+        onDismiss = onDismiss,
+        onConfirm = { onCreate(it); onDismiss() },
+    )
+}
+
+/**
+ * Studio outputs for the open thread. A sheet rather than a screen: it is a short list of file
+ * names with nothing to drill into from a phone, which cannot open the files anyway.
+ */
+@Composable
+fun StudioOutputsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
+    if (!state.studioOpen) return
+    val outputs = state.studioOutputs
+
+    SynaraActionSheet(
+        title = "Produced files",
+        subtitle = outputs?.let { "${it.size} file${if (it.size == 1) "" else "s"}" },
+        onDismiss = viewModel::closeStudioOutputs,
+    ) {
+        when {
+            outputs == null -> ActionSheetSection("Loading…")
+            outputs.isEmpty() -> ActionSheetSection("This thread has not written any Studio files.")
+            else -> Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                outputs.forEach { output ->
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                horizontal = SynaraTheme.spacing.xl,
+                                vertical = SynaraTheme.spacing.sm,
+                            ),
+                    ) {
+                        Text(
+                            output.name,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            output.relativePath,
+                            style = SynaraTheme.textStyles.monoSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            formatRelativeTimestamp(output.modifiedAt),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
+                }
+            }
+        }
+    }
 }

@@ -37,6 +37,7 @@ import com.synara.android.data.GitStatus
 import com.synara.android.data.PullRequestSnapshot
 import com.synara.android.data.PullRequestState
 import com.synara.android.data.SourceControlState
+import com.synara.android.data.SpaceItem
 import com.synara.android.data.TerminalSnapshot
 import com.synara.android.data.TerminalState
 import com.synara.android.data.DiffState
@@ -102,6 +103,7 @@ class GalleryActivity : ComponentActivity() {
                         "setup" -> SetupScreen(Fixtures.setup(), { _, _ -> }, {})
                         "setup-error" -> SetupScreen(Fixtures.setupError(), { _, _ -> }, {})
                         "workspace" -> WorkspaceScreen(Fixtures.workspace(), vm)
+                        "workspace-spaces" -> WorkspaceScreen(Fixtures.workspaceSpaces(), vm)
                         "workspace-empty" -> WorkspaceScreen(Fixtures.workspaceEmpty(), vm)
                         "workspace-no-projects" -> WorkspaceScreen(Fixtures.workspaceNoProjects(), vm)
                         "workspace-loading" -> WorkspaceScreen(Fixtures.workspaceLoading(), vm)
@@ -224,6 +226,14 @@ private object Fixtures {
     )
 
     fun workspace() = base()
+
+    fun workspaceSpaces() = base().copy(
+        spaces = listOf(
+            SpaceItem("s1", "Product", "folder", 0),
+            SpaceItem("s2", "Infra", "server", 1),
+        ),
+        projects = projects.map { if (it.id == "p1") it.copy(spaceId = "s1") else it.copy(spaceId = "s2") },
+    )
 
     fun workspaceEmpty() = base().copy(threads = emptyList())
 
