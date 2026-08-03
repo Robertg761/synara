@@ -1,5 +1,18 @@
 package com.synara.android.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import com.synara.android.data.ProviderSettings
+import com.synara.android.data.ProviderStatus
+import com.synara.android.data.ProviderUsage
+import com.synara.android.ui.components.SynaraBadge
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -133,6 +146,8 @@ fun SettingsScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                     }
                 }
 
+                ServerSettingsSections(state, viewModel)
+
                 SectionLabel("What this app does", Modifier.padding(top = SynaraTheme.spacing.md))
                 SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
                     FeatureRow(
@@ -260,3 +275,326 @@ private fun FeatureRow(icon: ImageVector, title: String, body: String) {
         }
     }
 }
+
+/**
+ * Server-side settings: the same values the desktop's Settings route writes, read and patched
+ * over `server.getSettings` / `server.updateSettings`.
+ *
+ * Every write is a sparse patch. Sending the whole settings object back would make the phone
+ * clobber fields it never rendered — per-provider launch args, custom model lists, skill
+ * exclusions — simply by having loaded them.
+ */
+@Composable
+private fun ServerSettingsSections(state: SynaraUiState, viewModel: SynaraViewModel) {
+    val server = state.serverSettings
+    val settings = server.settings
+
+    SectionLabel(
+        "Server",
+        Modifier.padding(top = SynaraTheme.spacing.md),
+        trailing = {
+            if (server.isLoading || server.isSaving) {
+                CircularProgressIndicator(
+                    Modifier.size(14.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                TextButton(onClick = { viewModel.loadServerSettings(refresh = true) }) {
+                    Text("Refresh", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        },
+    )
+
+    server.error?.let { InlineNotice(it) }
+
+    if (settings == null) {
+        if (!server.isLoading) {
+            Text(
+                if (state.isConnected) {
+                    "Server settings are unavailable."
+                } else {
+                    "Connect to read server settings."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        return
+    }
+
+    SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
+        SettingSwitch(
+            title = "Stream assistant output",
+            body = "Show tokens as they are produced instead of waiting for the finished turn.",
+            checked = settings.enableAssistantStreaming,
+            enabled = !server.isSaving,
+            onChange = viewModel::setAssistantStreaming,
+        )
+        SynaraDivider(startIndent = SynaraTheme.spacing.lg)
+        SettingSwitch(
+            title = "Check for provider updates",
+            body = "Let Synara report when an installed agent CLI is behind its latest release.",
+            checked = settings.enableProviderUpdateChecks,
+            enabled = !server.isSaving,
+            onChange = viewModel::setProviderUpdateChecks,
+        )
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm)) {
+        Text(
+            "New threads run in",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm)) {
+            listOf("local" to "The checkout", "worktree" to "A worktree").forEach { (wire, label) ->
+                EnvModeOption(
+                    label = label,
+                    selected = settings.defaultThreadEnvMode == wire,
+                    enabled = !server.isSaving,
+                    modifier = Modifier.weight(1f),
+                ) { viewModel.setDefaultThreadEnvMode(wire) }
+            }
+        }
+    }
+
+    SectionLabel("Providers", Modifier.padding(top = SynaraTheme.spacing.md))
+    SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
+        settings.providers.forEachIndexed { index, providerSettings ->
+            if (index > 0) SynaraDivider(startIndent = SynaraTheme.spacing.lg)
+            ProviderRow(
+                settings = providerSettings,
+                status = server.statuses.firstOrNull { it.provider == providerSettings.provider },
+                enabled = !server.isSaving,
+                onToggle = { viewModel.setProviderEnabled(providerSettings.provider, it) },
+            )
+        }
+    }
+
+    if (server.usage.isNotEmpty()) {
+        SectionLabel("Usage", Modifier.padding(top = SynaraTheme.spacing.md))
+        SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
+            server.usage.forEachIndexed { index, usage ->
+                if (index > 0) SynaraDivider(startIndent = SynaraTheme.spacing.lg)
+                UsageRow(usage)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingSwitch(
+    title: String,
+    body: String,
+    checked: Boolean,
+    enabled: Boolean,
+    onChange: (Boolean) -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(SynaraTheme.spacing.lg),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.md),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Text(
+                body,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onChange,
+            enabled = enabled,
+            colors = settingSwitchColors(),
+        )
+    }
+}
+
+@Composable
+private fun ProviderRow(
+    settings: ProviderSettings,
+    status: ProviderStatus?,
+    enabled: Boolean,
+    onToggle: (Boolean) -> Unit,
+) {
+    val accents = SynaraTheme.accents
+    Row(
+        Modifier.fillMaxWidth().padding(SynaraTheme.spacing.lg),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.md),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
+            ) {
+                Text(
+                    settings.provider.label,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                status?.version?.let { SynaraBadge(it) }
+                if (status?.updateAvailable == true) {
+                    SynaraBadge(
+                        "update",
+                        container = accents.infoSurface,
+                        contentColor = accents.infoForeground,
+                    )
+                }
+            }
+            // Availability and auth are separate failures: an installed binary that is not signed
+            // in needs a different fix from one that is missing, so they are not merged.
+            val detail = when {
+                status == null -> "Status unknown"
+                !status.available -> status.message ?: "Not installed"
+                status.authStatus == "authenticated" -> status.authLabel ?: "Signed in"
+                else -> "Needs sign-in"
+            }
+            val detailColor = when {
+                status == null -> MaterialTheme.colorScheme.onSurfaceVariant
+                !status.available -> accents.statusNeutral
+                status.authStatus == "authenticated" -> accents.successForeground
+                else -> accents.warningForeground
+            }
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = detailColor)
+        }
+        Switch(
+            checked = settings.enabled,
+            onCheckedChange = onToggle,
+            enabled = enabled,
+            colors = settingSwitchColors(),
+        )
+    }
+}
+
+@Composable
+private fun UsageRow(usage: ProviderUsage) {
+    val accents = SynaraTheme.accents
+    Column(
+        Modifier.fillMaxWidth().padding(SynaraTheme.spacing.lg),
+        verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
+        ) {
+            Text(
+                usage.provider.label,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            usage.planName?.let { SynaraBadge(it) }
+        }
+        when {
+            // "No usage to show" and "could not fetch" look identical without this distinction.
+            !usage.isOk -> Text(
+                usage.detail ?: when (usage.status) {
+                    "needs-auth" -> "Sign in to read usage."
+                    "unsupported" -> "This provider does not report usage."
+                    else -> "Usage could not be fetched."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            else -> {
+                usage.limits.forEach { limit ->
+                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(
+                                limit.window,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            limit.usedPercent?.let {
+                                Text(
+                                    "${it.toInt()}%",
+                                    style = SynaraTheme.textStyles.monoSmall,
+                                    color = if (it >= 90) accents.statusFailure else MaterialTheme.colorScheme.onSurface,
+                                )
+                            }
+                        }
+                        limit.usedPercent?.let { percent ->
+                            LinearProgressIndicator(
+                                progress = { (percent / 100.0).toFloat().coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth().height(4.dp),
+                                color = if (percent >= 90) accents.statusFailure else MaterialTheme.colorScheme.onSurface,
+                                trackColor = accents.mutedSurface,
+                                strokeCap = StrokeCap.Round,
+                                gapSize = 0.dp,
+                                drawStopIndicator = {},
+                            )
+                        }
+                    }
+                }
+                usage.lines.forEach { line ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(
+                            line.label,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            line.value,
+                            style = SynaraTheme.textStyles.monoSmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EnvModeOption(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val shape = MaterialTheme.shapes.medium
+    Box(
+        modifier
+            .background(
+                if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                shape,
+            )
+            .border(
+                1.dp,
+                if (selected) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.outlineVariant,
+                shape,
+            )
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(vertical = SynaraTheme.spacing.sm),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            color = if (selected) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+    }
+}
+
+@Composable
+private fun settingSwitchColors() = SwitchDefaults.colors(
+    checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+    checkedTrackColor = MaterialTheme.colorScheme.primary,
+    uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    uncheckedTrackColor = SynaraTheme.accents.mutedSurface,
+    uncheckedBorderColor = MaterialTheme.colorScheme.outlineVariant,
+)

@@ -24,6 +24,15 @@ enum class AppScreen {
     PULL_REQUEST,
 }
 
+data class ServerSettingsState(
+    val settings: ServerSettings? = null,
+    val statuses: List<ProviderStatus> = emptyList(),
+    val usage: List<ProviderUsage> = emptyList(),
+    val isLoading: Boolean = false,
+    val isSaving: Boolean = false,
+    val error: String? = null,
+)
+
 data class PullRequestState(
     val snapshot: PullRequestSnapshot? = null,
     val isLoading: Boolean = false,
@@ -136,6 +145,7 @@ data class SynaraUiState(
     /** Studio files the open thread produced; null until asked for. */
     val studioOutputs: List<StudioOutput>? = null,
     val studioOpen: Boolean = false,
+    val serverSettings: ServerSettingsState = ServerSettingsState(),
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -223,6 +233,75 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
 
     fun openSettings() {
         update { it.copy(screen = AppScreen.SETTINGS) }
+        if (_ui.value.serverSettings.settings == null) loadServerSettings()
+    }
+
+    /**
+     * Settings, provider availability and usage are three independent server reads. They are run
+     * concurrently and each failure is contained: a provider whose usage endpoint is down should
+     * not stop the settings screen from rendering the toggles.
+     */
+    fun loadServerSettings(refresh: Boolean = false) {
+        if (_ui.value.connection != ConnectionState.CONNECTED) return
+        update { it.copy(serverSettings = it.serverSettings.copy(isLoading = true, error = null)) }
+        viewModelScope.launch {
+            val settings = async { runCatching { repository.getServerSettings() } }
+            val statuses = async { runCatching { repository.providerStatuses(refresh) } }
+            val usage = async { runCatching { repository.listProviderUsage(refresh) } }
+            val settingsResult = settings.await()
+            val statusesResult = statuses.await()
+            val usageResult = usage.await()
+            update { state ->
+                state.copy(
+                    serverSettings = state.serverSettings.copy(
+                        settings = settingsResult.getOrNull() ?: state.serverSettings.settings,
+                        statuses = statusesResult.getOrNull() ?: state.serverSettings.statuses,
+                        usage = usageResult.getOrNull() ?: state.serverSettings.usage,
+                        isLoading = false,
+                        error = settingsResult.exceptionOrNull()?.let(::readableError),
+                    ),
+                )
+            }
+        }
+    }
+
+    /** Applies a sparse patch; omitted keys are left untouched by the server. */
+    private fun patchServerSettings(build: JSONObject.() -> Unit) {
+        update { it.copy(serverSettings = it.serverSettings.copy(isSaving = true, error = null)) }
+        viewModelScope.launch {
+            runCatching { repository.updateServerSettings(JSONObject().apply(build)) }
+                .onSuccess { updated ->
+                    update {
+                        it.copy(serverSettings = it.serverSettings.copy(settings = updated, isSaving = false))
+                    }
+                }
+                .onFailure { error ->
+                    update {
+                        it.copy(
+                            serverSettings = it.serverSettings.copy(
+                                isSaving = false,
+                                error = readableError(error),
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun setAssistantStreaming(enabled: Boolean) =
+        patchServerSettings { put("enableAssistantStreaming", enabled) }
+
+    fun setProviderUpdateChecks(enabled: Boolean) =
+        patchServerSettings { put("enableProviderUpdateChecks", enabled) }
+
+    fun setDefaultThreadEnvMode(mode: String) =
+        patchServerSettings { put("defaultThreadEnvMode", mode) }
+
+    fun setProviderEnabled(provider: Provider, enabled: Boolean) = patchServerSettings {
+        put(
+            "providers",
+            JSONObject().put(provider.kind, JSONObject().put("enabled", enabled)),
+        )
     }
 
     fun selectSpace(spaceId: String?) {

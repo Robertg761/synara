@@ -374,6 +374,36 @@ class SynaraRepository(context: Context) {
             JSONObject().put("cwd", cwd).put("scope", scope),
         )?.stringOrNull("patch").orEmpty()
 
+    // ── Server settings ──────────────────────────────────────────────────────────────────────
+
+    suspend fun getServerSettings(): ServerSettings =
+        ServerSettings.fromJson(rpc("server.getSettings", JSONObject()) ?: JSONObject())
+
+    /**
+     * `ServerSettingsPatch` is sparse by design: omitted keys are left alone. Sending the whole
+     * settings object back would make the phone clobber fields it never rendered, including
+     * per-provider options it has no UI for.
+     */
+    suspend fun updateServerSettings(patch: JSONObject): ServerSettings =
+        ServerSettings.fromJson(rpc("server.updateSettings", patch) ?: JSONObject())
+
+    suspend fun providerStatuses(refresh: Boolean = false): List<ProviderStatus> {
+        val tag = if (refresh) "server.refreshProviders" else "server.getConfig"
+        val response = rpc(tag, JSONObject()) ?: return emptyList()
+        return response.arrayOrEmpty("providerStatuses").objects().mapNotNull(ProviderStatus::fromJson)
+            .ifEmpty { response.arrayOrEmpty("providers").objects().mapNotNull(ProviderStatus::fromJson) }
+    }
+
+    suspend fun listProviderUsage(forceRefresh: Boolean = false): List<ProviderUsage> {
+        val response = rpc(
+            "server.listProviderUsage",
+            JSONObject().put("forceRefresh", forceRefresh),
+        ) ?: return emptyList()
+        // The result is a bare array; the transport wraps a non-object exit value under "value".
+        return response.arrayOrEmpty("value").objects().mapNotNull(ProviderUsage::fromJson)
+            .ifEmpty { response.arrayOrEmpty("usage").objects().mapNotNull(ProviderUsage::fromJson) }
+    }
+
     // ── Spaces ───────────────────────────────────────────────────────────────────────────────
 
     suspend fun createSpace(name: String, icon: String = "folder") {
