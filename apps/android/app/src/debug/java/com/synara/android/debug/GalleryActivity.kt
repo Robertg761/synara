@@ -37,7 +37,15 @@ import com.synara.android.data.GitStatus
 import com.synara.android.data.PullRequestSnapshot
 import com.synara.android.data.PullRequestState
 import com.synara.android.data.SourceControlState
+import com.synara.android.data.ProviderSettings
+import com.synara.android.data.ProviderStatus
+import com.synara.android.data.ProviderUsage
+import com.synara.android.data.Provider
+import com.synara.android.data.ServerSettings
+import com.synara.android.data.ServerSettingsState
 import com.synara.android.data.SpaceItem
+import com.synara.android.data.UsageLimit
+import com.synara.android.data.UsageLine
 import com.synara.android.data.TerminalSnapshot
 import com.synara.android.data.TerminalState
 import com.synara.android.data.DiffState
@@ -134,6 +142,7 @@ class GalleryActivity : ComponentActivity() {
                         "catalogue" -> CatalogueScreen(Fixtures.catalogue(), vm)
                         "pr" -> PullRequestScreen(Fixtures.pullRequest(), vm)
                         "settings" -> SettingsScreen(Fixtures.settings(), vm)
+                        "settings-server" -> SettingsScreen(Fixtures.settingsServer(), vm)
                         else -> WorkspaceScreen(Fixtures.workspace(), vm)
                     }
                 }
@@ -424,6 +433,44 @@ private object Fixtures {
     }
 
     fun settings() = base().copy(screen = AppScreen.SETTINGS)
+
+    fun settingsServer() = base().copy(
+        screen = AppScreen.SETTINGS,
+        serverSettings = ServerSettingsState(
+            settings = ServerSettings(
+                enableAssistantStreaming = true,
+                enableProviderUpdateChecks = true,
+                defaultThreadEnvMode = "local",
+                addProjectBaseDirectory = "",
+                providers = listOf(
+                    ProviderSettings(Provider.CODEX, true, "/usr/local/bin/codex"),
+                    ProviderSettings(Provider.CLAUDE_AGENT, true, null),
+                    ProviderSettings(Provider.CURSOR, false, null),
+                    ProviderSettings(Provider.GROK, true, null),
+                ),
+            ),
+            statuses = listOf(
+                ProviderStatus(Provider.CODEX, "ready", true, "authenticated", "ChatGPT Pro", "0.52.1", null, false),
+                ProviderStatus(Provider.CLAUDE_AGENT, "ready", true, "authenticated", "Max", "2.1.0", null, true),
+                ProviderStatus(Provider.CURSOR, "missing", false, "unknown", null, null, "Binary not found on PATH", false),
+                ProviderStatus(Provider.GROK, "ready", true, "unauthenticated", null, "0.9.3", null, false),
+            ),
+            usage = listOf(
+                ProviderUsage(
+                    Provider.CODEX,
+                    "ok",
+                    "Pro",
+                    null,
+                    listOf(
+                        UsageLimit("5-hour window", 34.0, null),
+                        UsageLimit("Weekly", 92.0, null),
+                    ),
+                    listOf(UsageLine("Requests today", "1,204", null)),
+                ),
+                ProviderUsage(Provider.GROK, "needs-auth", null, null, emptyList(), emptyList()),
+            ),
+        ),
+    )
 
     fun kanban() = base().copy(screen = AppScreen.KANBAN)
 
