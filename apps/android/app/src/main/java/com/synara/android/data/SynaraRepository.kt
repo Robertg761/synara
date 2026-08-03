@@ -374,6 +374,67 @@ class SynaraRepository(context: Context) {
             JSONObject().put("cwd", cwd).put("scope", scope),
         )?.stringOrNull("patch").orEmpty()
 
+    // ── Git ──────────────────────────────────────────────────────────────────────────────────
+
+    suspend fun gitStatus(cwd: String): GitStatus =
+        GitStatus.fromJson(rpc("git.status", JSONObject().put("cwd", cwd)) ?: JSONObject())
+
+    suspend fun listBranches(cwd: String): GitBranches =
+        GitBranches.fromJson(rpc("git.listBranches", JSONObject().put("cwd", cwd)) ?: JSONObject())
+
+    suspend fun checkout(cwd: String, branch: String) {
+        rpc("git.checkout", JSONObject().put("cwd", cwd).put("branch", branch))
+    }
+
+    /**
+     * Checkout that parks uncommitted work first. Plain `git.checkout` refuses to move when the
+     * tree is dirty, and losing an agent's in-progress edits to a branch switch is not recoverable
+     * from a phone.
+     */
+    suspend fun stashAndCheckout(cwd: String, branch: String) {
+        rpc("git.stashAndCheckout", JSONObject().put("cwd", cwd).put("branch", branch))
+    }
+
+    suspend fun createBranch(cwd: String, branch: String, publish: Boolean = false) {
+        rpc(
+            "git.createBranch",
+            JSONObject().put("cwd", cwd).put("branch", branch).put("publish", publish),
+        )
+    }
+
+    suspend fun pull(cwd: String): String =
+        rpc("git.pull", JSONObject().put("cwd", cwd))?.stringOrNull("status") ?: "pulled"
+
+    suspend fun stageFiles(cwd: String, paths: List<String>) {
+        if (paths.isEmpty()) return
+        rpc("git.stageFiles", JSONObject().put("cwd", cwd).put("paths", JSONArray(paths)))
+    }
+
+    suspend fun unstageFiles(cwd: String, paths: List<String>) {
+        if (paths.isEmpty()) return
+        rpc("git.unstageFiles", JSONObject().put("cwd", cwd).put("paths", JSONArray(paths)))
+    }
+
+    /**
+     * Commit, push and open-PR run as one server-side stacked action rather than three calls the
+     * phone sequences itself; a dropped connection between steps would otherwise leave the branch
+     * committed but unpushed with nothing to report it.
+     */
+    suspend fun runGitAction(
+        cwd: String,
+        action: GitAction,
+        commitMessage: String? = null,
+        filePaths: List<String>? = null,
+    ): GitActionOutcome {
+        val payload = JSONObject()
+            .put("actionId", newId())
+            .put("cwd", cwd)
+            .put("action", action.wire)
+        commitMessage?.takeIf { it.isNotBlank() }?.let { payload.put("commitMessage", it) }
+        filePaths?.takeIf { it.isNotEmpty() }?.let { payload.put("filePaths", JSONArray(it)) }
+        return GitActionOutcome.fromJson(rpc("git.runStackedAction", payload) ?: JSONObject())
+    }
+
     suspend fun listModels(provider: String = Provider.CODEX.kind): List<ModelOption> {
         val response = rpc(
             "provider.listModels",

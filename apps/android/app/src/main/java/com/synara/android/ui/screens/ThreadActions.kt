@@ -6,7 +6,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
+import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Archive
+import androidx.compose.material.icons.outlined.Difference
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Memory
@@ -72,6 +74,27 @@ fun ThreadActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
                 onClick = {
                     viewModel.setThreadPinned(thread.id, !thread.isPinned)
                     viewModel.closeThreadActions()
+                },
+            )
+
+            ActionSheetSection("Review")
+            ActionSheetItem(
+                icon = Icons.Outlined.Difference,
+                label = "Changes",
+                supporting = "Diff of what the agent touched",
+                onClick = {
+                    viewModel.closeThreadActions()
+                    viewModel.openDiff()
+                },
+            )
+            ActionSheetItem(
+                icon = Icons.Outlined.AccountTree,
+                label = "Source control",
+                supporting = thread.branch ?: thread.gitCwd?.substringAfterLast('/'),
+                enabled = thread.gitCwd != null,
+                onClick = {
+                    viewModel.closeThreadActions()
+                    viewModel.openSourceControl()
                 },
             )
 

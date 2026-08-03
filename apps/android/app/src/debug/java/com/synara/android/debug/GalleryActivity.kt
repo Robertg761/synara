@@ -16,6 +16,12 @@ import com.synara.android.data.ActivityItem
 import com.synara.android.data.AppScreen
 import com.synara.android.data.ConnectionState
 import com.synara.android.data.DiffScope
+import com.synara.android.data.GitBranchItem
+import com.synara.android.data.GitBranches
+import com.synara.android.data.GitFileChange
+import com.synara.android.data.GitPullRequestInfo
+import com.synara.android.data.GitStatus
+import com.synara.android.data.SourceControlState
 import com.synara.android.data.DiffState
 import com.synara.android.data.parseUnifiedDiff
 import com.synara.android.data.MessageItem
@@ -30,6 +36,7 @@ import com.synara.android.data.ThreadItem
 import com.synara.android.ui.screens.ChatScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
+import com.synara.android.ui.screens.SourceControlScreen
 import com.synara.android.ui.screens.SetupScreen
 import com.synara.android.ui.screens.WorkspaceScreen
 import com.synara.android.ui.theme.SynaraTheme
@@ -89,6 +96,8 @@ class GalleryActivity : ComponentActivity() {
                         "chat-empty" -> ChatScreen(Fixtures.chatEmpty(), vm)
                         "diff" -> DiffScreen(Fixtures.diff(), vm)
                         "diff-empty" -> DiffScreen(Fixtures.diffEmpty(), vm)
+                        "git" -> SourceControlScreen(Fixtures.sourceControl(), vm)
+                        "git-branches" -> SourceControlScreen(Fixtures.sourceControlBranches(), vm)
                         "settings" -> SettingsScreen(Fixtures.settings(), vm)
                         else -> WorkspaceScreen(Fixtures.workspace(), vm)
                     }
@@ -420,6 +429,62 @@ private object Fixtures {
             ),
         )
     }
+
+    private fun gitState(branchPickerOpen: Boolean = false) = SourceControlState(
+        cwd = "/home/me/projects/synara",
+        status = GitStatus(
+            branch = "agent/transcript-virtualiser",
+            hasWorkingTreeChanges = true,
+            files = listOf(
+                GitFileChange("apps/web/src/components/TranscriptList.tsx", 2, 1),
+                GitFileChange("apps/web/src/lib/markdownCache.ts", 6, 0),
+                GitFileChange("apps/web/src/lib/legacyDiffCache.ts", 0, 3),
+            ),
+            insertions = 8,
+            deletions = 4,
+            hasUpstream = true,
+            upstreamBranch = "origin/agent/transcript-virtualiser",
+            aheadCount = 2,
+            behindCount = 1,
+            pullRequest = GitPullRequestInfo(
+                number = 512,
+                title = "Key transcript rows by message id",
+                url = "https://github.com/octanethegenio/synara/pull/512",
+                baseBranch = "main",
+                headBranch = "agent/transcript-virtualiser",
+                state = "open",
+                isDraft = false,
+                mergeability = "mergeable",
+                additions = 8,
+                deletions = 4,
+                changedFiles = 3,
+            ),
+        ),
+        branches = GitBranches(
+            branches = listOf(
+                GitBranchItem("agent/transcript-virtualiser", isCurrent = true, isDefault = false, isRemote = false, remoteName = null, worktreePath = null),
+                GitBranchItem("main", isCurrent = false, isDefault = true, isRemote = false, remoteName = null, worktreePath = null),
+                GitBranchItem("agent/pairing-flow", isCurrent = false, isDefault = false, isRemote = false, remoteName = null, worktreePath = "/home/me/worktrees/pairing"),
+                GitBranchItem("origin/main", isCurrent = false, isDefault = false, isRemote = true, remoteName = "origin", worktreePath = null),
+            ),
+            isRepo = true,
+            hasOriginRemote = true,
+        ),
+        commitMessage = "Key transcript rows by message id",
+        branchPickerOpen = branchPickerOpen,
+    )
+
+    fun sourceControl(): SynaraUiState {
+        val t = thread("t-run", "Rewrite the transcript virtualiser")
+        return base().copy(
+            screen = AppScreen.SOURCE_CONTROL,
+            selectedThreadId = t.id,
+            detail = detail(t),
+            git = gitState(),
+        )
+    }
+
+    fun sourceControlBranches(): SynaraUiState = sourceControl().copy(git = gitState(branchPickerOpen = true))
 
     fun diffEmpty(): SynaraUiState {
         val t = thread("t-run", "Rewrite the transcript virtualiser")

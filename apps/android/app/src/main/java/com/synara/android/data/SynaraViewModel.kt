@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.util.UUID
@@ -15,7 +16,21 @@ enum class AppScreen {
     CHAT,
     SETTINGS,
     DIFF,
+    SOURCE_CONTROL,
 }
+
+data class SourceControlState(
+    val cwd: String? = null,
+    val status: GitStatus? = null,
+    val branches: GitBranches? = null,
+    val isLoading: Boolean = false,
+    /** Set while a mutating action runs, so the UI can disable the whole action set at once. */
+    val busyLabel: String? = null,
+    val error: String? = null,
+    val notice: String? = null,
+    val commitMessage: String = "",
+    val branchPickerOpen: Boolean = false,
+)
 
 /**
  * Which set of changes the diff screen is showing. The desktop offers the same three through its
@@ -61,6 +76,7 @@ data class SynaraUiState(
     val projectActionsFor: String? = null,
     val showArchived: Boolean = false,
     val diff: DiffState = DiffState(),
+    val git: SourceControlState = SourceControlState(),
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -487,6 +503,126 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
                     it.copy(diff = it.diff.copy(isLoading = false, error = readableError(error)))
                 }
             }
+        }
+    }
+
+    // ── Source control ───────────────────────────────────────────────────────────────────────
+
+    fun openSourceControl() {
+        val cwd = (_ui.value.detail?.thread ?: _ui.value.selectedThread)?.gitCwd
+        if (cwd == null) {
+            update { it.copy(error = "This thread has no checkout on disk.") }
+            return
+        }
+        update {
+            it.copy(
+                screen = AppScreen.SOURCE_CONTROL,
+                git = SourceControlState(cwd = cwd, isLoading = true),
+            )
+        }
+        refreshSourceControl()
+    }
+
+    fun closeSourceControl() {
+        update {
+            it.copy(
+                screen = if (it.selectedThreadId != null) AppScreen.CHAT else AppScreen.WORKSPACE,
+                git = SourceControlState(),
+            )
+        }
+    }
+
+    fun refreshSourceControl() {
+        val cwd = _ui.value.git.cwd ?: return
+        update { it.copy(git = it.git.copy(isLoading = true, error = null)) }
+        viewModelScope.launch {
+            // Status and branches are independent reads; running them together halves the wait on
+            // a repository large enough for `git status` to be slow.
+            val status = async { runCatching { repository.gitStatus(cwd) } }
+            val branches = async { runCatching { repository.listBranches(cwd) } }
+            val statusResult = status.await()
+            val branchResult = branches.await()
+            update { state ->
+                state.copy(
+                    git = state.git.copy(
+                        status = statusResult.getOrNull() ?: state.git.status,
+                        branches = branchResult.getOrNull() ?: state.git.branches,
+                        isLoading = false,
+                        error = statusResult.exceptionOrNull()?.let(::readableError),
+                    ),
+                )
+            }
+        }
+    }
+
+    fun setCommitMessage(message: String) {
+        update { it.copy(git = it.git.copy(commitMessage = message)) }
+    }
+
+    fun setBranchPickerOpen(open: Boolean) {
+        update { it.copy(git = it.git.copy(branchPickerOpen = open)) }
+    }
+
+    fun dismissGitNotice() {
+        update { it.copy(git = it.git.copy(notice = null, error = null)) }
+    }
+
+    fun runGitAction(action: GitAction) {
+        val cwd = _ui.value.git.cwd ?: return
+        val message = _ui.value.git.commitMessage.trim()
+        if (action != GitAction.PUSH && message.isEmpty()) {
+            update { it.copy(git = it.git.copy(error = "Write a commit message first.")) }
+            return
+        }
+        runGitOperation(action.label) {
+            val outcome = repository.runGitAction(cwd, action, message.ifEmpty { null })
+            update { it.copy(git = it.git.copy(commitMessage = "", notice = outcome.summary())) }
+        }
+    }
+
+    fun gitPull() = runGitOperation("Pull") {
+        val cwd = _ui.value.git.cwd!!
+        val status = repository.pull(cwd)
+        val notice = if (status == "skipped_up_to_date") "Already up to date." else "Pulled."
+        update { it.copy(git = it.git.copy(notice = notice)) }
+    }
+
+    fun checkoutBranch(branch: String, stashFirst: Boolean) = runGitOperation("Checkout") {
+        val cwd = _ui.value.git.cwd!!
+        if (stashFirst) repository.stashAndCheckout(cwd, branch) else repository.checkout(cwd, branch)
+        update {
+            it.copy(
+                git = it.git.copy(
+                    branchPickerOpen = false,
+                    notice = if (stashFirst) "Stashed changes and switched to $branch." else "Switched to $branch.",
+                ),
+            )
+        }
+    }
+
+    fun createBranch(name: String) {
+        val clean = name.trim()
+        if (clean.isEmpty()) return
+        runGitOperation("Create branch") {
+            repository.createBranch(_ui.value.git.cwd!!, clean)
+            update { it.copy(git = it.git.copy(branchPickerOpen = false, notice = "Created $clean.")) }
+        }
+    }
+
+    /**
+     * Every mutating git call follows the same arc: mark the screen busy, run, then re-read status
+     * so the branch, counts and file list reflect the result rather than what they were before it.
+     */
+    private fun runGitOperation(label: String, block: suspend () -> Unit) {
+        if (_ui.value.git.busyLabel != null) return
+        update { it.copy(git = it.git.copy(busyLabel = label, error = null, notice = null)) }
+        viewModelScope.launch {
+            runCatching { block() }
+                .onFailure { error ->
+                    update { it.copy(git = it.git.copy(error = readableError(error))) }
+                }
+            update { it.copy(git = it.git.copy(busyLabel = null)) }
+            refreshSourceControl()
         }
     }
 
