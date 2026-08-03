@@ -22,7 +22,10 @@ import com.synara.android.data.AutomationMode
 import com.synara.android.data.AutomationRun
 import com.synara.android.data.AutomationSchedule
 import com.synara.android.data.AutomationsState
+import com.synara.android.data.CatalogueEntry
+import com.synara.android.data.CatalogueState
 import com.synara.android.data.DiffScope
+import com.synara.android.data.ProviderCatalogue
 import com.synara.android.data.GitBranchItem
 import com.synara.android.data.GitBranches
 import com.synara.android.data.GitFileChange
@@ -43,7 +46,9 @@ import com.synara.android.data.SynaraViewModel
 import com.synara.android.data.ThreadDetail
 import com.synara.android.data.ThreadItem
 import com.synara.android.ui.screens.AutomationsScreen
+import com.synara.android.ui.screens.CatalogueScreen
 import com.synara.android.ui.screens.ChatScreen
+import com.synara.android.ui.screens.KanbanScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
 import com.synara.android.ui.screens.SourceControlScreen
@@ -116,6 +121,8 @@ class GalleryActivity : ComponentActivity() {
                             remember { vm.terminalBuffer.append(Fixtures.TERMINAL_OUTPUT) }
                             TerminalScreen(Fixtures.terminal(), vm)
                         }
+                        "kanban" -> KanbanScreen(Fixtures.kanban(), vm)
+                        "catalogue" -> CatalogueScreen(Fixtures.catalogue(), vm)
                         "settings" -> SettingsScreen(Fixtures.settings(), vm)
                         else -> WorkspaceScreen(Fixtures.workspace(), vm)
                     }
@@ -390,6 +397,30 @@ private object Fixtures {
     }
 
     fun settings() = base().copy(screen = AppScreen.SETTINGS)
+
+    fun kanban() = base().copy(screen = AppScreen.KANBAN)
+
+    fun catalogue() = base().copy(
+        screen = AppScreen.CATALOGUE,
+        catalogue = CatalogueState(
+            providerLabel = "Codex",
+            catalogue = ProviderCatalogue(
+                skills = listOf(
+                    CatalogueEntry("react-doctor", "Scan, triage and clean up React diagnostics.", "/repo/.claude/skills/react-doctor", "repo", true),
+                    CatalogueEntry("dataviz", "Design charts that read as one system.", "/home/me/.claude/skills/dataviz", "global", true),
+                    CatalogueEntry("verify", "Run Synara locally for runtime verification.", "/repo/.claude/skills/verify", "repo", false),
+                ),
+                commands = listOf(
+                    CatalogueEntry("review", "Review the working diff.", null, null, true),
+                    CatalogueEntry("init", "Write a CLAUDE.md for this repository.", null, null, true),
+                ),
+                agents = listOf(
+                    CatalogueEntry("explore", "Read-only codebase explorer.", null, "builtin", true),
+                    CatalogueEntry("build", "Implementation teammate for scoped changes.", null, "builtin", true),
+                ),
+            ),
+        ),
+    )
 
     private const val E = "\u001B"
 

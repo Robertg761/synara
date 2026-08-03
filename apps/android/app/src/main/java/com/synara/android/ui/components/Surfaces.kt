@@ -39,13 +39,21 @@ fun SynaraCard(
     contentSpacing: Dp = SynaraTheme.spacing.sm,
     border: BorderStroke? = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     onClick: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    val interaction = when {
+        onClick != null && onLongClick != null ->
+            Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick)
+
+        onClick != null -> Modifier.clickable(onClick = onClick)
+        else -> Modifier
+    }
     val base = modifier
         .clip(shape)
         .background(MaterialTheme.colorScheme.surfaceContainerLow, shape)
         .then(if (border != null) Modifier.border(border, shape) else Modifier)
-        .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+        .then(interaction)
     Column(
         modifier = base.padding(padding),
         verticalArrangement = Arrangement.spacedBy(contentSpacing),

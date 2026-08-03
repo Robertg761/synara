@@ -36,6 +36,7 @@ import androidx.compose.material.icons.outlined.EventRepeat
 import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.ViewKanban
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledTonalButton
@@ -307,6 +308,20 @@ private fun WorkspaceOverflowMenu(state: SynaraUiState, viewModel: SynaraViewMod
                 onClick = {
                     viewModel.setShowArchived(!state.showArchived)
                     expanded = false
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Board", style = MaterialTheme.typography.bodyMedium) },
+                leadingIcon = {
+                    Icon(
+                        Icons.Outlined.ViewKanban,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                },
+                onClick = {
+                    expanded = false
+                    viewModel.openKanban()
                 },
             )
             DropdownMenuItem(

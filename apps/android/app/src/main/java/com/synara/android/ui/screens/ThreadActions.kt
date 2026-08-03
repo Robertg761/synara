@@ -10,6 +10,7 @@ import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Archive
 import androidx.compose.material.icons.outlined.Difference
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.PushPin
@@ -107,6 +108,17 @@ fun ThreadActionsSheet(state: SynaraUiState, viewModel: SynaraViewModel) {
                 onClick = {
                     viewModel.closeThreadActions()
                     viewModel.openTerminal()
+                },
+            )
+
+            ActionSheetItem(
+                icon = Icons.Outlined.Extension,
+                label = "Skills & commands",
+                supporting = "What ${thread.providerLabel} can do here",
+                enabled = thread.gitCwd != null,
+                onClick = {
+                    viewModel.closeThreadActions()
+                    viewModel.openCatalogue()
                 },
             )
 
