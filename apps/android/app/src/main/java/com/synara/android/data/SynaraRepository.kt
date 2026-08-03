@@ -800,6 +800,31 @@ class SynaraRepository(context: Context) {
         )
     }
 
+    /**
+     * Reports how much output this client has actually parsed.
+     *
+     * The server holds a bounded send window per PTY. Without acks it eventually stops forwarding
+     * output to a client it believes is behind — which on a phone, where parsing is slower and the
+     * link is worse, is exactly the client that needs it. Best-effort by design: a missed ack is
+     * recovered by the replay on reconnect.
+     */
+    suspend fun ackTerminalOutput(
+        threadId: String,
+        bytes: Int,
+        terminalId: String = DEFAULT_TERMINAL_ID,
+    ) {
+        if (bytes <= 0) return
+        runCatching {
+            rpc(
+                "terminal.ackOutput",
+                JSONObject()
+                    .put("threadId", threadId)
+                    .put("terminalId", terminalId)
+                    .put("bytes", bytes.coerceAtMost(8_388_608)),
+            )
+        }
+    }
+
     suspend fun clearTerminal(threadId: String, terminalId: String = DEFAULT_TERMINAL_ID) {
         rpc("terminal.clear", JSONObject().put("threadId", threadId).put("terminalId", terminalId))
     }
