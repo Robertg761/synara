@@ -32,6 +32,9 @@ sealed interface RepositoryEvent {
     data class ThreadSnapshot(val detail: ThreadDetail) : RepositoryEvent
     data class ThreadEvent(val threadId: String, val event: JSONObject) : RepositoryEvent
     data class ShellChanged(val snapshot: WorkspaceSnapshot) : RepositoryEvent
+    data class AutomationsChanged(val list: AutomationList) : RepositoryEvent
+    data class ProviderStatusesChanged(val statuses: List<ProviderStatus>) : RepositoryEvent
+    data class ServerSettingsChanged(val settings: ServerSettings) : RepositoryEvent
     data class Error(val message: String) : RepositoryEvent
 }
 
@@ -608,6 +611,62 @@ class SynaraRepository(context: Context) {
     /** Streams every terminal event; callers filter to the session they are showing. */
     suspend fun subscribeTerminalEvents(onEvent: (JSONObject) -> Unit): String =
         streamRpc("terminal.subscribeEvents", JSONObject(), onEvent)
+
+    // ── Live subscriptions ───────────────────────────────────────────────────────────────────
+
+    /**
+     * Streams automation changes.
+     *
+     * The stream is authoritative but incremental: after the opening snapshot the server sends one
+     * upsert per change. Those are folded into a locally held list rather than triggering a
+     * refetch, because a schedule firing every thirty seconds would otherwise re-list every
+     * automation and its whole run history on each tick.
+     */
+    suspend fun subscribeAutomations(): String {
+        var current = AutomationList(emptyList(), emptyList())
+        return streamRpc("automation.subscribe", JSONObject()) { item ->
+            current = when (item.stringOrNull("type")) {
+                "snapshot" -> AutomationList.fromJson(item)
+
+                "definition-upserted" -> item.objectOrNull("definition")
+                    ?.let(Automation::fromJson)
+                    ?.let { updated ->
+                        current.copy(
+                            definitions = current.definitions.filterNot { it.id == updated.id } + updated,
+                        )
+                    } ?: current
+
+                "definition-deleted" -> item.stringOrNull("automationId")?.let { removed ->
+                    current.copy(
+                        definitions = current.definitions.filterNot { it.id == removed },
+                        runs = current.runs.filterNot { it.automationId == removed },
+                    )
+                } ?: current
+
+                "run-upserted" -> item.objectOrNull("run")
+                    ?.let(AutomationRun::fromJson)
+                    ?.let { updated ->
+                        current.copy(runs = current.runs.filterNot { it.id == updated.id } + updated)
+                    } ?: current
+
+                else -> current
+            }
+            events.tryEmit(RepositoryEvent.AutomationsChanged(current))
+        }
+    }
+
+    suspend fun subscribeProviderStatuses(): String =
+        streamRpc("server.subscribeProviderStatuses", JSONObject()) { item ->
+            val statuses = item.arrayOrEmpty("providers").objects().mapNotNull(ProviderStatus::fromJson)
+            events.tryEmit(RepositoryEvent.ProviderStatusesChanged(statuses))
+        }
+
+    suspend fun subscribeServerSettings(): String =
+        streamRpc("server.subscribeSettings", JSONObject()) { item ->
+            item.objectOrNull("settings")?.let {
+                events.tryEmit(RepositoryEvent.ServerSettingsChanged(ServerSettings.fromJson(it)))
+            }
+        }
 
     // ── Automations ──────────────────────────────────────────────────────────────────────────
 

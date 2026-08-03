@@ -179,6 +179,7 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
 
     private var activeThreadStream: String? = null
     private var activeShellStream: String? = null
+    private val liveStreams = mutableListOf<String>()
 
     init {
         viewModelScope.launch {
@@ -1013,8 +1014,16 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
     // ── Automations ──────────────────────────────────────────────────────────────────────────
 
     fun openAutomations() {
-        update { it.copy(screen = AppScreen.AUTOMATIONS, automations = AutomationsState(isLoading = true)) }
-        refreshAutomations()
+        // The subscription keeps the list current, so opening the screen only needs a fetch when
+        // nothing has arrived yet — on an older server without the stream, or before it opens.
+        val hasLive = _ui.value.automations.list != null
+        update {
+            it.copy(
+                screen = AppScreen.AUTOMATIONS,
+                automations = it.automations.copy(isLoading = !hasLive),
+            )
+        }
+        if (!hasLive) refreshAutomations()
     }
 
     fun closeAutomations() {
@@ -1297,6 +1306,8 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         terminalStream?.let(repository::stopStream)
         terminalStream = null
         terminalBuffer.clear()
+        liveStreams.forEach(repository::stopStream)
+        liveStreams.clear()
         repository.disconnect(clearCredentials = true)
         update {
             SynaraUiState(
@@ -1313,7 +1324,26 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         stopActiveThreadStream()
         terminalStream?.let(repository::stopStream)
         activeShellStream?.let(repository::stopStream)
+        liveStreams.forEach(repository::stopStream)
         super.onCleared()
+    }
+
+    /**
+     * Subscribes to the pushes that keep secondary screens current. Failures are swallowed per
+     * stream: an older server without one of these subscriptions should lose only that stream's
+     * liveness, not the connection.
+     */
+    private fun openLiveSubscriptions() {
+        if (liveStreams.isNotEmpty()) return
+        viewModelScope.launch {
+            listOf<suspend () -> String>(
+                repository::subscribeAutomations,
+                repository::subscribeProviderStatuses,
+                repository::subscribeServerSettings,
+            ).forEach { subscribe ->
+                runCatching { subscribe() }.getOrNull()?.let(liveStreams::add)
+            }
+        }
     }
 
     private suspend fun loadModels() {
@@ -1325,11 +1355,19 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
 
     private fun onRepositoryEvent(event: RepositoryEvent) {
         when (event) {
-            is RepositoryEvent.ConnectionChanged -> update { state ->
-                state.copy(
-                    connection = event.state,
-                    hasStoredSession = state.hasStoredSession || event.state == ConnectionState.CONNECTED,
-                )
+            is RepositoryEvent.ConnectionChanged -> {
+                update { state ->
+                    state.copy(
+                        connection = event.state,
+                        hasStoredSession = state.hasStoredSession || event.state == ConnectionState.CONNECTED,
+                    )
+                }
+                if (event.state == ConnectionState.CONNECTED) {
+                    openLiveSubscriptions()
+                } else {
+                    // Stream ids from the previous socket are meaningless on the next one.
+                    liveStreams.clear()
+                }
             }
             is RepositoryEvent.ShellChanged -> updateFromWorkspace(event.snapshot)
             is RepositoryEvent.ThreadSnapshot -> {
@@ -1340,6 +1378,21 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
             is RepositoryEvent.ThreadEvent -> {
                 if (event.threadId == _ui.value.selectedThreadId) applyThreadEvent(event.event)
             }
+            // Live updates replace the on-demand reads these screens used to do. Automations in
+            // particular fire on their own schedule, so a polled list was stale the moment it was
+            // rendered.
+            is RepositoryEvent.AutomationsChanged -> update {
+                it.copy(automations = it.automations.copy(list = event.list, isLoading = false))
+            }
+
+            is RepositoryEvent.ProviderStatusesChanged -> update {
+                it.copy(serverSettings = it.serverSettings.copy(statuses = event.statuses))
+            }
+
+            is RepositoryEvent.ServerSettingsChanged -> update {
+                it.copy(serverSettings = it.serverSettings.copy(settings = event.settings))
+            }
+
             is RepositoryEvent.Error -> update { it.copy(error = event.message) }
         }
     }
