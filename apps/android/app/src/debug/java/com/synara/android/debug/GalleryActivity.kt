@@ -15,7 +15,11 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.synara.android.data.ActivityItem
 import com.synara.android.data.AppScreen
+import androidx.compose.ui.platform.LocalContext
+import com.synara.android.data.AttentionKind
 import com.synara.android.data.ConnectionState
+import com.synara.android.data.ThreadAttention
+import com.synara.android.notifications.SynaraNotifier
 import com.synara.android.data.Automation
 import com.synara.android.data.AutomationList
 import com.synara.android.data.AutomationMode
@@ -143,6 +147,19 @@ class GalleryActivity : ComponentActivity() {
                         "kanban" -> KanbanScreen(Fixtures.kanban(), vm)
                         "catalogue" -> CatalogueScreen(Fixtures.catalogue(), vm)
                         "pr" -> PullRequestScreen(Fixtures.pullRequest(), vm)
+                        // Fires one notification of each kind so the channels, icon, priority and
+                        // deep link can be checked in the shade without a paired server.
+                        "notify" -> {
+                            val context = LocalContext.current
+                            remember {
+                                listOf(
+                                    ThreadAttention("t-approve", "Migrate the pairing flow off bearer tokens", AttentionKind.APPROVAL),
+                                    ThreadAttention("t-ask", "Choose a persistence strategy", AttentionKind.INPUT),
+                                    ThreadAttention("t-run", "Rewrite the transcript virtualiser", AttentionKind.FINISHED),
+                                ).forEach { SynaraNotifier.notifyAttention(context, it) }
+                            }
+                            SettingsScreen(Fixtures.settingsServer(), vm)
+                        }
                         "settings" -> SettingsScreen(Fixtures.settings(), vm)
                         "settings-server" -> SettingsScreen(Fixtures.settingsServer(), vm)
                         else -> WorkspaceScreen(Fixtures.workspace(), vm)
