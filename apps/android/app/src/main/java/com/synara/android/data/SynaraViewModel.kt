@@ -14,7 +14,28 @@ enum class AppScreen {
     WORKSPACE,
     CHAT,
     SETTINGS,
+    DIFF,
 }
+
+/**
+ * Which set of changes the diff screen is showing. The desktop offers the same three through its
+ * DiffPanel toolbar; keeping them as one enum means the screen has a single source of truth for
+ * both the request it makes and the label it shows.
+ */
+enum class DiffScope(val label: String) {
+    THREAD("All thread changes"),
+    TURN("Latest turn"),
+    WORKING_TREE("Working tree"),
+}
+
+data class DiffState(
+    val scope: DiffScope = DiffScope.THREAD,
+    val parsed: ParsedDiff? = null,
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    /** Paths currently expanded in the file list. */
+    val expanded: Set<String> = emptySet(),
+)
 
 data class SynaraUiState(
     val screen: AppScreen = AppScreen.WORKSPACE,
@@ -39,6 +60,7 @@ data class SynaraUiState(
     /** Project whose action sheet is open, if any. */
     val projectActionsFor: String? = null,
     val showArchived: Boolean = false,
+    val diff: DiffState = DiffState(),
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -376,6 +398,96 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
             state.copy(selectedProjectId = state.selectedProjectId?.takeIf { it != projectId })
         }
         repository.refreshWorkspace()
+    }
+
+    // ── Diffs ────────────────────────────────────────────────────────────────────────────────
+
+    fun openDiff(scope: DiffScope = DiffScope.THREAD) {
+        update { it.copy(screen = AppScreen.DIFF, diff = DiffState(scope = scope, isLoading = true)) }
+        loadDiff(scope)
+    }
+
+    fun setDiffScope(scope: DiffScope) {
+        if (_ui.value.diff.scope == scope && _ui.value.diff.parsed != null) return
+        update { it.copy(diff = it.diff.copy(scope = scope, isLoading = true, error = null)) }
+        loadDiff(scope)
+    }
+
+    fun reloadDiff() = loadDiff(_ui.value.diff.scope)
+
+    fun toggleDiffFile(path: String) {
+        update { state ->
+            val expanded = state.diff.expanded
+            state.copy(
+                diff = state.diff.copy(
+                    expanded = if (path in expanded) expanded - path else expanded + path,
+                ),
+            )
+        }
+    }
+
+    fun closeDiff() {
+        update {
+            it.copy(
+                screen = if (it.selectedThreadId != null) AppScreen.CHAT else AppScreen.WORKSPACE,
+                diff = DiffState(),
+            )
+        }
+    }
+
+    private fun loadDiff(scope: DiffScope) {
+        val detail = _ui.value.detail
+        val thread = detail?.thread ?: _ui.value.selectedThread
+        update { it.copy(diff = it.diff.copy(isLoading = true, error = null)) }
+        viewModelScope.launch {
+            runCatching {
+                when (scope) {
+                    DiffScope.THREAD -> {
+                        val to = detail?.latestTurnCount
+                            ?: error("This thread has no completed turns to compare yet.")
+                        repository.getFullThreadDiff(thread!!.id, to)
+                    }
+
+                    DiffScope.TURN -> {
+                        val to = detail?.latestTurnCount
+                            ?: error("This thread has no completed turns to compare yet.")
+                        // A turn's own change set is the span since the previous checkpoint; the
+                        // first turn compares against an empty tree at count 0.
+                        val from = detail.checkpoints
+                            .map { it.turnCount }
+                            .filter { it < to }
+                            .maxOrNull()
+                            ?: 0
+                        repository.getTurnDiff(thread!!.id, from, to)
+                    }
+
+                    DiffScope.WORKING_TREE -> {
+                        val cwd = thread?.gitCwd
+                            ?: error("This thread has no checkout on disk to diff.")
+                        repository.readWorkingTreeDiff(cwd)
+                    }
+                }
+            }.onSuccess { patch ->
+                val parsed = parseUnifiedDiff(patch)
+                update {
+                    it.copy(
+                        diff = it.diff.copy(
+                            scope = scope,
+                            parsed = parsed,
+                            isLoading = false,
+                            error = null,
+                            // A single changed file is opened for you; more than that and the file
+                            // list is the more useful first view.
+                            expanded = if (parsed.files.size == 1) setOf(parsed.files.first().path) else emptySet(),
+                        ),
+                    )
+                }
+            }.onFailure { error ->
+                update {
+                    it.copy(diff = it.diff.copy(isLoading = false, error = readableError(error)))
+                }
+            }
+        }
     }
 
     // ── Sheets ───────────────────────────────────────────────────────────────────────────────

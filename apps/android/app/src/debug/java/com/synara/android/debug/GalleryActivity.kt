@@ -15,6 +15,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.synara.android.data.ActivityItem
 import com.synara.android.data.AppScreen
 import com.synara.android.data.ConnectionState
+import com.synara.android.data.DiffScope
+import com.synara.android.data.DiffState
+import com.synara.android.data.parseUnifiedDiff
 import com.synara.android.data.MessageItem
 import com.synara.android.data.ModelOption
 import com.synara.android.data.PendingInteraction
@@ -25,6 +28,7 @@ import com.synara.android.data.SynaraViewModel
 import com.synara.android.data.ThreadDetail
 import com.synara.android.data.ThreadItem
 import com.synara.android.ui.screens.ChatScreen
+import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
 import com.synara.android.ui.screens.SetupScreen
 import com.synara.android.ui.screens.WorkspaceScreen
@@ -83,6 +87,8 @@ class GalleryActivity : ComponentActivity() {
                         "chat-approval" -> ChatScreen(Fixtures.chatApproval(), vm)
                         "chat-question" -> ChatScreen(Fixtures.chatQuestion(), vm)
                         "chat-empty" -> ChatScreen(Fixtures.chatEmpty(), vm)
+                        "diff" -> DiffScreen(Fixtures.diff(), vm)
+                        "diff-empty" -> DiffScreen(Fixtures.diffEmpty(), vm)
                         "settings" -> SettingsScreen(Fixtures.settings(), vm)
                         else -> WorkspaceScreen(Fixtures.workspace(), vm)
                     }
@@ -137,6 +143,9 @@ private object Fixtures {
         isPinned = false,
         archivedAt = null,
         updatedAt = ago(updatedAgo, unit),
+        workingDirectory = "/home/me/projects/synara",
+        worktreePath = null,
+        branch = "main",
     )
 
     private val threads = listOf(
@@ -354,4 +363,71 @@ private object Fixtures {
     }
 
     fun settings() = base().copy(screen = AppScreen.SETTINGS)
+
+    private val samplePatch = """
+        diff --git a/apps/web/src/components/TranscriptList.tsx b/apps/web/src/components/TranscriptList.tsx
+        index 1111111..2222222 100644
+        --- a/apps/web/src/components/TranscriptList.tsx
+        +++ b/apps/web/src/components/TranscriptList.tsx
+        @@ -42,9 +42,9 @@ export function TranscriptList({ messages }: Props) {
+           const virtualizer = useVirtualizer({
+             count: messages.length,
+        -    getItemKey: (index) => hash(messages[index].text),
+        +    getItemKey: (index) => messages[index].id,
+             estimateSize: () => 96,
+           });
+        @@ -88,6 +88,7 @@ export function TranscriptList({ messages }: Props) {
+           return (
+             <div ref={parentRef} className="h-full overflow-auto">
+        +      {/* Rows are keyed by id so Compose can reuse slots across a stream. */}
+               {items.map((item) => (
+                 <MessageRow key={item.key} message={messages[item.index]} />
+               ))}
+        diff --git a/apps/web/src/lib/markdownCache.ts b/apps/web/src/lib/markdownCache.ts
+        new file mode 100644
+        --- /dev/null
+        +++ b/apps/web/src/lib/markdownCache.ts
+        @@ -0,0 +1,6 @@
+        +const cache = new Map<string, ParsedMarkdown>();
+        +
+        +export function rememberMarkdown(text: string): ParsedMarkdown {
+        +  const hit = cache.get(text);
+        +  return hit ?? parse(text);
+        +}
+        diff --git a/apps/web/src/lib/legacyDiffCache.ts b/apps/web/src/lib/legacyDiffCache.ts
+        deleted file mode 100644
+        --- a/apps/web/src/lib/legacyDiffCache.ts
+        +++ /dev/null
+        @@ -1,3 +0,0 @@
+        -export const legacyCache = new Map();
+        -// Superseded by markdownCache.
+        -export default legacyCache;
+        diff --git a/docs/perf.png b/docs/perf.png
+        index 3333333..4444444 100644
+        Binary files a/docs/perf.png and b/docs/perf.png differ
+    """.trimIndent()
+
+    fun diff(): SynaraUiState {
+        val t = thread("t-run", "Rewrite the transcript virtualiser", running = false)
+        return base().copy(
+            screen = AppScreen.DIFF,
+            selectedThreadId = t.id,
+            detail = detail(t),
+            diff = DiffState(
+                scope = DiffScope.THREAD,
+                parsed = parseUnifiedDiff(samplePatch),
+                expanded = setOf("apps/web/src/components/TranscriptList.tsx"),
+            ),
+        )
+    }
+
+    fun diffEmpty(): SynaraUiState {
+        val t = thread("t-run", "Rewrite the transcript virtualiser")
+        return base().copy(
+            screen = AppScreen.DIFF,
+            selectedThreadId = t.id,
+            detail = detail(t),
+            diff = DiffState(scope = DiffScope.WORKING_TREE, parsed = parseUnifiedDiff("")),
+        )
+    }
 }

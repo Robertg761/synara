@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.CheckBoxOutlineBlank
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.Difference
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.Button
@@ -152,6 +153,17 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                 title = thread?.title ?: "Thread",
                 subtitle = thread?.let { "${it.providerLabel} · ${it.model}" },
                 actions = {
+                    // Mirrors the desktop chat header's +N/-M toggle, which opens the DiffPanel.
+                    IconButton(
+                        onClick = { viewModel.openDiff() },
+                        enabled = detail?.latestTurnCount != null,
+                    ) {
+                        Icon(
+                            Icons.Outlined.Difference,
+                            contentDescription = "View changes",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     IconButton(onClick = viewModel::refreshOrReconnect) {
                         Icon(
                             Icons.Outlined.Refresh,

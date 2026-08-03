@@ -24,6 +24,7 @@ import com.synara.android.data.ConnectionState
 import com.synara.android.data.SynaraViewModel
 import com.synara.android.ui.components.SynaraWordmark
 import com.synara.android.ui.screens.ChatScreen
+import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
 import com.synara.android.ui.screens.SetupScreen
 import com.synara.android.ui.screens.WorkspaceScreen
@@ -59,6 +60,7 @@ fun SynaraApp(viewModel: SynaraViewModel) {
                         AppScreen.WORKSPACE -> WorkspaceScreen(state, viewModel)
                         AppScreen.CHAT -> ChatScreen(state, viewModel)
                         AppScreen.SETTINGS -> SettingsScreen(state, viewModel)
+                        AppScreen.DIFF -> DiffScreen(state, viewModel)
                     }
                 }
             }

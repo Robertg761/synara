@@ -133,7 +133,15 @@ data class ThreadItem(
     val isPinned: Boolean,
     val archivedAt: String?,
     val updatedAt: String,
+    /** Git operations need a checkout to act on; this is the thread's own, worktree included. */
+    val workingDirectory: String?,
+    val worktreePath: String?,
+    val branch: String?,
 ) {
+    /** Where git commands for this thread should run. A worktree wins over the project root. */
+    val gitCwd: String?
+        get() = worktreePath?.takeIf { it.isNotBlank() } ?: workingDirectory?.takeIf { it.isNotBlank() }
+
     val isRunning: Boolean
         get() = latestTurn?.state == "running" || sessionStatus == "running" || sessionStatus == "starting"
 
@@ -169,6 +177,9 @@ data class ThreadItem(
                 isPinned = json.optBoolean("isPinned", false),
                 archivedAt = json.stringOrNull("archivedAt"),
                 updatedAt = json.stringOrNull("updatedAt") ?: "",
+                workingDirectory = json.stringOrNull("workingDirectory"),
+                worktreePath = json.stringOrNull("worktreePath"),
+                branch = json.stringOrNull("branch"),
             )
         }
     }
@@ -276,7 +287,15 @@ data class ThreadDetail(
     val notes: String?,
     val proposedPlan: String?,
     val sequence: Long,
+    /**
+     * Turn checkpoints, oldest first. The diff RPCs address turns by count rather than id, and the
+     * checkpoint list is the only place that count is exposed to a client.
+     */
+    val checkpoints: List<Checkpoint> = emptyList(),
 ) {
+    /** Highest checkpoint turn count, i.e. the `toTurnCount` for a whole-thread diff. */
+    val latestTurnCount: Int?
+        get() = checkpoints.maxOfOrNull { it.turnCount }
     fun userInputQuestions(interaction: PendingInteraction): List<UserInputQuestion> =
         activities.asReversed()
             .firstOrNull { activity ->
@@ -308,6 +327,31 @@ data class ThreadDetail(
                 .lastOrNull()
                 ?.stringOrNull("planMarkdown"),
             sequence = sequence,
+            checkpoints = json.arrayOrEmpty("checkpoints")
+                .objects()
+                .map(Checkpoint::fromJson)
+                .sortedBy { it.turnCount },
+        )
+    }
+}
+
+/** `OrchestrationCheckpointSummary`: one committed turn's file snapshot. */
+data class Checkpoint(
+    val turnId: String,
+    val turnCount: Int,
+    val status: String,
+    val assistantMessageId: String?,
+    val completedAt: String,
+    val fileCount: Int,
+) {
+    companion object {
+        fun fromJson(json: JSONObject): Checkpoint = Checkpoint(
+            turnId = json.stringOrNull("turnId") ?: "",
+            turnCount = json.optInt("checkpointTurnCount", 0),
+            status = json.stringOrNull("status") ?: "unknown",
+            assistantMessageId = json.stringOrNull("assistantMessageId"),
+            completedAt = json.stringOrNull("completedAt") ?: "",
+            fileCount = json.arrayOrEmpty("files").length(),
         )
     }
 }
