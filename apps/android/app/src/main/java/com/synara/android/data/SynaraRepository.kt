@@ -563,6 +563,21 @@ class SynaraRepository(context: Context) {
     suspend fun gitStatus(cwd: String): GitStatus =
         GitStatus.fromJson(rpc("git.status", JSONObject().put("cwd", cwd)) ?: JSONObject())
 
+    /**
+     * Live CI and unresolved review comments for a pull request.
+     *
+     * Kept separate from `git.status`, which only reports the PR's identity. Checks and comments
+     * come from GitHub over the network and are slow enough that folding them into the status read
+     * would stall the whole source-control screen behind them.
+     */
+    suspend fun pullRequestSnapshot(cwd: String, reference: String): PullRequestSnapshot? =
+        PullRequestSnapshot.fromJson(
+            rpc(
+                "git.pullRequestSnapshot",
+                JSONObject().put("cwd", cwd).put("reference", reference),
+            ) ?: JSONObject(),
+        )
+
     suspend fun listBranches(cwd: String): GitBranches =
         GitBranches.fromJson(rpc("git.listBranches", JSONObject().put("cwd", cwd)) ?: JSONObject())
 

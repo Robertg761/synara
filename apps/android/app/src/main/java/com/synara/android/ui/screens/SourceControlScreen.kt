@@ -140,7 +140,9 @@ fun SourceControlScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                     }
                     git.error?.let { error -> item("error") { InlineNotice(error) } }
 
-                    status.pullRequest?.let { pr -> item("pr") { PullRequestCard(pr) } }
+                    status.pullRequest?.let { pr ->
+                        item("pr") { PullRequestCard(pr, viewModel::openPullRequest) }
+                    }
 
                     item("commit") { CommitCard(state, viewModel) }
 
@@ -327,18 +329,16 @@ private fun CommitCard(state: SynaraUiState, viewModel: SynaraViewModel) {
 }
 
 @Composable
-private fun PullRequestCard(pr: com.synara.android.data.GitPullRequestInfo) {
+private fun PullRequestCard(pr: com.synara.android.data.GitPullRequestInfo, onOpen: () -> Unit) {
     val accents = SynaraTheme.accents
-    val uriHandler = LocalUriHandler.current
     val stateColor = when (pr.state) {
         "merged" -> accents.statusMerged
         "closed" -> accents.statusFailure
         else -> accents.statusSuccess
     }
-    SynaraCard(
-        contentSpacing = SynaraTheme.spacing.sm,
-        onClick = { if (pr.url.isNotBlank()) uriHandler.openUri(pr.url) },
-    ) {
+    // Opens the in-app detail rather than the browser: checks and unresolved comments are the
+    // reason to look, and bouncing to GitHub loses the session context.
+    SynaraCard(contentSpacing = SynaraTheme.spacing.sm, onClick = onOpen) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             SynaraBadge(
                 text = if (pr.isDraft) "Draft" else pr.state.replaceFirstChar { it.uppercase() },
@@ -354,7 +354,7 @@ private fun PullRequestCard(pr: com.synara.android.data.GitPullRequestInfo) {
             Spacer(Modifier.weight(1f))
             Icon(
                 Icons.AutoMirrored.Outlined.OpenInNew,
-                contentDescription = "Open pull request",
+                contentDescription = "Open pull request details",
                 modifier = Modifier.size(16.dp),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )

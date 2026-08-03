@@ -51,6 +51,77 @@ data class GitPullRequestInfo(
     }
 }
 
+/** Normalised CI state, combining GitHub check runs and commit statuses. */
+enum class CheckStatus(val wire: String, val label: String) {
+    PENDING("pending", "Pending"),
+    SUCCESS("success", "Passed"),
+    FAILURE("failure", "Failed"),
+    SKIPPED("skipped", "Skipped"),
+    NEUTRAL("neutral", "Neutral"),
+    CANCELLED("cancelled", "Cancelled"),
+    ;
+
+    companion object {
+        fun fromWire(wire: String?) = entries.firstOrNull { it.wire == wire } ?: PENDING
+    }
+}
+
+data class GitCheck(val name: String, val status: CheckStatus, val url: String?) {
+    companion object {
+        fun fromJson(json: JSONObject) = GitCheck(
+            name = json.stringOrNull("name") ?: "",
+            status = CheckStatus.fromWire(json.stringOrNull("status")),
+            url = json.stringOrNull("url"),
+        )
+    }
+}
+
+/** Root comment of an *unresolved* review thread; resolved threads and replies are excluded. */
+data class GitReviewComment(
+    val id: String,
+    val author: String?,
+    val body: String,
+    val path: String?,
+    val url: String?,
+    val createdAt: String?,
+) {
+    companion object {
+        fun fromJson(json: JSONObject) = GitReviewComment(
+            id = json.stringOrNull("id") ?: "",
+            author = json.stringOrNull("author"),
+            body = json.stringOrNull("body").orEmpty(),
+            path = json.stringOrNull("path"),
+            url = json.stringOrNull("url"),
+            createdAt = json.stringOrNull("createdAt"),
+        )
+    }
+}
+
+/** Live CI and review state for one pull request. */
+data class PullRequestSnapshot(
+    val pullRequest: GitPullRequestInfo,
+    val checks: List<GitCheck>,
+    val comments: List<GitReviewComment>,
+    val commentsTruncated: Boolean,
+    val commentsError: String?,
+) {
+    val failingChecks: Int get() = checks.count { it.status == CheckStatus.FAILURE }
+    val pendingChecks: Int get() = checks.count { it.status == CheckStatus.PENDING }
+
+    companion object {
+        fun fromJson(json: JSONObject): PullRequestSnapshot? {
+            val pr = json.objectOrNull("pullRequest") ?: return null
+            return PullRequestSnapshot(
+                pullRequest = GitPullRequestInfo.fromJson(pr),
+                checks = json.arrayOrEmpty("checks").objects().map(GitCheck::fromJson),
+                comments = json.arrayOrEmpty("comments").objects().map(GitReviewComment::fromJson),
+                commentsTruncated = json.optBoolean("commentsTruncated", false),
+                commentsError = json.stringOrNull("commentsError"),
+            )
+        }
+    }
+}
+
 /** `GitStatusResult`: the whole source-control picture for one checkout. */
 data class GitStatus(
     val branch: String?,

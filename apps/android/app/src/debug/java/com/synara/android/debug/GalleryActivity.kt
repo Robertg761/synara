@@ -30,7 +30,12 @@ import com.synara.android.data.GitBranchItem
 import com.synara.android.data.GitBranches
 import com.synara.android.data.GitFileChange
 import com.synara.android.data.GitPullRequestInfo
+import com.synara.android.data.CheckStatus
+import com.synara.android.data.GitCheck
+import com.synara.android.data.GitReviewComment
 import com.synara.android.data.GitStatus
+import com.synara.android.data.PullRequestSnapshot
+import com.synara.android.data.PullRequestState
 import com.synara.android.data.SourceControlState
 import com.synara.android.data.TerminalSnapshot
 import com.synara.android.data.TerminalState
@@ -49,6 +54,7 @@ import com.synara.android.ui.screens.AutomationsScreen
 import com.synara.android.ui.screens.CatalogueScreen
 import com.synara.android.ui.screens.ChatScreen
 import com.synara.android.ui.screens.KanbanScreen
+import com.synara.android.ui.screens.PullRequestScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
 import com.synara.android.ui.screens.SourceControlScreen
@@ -124,6 +130,7 @@ class GalleryActivity : ComponentActivity() {
                         }
                         "kanban" -> KanbanScreen(Fixtures.kanban(), vm)
                         "catalogue" -> CatalogueScreen(Fixtures.catalogue(), vm)
+                        "pr" -> PullRequestScreen(Fixtures.pullRequest(), vm)
                         "settings" -> SettingsScreen(Fixtures.settings(), vm)
                         else -> WorkspaceScreen(Fixtures.workspace(), vm)
                     }
@@ -654,6 +661,46 @@ private object Fixtures {
             selectedThreadId = t.id,
             detail = detail(t),
             git = gitState(),
+        )
+    }
+
+    fun pullRequest(): SynaraUiState {
+        val pr = gitState().status!!.pullRequest!!
+        return sourceControl().copy(
+            screen = AppScreen.PULL_REQUEST,
+            pullRequest = PullRequestState(
+                snapshot = PullRequestSnapshot(
+                    pullRequest = pr,
+                    checks = listOf(
+                        GitCheck("build / android", CheckStatus.SUCCESS, "https://ci/1"),
+                        GitCheck("test / vitest", CheckStatus.FAILURE, "https://ci/2"),
+                        GitCheck("lint / oxlint", CheckStatus.SUCCESS, null),
+                        GitCheck("e2e / playwright", CheckStatus.PENDING, "https://ci/4"),
+                        GitCheck("bundle-size", CheckStatus.SKIPPED, null),
+                    ),
+                    comments = listOf(
+                        GitReviewComment(
+                            "c1",
+                            "dana",
+                            "This still reparses on every token. Can we hoist `rememberMarkdown` " +
+                                "out of the row?\n\n```ts\nconst parsed = useMemo(() => parse(text), [text]);\n```",
+                            "apps/web/src/components/TranscriptList.tsx",
+                            "https://github.com/x/y/pull/512#discussion_r1",
+                            ago(2, ChronoUnit.HOURS),
+                        ),
+                        GitReviewComment(
+                            "c2",
+                            "sam",
+                            "Nit: the **key** should be stable across reorders too.",
+                            null,
+                            null,
+                            ago(40, ChronoUnit.MINUTES),
+                        ),
+                    ),
+                    commentsTruncated = true,
+                    commentsError = null,
+                ),
+            ),
         )
     }
 
