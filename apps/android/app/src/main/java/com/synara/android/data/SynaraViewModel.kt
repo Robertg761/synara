@@ -19,7 +19,16 @@ enum class AppScreen {
     SOURCE_CONTROL,
     AUTOMATIONS,
     TERMINAL,
+    KANBAN,
+    CATALOGUE,
 }
+
+data class CatalogueState(
+    val catalogue: ProviderCatalogue? = null,
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    val providerLabel: String? = null,
+)
 
 data class TerminalState(
     val threadId: String? = null,
@@ -108,6 +117,7 @@ data class SynaraUiState(
     val git: SourceControlState = SourceControlState(),
     val automations: AutomationsState = AutomationsState(),
     val terminal: TerminalState = TerminalState(),
+    val catalogue: CatalogueState = CatalogueState(),
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -534,6 +544,53 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
                     it.copy(diff = it.diff.copy(isLoading = false, error = readableError(error)))
                 }
             }
+        }
+    }
+
+    // ── Board and catalogue ──────────────────────────────────────────────────────────────────
+
+    fun openKanban() {
+        update { it.copy(screen = AppScreen.KANBAN) }
+    }
+
+    fun closeKanban() {
+        update { it.copy(screen = AppScreen.WORKSPACE) }
+    }
+
+    fun openCatalogue() {
+        val thread = _ui.value.detail?.thread ?: _ui.value.selectedThread
+        val cwd = thread?.gitCwd
+        if (thread == null || cwd == null) {
+            update { it.copy(error = "This thread has no working directory to read skills from.") }
+            return
+        }
+        update {
+            it.copy(
+                screen = AppScreen.CATALOGUE,
+                catalogue = CatalogueState(isLoading = true, providerLabel = thread.providerLabel),
+            )
+        }
+        viewModelScope.launch {
+            runCatching { repository.loadCatalogue(thread.provider, cwd, thread.id) }
+                .onSuccess { catalogue ->
+                    update { it.copy(catalogue = it.catalogue.copy(catalogue = catalogue, isLoading = false)) }
+                }
+                .onFailure { error ->
+                    update {
+                        it.copy(
+                            catalogue = it.catalogue.copy(isLoading = false, error = readableError(error)),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun closeCatalogue() {
+        update {
+            it.copy(
+                screen = if (it.selectedThreadId != null) AppScreen.CHAT else AppScreen.WORKSPACE,
+                catalogue = CatalogueState(),
+            )
         }
     }
 

@@ -24,7 +24,9 @@ import com.synara.android.data.ConnectionState
 import com.synara.android.data.SynaraViewModel
 import com.synara.android.ui.components.SynaraWordmark
 import com.synara.android.ui.screens.AutomationsScreen
+import com.synara.android.ui.screens.CatalogueScreen
 import com.synara.android.ui.screens.ChatScreen
+import com.synara.android.ui.screens.KanbanScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
 import com.synara.android.ui.screens.SourceControlScreen
@@ -67,6 +69,8 @@ fun SynaraApp(viewModel: SynaraViewModel) {
                         AppScreen.SOURCE_CONTROL -> SourceControlScreen(state, viewModel)
                         AppScreen.AUTOMATIONS -> AutomationsScreen(state, viewModel)
                         AppScreen.TERMINAL -> TerminalScreen(state, viewModel)
+                        AppScreen.KANBAN -> KanbanScreen(state, viewModel)
+                        AppScreen.CATALOGUE -> CatalogueScreen(state, viewModel)
                     }
                 }
             }

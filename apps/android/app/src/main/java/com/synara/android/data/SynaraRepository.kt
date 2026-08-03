@@ -374,6 +374,35 @@ class SynaraRepository(context: Context) {
             JSONObject().put("cwd", cwd).put("scope", scope),
         )?.stringOrNull("patch").orEmpty()
 
+    // ── Provider catalogue ───────────────────────────────────────────────────────────────────
+
+    /**
+     * Skills, slash commands and subagents available to a thread.
+     *
+     * All three are per-provider *and* per-checkout: a skill in the repository's `.claude/skills`
+     * only exists for a thread rooted there. Fetching them together keeps the three lists
+     * consistent with each other, which matters because the composer offers them side by side.
+     */
+    suspend fun loadCatalogue(provider: String, cwd: String, threadId: String?): ProviderCatalogue =
+        withContext(Dispatchers.IO) {
+            fun payload() = JSONObject()
+                .put("provider", provider)
+                .put("cwd", cwd)
+                .apply { threadId?.let { put("threadId", it) } }
+
+            // A provider that does not implement one of these fails only that list; the others
+            // still populate rather than the whole screen erroring.
+            val skills = async { runCatching { rpc("provider.listSkills", payload()) }.getOrNull() }
+            val commands = async { runCatching { rpc("provider.listCommands", payload()) }.getOrNull() }
+            val agents = async { runCatching { rpc("provider.listAgents", payload()) }.getOrNull() }
+
+            ProviderCatalogue(
+                skills = skills.await()?.arrayOrEmpty("skills")?.objects()?.map(CatalogueEntry::skill).orEmpty(),
+                commands = commands.await()?.arrayOrEmpty("commands")?.objects()?.map(CatalogueEntry::command).orEmpty(),
+                agents = agents.await()?.arrayOrEmpty("agents")?.objects()?.map(CatalogueEntry::agent).orEmpty(),
+            )
+        }
+
     // ── Terminal ─────────────────────────────────────────────────────────────────────────────
 
     /**
