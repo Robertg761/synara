@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Platform-level colors only. Everything the UI draws comes from the Compose palette in
+  ui/theme/Color.kt; these exist for the frame the system paints before Compose is running
+  (the launch window) and for the launcher icon. Values are the web app's background tokens,
+  so the pre-Compose window matches the first composed frame exactly.
+-->
+<resources>
+    <color name="window_background">#FCFCFC</color>
+    <color name="ic_launcher_background">#0E0E0E</color>
+</resources>

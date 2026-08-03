@@ -1,0 +1,641 @@
+package com.synara.android.data
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.util.UUID
+
+enum class AppScreen {
+    WORKSPACE,
+    CHAT,
+    SETTINGS,
+}
+
+data class SynaraUiState(
+    val screen: AppScreen = AppScreen.WORKSPACE,
+    val connection: ConnectionState = ConnectionState.DISCONNECTED,
+    val serverUrl: String = "",
+    val hasStoredSession: Boolean = false,
+    val projects: List<ProjectItem> = emptyList(),
+    val threads: List<ThreadItem> = emptyList(),
+    val selectedProjectId: String? = null,
+    val selectedThreadId: String? = null,
+    val detail: ThreadDetail? = null,
+        val models: List<ModelOption> = listOf(ModelOption("gpt-5.6-sol", "GPT-5.6 Sol", null)),
+    val isLoading: Boolean = false,
+    val isSending: Boolean = false,
+    val isRefreshing: Boolean = false,
+    val setupError: String? = null,
+    val error: String? = null,
+    val createProjectOpen: Boolean = false,
+    val createThreadOpen: Boolean = false,
+    /** Thread whose action sheet is open, if any. */
+    val threadActionsFor: String? = null,
+    /** Project whose action sheet is open, if any. */
+    val projectActionsFor: String? = null,
+    val showArchived: Boolean = false,
+) {
+    val isConnected: Boolean
+        get() = connection == ConnectionState.CONNECTED
+
+    val selectedThread: ThreadItem?
+        get() = selectedThreadId?.let { id -> threads.firstOrNull { it.id == id } }
+            ?: detail?.thread
+}
+
+class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
+    private val _ui = MutableStateFlow(
+        SynaraUiState(
+            serverUrl = repository.storedSession()?.baseUrl ?: "",
+            hasStoredSession = repository.storedSession() != null,
+        ),
+    )
+    val ui: StateFlow<SynaraUiState> = _ui.asStateFlow()
+
+    private var activeThreadStream: String? = null
+    private var activeShellStream: String? = null
+
+    init {
+        viewModelScope.launch {
+            repository.events().collect(::onRepositoryEvent)
+        }
+        if (repository.storedSession() != null) {
+            reconnectStored()
+        }
+    }
+
+    fun connect(serverUrl: String, pairingInput: String) {
+        update { it.copy(serverUrl = serverUrl.trim(), setupError = null, isLoading = true) }
+        viewModelScope.launch {
+            runCatching {
+                repository.connectWithPairing(serverUrl, pairingInput)
+                loadModels()
+            }.onSuccess {
+                update { it.copy(isLoading = false, screen = AppScreen.WORKSPACE, hasStoredSession = true) }
+            }.onFailure { error ->
+                repository.disconnect(clearCredentials = error is AuthRequiredException)
+                update {
+                    it.copy(
+                        isLoading = false,
+                        hasStoredSession = error !is AuthRequiredException && repository.storedSession() != null,
+                        setupError = readableError(error),
+                    )
+                }
+            }
+        }
+    }
+
+    fun reconnectStored() {
+        if (_ui.value.isLoading || _ui.value.connection == ConnectionState.CONNECTING) return
+        update { it.copy(connection = ConnectionState.CONNECTING, isLoading = true, error = null) }
+        viewModelScope.launch {
+            runCatching {
+                repository.reconnectStored()
+                loadModels()
+            }.onSuccess {
+                update { it.copy(isLoading = false, screen = AppScreen.WORKSPACE) }
+            }.onFailure { error ->
+                val needsPairing = error is AuthRequiredException
+                if (needsPairing) repository.disconnect(clearCredentials = true)
+                update {
+                    it.copy(
+                        isLoading = false,
+                        hasStoredSession = !needsPairing && repository.storedSession() != null,
+                        setupError = if (needsPairing) readableError(error) else null,
+                        error = if (needsPairing) null else readableError(error),
+                    )
+                }
+            }
+        }
+    }
+
+    fun refreshOrReconnect() {
+        if (_ui.value.connection == ConnectionState.CONNECTED) refresh()
+        else if (_ui.value.hasStoredSession) reconnectStored()
+    }
+
+    fun openWorkspace() {
+        update { it.copy(screen = AppScreen.WORKSPACE, selectedThreadId = null, detail = null) }
+        stopActiveThreadStream()
+    }
+
+    fun openSettings() {
+        update { it.copy(screen = AppScreen.SETTINGS) }
+    }
+
+    fun selectProject(projectId: String?) {
+        update { it.copy(selectedProjectId = projectId, screen = AppScreen.WORKSPACE) }
+    }
+
+    fun selectThread(threadId: String) {
+        if (_ui.value.selectedThreadId == threadId && _ui.value.detail != null) {
+            update { it.copy(screen = AppScreen.CHAT) }
+            return
+        }
+        update {
+            it.copy(
+                screen = AppScreen.CHAT,
+                selectedThreadId = threadId,
+                detail = null,
+                isLoading = true,
+                error = null,
+            )
+        }
+        stopActiveThreadStream()
+        viewModelScope.launch {
+            runCatching {
+                repository.loadThread(threadId)
+                repository.subscribeThread(threadId)
+            }.onSuccess { streamId ->
+                activeThreadStream = streamId
+                update { it.copy(isLoading = false) }
+            }.onFailure { error ->
+                update { it.copy(isLoading = false, error = readableError(error)) }
+            }
+        }
+    }
+
+    fun refresh() {
+        if (_ui.value.connection != ConnectionState.CONNECTED) return
+        update { it.copy(isRefreshing = true, error = null) }
+        viewModelScope.launch {
+            runCatching { repository.refreshWorkspace() }
+                .onFailure { error -> update { it.copy(error = readableError(error)) } }
+            update { it.copy(isRefreshing = false) }
+        }
+    }
+
+    fun sendMessage(text: String) {
+        val cleanText = text.trim()
+        val detail = _ui.value.detail ?: return
+        val thread = detail.thread
+        if (cleanText.isBlank() || _ui.value.isSending) return
+        val messageId = UUID.randomUUID().toString()
+        val optimistic = MessageItem(
+            id = messageId,
+            role = "user",
+            text = cleanText,
+            streaming = false,
+            createdAt = nowIso(),
+            turnId = null,
+        )
+        update {
+            it.copy(
+                isSending = true,
+                error = null,
+                detail = detail.copy(messages = detail.messages + optimistic),
+            )
+        }
+        viewModelScope.launch {
+            runCatching { repository.sendMessage(thread, cleanText, messageId) }
+                .onSuccess { update { it.copy(isSending = false) } }
+                .onFailure { error ->
+                    update { it.copy(isSending = false, error = readableError(error)) }
+                    repository.loadThread(thread.id)
+                }
+        }
+    }
+
+    fun interruptThread() {
+        val thread = _ui.value.detail?.thread ?: return
+        viewModelScope.launch {
+            runCatching { repository.interruptThread(thread) }
+                .onFailure { error -> update { it.copy(error = readableError(error)) } }
+        }
+    }
+
+    fun respondToApproval(interaction: PendingInteraction, decision: String) {
+        val threadId = _ui.value.selectedThreadId ?: return
+        viewModelScope.launch {
+            runCatching { repository.respondToApproval(threadId, interaction, decision) }
+                .onFailure { error -> update { it.copy(error = readableError(error)) } }
+        }
+    }
+
+    fun respondToUserInput(interaction: PendingInteraction, answers: JSONObject) {
+        val threadId = _ui.value.detail?.thread?.id ?: _ui.value.selectedThreadId ?: return
+        markInteractionStatus(interaction, "responding")
+        viewModelScope.launch {
+            runCatching { repository.respondToUserInput(threadId, interaction, answers) }
+                .onFailure {
+                    markInteractionStatus(interaction, "retryable")
+                    update { state -> state.copy(error = readableError(it)) }
+                }
+        }
+    }
+
+    fun openCreateProject() {
+        update { it.copy(createProjectOpen = true) }
+    }
+
+    fun closeCreateProject() {
+        update { it.copy(createProjectOpen = false) }
+    }
+
+    fun createProject(title: String, root: String, model: ModelOption) {
+        if (title.isBlank() || root.isBlank()) return
+        update { it.copy(createProjectOpen = false, isLoading = true, error = null) }
+        viewModelScope.launch {
+            runCatching { repository.createProject(title.trim(), root.trim(), model) }
+                .onSuccess {
+                    repository.refreshWorkspace()
+                    update { it.copy(isLoading = false) }
+                }
+                .onFailure { error -> update { it.copy(isLoading = false, error = readableError(error)) } }
+        }
+    }
+
+    fun openCreateThread(projectId: String? = _ui.value.selectedProjectId) {
+        if (projectId != null) update { it.copy(selectedProjectId = projectId) }
+        update { it.copy(createThreadOpen = true) }
+    }
+
+    fun closeCreateThread() {
+        update { it.copy(createThreadOpen = false) }
+    }
+
+    fun createThread(
+        title: String,
+        model: ModelOption,
+        runtimeMode: RuntimeMode,
+        interactionMode: InteractionMode = InteractionMode.DEFAULT,
+    ) {
+        val project = _ui.value.selectedProjectId?.let { id -> _ui.value.projects.firstOrNull { it.id == id } }
+            ?: _ui.value.projects.firstOrNull()
+            ?: return
+        if (title.isBlank()) return
+        update { it.copy(createThreadOpen = false, isLoading = true, error = null) }
+        viewModelScope.launch {
+            runCatching {
+                repository.createThread(
+                    project,
+                    title.trim(),
+                    model,
+                    runtimeMode.wire,
+                    interactionMode.wire,
+                )
+            }
+                .onSuccess { threadId ->
+                    repository.refreshWorkspace()
+                    update { it.copy(isLoading = false) }
+                    selectThread(threadId)
+                }
+                .onFailure { error -> update { it.copy(isLoading = false, error = readableError(error)) } }
+        }
+    }
+
+    // ── Thread management ────────────────────────────────────────────────────────────────────
+
+    /**
+     * Mutations follow one shape: run the command, surface a failure as a dismissible error, and
+     * let the authoritative shell snapshot that follows correct local state. Nothing here writes
+     * an optimistic result the server might contradict, which is what keeps the list honest when
+     * a command is rejected.
+     */
+    private fun mutate(onFailure: String? = null, block: suspend () -> Unit) {
+        viewModelScope.launch {
+            runCatching { block() }
+                .onFailure { error ->
+                    update { it.copy(error = onFailure ?: readableError(error)) }
+                }
+        }
+    }
+
+    fun archiveThread(threadId: String) = mutate {
+        repository.archiveThread(threadId)
+        // Leaving the archived thread open would strand the user on a screen the workspace list
+        // no longer offers a way back to.
+        if (_ui.value.selectedThreadId == threadId) openWorkspace()
+        repository.refreshWorkspace()
+    }
+
+    fun unarchiveThread(threadId: String) = mutate {
+        repository.unarchiveThread(threadId)
+        repository.refreshWorkspace()
+    }
+
+    fun deleteThread(threadId: String) = mutate {
+        repository.deleteThread(threadId)
+        if (_ui.value.selectedThreadId == threadId) openWorkspace()
+        repository.refreshWorkspace()
+    }
+
+    fun renameThread(threadId: String, title: String) {
+        val clean = title.trim()
+        if (clean.isEmpty()) return
+        mutate {
+            repository.updateThreadMeta(threadId, title = clean)
+            repository.refreshWorkspace()
+        }
+    }
+
+    fun setThreadPinned(threadId: String, pinned: Boolean) = mutate {
+        repository.updateThreadMeta(threadId, isPinned = pinned)
+        repository.refreshWorkspace()
+    }
+
+    fun setThreadModel(threadId: String, model: ModelOption) = mutate {
+        repository.updateThreadMeta(threadId, model = model)
+        repository.loadThread(threadId)
+    }
+
+    fun setRuntimeMode(threadId: String, runtimeMode: RuntimeMode) = mutate {
+        repository.setRuntimeMode(threadId, runtimeMode.wire)
+        repository.loadThread(threadId)
+    }
+
+    fun setInteractionMode(threadId: String, interactionMode: InteractionMode) = mutate {
+        repository.setInteractionMode(threadId, interactionMode.wire)
+        repository.loadThread(threadId)
+    }
+
+    // ── Project management ───────────────────────────────────────────────────────────────────
+
+    fun renameProject(projectId: String, title: String) {
+        val clean = title.trim()
+        if (clean.isEmpty()) return
+        mutate {
+            repository.updateProjectMeta(projectId, title = clean)
+            repository.refreshWorkspace()
+        }
+    }
+
+    fun setProjectPinned(projectId: String, pinned: Boolean) = mutate {
+        repository.updateProjectMeta(projectId, isPinned = pinned)
+        repository.refreshWorkspace()
+    }
+
+    fun deleteProject(projectId: String) = mutate {
+        repository.deleteProject(projectId)
+        update { state ->
+            state.copy(selectedProjectId = state.selectedProjectId?.takeIf { it != projectId })
+        }
+        repository.refreshWorkspace()
+    }
+
+    // ── Sheets ───────────────────────────────────────────────────────────────────────────────
+
+    fun openThreadActions(threadId: String) {
+        update { it.copy(threadActionsFor = threadId) }
+    }
+
+    fun closeThreadActions() {
+        update { it.copy(threadActionsFor = null) }
+    }
+
+    fun openProjectActions(projectId: String) {
+        update { it.copy(projectActionsFor = projectId) }
+    }
+
+    fun closeProjectActions() {
+        update { it.copy(projectActionsFor = null) }
+    }
+
+    fun setShowArchived(show: Boolean) {
+        update { it.copy(showArchived = show) }
+    }
+
+    fun dismissError() {
+        update { it.copy(error = null) }
+    }
+
+    fun disconnect() {
+        stopActiveThreadStream()
+        activeShellStream?.let(repository::stopStream)
+        activeShellStream = null
+        repository.disconnect(clearCredentials = true)
+        update {
+            SynaraUiState(
+                serverUrl = it.serverUrl,
+                models = it.models,
+                setupError = null,
+            )
+        }
+    }
+
+    override fun onCleared() {
+        stopActiveThreadStream()
+        activeShellStream?.let(repository::stopStream)
+        repository.disconnect()
+        super.onCleared()
+    }
+
+    private suspend fun loadModels() {
+        // Every provider is queried, not just Codex, so the model picker reflects what the
+        // workspace can actually run.
+        val discovered = runCatching { repository.listAllModels() }.getOrDefault(emptyList())
+        if (discovered.isNotEmpty()) update { it.copy(models = discovered) }
+    }
+
+    private fun onRepositoryEvent(event: RepositoryEvent) {
+        when (event) {
+            is RepositoryEvent.ConnectionChanged -> update { state ->
+                state.copy(
+                    connection = event.state,
+                    hasStoredSession = state.hasStoredSession || event.state == ConnectionState.CONNECTED,
+                )
+            }
+            is RepositoryEvent.ShellChanged -> updateFromWorkspace(event.snapshot)
+            is RepositoryEvent.ThreadSnapshot -> {
+                if (event.detail.thread.id == _ui.value.selectedThreadId) {
+                    updateFromDetail(event.detail)
+                }
+            }
+            is RepositoryEvent.ThreadEvent -> {
+                if (event.threadId == _ui.value.selectedThreadId) applyThreadEvent(event.event)
+            }
+            is RepositoryEvent.Error -> update { it.copy(error = event.message) }
+        }
+    }
+
+    private fun updateFromWorkspace(snapshot: WorkspaceSnapshot) {
+        update { state ->
+            state.copy(
+                projects = snapshot.projects,
+                threads = snapshot.threads,
+                selectedProjectId = state.selectedProjectId?.takeIf { id -> snapshot.projects.any { it.id == id } },
+            )
+        }
+    }
+
+    private fun updateFromDetail(detail: ThreadDetail) {
+        update { state ->
+            val threads = state.threads.map { if (it.id == detail.thread.id) detail.thread else it }
+            state.copy(detail = detail, threads = threads)
+        }
+    }
+
+    private fun applyThreadEvent(event: JSONObject) {
+        val detail = _ui.value.detail ?: return
+        val payload = event.objectOrNull("payload") ?: return
+        val type = event.stringOrNull("type") ?: return
+        val updated = when (type) {
+            "thread.message-sent" -> applyMessageEvent(detail, payload)
+            "thread.session-set" -> {
+                val session = payload.objectOrNull("session")
+                session?.let {
+                    detail.copy(
+                        thread = detail.thread.copy(
+                            sessionStatus = it.stringOrNull("status"),
+                            activeTurnId = it.stringOrNull("activeTurnId"),
+                        ),
+                    )
+                } ?: detail
+            }
+            "thread.activity-appended" -> {
+                payload.objectOrNull("activity")?.let { activity ->
+                    applyActivityEvent(detail, ActivityItem.fromJson(activity))
+                } ?: detail
+            }
+            "thread.approval-response-requested" -> updateInteractionStatus(detail, payload, "approval", "responding")
+            "thread.user-input-response-requested" -> updateInteractionStatus(detail, payload, "userInput", "responding")
+            "thread.proposed-plan-upserted" -> {
+                detail.copy(proposedPlan = payload.objectOrNull("proposedPlan")?.stringOrNull("planMarkdown"))
+            }
+            "thread.turn-start-requested", "thread.turn-queued" -> detail.copy(
+                thread = detail.thread.copy(
+                    latestTurn = detail.thread.latestTurn?.copy(state = "running")
+                        ?: LatestTurn("", "running"),
+                ),
+            )
+            "thread.meta-updated" -> detail.copy(
+                thread = detail.thread.copy(
+                    title = payload.stringOrNull("title") ?: detail.thread.title,
+                    runtimeMode = payload.stringOrNull("runtimeMode") ?: detail.thread.runtimeMode,
+                ),
+            )
+            else -> detail
+        }
+        updateFromDetail(updated)
+    }
+
+    private fun applyActivityEvent(detail: ThreadDetail, activity: ActivityItem): ThreadDetail {
+        val activities = if (activity.id.isNotBlank()) {
+            detail.activities.filterNot { it.id == activity.id } + activity
+        } else {
+            detail.activities + activity
+        }
+        val payload = activity.payload
+        val requestId = payload?.stringOrNull("requestId")
+        val lifecycleGeneration = payload?.stringOrNull("lifecycleGeneration")
+        val interactionKind = when (activity.kind) {
+            "approval.requested", "approval.resolved", "provider.approval.respond.failed" -> "approval"
+            "user-input.requested", "user-input.resolved", "provider.user-input.respond.failed" -> "userInput"
+            else -> null
+        }
+        if (requestId == null || interactionKind == null) return detail.copy(activities = activities)
+
+        val pending = detail.pendingInteractions.toMutableList()
+        val matches = { interaction: PendingInteraction ->
+            interaction.kind == interactionKind &&
+                interaction.requestId == requestId &&
+                (lifecycleGeneration == null || interaction.lifecycleGeneration == lifecycleGeneration)
+        }
+        when (activity.kind) {
+            "approval.resolved", "user-input.resolved" -> pending.removeAll(matches)
+            "provider.approval.respond.failed", "provider.user-input.respond.failed" -> {
+                val status = if (payload.stringOrNull("settlementStatus") == "retryable") "retryable" else "uncertain"
+                pending.replaceAll { interaction -> if (matches(interaction)) interaction.copy(status = status) else interaction }
+            }
+            else -> {
+                val existingIndex = pending.indexOfFirst { it.kind == interactionKind && it.requestId == requestId }
+                val existing = pending.getOrNull(existingIndex)
+                val preservesSettlingState = existing != null &&
+                    existing.lifecycleGeneration == lifecycleGeneration &&
+                    existing.status in setOf("responding", "confirmed", "uncertain")
+                if (!preservesSettlingState) {
+                    val next = PendingInteraction(interactionKind, requestId, lifecycleGeneration, "pending", null)
+                    if (existingIndex >= 0) pending[existingIndex] = next else pending += next
+                }
+            }
+        }
+        return detail.copy(activities = activities, pendingInteractions = pending)
+    }
+
+    private fun updateInteractionStatus(
+        detail: ThreadDetail,
+        payload: JSONObject,
+        kind: String,
+        status: String,
+    ): ThreadDetail {
+        val requestId = payload.stringOrNull("requestId") ?: return detail
+        val lifecycleGeneration = payload.stringOrNull("lifecycleGeneration")
+        return detail.copy(
+            pendingInteractions = detail.pendingInteractions.map { interaction ->
+                if (interaction.kind == kind && interaction.requestId == requestId &&
+                    (lifecycleGeneration == null || interaction.lifecycleGeneration == lifecycleGeneration)
+                ) {
+                    interaction.copy(
+                        status = status,
+                        decision = payload.stringOrNull("decision") ?: interaction.decision,
+                    )
+                } else interaction
+            },
+        )
+    }
+
+    private fun markInteractionStatus(interaction: PendingInteraction, status: String) {
+        update { state ->
+            state.copy(
+                detail = state.detail?.copy(
+                    pendingInteractions = state.detail.pendingInteractions.map { current ->
+                        if (current.kind == interaction.kind && current.requestId == interaction.requestId) {
+                            current.copy(status = status)
+                        } else current
+                    },
+                ),
+            )
+        }
+    }
+
+    private fun applyMessageEvent(detail: ThreadDetail, payload: JSONObject): ThreadDetail {
+        val incoming = MessageItem.fromJson(payload)
+        val existingIndex = detail.messages.indexOfFirst { it.id == incoming.id }
+        val messages = detail.messages.toMutableList()
+        if (existingIndex < 0) {
+            messages += incoming
+        } else {
+            val existing = messages[existingIndex]
+            messages[existingIndex] = if (incoming.streaming) {
+                existing.copy(
+                    text = existing.text + incoming.text,
+                    streaming = true,
+                    turnId = incoming.turnId ?: existing.turnId,
+                    createdAt = incoming.createdAt.ifBlank { existing.createdAt },
+                )
+            } else {
+                incoming.copy(text = incoming.text.ifBlank { existing.text })
+            }
+        }
+        return detail.copy(messages = messages)
+    }
+
+    private fun stopActiveThreadStream() {
+        activeThreadStream?.let(repository::stopStream)
+        activeThreadStream = null
+    }
+
+    private fun update(transform: (SynaraUiState) -> SynaraUiState) {
+        _ui.value = transform(_ui.value)
+    }
+
+    private fun readableError(error: Throwable): String = when (error) {
+        is AuthRequiredException -> error.message ?: "Pair this phone with Synara again."
+        is java.util.concurrent.TimeoutException -> "The server took too long to respond."
+        else -> error.message?.takeIf { it.isNotBlank() } ?: "Something went wrong."
+    }
+
+    companion object {
+        fun factory(repository: SynaraRepository): ViewModelProvider.Factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                    SynaraViewModel(repository) as T
+            }
+    }
+}
