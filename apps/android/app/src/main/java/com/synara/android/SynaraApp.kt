@@ -27,6 +27,7 @@ import com.synara.android.ui.screens.AutomationsScreen
 import com.synara.android.ui.screens.CatalogueScreen
 import com.synara.android.ui.screens.ChatScreen
 import com.synara.android.ui.screens.KanbanScreen
+import com.synara.android.ui.screens.PullRequestScreen
 import com.synara.android.ui.screens.DiffScreen
 import com.synara.android.ui.screens.SettingsScreen
 import com.synara.android.ui.screens.SourceControlScreen
@@ -71,6 +72,7 @@ fun SynaraApp(viewModel: SynaraViewModel) {
                         AppScreen.TERMINAL -> TerminalScreen(state, viewModel)
                         AppScreen.KANBAN -> KanbanScreen(state, viewModel)
                         AppScreen.CATALOGUE -> CatalogueScreen(state, viewModel)
+                        AppScreen.PULL_REQUEST -> PullRequestScreen(state, viewModel)
                     }
                 }
             }

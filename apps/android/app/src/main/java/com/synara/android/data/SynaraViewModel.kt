@@ -21,7 +21,14 @@ enum class AppScreen {
     TERMINAL,
     KANBAN,
     CATALOGUE,
+    PULL_REQUEST,
 }
+
+data class PullRequestState(
+    val snapshot: PullRequestSnapshot? = null,
+    val isLoading: Boolean = false,
+    val error: String? = null,
+)
 
 data class CatalogueState(
     val catalogue: ProviderCatalogue? = null,
@@ -120,6 +127,7 @@ data class SynaraUiState(
     val automations: AutomationsState = AutomationsState(),
     val terminal: TerminalState = TerminalState(),
     val catalogue: CatalogueState = CatalogueState(),
+    val pullRequest: PullRequestState = PullRequestState(),
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -549,6 +557,48 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
                     it.copy(diff = it.diff.copy(isLoading = false, error = readableError(error)))
                 }
             }
+        }
+    }
+
+    // ── Pull request ─────────────────────────────────────────────────────────────────────────
+
+    fun openPullRequest() {
+        val cwd = _ui.value.git.cwd
+        val number = _ui.value.git.status?.pullRequest?.number
+        if (cwd == null || number == null) return
+        update {
+            it.copy(screen = AppScreen.PULL_REQUEST, pullRequest = PullRequestState(isLoading = true))
+        }
+        refreshPullRequest()
+    }
+
+    fun closePullRequest() {
+        update { it.copy(screen = AppScreen.SOURCE_CONTROL, pullRequest = PullRequestState()) }
+    }
+
+    fun refreshPullRequest() {
+        val cwd = _ui.value.git.cwd ?: return
+        val number = _ui.value.git.status?.pullRequest?.number ?: return
+        update { it.copy(pullRequest = it.pullRequest.copy(isLoading = true, error = null)) }
+        viewModelScope.launch {
+            runCatching { repository.pullRequestSnapshot(cwd, number.toString()) }
+                .onSuccess { snapshot ->
+                    update {
+                        it.copy(
+                            pullRequest = it.pullRequest.copy(snapshot = snapshot, isLoading = false),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    update {
+                        it.copy(
+                            pullRequest = it.pullRequest.copy(
+                                isLoading = false,
+                                error = readableError(error),
+                            ),
+                        )
+                    }
+                }
         }
     }
 
