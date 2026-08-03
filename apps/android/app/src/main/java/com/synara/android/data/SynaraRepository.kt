@@ -170,10 +170,51 @@ class SynaraRepository(context: Context) {
         sendFrame(JSONObject().put("_tag", "Interrupt").put("requestId", requestId))
     }
 
+    /**
+     * Uploads attachment bytes and returns the descriptor the turn command references.
+     *
+     * Bytes go over HTTP rather than the WebSocket: the RPC frame carries only metadata (id, name,
+     * mime type, size), and pushing a multi-megabyte image through the same socket that streams
+     * assistant tokens would stall the transcript behind it.
+     */
+    suspend fun uploadAttachment(
+        threadId: String,
+        name: String,
+        mimeType: String,
+        bytes: ByteArray,
+    ): JSONObject = withContext(Dispatchers.IO) {
+        val base = baseUrl ?: throw IOException("Not connected to Synara.")
+        val token = sessionToken ?: throw AuthRequiredException("Pair this phone with Synara again.")
+        val type = if (mimeType.startsWith("image/", ignoreCase = true)) "image" else "file"
+        val url = base.newBuilder()
+            .encodedPath("/api/attachments/upload")
+            .addQueryParameter("type", type)
+            .addQueryParameter("threadId", threadId)
+            .addQueryParameter("name", name)
+            .addQueryParameter("mimeType", mimeType)
+            .build()
+        val response = executeRequest(
+            Request.Builder()
+                .url(url)
+                .post(bytes.toRequestBody(mimeType.toMediaType()))
+                .header("Authorization", "Bearer $token")
+                .build(),
+        ).body
+        // The server assigns the id; everything else is echoed back so the descriptor the turn
+        // references is the server's, not the phone's guess at it.
+        JSONObject()
+            .put("type", response.stringOrNull("type") ?: type)
+            .put("id", response.stringOrNull("id") ?: response.stringOrNull("attachmentId").orEmpty())
+            .put("name", response.stringOrNull("name") ?: name)
+            .put("mimeType", response.stringOrNull("mimeType") ?: mimeType)
+            .put("sizeBytes", if (response.has("sizeBytes")) response.optInt("sizeBytes") else bytes.size)
+    }
+
     suspend fun sendMessage(
         thread: ThreadItem,
         text: String,
         messageId: String,
+        attachments: List<JSONObject> = emptyList(),
     ) {
         dispatch("thread.turn.start") {
             put("threadId", thread.id)
@@ -183,7 +224,7 @@ class SynaraRepository(context: Context) {
                     .put("messageId", messageId)
                     .put("role", "user")
                     .put("text", text)
-                    .put("attachments", JSONArray()),
+                    .put("attachments", JSONArray(attachments)),
             )
             put("runtimeMode", thread.runtimeMode)
             put("interactionMode", thread.interactionMode)

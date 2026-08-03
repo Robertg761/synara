@@ -1,5 +1,14 @@
 package com.synara.android.ui.screens
 
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.outlined.AttachFile
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Image
+import androidx.compose.ui.platform.LocalContext
+import com.synara.android.data.PendingAttachment
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyRow
@@ -210,6 +219,9 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                 draft = draft,
                 onDraftChange = { draft = it },
                 catalogue = state.catalogue.catalogue,
+                attachments = state.pendingAttachments,
+                onAttach = { name, mime, bytes -> viewModel.attachFile(name, mime, bytes) },
+                onRemoveAttachment = viewModel::removeAttachment,
                 interactionMode = thread?.interactionMode,
                 onToggleInteractionMode = {
                     thread?.let {
@@ -811,6 +823,9 @@ private fun Composer(
     draft: TextFieldValue,
     onDraftChange: (TextFieldValue) -> Unit,
     catalogue: ProviderCatalogue?,
+    attachments: List<PendingAttachment>,
+    onAttach: (String, String, ByteArray) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
     interactionMode: String?,
     onToggleInteractionMode: () -> Unit,
     onSend: () -> Unit,
@@ -842,6 +857,13 @@ private fun Composer(
                 }
             }
         }
+        AnimatedVisibility(
+            visible = attachments.isNotEmpty(),
+            enter = disclosureEnter(),
+            exit = disclosureExit(),
+        ) {
+            AttachmentRow(attachments, onRemoveAttachment)
+        }
         PlanModeToggle(interactionMode, enabled, onToggleInteractionMode)
         Row(
             Modifier
@@ -853,6 +875,7 @@ private fun Composer(
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm),
         ) {
+            AttachButton(enabled = enabled && !isSending, onAttach = onAttach)
             OutlinedTextField(
                 value = draft,
                 onValueChange = onDraftChange,
@@ -870,7 +893,8 @@ private fun Composer(
                 colors = synaraTextFieldColors(),
             )
 
-            val canSend = enabled && draft.text.isNotBlank() && !isSending
+            // A turn may carry attachments with no text, so send stays live when either is present.
+            val canSend = enabled && (draft.text.isNotBlank() || attachments.isNotEmpty()) && !isSending
             if (isRunning) {
                 ComposerAction(
                     onClick = onStop,
@@ -989,6 +1013,111 @@ private fun PlanModeToggle(interactionMode: String?, enabled: Boolean, onToggle:
             )
         }
     }
+}
+
+/**
+ * Opens the system picker and hands the bytes up.
+ *
+ * `OpenDocument` rather than a photo-only picker: agents are asked to look at logs, patches and
+ * configs at least as often as screenshots, and the contract accepts any mime type as a file
+ * attachment.
+ */
+@Composable
+private fun AttachButton(enabled: Boolean, onAttach: (String, String, ByteArray) -> Unit) {
+    val context = LocalContext.current
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val resolver = context.contentResolver
+        val mimeType = resolver.getType(uri) ?: "application/octet-stream"
+        val name = resolver.query(uri, null, null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+        } ?: uri.lastPathSegment ?: "attachment"
+        // Read on the caller's side so a permission or provider failure surfaces here rather than
+        // as an opaque upload error later.
+        runCatching { resolver.openInputStream(uri)?.use { it.readBytes() } }
+            .getOrNull()
+            ?.let { onAttach(name, mimeType, it) }
+    }
+
+    IconButton(
+        onClick = { picker.launch(arrayOf("*/*")) },
+        enabled = enabled,
+        modifier = Modifier.padding(bottom = 4.dp).size(44.dp),
+    ) {
+        Icon(
+            Icons.Outlined.AttachFile,
+            contentDescription = "Attach a file",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(20.dp),
+        )
+    }
+}
+
+/** Staged attachments, removable before send. */
+@Composable
+private fun AttachmentRow(
+    attachments: List<PendingAttachment>,
+    onRemove: (String) -> Unit,
+) {
+    LazyRow(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = SynaraTheme.spacing.md, vertical = SynaraTheme.spacing.xs),
+        horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
+    ) {
+        items(attachments, key = { it.id }) { attachment ->
+            val shape = MaterialTheme.shapes.small
+            Row(
+                Modifier
+                    .widthIn(max = 220.dp)
+                    .clip(shape)
+                    .background(SynaraTheme.accents.mutedSurface, shape)
+                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+                    .padding(start = SynaraTheme.spacing.sm),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Icon(
+                    if (attachment.isImage) Icons.Outlined.Image else Icons.Outlined.Description,
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Column(Modifier.weight(1f, fill = false)) {
+                    Text(
+                        attachment.name,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        formatBytes(attachment.sizeBytes),
+                        style = SynaraTheme.textStyles.monoSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
+                }
+                IconButton(
+                    onClick = { onRemove(attachment.id) },
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.Close,
+                        contentDescription = "Remove ${attachment.name}",
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun formatBytes(bytes: Int): String = when {
+    bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
+    bytes >= 1_024 -> "${bytes / 1_024} KB"
+    else -> "$bytes B"
 }
 
 @Composable

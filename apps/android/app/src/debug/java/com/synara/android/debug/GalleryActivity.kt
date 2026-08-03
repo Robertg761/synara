@@ -52,6 +52,7 @@ import com.synara.android.data.DiffState
 import com.synara.android.data.parseUnifiedDiff
 import com.synara.android.data.MessageItem
 import com.synara.android.data.ModelOption
+import com.synara.android.data.PendingAttachment
 import com.synara.android.data.PendingInteraction
 import com.synara.android.data.ProjectItem
 import com.synara.android.data.SynaraRepository
@@ -124,6 +125,7 @@ class GalleryActivity : ComponentActivity() {
                         "dialog-project" -> WorkspaceScreen(Fixtures.createProjectOpen(), vm)
                         "chat" -> ChatScreen(Fixtures.chat(), vm)
                         "chat-plan" -> ChatScreen(Fixtures.chatPlanMode(), vm)
+                        "chat-attachments" -> ChatScreen(Fixtures.chatAttachments(), vm)
                         "chat-approval" -> ChatScreen(Fixtures.chatApproval(), vm)
                         "chat-question" -> ChatScreen(Fixtures.chatQuestion(), vm)
                         "chat-empty" -> ChatScreen(Fixtures.chatEmpty(), vm)
@@ -360,6 +362,13 @@ private object Fixtures {
             catalogue = catalogue().catalogue,
         )
     }
+
+    fun chatAttachments(): SynaraUiState = chat().copy(
+        pendingAttachments = listOf(
+            PendingAttachment("a1", "screenshot-frame-drop.png", "image/png", 428_133, JSONObject()),
+            PendingAttachment("a2", "vitest-failure.log", "text/plain", 8_214, JSONObject()),
+        ),
+    )
 
     fun chatApproval(): SynaraUiState {
         val t = thread("t-approve", "Migrate the pairing flow off bearer tokens", approvals = true)

@@ -24,6 +24,17 @@ enum class AppScreen {
     PULL_REQUEST,
 }
 
+/** An attachment already uploaded and waiting to be referenced by the next turn. */
+data class PendingAttachment(
+    val id: String,
+    val name: String,
+    val mimeType: String,
+    val sizeBytes: Int,
+    val descriptor: JSONObject,
+) {
+    val isImage: Boolean get() = mimeType.startsWith("image/", ignoreCase = true)
+}
+
 data class ServerSettingsState(
     val settings: ServerSettings? = null,
     val statuses: List<ProviderStatus> = emptyList(),
@@ -146,6 +157,8 @@ data class SynaraUiState(
     val studioOutputs: List<StudioOutput>? = null,
     val studioOpen: Boolean = false,
     val serverSettings: ServerSettingsState = ServerSettingsState(),
+    /** Attachments staged for the next turn, in the order they were added. */
+    val pendingAttachments: List<PendingAttachment> = emptyList(),
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -378,11 +391,44 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         }
     }
 
+    /**
+     * Uploads bytes immediately rather than at send time. A large image uploaded during send would
+     * leave the composer frozen with no way to tell whether anything was happening, and a failure
+     * would arrive after the message was already gone from the input.
+     */
+    fun attachFile(name: String, mimeType: String, bytes: ByteArray) {
+        val threadId = _ui.value.selectedThreadId ?: return
+        viewModelScope.launch {
+            runCatching { repository.uploadAttachment(threadId, name, mimeType, bytes) }
+                .onSuccess { descriptor ->
+                    update {
+                        it.copy(
+                            pendingAttachments = it.pendingAttachments + PendingAttachment(
+                                id = descriptor.optString("id"),
+                                name = descriptor.optString("name"),
+                                mimeType = descriptor.optString("mimeType"),
+                                sizeBytes = descriptor.optInt("sizeBytes"),
+                                descriptor = descriptor,
+                            ),
+                        )
+                    }
+                }
+                .onFailure { error -> update { it.copy(error = readableError(error)) } }
+        }
+    }
+
+    fun removeAttachment(id: String) {
+        update { it.copy(pendingAttachments = it.pendingAttachments.filterNot { a -> a.id == id }) }
+    }
+
     fun sendMessage(text: String) {
         val cleanText = text.trim()
         val detail = _ui.value.detail ?: return
         val thread = detail.thread
-        if (cleanText.isBlank() || _ui.value.isSending) return
+        val attachments = _ui.value.pendingAttachments
+        // The contract allows a turn with attachments and no text, so an empty draft is only a
+        // reason to stop when nothing is attached either.
+        if ((cleanText.isBlank() && attachments.isEmpty()) || _ui.value.isSending) return
         val messageId = UUID.randomUUID().toString()
         val optimistic = MessageItem(
             id = messageId,
@@ -396,11 +442,14 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
             it.copy(
                 isSending = true,
                 error = null,
+                pendingAttachments = emptyList(),
                 detail = detail.copy(messages = detail.messages + optimistic),
             )
         }
         viewModelScope.launch {
-            runCatching { repository.sendMessage(thread, cleanText, messageId) }
+            runCatching {
+                repository.sendMessage(thread, cleanText, messageId, attachments.map { it.descriptor })
+            }
                 .onSuccess { update { it.copy(isSending = false) } }
                 .onFailure { error ->
                     update { it.copy(isSending = false, error = readableError(error)) }
