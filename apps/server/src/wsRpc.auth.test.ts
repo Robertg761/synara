@@ -22,8 +22,9 @@ it.effect("rejects an unauthorized websocket upgrade on a non-loopback bind", ()
     );
 
     const error = yield* authenticateRpcWebSocketUpgrade({
-      config: { host: "0.0.0.0", authToken: "remote-secret", publicUrl: undefined },
+      config: { host: "0.0.0.0", authToken: "remote-secret", publicUrl: undefined, mode: "web" },
       legacyToken: null,
+      remoteAddress: "192.168.1.60",
       request: {
         headers: {},
         cookies: {},
@@ -49,8 +50,14 @@ it.effect("does not accept a legacy query token on a non-loopback bind", () =>
     );
 
     const error = yield* authenticateRpcWebSocketUpgrade({
-      config: { host: "192.168.1.50", authToken: "remote-secret", publicUrl: undefined },
+      config: {
+        host: "192.168.1.50",
+        authToken: "remote-secret",
+        publicUrl: undefined,
+        mode: "web",
+      },
       legacyToken: "remote-secret",
+      remoteAddress: "192.168.1.60",
       request: {
         headers: {},
         cookies: {},
@@ -75,8 +82,9 @@ it.effect("accepts an authenticated session on a non-loopback bind", () =>
     const authenticateWebSocketUpgrade = vi.fn(() => Effect.succeed(authenticatedSession));
 
     const session = yield* authenticateRpcWebSocketUpgrade({
-      config: { host: "0.0.0.0", authToken: "remote-secret", publicUrl: undefined },
+      config: { host: "0.0.0.0", authToken: "remote-secret", publicUrl: undefined, mode: "web" },
       legacyToken: "remote-secret",
+      remoteAddress: "192.168.1.60",
       request: {
         headers: {},
         cookies: { "synara-session": "paired-session-credential" },
@@ -97,8 +105,14 @@ it.effect("preserves the legacy query token for loopback desktop sessions", () =
     );
 
     const session = yield* authenticateRpcWebSocketUpgrade({
-      config: { host: "127.0.0.1", authToken: "desktop-secret", publicUrl: undefined },
+      config: {
+        host: "127.0.0.1",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        mode: "desktop",
+      },
       legacyToken: "desktop-secret",
+      remoteAddress: "127.0.0.1",
       request: {
         headers: {},
         cookies: {},
@@ -109,6 +123,85 @@ it.effect("preserves the legacy query token for loopback desktop sessions", () =
 
     assert.equal(session, null);
     assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 0);
+  }),
+);
+
+it.effect("accepts the legacy token from a loopback peer on a desktop wildcard bind", () =>
+  Effect.gen(function* () {
+    const authenticateWebSocketUpgrade = vi.fn(() =>
+      Effect.fail(new AuthError({ message: "Unexpected authentication call.", status: 500 })),
+    );
+
+    const session = yield* authenticateRpcWebSocketUpgrade({
+      config: {
+        host: "0.0.0.0",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        mode: "desktop",
+      },
+      legacyToken: "desktop-secret",
+      remoteAddress: "::ffff:127.0.0.1",
+      request: {
+        headers: {},
+        cookies: {},
+        url: new URL("http://127.0.0.1:3773/ws?token=desktop-secret"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    });
+
+    assert.equal(session, null);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 0);
+  }),
+);
+
+it.effect("requires session auth from a remote peer on a desktop wildcard bind", () =>
+  Effect.gen(function* () {
+    const authenticateWebSocketUpgrade = vi.fn(() =>
+      Effect.fail(new AuthError({ message: "Authentication required.", status: 401 })),
+    );
+
+    const error = yield* authenticateRpcWebSocketUpgrade({
+      config: {
+        host: "0.0.0.0",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        mode: "desktop",
+      },
+      legacyToken: "desktop-secret",
+      remoteAddress: "100.71.203.50",
+      request: {
+        headers: {},
+        cookies: {},
+        url: new URL("http://100.71.203.27:3773/ws?token=desktop-secret"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    }).pipe(Effect.flip);
+
+    assert.equal(error.status, 401);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 1);
+  }),
+);
+
+it.effect("does not extend the loopback-peer allowance to web mode wildcard binds", () =>
+  Effect.gen(function* () {
+    const authenticateWebSocketUpgrade = vi.fn(() =>
+      Effect.fail(new AuthError({ message: "Authentication required.", status: 401 })),
+    );
+
+    const error = yield* authenticateRpcWebSocketUpgrade({
+      config: { host: "0.0.0.0", authToken: "web-secret", publicUrl: undefined, mode: "web" },
+      legacyToken: "web-secret",
+      remoteAddress: "127.0.0.1",
+      request: {
+        headers: {},
+        cookies: {},
+        url: new URL("http://127.0.0.1:3773/ws?token=web-secret"),
+      },
+      serverAuth: { authenticateWebSocketUpgrade },
+    }).pipe(Effect.flip);
+
+    assert.equal(error.status, 401);
+    assert.equal(authenticateWebSocketUpgrade.mock.calls.length, 1);
   }),
 );
 
@@ -129,8 +222,10 @@ it.effect(
           host: "127.0.0.1",
           authToken: "proxy-secret",
           publicUrl: new URL("https://synara.example.test/"),
+          mode: "web",
         },
         legacyToken: "proxy-secret",
+        remoteAddress: "127.0.0.1",
         request: {
           headers: {},
           cookies: { "synara-session": "paired-session-credential" },

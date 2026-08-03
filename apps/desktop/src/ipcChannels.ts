@@ -28,6 +28,12 @@ export const DESKTOP_IPC_CHANNELS = {
   zoomFactorChanged: "desktop:zoom-factor-changed",
   wsUrl: "desktop:get-ws-url",
   transcribeVoice: "desktop:server-transcribe-voice",
+  remoteAccess: {
+    getState: "desktop:remote-access-get-state",
+    setEnabled: "desktop:remote-access-set-enabled",
+    state: "desktop:remote-access-state",
+    bootstrapCredential: "desktop:remote-access-bootstrap-credential",
+  },
   storageMigration: {
     read: "desktop:storage-migration-read",
     acknowledge: "desktop:storage-migration-acknowledge",

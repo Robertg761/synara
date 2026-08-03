@@ -58,22 +58,31 @@ export class StartupError extends Data.TaggedError("StartupError")<{
 }> {}
 
 const DESKTOP_SHUTDOWN_TOKEN_ENV_KEY = "SYNARA_DESKTOP_SHUTDOWN_TOKEN";
+const DESKTOP_BOOTSTRAP_CREDENTIAL_ENV_KEY = "SYNARA_DESKTOP_BOOTSTRAP_CREDENTIAL";
 
-function consumeDesktopShutdownTokenFromProcessEnvironment(): string | undefined {
+// Desktop-only secrets are removed from the environment once read so provider
+// and tool child processes never inherit them.
+function consumeSecretFromProcessEnvironment(envKey: string): string | undefined {
   const matchingKeys =
     process.platform === "win32"
-      ? Object.keys(process.env).filter(
-          (key) => key.toUpperCase() === DESKTOP_SHUTDOWN_TOKEN_ENV_KEY,
-        )
-      : [DESKTOP_SHUTDOWN_TOKEN_ENV_KEY];
-  let token: string | undefined;
+      ? Object.keys(process.env).filter((key) => key.toUpperCase() === envKey)
+      : [envKey];
+  let secret: string | undefined;
 
   for (const key of matchingKeys) {
-    token ??= process.env[key];
+    secret ??= process.env[key];
     delete process.env[key];
   }
 
-  return token;
+  return secret;
+}
+
+function consumeDesktopShutdownTokenFromProcessEnvironment(): string | undefined {
+  return consumeSecretFromProcessEnvironment(DESKTOP_SHUTDOWN_TOKEN_ENV_KEY);
+}
+
+function consumeDesktopBootstrapCredentialFromProcessEnvironment(): string | undefined {
+  return consumeSecretFromProcessEnvironment(DESKTOP_BOOTSTRAP_CREDENTIAL_ENV_KEY);
 }
 
 interface CliInput {
@@ -181,6 +190,9 @@ const ServerConfigLive = (input: CliInput) =>
       const liveProcessDesktopShutdownToken = yield* Effect.sync(
         consumeDesktopShutdownTokenFromProcessEnvironment,
       );
+      const liveProcessDesktopBootstrapCredential = yield* Effect.sync(
+        consumeDesktopBootstrapCredentialFromProcessEnvironment,
+      );
 
       const mode = Option.getOrElse(input.mode, () => env.mode);
 
@@ -225,6 +237,7 @@ const ServerConfigLive = (input: CliInput) =>
       const noBrowser = resolveBooleanConfig(input.noBrowser, env.noBrowser, mode === "desktop");
       const authToken = Option.getOrUndefined(input.authToken) ?? env.authToken;
       const desktopShutdownToken = env.desktopShutdownToken ?? liveProcessDesktopShutdownToken;
+      const desktopBootstrapCredential = liveProcessDesktopBootstrapCredential;
       const autoBootstrapProjectFromCwd = resolveBooleanConfig(
         input.autoBootstrapProjectFromCwd,
         env.autoBootstrapProjectFromCwd,
@@ -282,6 +295,7 @@ const ServerConfigLive = (input: CliInput) =>
         noBrowser,
         authToken,
         desktopShutdownToken,
+        desktopBootstrapCredential,
         autoBootstrapProjectFromCwd,
         logProviderEvents,
         logWebSocketEvents,
@@ -358,8 +372,11 @@ const makeServerProgram = (input: CliInput) =>
         ? `http://${formatHostForUrl(config.host)}:${config.port}`
         : localUrl;
     const pairingBaseUrl = config.publicUrl?.origin ?? bindUrl;
+    // Desktop mode manages pairing links from the app's Remote access settings
+    // instead: an auto-issued owner link would sit unclaimed in that list (and
+    // in the logs) on every launch.
     const startupPairingUrl =
-      config.publicUrl || !isLoopbackHost(config.host)
+      config.mode !== "desktop" && (config.publicUrl || !isLoopbackHost(config.host))
         ? yield* serverAuth.issueStartupPairingUrl(pairingBaseUrl).pipe(
             Effect.mapError(
               (cause) =>

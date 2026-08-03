@@ -19,7 +19,8 @@ export function resolveWsHttpUrl(rawPath: string): string {
       : typeof envWsUrl === "string" && envWsUrl.length > 0
         ? envWsUrl
         : null;
-  if (!wsCandidate) return new URL(rawPath, window.location.origin).toString();
+  const pageOrigin = window.location?.origin;
+  if (!wsCandidate) return pageOrigin ? new URL(rawPath, pageOrigin).toString() : rawPath;
   try {
     const wsUrl = new URL(wsCandidate);
     const protocol =
@@ -31,7 +32,7 @@ export function resolveWsHttpUrl(rawPath: string): string {
     }
     return httpUrl.toString();
   } catch {
-    return new URL(rawPath, window.location.origin).toString();
+    return pageOrigin ? new URL(rawPath, pageOrigin).toString() : rawPath;
   }
 }
 

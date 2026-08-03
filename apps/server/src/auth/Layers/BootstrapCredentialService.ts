@@ -2,6 +2,7 @@ import type { AuthPairingLink } from "@synara/contracts";
 import * as Crypto from "node:crypto";
 import { DateTime, Duration, Effect, Layer, Option, PubSub, Ref, Stream } from "effect";
 
+import { ServerConfig } from "../../config";
 import { AuthPairingLinkRepositoryLive } from "../../persistence/Layers/AuthPairingLinks";
 import { AuthPairingLinkRepository } from "../../persistence/Services/AuthPairingLinks";
 import {
@@ -18,6 +19,8 @@ interface StoredBootstrapGrant extends BootstrapGrant {
 }
 
 const DEFAULT_ONE_TIME_TOKEN_TTL = Duration.minutes(5);
+const DESKTOP_BOOTSTRAP_GRANT_TTL = Duration.days(30);
+export const DESKTOP_BOOTSTRAP_GRANT_SUBJECT = "desktop-app";
 const PAIRING_TOKEN_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const PAIRING_TOKEN_LENGTH = 12;
 
@@ -53,8 +56,29 @@ const toPairingLink = (row: {
 
 export const makeBootstrapCredentialService = Effect.gen(function* () {
   const pairingLinks = yield* AuthPairingLinkRepository;
+  const config = yield* ServerConfig;
   const seededGrantsRef = yield* Ref.make(new Map<string, StoredBootstrapGrant>());
   const changesPubSub = yield* PubSub.unbounded<BootstrapCredentialChange>();
+
+  // The desktop shell mints a per-launch credential so its own window can
+  // bootstrap an owner session when the server is remote-reachable. The grant
+  // is memory-only (never SQLite) and reusable within the launch: the renderer
+  // holds its bearer session in memory and re-bootstraps after reloads.
+  const desktopBootstrapCredential = config.desktopBootstrapCredential?.trim();
+  if (config.mode === "desktop" && desktopBootstrapCredential) {
+    const seededAt = yield* DateTime.now;
+    yield* Ref.update(seededGrantsRef, (current) => {
+      const next = new Map(current);
+      next.set(desktopBootstrapCredential, {
+        method: "desktop-bootstrap",
+        role: "owner",
+        subject: DESKTOP_BOOTSTRAP_GRANT_SUBJECT,
+        expiresAt: DateTime.addDuration(seededAt, DESKTOP_BOOTSTRAP_GRANT_TTL),
+        remainingUses: "unbounded",
+      });
+      return next;
+    });
+  }
 
   const emitUpsert = (pairingLink: AuthPairingLink) =>
     PubSub.publish(changesPubSub, {

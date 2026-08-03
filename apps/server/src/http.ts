@@ -39,7 +39,7 @@ import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnap
 import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegistry";
 import { threadArchiveChunks, threadArchiveFileName } from "./orchestration/exportThreadArchive";
 import type { ServerReadiness } from "./server/readiness";
-import { isLoopbackHost } from "./startupAccess";
+import { isLoopbackHost, isLoopbackPeerAddress } from "./startupAccess";
 import {
   attachmentPrincipalForSession,
   LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL,
@@ -310,8 +310,19 @@ function trustedMutationCorsHeaders(input: {
 export function isLegacyTokenAuthorized(input: {
   readonly config: ServerConfigShape;
   readonly url: URL;
+  readonly remoteAddress: string | null | undefined;
 }): boolean {
-  if (!isLoopbackHost(input.config.host) || input.config.publicUrl) {
+  if (input.config.publicUrl) {
+    return false;
+  }
+  // The static startup token only carries local trust: it authorizes requests
+  // when the deployment itself is loopback-only, or — for a desktop instance
+  // bound to 0.0.0.0 for remote access — when the requesting peer is loopback
+  // (the desktop app's own window). Remote peers must hold a real session.
+  const isLocalScope =
+    isLoopbackHost(input.config.host) ||
+    (input.config.mode === "desktop" && isLoopbackPeerAddress(input.remoteAddress));
+  if (!isLocalScope) {
     return false;
   }
   const legacyToken = input.url.searchParams.get("token");
@@ -404,183 +415,227 @@ const readEffectBinary = (
   );
 };
 
+// The desktop app's window calls these routes cross-origin (from synara://app)
+// with bearer sessions, so trusted app origins get real CORS: an OPTIONS
+// preflight allowing the Authorization header, and response headers on every
+// branch. Browser cookie flows stay same-origin and receive no CORS headers.
+function authCorsHeaders(input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly url: URL;
+  readonly config: ServerConfigShape;
+}): Record<string, string> | null {
+  const origin = normalizeCorsOrigin(input.request.headers.origin);
+  if (!origin) return {};
+  if (!isTrustedAppOrigin({ origin, requestOrigin: input.url.origin, config: input.config })) {
+    return null;
+  }
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    Vary: "Origin",
+  };
+}
+
+const authRouteResponse = Effect.gen(function* () {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const config = yield* ServerConfig;
+  const serverAuth = yield* ServerAuth;
+  const sessions = yield* SessionCredentialService;
+  const url = HttpServerRequest.toURL(request);
+  if (!url) return HttpServerResponse.text("Bad Request", { status: 400 });
+  const authRequest = makeEffectAuthRequest(request);
+
+  if (request.method === "GET" && url.pathname === "/api/auth/session") {
+    return HttpServerResponse.jsonUnsafe(yield* serverAuth.getSessionState(authRequest));
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/bootstrap") {
+    const payload = yield* readEffectJson(request, "Invalid bootstrap payload.").pipe(
+      Effect.flatMap(decodeBootstrapInput),
+      Effect.mapError((cause) => mapPayloadError("Invalid bootstrap payload.", cause)),
+    );
+    const result = yield* serverAuth.exchangeBootstrapCredential(payload.credential, {
+      ...deriveAuthClientMetadata({
+        headers: request.headers,
+        remoteAddress: request.remoteAddress ?? null,
+      }),
+    });
+    return HttpServerResponse.jsonUnsafe(result.response, {
+      headers: {
+        "Set-Cookie": encodeCookie({
+          name: sessions.cookieName,
+          value: result.sessionToken,
+          expiresAt: result.response.expiresAt,
+          secure: config.publicUrl !== undefined,
+        }),
+      },
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/bootstrap/bearer") {
+    const payload = yield* readEffectJson(request, "Invalid bootstrap payload.").pipe(
+      Effect.flatMap(decodeBootstrapInput),
+      Effect.mapError((cause) => mapPayloadError("Invalid bootstrap payload.", cause)),
+    );
+    return HttpServerResponse.jsonUnsafe(
+      yield* serverAuth.exchangeBootstrapCredentialForBearerSession(payload.credential, {
+        ...deriveAuthClientMetadata({
+          headers: request.headers,
+          remoteAddress: request.remoteAddress ?? null,
+        }),
+      }),
+    );
+  }
+
+  const authenticatedMutationSession = requireAuthenticatedMutationRequest;
+
+  if (request.method === "POST" && url.pathname === "/api/auth/ws-token") {
+    const session = yield* authenticatedMutationSession;
+    return HttpServerResponse.jsonUnsafe(yield* serverAuth.issueWebSocketToken(session));
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/pairing-token") {
+    const session = yield* authenticatedMutationSession;
+    if (session.role !== "owner")
+      return HttpServerResponse.jsonUnsafe(
+        { error: "Only owner sessions can create pairing credentials." },
+        { status: 403 },
+      );
+    const payload =
+      Number(request.headers["content-length"] ?? "0") > 0
+        ? yield* readEffectJson(request, "Invalid pairing credential payload.").pipe(
+            Effect.flatMap(decodeCreatePairingCredentialInput),
+            Effect.mapError((cause) =>
+              mapPayloadError("Invalid pairing credential payload.", cause),
+            ),
+          )
+        : {};
+    return HttpServerResponse.jsonUnsafe(yield* serverAuth.issuePairingCredential(payload));
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+    const session = yield* authenticatedMutationSession;
+    return HttpServerResponse.jsonUnsafe(
+      { revoked: yield* serverAuth.logoutSession(session.sessionId) },
+      {
+        headers: {
+          "Set-Cookie": encodeExpiredCookie({
+            name: sessions.cookieName,
+            secure: config.publicUrl !== undefined,
+          }),
+        },
+      },
+    );
+  }
+
+  const ownerSession = Effect.gen(function* () {
+    const session = yield* serverAuth.authenticateHttpRequest(authRequest);
+    if (session.role !== "owner") {
+      return yield* Effect.fail({
+        message: "Only owner sessions can manage network access.",
+        status: 403 as const,
+      });
+    }
+    return session;
+  });
+
+  const ownerMutationSession = Effect.gen(function* () {
+    const session = yield* authenticatedMutationSession;
+    if (session.role !== "owner") {
+      return yield* Effect.fail({
+        message: "Only owner sessions can manage network access.",
+        status: 403 as const,
+      });
+    }
+    return session;
+  });
+
+  if (request.method === "GET" && url.pathname === "/api/auth/pairing-links") {
+    yield* ownerSession;
+    return HttpServerResponse.jsonUnsafe(yield* serverAuth.listPairingLinks());
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/pairing-links/revoke") {
+    yield* ownerMutationSession;
+    const payload = yield* readEffectJson(request, "Invalid revoke pairing link payload.").pipe(
+      Effect.flatMap(decodeRevokePairingLinkInput),
+      Effect.mapError((cause) => mapPayloadError("Invalid revoke pairing link payload.", cause)),
+    );
+    return HttpServerResponse.jsonUnsafe({
+      revoked: yield* serverAuth.revokePairingLink(payload.id),
+    });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/auth/clients") {
+    const session = yield* ownerSession;
+    return HttpServerResponse.jsonUnsafe(yield* serverAuth.listClientSessions(session.sessionId));
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/clients/revoke") {
+    const session = yield* ownerMutationSession;
+    const payload = yield* readEffectJson(request, "Invalid revoke client payload.").pipe(
+      Effect.flatMap(decodeRevokeClientSessionInput),
+      Effect.mapError((cause) => mapPayloadError("Invalid revoke client payload.", cause)),
+    );
+    return HttpServerResponse.jsonUnsafe({
+      revoked: yield* serverAuth.revokeClientSession(session.sessionId, payload.sessionId),
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/clients/revoke-others") {
+    const session = yield* ownerMutationSession;
+    return HttpServerResponse.jsonUnsafe({
+      revokedCount: yield* serverAuth.revokeOtherClientSessions(session.sessionId),
+    });
+  }
+
+  return HttpServerResponse.text("Not Found", { status: 404 });
+}).pipe(
+  Effect.catch((error) =>
+    Effect.succeed(
+      HttpServerResponse.jsonUnsafe(
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : String((error as { message?: unknown }).message ?? error),
+        },
+        {
+          status:
+            typeof (error as { status?: unknown }).status === "number"
+              ? (error as { status: number }).status
+              : 500,
+        },
+      ),
+    ),
+  ),
+);
+
 export const authEffectRouteLayer = HttpRouter.add(
   "*",
   "/api/auth/*",
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const config = yield* ServerConfig;
-    const serverAuth = yield* ServerAuth;
-    const sessions = yield* SessionCredentialService;
     const url = HttpServerRequest.toURL(request);
     if (!url) return HttpServerResponse.text("Bad Request", { status: 400 });
-    const authRequest = makeEffectAuthRequest(request);
-
-    if (request.method === "GET" && url.pathname === "/api/auth/session") {
-      return HttpServerResponse.jsonUnsafe(yield* serverAuth.getSessionState(authRequest));
-    }
-
-    if (request.method === "POST" && url.pathname === "/api/auth/bootstrap") {
-      const payload = yield* readEffectJson(request, "Invalid bootstrap payload.").pipe(
-        Effect.flatMap(decodeBootstrapInput),
-        Effect.mapError((cause) => mapPayloadError("Invalid bootstrap payload.", cause)),
-      );
-      const result = yield* serverAuth.exchangeBootstrapCredential(payload.credential, {
-        ...deriveAuthClientMetadata({
-          headers: request.headers,
-          remoteAddress: request.remoteAddress ?? null,
-        }),
-      });
-      return HttpServerResponse.jsonUnsafe(result.response, {
-        headers: {
-          "Set-Cookie": encodeCookie({
-            name: sessions.cookieName,
-            value: result.sessionToken,
-            expiresAt: result.response.expiresAt,
-            secure: config.publicUrl !== undefined,
-          }),
-        },
-      });
-    }
-
-    if (request.method === "POST" && url.pathname === "/api/auth/bootstrap/bearer") {
-      const payload = yield* readEffectJson(request, "Invalid bootstrap payload.").pipe(
-        Effect.flatMap(decodeBootstrapInput),
-        Effect.mapError((cause) => mapPayloadError("Invalid bootstrap payload.", cause)),
-      );
+    const corsHeaders = authCorsHeaders({ request, url, config });
+    if (corsHeaders === null) {
       return HttpServerResponse.jsonUnsafe(
-        yield* serverAuth.exchangeBootstrapCredentialForBearerSession(payload.credential, {
-          ...deriveAuthClientMetadata({
-            headers: request.headers,
-            remoteAddress: request.remoteAddress ?? null,
-          }),
-        }),
+        { error: "Trusted request origin required." },
+        { status: 403 },
       );
     }
-
-    const authenticatedMutationSession = requireAuthenticatedMutationRequest;
-
-    if (request.method === "POST" && url.pathname === "/api/auth/ws-token") {
-      const session = yield* authenticatedMutationSession;
-      return HttpServerResponse.jsonUnsafe(yield* serverAuth.issueWebSocketToken(session));
+    if (request.method === "OPTIONS") {
+      return HttpServerResponse.empty({ status: 204, headers: corsHeaders });
     }
-
-    if (request.method === "POST" && url.pathname === "/api/auth/pairing-token") {
-      const session = yield* authenticatedMutationSession;
-      if (session.role !== "owner")
-        return HttpServerResponse.jsonUnsafe(
-          { error: "Only owner sessions can create pairing credentials." },
-          { status: 403 },
-        );
-      const payload =
-        Number(request.headers["content-length"] ?? "0") > 0
-          ? yield* readEffectJson(request, "Invalid pairing credential payload.").pipe(
-              Effect.flatMap(decodeCreatePairingCredentialInput),
-              Effect.mapError((cause) =>
-                mapPayloadError("Invalid pairing credential payload.", cause),
-              ),
-            )
-          : {};
-      return HttpServerResponse.jsonUnsafe(yield* serverAuth.issuePairingCredential(payload));
-    }
-
-    if (request.method === "POST" && url.pathname === "/api/auth/logout") {
-      const session = yield* authenticatedMutationSession;
-      return HttpServerResponse.jsonUnsafe(
-        { revoked: yield* serverAuth.logoutSession(session.sessionId) },
-        {
-          headers: {
-            "Set-Cookie": encodeExpiredCookie({
-              name: sessions.cookieName,
-              secure: config.publicUrl !== undefined,
-            }),
-          },
-        },
-      );
-    }
-
-    const ownerSession = Effect.gen(function* () {
-      const session = yield* serverAuth.authenticateHttpRequest(authRequest);
-      if (session.role !== "owner") {
-        return yield* Effect.fail({
-          message: "Only owner sessions can manage network access.",
-          status: 403 as const,
-        });
-      }
-      return session;
-    });
-
-    const ownerMutationSession = Effect.gen(function* () {
-      const session = yield* authenticatedMutationSession;
-      if (session.role !== "owner") {
-        return yield* Effect.fail({
-          message: "Only owner sessions can manage network access.",
-          status: 403 as const,
-        });
-      }
-      return session;
-    });
-
-    if (request.method === "GET" && url.pathname === "/api/auth/pairing-links") {
-      yield* ownerSession;
-      return HttpServerResponse.jsonUnsafe(yield* serverAuth.listPairingLinks());
-    }
-
-    if (request.method === "POST" && url.pathname === "/api/auth/pairing-links/revoke") {
-      yield* ownerMutationSession;
-      const payload = yield* readEffectJson(request, "Invalid revoke pairing link payload.").pipe(
-        Effect.flatMap(decodeRevokePairingLinkInput),
-        Effect.mapError((cause) => mapPayloadError("Invalid revoke pairing link payload.", cause)),
-      );
-      return HttpServerResponse.jsonUnsafe({
-        revoked: yield* serverAuth.revokePairingLink(payload.id),
-      });
-    }
-
-    if (request.method === "GET" && url.pathname === "/api/auth/clients") {
-      const session = yield* ownerSession;
-      return HttpServerResponse.jsonUnsafe(yield* serverAuth.listClientSessions(session.sessionId));
-    }
-
-    if (request.method === "POST" && url.pathname === "/api/auth/clients/revoke") {
-      const session = yield* ownerMutationSession;
-      const payload = yield* readEffectJson(request, "Invalid revoke client payload.").pipe(
-        Effect.flatMap(decodeRevokeClientSessionInput),
-        Effect.mapError((cause) => mapPayloadError("Invalid revoke client payload.", cause)),
-      );
-      return HttpServerResponse.jsonUnsafe({
-        revoked: yield* serverAuth.revokeClientSession(session.sessionId, payload.sessionId),
-      });
-    }
-
-    if (request.method === "POST" && url.pathname === "/api/auth/clients/revoke-others") {
-      const session = yield* ownerMutationSession;
-      return HttpServerResponse.jsonUnsafe({
-        revokedCount: yield* serverAuth.revokeOtherClientSessions(session.sessionId),
-      });
-    }
-
-    return HttpServerResponse.text("Not Found", { status: 404 });
-  }).pipe(
-    Effect.catch((error) =>
-      Effect.succeed(
-        HttpServerResponse.jsonUnsafe(
-          {
-            error:
-              error instanceof Error
-                ? error.message
-                : String((error as { message?: unknown }).message ?? error),
-          },
-          {
-            status:
-              typeof (error as { status?: unknown }).status === "number"
-                ? (error as { status: number }).status
-                : 500,
-          },
-        ),
-      ),
-    ),
-  ),
+    const response = yield* authRouteResponse;
+    return Object.keys(corsHeaders).length > 0
+      ? HttpServerResponse.setHeaders(response, corsHeaders)
+      : response;
+  }),
 );
 
 export const projectFaviconEffectRouteLayer = HttpRouter.add(
@@ -640,7 +695,7 @@ const siteFaviconEffectRouteLayer = HttpRouter.add(
     // same startup-token rule the local-image/attachments routes use so favicons
     // load in local dev without a session cookie.
     const config = yield* ServerConfig;
-    if (!isLegacyTokenAuthorized({ config, url })) {
+    if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
       yield* requireAuthenticatedRequest;
     }
 
@@ -686,7 +741,7 @@ const threadExportEffectRouteLayer = HttpRouter.add(
     if (!url) return HttpServerResponse.text("Bad Request", { status: 400 });
 
     const config = yield* ServerConfig;
-    if (!isLegacyTokenAuthorized({ config, url })) {
+    if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
       yield* requireAuthenticatedRequest;
     }
 
@@ -741,7 +796,7 @@ export const editorIconEffectRouteLayer = HttpRouter.add(
     if (!url) return HttpServerResponse.text("Bad Request", { status: 400 });
 
     const config = yield* ServerConfig;
-    if (!isLegacyTokenAuthorized({ config, url })) {
+    if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
       yield* requireAuthenticatedRequest;
     }
 
@@ -784,7 +839,7 @@ export const localImageEffectRouteLayer = HttpRouter.add(
     if (!url) return HttpServerResponse.text("Bad Request", { status: 400 });
 
     const config = yield* ServerConfig;
-    if (!isLegacyTokenAuthorized({ config, url })) {
+    if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
       yield* requireAuthenticatedRequest;
     }
 
@@ -845,7 +900,11 @@ const binaryUploadEffectHandler = Effect.gen(function* () {
   if (request.method !== "POST") {
     return HttpServerResponse.text("Method Not Allowed", { status: 405, headers: corsHeaders });
   }
-  const attachmentPrincipal = isLegacyTokenAuthorized({ config, url })
+  const attachmentPrincipal = isLegacyTokenAuthorized({
+    config,
+    url,
+    remoteAddress: request.remoteAddress,
+  })
     ? LOCAL_LOOPBACK_ATTACHMENT_PRINCIPAL
     : attachmentPrincipalForSession((yield* requireAuthenticatedMutationRequest).sessionId);
 
@@ -1039,7 +1098,7 @@ export const attachmentsEffectRouteLayer = HttpRouter.add(
     const config = yield* ServerConfig;
     // Desktop image tags cannot attach Authorization headers; preserve the same
     // startup token rule that the WebSocket route already accepts.
-    if (!isLegacyTokenAuthorized({ config, url })) {
+    if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
       yield* requireAuthenticatedRequest;
     }
 

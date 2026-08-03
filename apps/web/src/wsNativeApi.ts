@@ -49,6 +49,7 @@ import { VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH } from "@synara/shared/binaryTran
 
 import { showConfirmDialogFallback } from "./confirmDialogFallback";
 import { showContextMenuFallback } from "./contextMenuFallback";
+import { acquireDesktopBearerToken, invalidateDesktopBearerToken } from "./desktopAuthSession";
 import { requireHttpExternalUrl } from "./lib/externalUrl";
 import { WsTransport, type WsThreadStreamFailure } from "./wsTransport";
 import { emitWsCompatibilityIssue, emitWsTransportState } from "./wsTransportEvents";
@@ -206,16 +207,35 @@ async function requestAuthJson<T>(
   } = {},
 ): Promise<T> {
   const hasBody = options.body !== undefined;
-  const response = await fetch(path, {
-    method: options.method ?? "GET",
-    credentials: "same-origin",
-    ...(hasBody
-      ? {
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(options.body),
-        }
-      : {}),
-  });
+  // Resolved against the WS bridge host: the desktop window runs on a custom
+  // scheme where relative paths never reach the server. Browsers resolve to
+  // the page origin and keep authenticating with the session cookie; the
+  // desktop window attaches its owner bearer session instead.
+  const url = resolveWsHttpUrl(path);
+  const attempt = async (bearerToken: string | null) =>
+    fetch(url, {
+      method: options.method ?? "GET",
+      credentials: "same-origin",
+      ...(hasBody || bearerToken
+        ? {
+            headers: {
+              ...(hasBody ? { "Content-Type": "application/json" } : {}),
+              ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
+            },
+          }
+        : {}),
+      ...(hasBody ? { body: JSON.stringify(options.body) } : {}),
+    });
+
+  let bearerToken = await acquireDesktopBearerToken();
+  let response = await attempt(bearerToken);
+  if (response.status === 401 && bearerToken) {
+    // The bearer session was revoked or expired; re-bootstrap once from the
+    // desktop shell's launch credential.
+    invalidateDesktopBearerToken();
+    bearerToken = await acquireDesktopBearerToken();
+    response = await attempt(bearerToken);
+  }
   const payload = (await response.json().catch(() => null)) as unknown;
   if (!response.ok) {
     const message =
