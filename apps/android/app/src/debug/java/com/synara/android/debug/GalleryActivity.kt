@@ -1,0 +1,357 @@
+package com.synara.android.debug
+
+import android.graphics.Color
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.ui.Modifier
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.synara.android.data.ActivityItem
+import com.synara.android.data.AppScreen
+import com.synara.android.data.ConnectionState
+import com.synara.android.data.MessageItem
+import com.synara.android.data.ModelOption
+import com.synara.android.data.PendingInteraction
+import com.synara.android.data.ProjectItem
+import com.synara.android.data.SynaraRepository
+import com.synara.android.data.SynaraUiState
+import com.synara.android.data.SynaraViewModel
+import com.synara.android.data.ThreadDetail
+import com.synara.android.data.ThreadItem
+import com.synara.android.ui.screens.ChatScreen
+import com.synara.android.ui.screens.SettingsScreen
+import com.synara.android.ui.screens.SetupScreen
+import com.synara.android.ui.screens.WorkspaceScreen
+import com.synara.android.ui.theme.SynaraTheme
+import org.json.JSONArray
+import org.json.JSONObject
+import java.time.Instant
+import java.time.temporal.ChronoUnit
+
+/**
+ * Debug-only harness for looking at the UI.
+ *
+ * Every screen in this app renders from a `SynaraUiState` value, so each visual state — empty,
+ * loading, offline, streaming, approval-pending — can be rendered from a fixture without a paired
+ * server. That matters because the states worth checking are exactly the ones a live server will
+ * not reproduce on demand.
+ *
+ * Lives in `src/debug`, so it is absent from release builds. Drive it with:
+ *
+ *   adb shell am start -n com.synara.android/com.synara.android.debug.GalleryActivity \
+ *       -e scene workspace --ez dark true
+ */
+class GalleryActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT),
+        )
+        super.onCreate(savedInstanceState)
+        val scene = intent.getStringExtra("scene") ?: "workspace"
+        val forcedDark = if (intent.hasExtra("dark")) intent.getBooleanExtra("dark", true) else null
+
+        setContent {
+            SynaraTheme(darkTheme = forcedDark ?: isSystemInDarkTheme()) {
+                // A real view model supplies the callbacks; the rendered state is the fixture
+                // passed in below, never the view model's own.
+                val vm: SynaraViewModel = viewModel(
+                    factory = SynaraViewModel.factory(SynaraRepository(applicationContext)),
+                )
+                Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) {
+                    when (scene) {
+                        "setup" -> SetupScreen(Fixtures.setup(), { _, _ -> }, {})
+                        "setup-error" -> SetupScreen(Fixtures.setupError(), { _, _ -> }, {})
+                        "workspace" -> WorkspaceScreen(Fixtures.workspace(), vm)
+                        "workspace-empty" -> WorkspaceScreen(Fixtures.workspaceEmpty(), vm)
+                        "workspace-no-projects" -> WorkspaceScreen(Fixtures.workspaceNoProjects(), vm)
+                        "workspace-loading" -> WorkspaceScreen(Fixtures.workspaceLoading(), vm)
+                        "workspace-offline" -> WorkspaceScreen(Fixtures.workspaceOffline(), vm)
+                        "workspace-error" -> WorkspaceScreen(Fixtures.workspaceError(), vm)
+                        "dialog-thread" -> WorkspaceScreen(Fixtures.createThreadOpen(), vm)
+                        "thread-actions" -> WorkspaceScreen(Fixtures.threadActions(), vm)
+                        "project-actions" -> WorkspaceScreen(Fixtures.projectActions(), vm)
+                        "workspace-archived" -> WorkspaceScreen(Fixtures.workspaceArchived(), vm)
+                        "dialog-project" -> WorkspaceScreen(Fixtures.createProjectOpen(), vm)
+                        "chat" -> ChatScreen(Fixtures.chat(), vm)
+                        "chat-approval" -> ChatScreen(Fixtures.chatApproval(), vm)
+                        "chat-question" -> ChatScreen(Fixtures.chatQuestion(), vm)
+                        "chat-empty" -> ChatScreen(Fixtures.chatEmpty(), vm)
+                        "settings" -> SettingsScreen(Fixtures.settings(), vm)
+                        else -> WorkspaceScreen(Fixtures.workspace(), vm)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private object Fixtures {
+    private fun ago(amount: Long, unit: ChronoUnit): String =
+        Instant.now().minus(amount, unit).toString()
+
+    private val models = listOf(
+        ModelOption("gpt-5.6-sol", "GPT-5.6 Sol", "Fast, high-reasoning default"),
+        ModelOption("claude-opus-5", "Claude Opus 5", "Strongest taste for UI work", "claudeAgent"),
+        ModelOption("claude-sonnet-5", "Claude Sonnet 5", null, "claudeAgent"),
+        ModelOption("composer-1", "Composer", null, "cursor"),
+        ModelOption("grok-code", "Grok Code", null, "grok"),
+        ModelOption("droid-core", "Droid Core", null, "droid"),
+    )
+
+    private val projects = listOf(
+        ProjectItem("p1", "synara", "/home/me/projects/synara", isPinned = true, spaceId = null, threadCount = 3),
+        ProjectItem("p2", "orbit-api", "/home/me/projects/orbit-api", isPinned = false, spaceId = null, threadCount = 1),
+    )
+
+    private fun thread(
+        id: String,
+        title: String,
+        provider: String = "codex",
+        model: String = "gpt-5.6-sol",
+        projectId: String = "p1",
+        running: Boolean = false,
+        approvals: Boolean = false,
+        userInput: Boolean = false,
+        updatedAgo: Long = 5,
+        unit: ChronoUnit = ChronoUnit.MINUTES,
+    ) = ThreadItem(
+        id = id,
+        projectId = projectId,
+        title = title,
+        provider = provider,
+        model = model,
+        runtimeMode = "approval-required",
+        interactionMode = "default",
+        latestTurn = com.synara.android.data.LatestTurn("t1", if (running) "running" else "completed"),
+        sessionStatus = if (running) "running" else "idle",
+        activeTurnId = if (running) "t1" else null,
+        hasPendingApprovals = approvals,
+        hasPendingUserInput = userInput,
+        isPinned = false,
+        archivedAt = null,
+        updatedAt = ago(updatedAgo, unit),
+    )
+
+    private val threads = listOf(
+        thread("t-approve", "Migrate the pairing flow off bearer tokens", approvals = true, updatedAgo = 2),
+        thread(
+            "t-run",
+            "Rewrite the transcript virtualiser so long threads stop dropping frames",
+            provider = "claudeAgent",
+            model = "claude-opus-5",
+            running = true,
+            updatedAgo = 4,
+        ),
+        thread("t-1", "Fix the onboarding flow", updatedAgo = 42),
+        thread("t-2", "Audit websocket reconnect backoff", projectId = "p2", model = "claude-opus-5", updatedAgo = 3, unit = ChronoUnit.HOURS),
+        thread("t-3", "Bump the Compose BOM and retest the composer", updatedAgo = 2, unit = ChronoUnit.DAYS),
+    )
+
+    private fun base() = SynaraUiState(
+        screen = AppScreen.WORKSPACE,
+        connection = ConnectionState.CONNECTED,
+        serverUrl = "http://192.168.1.20:3773",
+        hasStoredSession = true,
+        projects = projects,
+        threads = threads,
+        models = models,
+    )
+
+    fun setup() = SynaraUiState(serverUrl = "http://192.168.1.20:3773", hasStoredSession = false)
+
+    fun setupError() = SynaraUiState(
+        serverUrl = "http://192.168.1.20:3773",
+        hasStoredSession = true,
+        setupError = "Synara rejected this pairing link. Generate a fresh one on your desktop.",
+    )
+
+    fun workspace() = base()
+
+    fun workspaceEmpty() = base().copy(threads = emptyList())
+
+    fun workspaceNoProjects() = base().copy(threads = emptyList(), projects = emptyList())
+
+    fun workspaceLoading() = base().copy(threads = emptyList(), isLoading = true)
+
+    fun workspaceOffline() = base().copy(connection = ConnectionState.DISCONNECTED)
+
+    fun workspaceError() = base().copy(
+        error = "The server took too long to respond.",
+    )
+
+    fun createThreadOpen() = base().copy(createThreadOpen = true, selectedProjectId = "p1")
+
+    fun threadActions() = base().copy(threadActionsFor = "t-run")
+
+    fun projectActions() = base().copy(projectActionsFor = "p1")
+
+    fun workspaceArchived() = base().copy(
+        showArchived = true,
+        threads = threads + thread("t-old", "Retire the legacy pairing endpoint", updatedAgo = 9, unit = ChronoUnit.DAYS)
+            .copy(archivedAt = ago(9, ChronoUnit.DAYS)),
+    )
+
+    fun createProjectOpen() = base().copy(createProjectOpen = true)
+
+    private val transcript = listOf(
+        MessageItem(
+            "m1",
+            "user",
+            "The thread list drops frames once a transcript passes a few hundred messages. Can you find the cause?",
+            false,
+            ago(9, ChronoUnit.MINUTES),
+            "t1",
+        ),
+        MessageItem(
+            "m2",
+            "assistant",
+            """
+            Found it. `TranscriptList` re-measures **every** row whenever a single message mutates,
+            because the item key is derived from the message *body* rather than its id.
+
+            Two changes:
+
+            1. Key rows by `message.id` so Compose can reuse slots.
+            2. Hoist `rememberMarkdown(text)` out of the row so a streamed token does not reparse
+               the entire transcript.
+
+            ```kotlin
+            items(messages, key = { it.id }) { message ->
+                MessageRow(message)
+            }
+            ```
+
+            The second one is the expensive half — parsing was running `O(n)` times per token.
+            """.trimIndent(),
+            false,
+            ago(8, ChronoUnit.MINUTES),
+            "t1",
+        ),
+        MessageItem("m3", "user", "Ship it behind the existing flag.", false, ago(3, ChronoUnit.MINUTES), "t2"),
+        MessageItem(
+            "m4",
+            "assistant",
+            "Patching `TranscriptList` now — keying rows by id first, then hoisting the parse.",
+            true,
+            ago(1, ChronoUnit.MINUTES),
+            "t2",
+        ),
+    )
+
+    private val activities = listOf(
+        ActivityItem("a1", "info", "turn.started", "Turn started on gpt-5.6-sol", ago(9, ChronoUnit.MINUTES), null),
+        ActivityItem("a2", "info", "tool.ran", "Read apps/web/src/components/TranscriptList.tsx", ago(8, ChronoUnit.MINUTES), null),
+        ActivityItem("a3", "approval", "approval.requested", "Approval requested: write 2 files", ago(4, ChronoUnit.MINUTES), null),
+        ActivityItem("a4", "error", "provider.error", "Provider stream reconnected after a dropped frame", ago(2, ChronoUnit.MINUTES), null),
+    )
+
+    private fun detail(
+        thread: ThreadItem,
+        messages: List<MessageItem> = transcript,
+        pending: List<PendingInteraction> = emptyList(),
+        extraActivities: List<ActivityItem> = emptyList(),
+        plan: String? = null,
+    ) = ThreadDetail(
+        thread = thread,
+        messages = messages,
+        activities = activities + extraActivities,
+        pendingInteractions = pending,
+        notes = null,
+        proposedPlan = plan,
+        sequence = 1,
+    )
+
+    fun chat(): SynaraUiState {
+        val t = thread("t-run", "Rewrite the transcript virtualiser", running = true)
+        return base().copy(
+            screen = AppScreen.CHAT,
+            selectedThreadId = t.id,
+            detail = detail(
+                t,
+                plan = "1. Key transcript rows by message id.\n" +
+                    "2. Hoist markdown parsing out of the row.\n" +
+                    "3. Add a frame-timing regression test.",
+            ),
+        )
+    }
+
+    fun chatApproval(): SynaraUiState {
+        val t = thread("t-approve", "Migrate the pairing flow off bearer tokens", approvals = true)
+        return base().copy(
+            screen = AppScreen.CHAT,
+            selectedThreadId = t.id,
+            detail = detail(
+                t,
+                messages = transcript.dropLast(1),
+                pending = listOf(PendingInteraction("approval", "req-1", "gen-1", "pending", null)),
+            ),
+        )
+    }
+
+    fun chatQuestion(): SynaraUiState {
+        val t = thread("t-ask", "Choose a persistence strategy", userInput = true)
+        val questions = JSONObject()
+            .put("requestId", "req-2")
+            .put(
+                "questions",
+                JSONArray().put(
+                    JSONObject()
+                        .put("id", "storage")
+                        .put("header", "Storage")
+                        .put("question", "Where should the paired session live?")
+                        .put("multiSelect", false)
+                        .put(
+                            "options",
+                            JSONArray()
+                                .put(
+                                    JSONObject()
+                                        .put("label", "Android Keystore")
+                                        .put("description", "Hardware-backed, wiped on uninstall."),
+                                )
+                                .put(
+                                    JSONObject()
+                                        .put("label", "Encrypted DataStore")
+                                        .put("description", "Portable across form factors, slower to read."),
+                                ),
+                        ),
+                ),
+            )
+        return base().copy(
+            screen = AppScreen.CHAT,
+            selectedThreadId = t.id,
+            detail = detail(
+                t,
+                messages = transcript.take(2),
+                pending = listOf(PendingInteraction("userInput", "req-2", "gen-1", "pending", null)),
+                extraActivities = listOf(
+                    ActivityItem(
+                        "a5",
+                        "approval",
+                        "user-input.requested",
+                        "The agent asked a question",
+                        ago(1, ChronoUnit.MINUTES),
+                        questions,
+                    ),
+                ),
+            ),
+        )
+    }
+
+    fun chatEmpty(): SynaraUiState {
+        val t = thread("t-new", "Investigate the flaky pairing test")
+        return base().copy(
+            screen = AppScreen.CHAT,
+            selectedThreadId = t.id,
+            detail = ThreadDetail(t, emptyList(), emptyList(), emptyList(), null, null, 1),
+        )
+    }
+
+    fun settings() = base().copy(screen = AppScreen.SETTINGS)
+}
