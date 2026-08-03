@@ -124,6 +124,7 @@ class GalleryActivity : ComponentActivity() {
                         "workspace-error" -> WorkspaceScreen(Fixtures.workspaceError(), vm)
                         "dialog-thread" -> WorkspaceScreen(Fixtures.createThreadOpen(), vm)
                         "thread-actions" -> WorkspaceScreen(Fixtures.threadActions(), vm)
+                        "thread-actions-chat" -> ChatScreen(Fixtures.chat().copy(threadActionsFor = "t-run"), vm)
                         "project-actions" -> WorkspaceScreen(Fixtures.projectActions(), vm)
                         "workspace-archived" -> WorkspaceScreen(Fixtures.workspaceArchived(), vm)
                         "dialog-project" -> WorkspaceScreen(Fixtures.createProjectOpen(), vm)

@@ -612,6 +612,61 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         repository.loadThread(threadId)
     }
 
+    // ── Thread history and branching ─────────────────────────────────────────────────────────
+
+    fun revertToCheckpoint(threadId: String, turnCount: Int, filesOnly: Boolean) = mutate {
+        repository.revertToCheckpoint(threadId, turnCount, filesOnly)
+        repository.loadThread(threadId)
+    }
+
+    fun rollbackConversation(threadId: String, messageId: String, numTurns: Int) = mutate {
+        repository.rollbackConversation(threadId, messageId, numTurns)
+        repository.loadThread(threadId)
+    }
+
+    fun editAndResend(messageId: String, text: String) {
+        val thread = _ui.value.detail?.thread ?: return
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        mutate {
+            repository.editAndResend(thread, messageId, clean)
+            repository.loadThread(thread.id)
+        }
+    }
+
+    fun stopSession(threadId: String) = mutate {
+        repository.stopSession(threadId)
+        repository.loadThread(threadId)
+    }
+
+    fun setMessagePinned(messageId: String, pinned: Boolean) {
+        val threadId = _ui.value.selectedThreadId ?: return
+        mutate {
+            if (pinned) repository.pinMessage(threadId, messageId) else repository.unpinMessage(threadId, messageId)
+            repository.loadThread(threadId)
+        }
+    }
+
+    /** Forks or hands off, then opens the new thread — the point of both is to continue there. */
+    fun branchThread(handoff: Boolean, title: String, model: ModelOption) {
+        val source = _ui.value.detail?.thread ?: _ui.value.selectedThread ?: return
+        val clean = title.trim().ifEmpty { source.title }
+        viewModelScope.launch {
+            runCatching {
+                if (handoff) {
+                    repository.handoffThread(source, clean, model)
+                } else {
+                    repository.forkThread(source, clean, model)
+                }
+            }
+                .onSuccess { threadId ->
+                    repository.refreshWorkspace()
+                    selectThread(threadId)
+                }
+                .onFailure { error -> update { it.copy(error = readableError(error)) } }
+        }
+    }
+
     // ── Project management ───────────────────────────────────────────────────────────────────
 
     fun renameProject(projectId: String, title: String) {
