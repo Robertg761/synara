@@ -80,10 +80,18 @@ import com.synara.android.ui.theme.SynaraTheme
 @Composable
 fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
     var selectedProject by rememberSaveable { mutableStateOf<String?>(null) }
+    var creatingSpace by rememberSaveable { mutableStateOf(false) }
 
-    val visible = remember(state.threads, selectedProject, state.showArchived) {
+    val spaceProjectIds = remember(state.projects, state.selectedSpaceId) {
+        state.projects
+            .filter { state.selectedSpaceId == null || it.spaceId == state.selectedSpaceId }
+            .map { it.id }
+            .toSet()
+    }
+    val visible = remember(state.threads, selectedProject, state.showArchived, spaceProjectIds) {
         state.threads
             .filter { if (state.showArchived) it.isArchived else !it.isArchived }
+            .filter { it.projectId in spaceProjectIds }
             .filter { selectedProject == null || it.projectId == selectedProject }
             .sortedWith(
                 compareByDescending<ThreadItem> { it.needsAttention }
@@ -95,6 +103,11 @@ fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
     val attention = remember(visible) { visible.filter { it.needsAttention } }
     val rest = remember(visible) { visible.filterNot { it.needsAttention } }
     val projectsById = remember(state.projects) { state.projects.associateBy(ProjectItem::id) }
+    // Projects outside the chosen space are hidden along with their threads, so a space acts as a
+    // real workspace boundary rather than only a label on the chip row.
+    val spaceProjects = remember(state.projects, spaceProjectIds) {
+        state.projects.filter { it.id in spaceProjectIds }
+    }
     val showSkeletons = state.isLoading && state.threads.isEmpty()
     val showEmptyState = !showSkeletons && visible.isEmpty()
 
@@ -125,7 +138,7 @@ fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                             )
                         }
                     }
-                    WorkspaceOverflowMenu(state, viewModel)
+                    WorkspaceOverflowMenu(state, viewModel) { creatingSpace = true }
                 },
             )
         },
@@ -169,10 +182,21 @@ fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                     }
                 }
 
-                if (state.projects.isNotEmpty()) {
+                if (state.spaces.isNotEmpty()) {
+                    item(key = "spaces") {
+                        SpaceFilters(
+                            spaces = state.spaces,
+                            selected = state.selectedSpaceId,
+                            onSelect = viewModel::selectSpace,
+                            onLongPress = { spaceId -> viewModel.openSpaceActions(spaceId) },
+                        )
+                    }
+                }
+
+                if (spaceProjects.isNotEmpty()) {
                     item(key = "filters") {
                         ProjectFilters(
-                            projects = state.projects,
+                            projects = spaceProjects,
                             selected = selectedProject,
                             onSelect = { selectedProject = it },
                             onLongPress = viewModel::openProjectActions,
@@ -262,6 +286,44 @@ fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
     if (state.createThreadOpen) CreateThreadDialog(state, viewModel)
     ThreadActionsSheet(state, viewModel)
     ProjectActionsSheet(state, viewModel)
+    SpaceActionsSheet(state, viewModel)
+    if (creatingSpace) {
+        CreateSpaceDialog(
+            onDismiss = { creatingSpace = false },
+            onCreate = viewModel::createSpace,
+        )
+    }
+}
+
+/**
+ * Space row. "All" is not a space — it is the absence of the filter, which also reveals projects
+ * that sit outside every space (the desktop calls that Void). Modelling it as a chip beside the
+ * real spaces keeps that reachable without inventing a fake space to hold it.
+ */
+@Composable
+private fun SpaceFilters(
+    spaces: List<com.synara.android.data.SpaceItem>,
+    selected: String?,
+    onSelect: (String?) -> Unit,
+    onLongPress: (String) -> Unit,
+) {
+    LazyRow(
+        modifier = Modifier.padding(top = SynaraTheme.spacing.sm),
+        contentPadding = PaddingValues(horizontal = SynaraTheme.spacing.screenGutter),
+        horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm),
+    ) {
+        item {
+            ProjectChip("All spaces", selected == null, onClick = { onSelect(null) })
+        }
+        items(spaces, key = { it.id }) { space ->
+            ProjectChip(
+                label = space.name,
+                selected = selected == space.id,
+                onClick = { onSelect(space.id) },
+                onLongClick = { onLongPress(space.id) },
+            )
+        }
+    }
 }
 
 /**
@@ -270,7 +332,11 @@ fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
  * the desktop but invisible on the phone.
  */
 @Composable
-private fun WorkspaceOverflowMenu(state: SynaraUiState, viewModel: SynaraViewModel) {
+private fun WorkspaceOverflowMenu(
+    state: SynaraUiState,
+    viewModel: SynaraViewModel,
+    onCreateSpace: () -> Unit,
+) {
     var expanded by remember { mutableStateOf(false) }
     val archivedCount = remember(state.threads) { state.threads.count { it.isArchived } }
     Box {
@@ -308,6 +374,20 @@ private fun WorkspaceOverflowMenu(state: SynaraUiState, viewModel: SynaraViewMod
                 onClick = {
                     viewModel.setShowArchived(!state.showArchived)
                     expanded = false
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("New space", style = MaterialTheme.typography.bodyMedium) },
+                leadingIcon = {
+                    Icon(
+                        Icons.Outlined.CreateNewFolder,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                },
+                onClick = {
+                    expanded = false
+                    onCreateSpace()
                 },
             )
             DropdownMenuItem(

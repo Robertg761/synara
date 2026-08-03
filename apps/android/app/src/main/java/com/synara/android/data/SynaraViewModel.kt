@@ -106,6 +106,9 @@ data class SynaraUiState(
     val hasStoredSession: Boolean = false,
     val projects: List<ProjectItem> = emptyList(),
     val threads: List<ThreadItem> = emptyList(),
+    val spaces: List<SpaceItem> = emptyList(),
+    /** Space filter; null means every project regardless of space. */
+    val selectedSpaceId: String? = null,
     val selectedProjectId: String? = null,
     val selectedThreadId: String? = null,
     val detail: ThreadDetail? = null,
@@ -121,6 +124,8 @@ data class SynaraUiState(
     val threadActionsFor: String? = null,
     /** Project whose action sheet is open, if any. */
     val projectActionsFor: String? = null,
+    /** Space whose action sheet is open, if any. */
+    val spaceActionsFor: String? = null,
     val showArchived: Boolean = false,
     val diff: DiffState = DiffState(),
     val git: SourceControlState = SourceControlState(),
@@ -128,6 +133,9 @@ data class SynaraUiState(
     val terminal: TerminalState = TerminalState(),
     val catalogue: CatalogueState = CatalogueState(),
     val pullRequest: PullRequestState = PullRequestState(),
+    /** Studio files the open thread produced; null until asked for. */
+    val studioOutputs: List<StudioOutput>? = null,
+    val studioOpen: Boolean = false,
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -215,6 +223,35 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
 
     fun openSettings() {
         update { it.copy(screen = AppScreen.SETTINGS) }
+    }
+
+    fun selectSpace(spaceId: String?) {
+        update { it.copy(selectedSpaceId = spaceId, selectedProjectId = null) }
+    }
+
+    fun createSpace(name: String) = mutate {
+        repository.createSpace(name.trim())
+        repository.refreshWorkspace()
+    }
+
+    fun renameSpace(spaceId: String, name: String) = mutate {
+        repository.renameSpace(spaceId, name.trim())
+        repository.refreshWorkspace()
+    }
+
+    fun deleteSpace(spaceId: String) = mutate {
+        repository.deleteSpace(spaceId)
+        update { it.copy(selectedSpaceId = it.selectedSpaceId?.takeIf { id -> id != spaceId }) }
+        repository.refreshWorkspace()
+    }
+
+    fun moveProjectToSpace(projectId: String, spaceId: String?) = mutate {
+        if (spaceId == null) {
+            repository.moveProjectToVoid(projectId)
+        } else {
+            repository.assignProjectsToSpace(spaceId, listOf(projectId))
+        }
+        repository.refreshWorkspace()
     }
 
     fun selectProject(projectId: String?) {
@@ -558,6 +595,28 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
                 }
             }
         }
+    }
+
+    // ── Studio ───────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Files the thread wrote into the Studio workspace. Loaded on demand rather than with the
+     * thread: it is a filesystem scan on the server, and most threads produce nothing.
+     */
+    fun openStudioOutputs() {
+        val threadId = _ui.value.selectedThreadId ?: return
+        update { it.copy(studioOpen = true) }
+        viewModelScope.launch {
+            runCatching { repository.listStudioOutputs(threadId) }
+                .onSuccess { entries -> update { it.copy(studioOutputs = entries) } }
+                .onFailure { error ->
+                    update { it.copy(studioOpen = false, error = readableError(error)) }
+                }
+        }
+    }
+
+    fun closeStudioOutputs() {
+        update { it.copy(studioOpen = false) }
     }
 
     // ── Pull request ─────────────────────────────────────────────────────────────────────────
@@ -1081,6 +1140,14 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         update { it.copy(projectActionsFor = projectId) }
     }
 
+    fun openSpaceActions(spaceId: String) {
+        update { it.copy(spaceActionsFor = spaceId) }
+    }
+
+    fun closeSpaceActions() {
+        update { it.copy(spaceActionsFor = null) }
+    }
+
     fun closeProjectActions() {
         update { it.copy(projectActionsFor = null) }
     }
@@ -1151,6 +1218,8 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
     private fun updateFromWorkspace(snapshot: WorkspaceSnapshot) {
         update { state ->
             state.copy(
+                spaces = snapshot.spaces,
+                selectedSpaceId = state.selectedSpaceId?.takeIf { id -> snapshot.spaces.any { it.id == id } },
                 projects = snapshot.projects,
                 threads = snapshot.threads,
                 selectedProjectId = state.selectedProjectId?.takeIf { id -> snapshot.projects.any { it.id == id } },
