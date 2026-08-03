@@ -283,11 +283,13 @@ describe("ServerAuthLive", () => {
           host: "0.0.0.0",
           authToken: "remote-startup-secret",
           publicUrl: undefined,
+          mode: "web",
         } as const;
 
         const legacyError = yield* authenticateRpcWebSocketUpgrade({
           config,
           legacyToken: "remote-startup-secret",
+          remoteAddress: "192.168.1.60",
           request: {
             headers: {},
             cookies: {},
@@ -307,6 +309,7 @@ describe("ServerAuthLive", () => {
         const upgraded = yield* authenticateRpcWebSocketUpgrade({
           config,
           legacyToken: "remote-startup-secret",
+          remoteAddress: "192.168.1.60",
           request: {
             ...makeCookieRequest(exchanged.sessionToken),
             url: new URL("ws://192.168.1.50:3773/ws?token=remote-startup-secret"),

@@ -90,9 +90,6 @@ describe("desktop shutdown authorization", () => {
 
   it.each([
     ["web mode", { mode: "web" as const }],
-    ["a wildcard IPv4 bind", { host: "0.0.0.0" }],
-    ["a wildcard IPv6 bind", { host: "::" }],
-    ["a non-loopback bind", { host: "192.168.1.50" }],
     ["a public URL", { publicUrl: new URL("https://synara.example.test/") }],
     ["a missing token", { desktopShutdownToken: undefined }],
     ["an empty token", { desktopShutdownToken: "   " }],
@@ -103,6 +100,33 @@ describe("desktop shutdown authorization", () => {
         authorizeDesktopShutdown({
           config: { ...desktopConfig, ...overrides },
           remoteAddress: "127.0.0.1",
+          authorization: `Bearer ${SHUTDOWN_TOKEN}`,
+        }),
+      ).toEqual({ authorized: false, reason: "unavailable", status: 404 });
+    },
+  );
+
+  // Desktop remote access binds 0.0.0.0 while the desktop app still stops its
+  // backend from the same machine — the loopback-peer check is what guards the
+  // route, not the listen host.
+  it.each([
+    ["a wildcard IPv4 bind", { host: "0.0.0.0" }],
+    ["a wildcard IPv6 bind", { host: "::" }],
+    ["a non-loopback bind", { host: "192.168.1.50" }],
+  ] satisfies ReadonlyArray<readonly [string, Partial<ShutdownConfig>]>)(
+    "keeps the endpoint available to loopback peers under %s",
+    (_label, overrides) => {
+      expect(
+        authorizeDesktopShutdown({
+          config: { ...desktopConfig, ...overrides },
+          remoteAddress: "127.0.0.1",
+          authorization: `Bearer ${SHUTDOWN_TOKEN}`,
+        }),
+      ).toEqual({ authorized: true });
+      expect(
+        authorizeDesktopShutdown({
+          config: { ...desktopConfig, ...overrides },
+          remoteAddress: "192.168.1.60",
           authorization: `Bearer ${SHUTDOWN_TOKEN}`,
         }),
       ).toEqual({ authorized: false, reason: "unavailable", status: 404 });

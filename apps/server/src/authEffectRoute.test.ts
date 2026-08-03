@@ -6,6 +6,7 @@ import path from "node:path";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { AuthSessionId } from "@synara/contracts";
+import { SYNARA_DESKTOP_ORIGIN } from "@synara/shared/desktopIdentity";
 import {
   ATTACHMENT_CANCEL_ROUTE_PATH,
   ATTACHMENT_UPLOAD_ROUTE_PATH,
@@ -185,6 +186,40 @@ function mutationRequest(input: {
 }
 
 describe("authEffectRouteLayer", () => {
+  it("serves CORS preflight and response headers to the trusted desktop origin", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "0.0.0.0", publicUrl: undefined, mode: "desktop" } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const preflight = await fetch(`${serverOrigin}/api/auth/bootstrap/bearer`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: SYNARA_DESKTOP_ORIGIN,
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "authorization, content-type",
+        },
+      });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-origin")).toBe(SYNARA_DESKTOP_ORIGIN);
+      expect(preflight.headers.get("access-control-allow-headers")).toContain("Authorization");
+      expect(sideEffects.count).toBe(0);
+
+      const bearerExchange = await fetch(`${serverOrigin}/api/auth/bootstrap/bearer`, {
+        method: "POST",
+        headers: { Origin: SYNARA_DESKTOP_ORIGIN, "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
+      });
+      expect(bearerExchange.status).toBe(200);
+      expect(bearerExchange.headers.get("access-control-allow-origin")).toBe(SYNARA_DESKTOP_ORIGIN);
+      expect(sideEffects.count).toBe(1);
+
+      const untrustedPreflight = await fetch(`${serverOrigin}/api/auth/bootstrap/bearer`, {
+        method: "OPTIONS",
+        headers: { Origin: "http://evil.example.test" },
+      });
+      expect(untrustedPreflight.status).toBe(403);
+    });
+  });
+
   it("rejects declared and chunked oversized bootstrap JSON before auth exchange", async () => {
     const sideEffects = { count: 0 };
     const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;

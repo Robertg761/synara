@@ -18,6 +18,7 @@ export const SETTINGS_SECTION_IDS = [
   "skills",
   "usage",
   "integrations",
+  "remote",
   "advanced",
 ] as const;
 
@@ -159,6 +160,14 @@ export const SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = [
     description: "Review and clean up isolated workspaces created by Synara.",
     icon: "branch-simple",
     eyebrow: "Workspace management",
+  },
+  {
+    id: "remote",
+    group: "system",
+    label: "Remote access",
+    description: "Open this Synara from your phone or another device on your network.",
+    icon: "wifi-full",
+    eyebrow: "Other devices",
   },
   {
     id: "advanced",
