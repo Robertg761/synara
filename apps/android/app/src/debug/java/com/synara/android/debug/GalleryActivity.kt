@@ -107,6 +107,7 @@ class GalleryActivity : ComponentActivity() {
                         "workspace-archived" -> WorkspaceScreen(Fixtures.workspaceArchived(), vm)
                         "dialog-project" -> WorkspaceScreen(Fixtures.createProjectOpen(), vm)
                         "chat" -> ChatScreen(Fixtures.chat(), vm)
+                        "chat-plan" -> ChatScreen(Fixtures.chatPlanMode(), vm)
                         "chat-approval" -> ChatScreen(Fixtures.chatApproval(), vm)
                         "chat-question" -> ChatScreen(Fixtures.chatQuestion(), vm)
                         "chat-empty" -> ChatScreen(Fixtures.chatEmpty(), vm)
@@ -322,6 +323,15 @@ private object Fixtures {
                     "2. Hoist markdown parsing out of the row.\n" +
                     "3. Add a frame-timing regression test.",
             ),
+        )
+    }
+
+    fun chatPlanMode(): SynaraUiState {
+        val base = chat()
+        val detail = base.detail!!
+        return base.copy(
+            detail = detail.copy(thread = detail.thread.copy(interactionMode = "plan")),
+            catalogue = catalogue().catalogue,
         )
     }
 
