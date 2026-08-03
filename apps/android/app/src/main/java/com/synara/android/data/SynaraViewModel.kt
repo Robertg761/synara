@@ -1308,10 +1308,11 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
     }
 
     override fun onCleared() {
+        // Streams this view model opened are released, but the connection itself is not: it is
+        // owned by the application and may still be serving the background watch service.
         stopActiveThreadStream()
         terminalStream?.let(repository::stopStream)
         activeShellStream?.let(repository::stopStream)
-        repository.disconnect()
         super.onCleared()
     }
 

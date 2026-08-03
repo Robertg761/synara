@@ -1,5 +1,13 @@
 package com.synara.android.ui.screens
 
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import com.synara.android.data.NotificationPreferences
+import com.synara.android.notifications.SynaraConnectionService
+import com.synara.android.notifications.SynaraNotifier
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -145,6 +153,8 @@ fun SettingsScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                         }
                     }
                 }
+
+                NotificationSection()
 
                 ServerSettingsSections(state, viewModel)
 
@@ -598,3 +608,63 @@ private fun settingSwitchColors() = SwitchDefaults.colors(
     uncheckedTrackColor = SynaraTheme.accents.mutedSurface,
     uncheckedBorderColor = MaterialTheme.colorScheme.outlineVariant,
 )
+
+/**
+ * The background watch.
+ *
+ * The server has no push infrastructure, so the only way the phone learns about a blocked agent
+ * while backgrounded is to hold the connection itself — which Android requires a foreground
+ * service and a persistent notice for. That cost is stated plainly rather than hidden, and the
+ * whole thing is off until asked for.
+ */
+@Composable
+private fun NotificationSection() {
+    val context = LocalContext.current
+    val preferences = remember { NotificationPreferences(context) }
+    var enabled by remember { mutableStateOf(preferences.backgroundWatchEnabled) }
+    var permissionDenied by remember { mutableStateOf(false) }
+
+    fun apply(on: Boolean) {
+        enabled = on
+        preferences.backgroundWatchEnabled = on
+        if (on) SynaraConnectionService.start(context) else SynaraConnectionService.stop(context)
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        // Starting the service without permission would run the socket and silently drop every
+        // notification, which is worse than not starting it.
+        if (granted) apply(true) else permissionDenied = true
+    }
+
+    SectionLabel("Notifications", Modifier.padding(top = SynaraTheme.spacing.md))
+    SynaraCard(padding = 0.dp, contentSpacing = 0.dp) {
+        SettingSwitch(
+            title = "Watch in the background",
+            body = "Stay connected while the app is closed and notify when an agent needs an " +
+                "approval, asks a question, or finishes. Shows a permanent notice, as Android requires.",
+            checked = enabled,
+            enabled = true,
+            onChange = { on ->
+                when {
+                    !on -> apply(false)
+                    SynaraNotifier.canPost(context) -> apply(true)
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ->
+                        permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+
+                    else -> apply(true)
+                }
+            },
+        )
+    }
+    if (permissionDenied) {
+        InlineNotice(
+            "Notifications are blocked for Synara. Turn them on in Android settings to use the " +
+                "background watch.",
+            icon = Icons.Outlined.Info,
+            contentColor = SynaraTheme.accents.warningForeground,
+            container = SynaraTheme.accents.warningSurface,
+        )
+    }
+}
