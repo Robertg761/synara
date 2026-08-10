@@ -193,6 +193,28 @@ describe("PhoneHomeScreen", () => {
     }
   });
 
+  it("adds no tab-bar clearance of its own", async () => {
+    if (!host) throw new Error("missing host");
+    const screen = await renderPhoneHome(host);
+
+    try {
+      const root = await vi.waitUntil(
+        () => document.querySelector<HTMLElement>('[data-testid="phone-home-screen"]'),
+        { timeout: 20_000, interval: 25 },
+      );
+      const scroller = root.firstElementChild;
+      expect(scroller).not.toBeNull();
+
+      // `PhoneAppShell` already pads the wrapper this screen mounts into with
+      // `PHONE_TAB_BAR_CONTENT_INSET_CLASS`. A second clearance here (this screen used to carry
+      // `pb-[calc(env(safe-area-inset-bottom)+4.5rem)]`) stacks with it and strands the last
+      // thread row ~72px above the bar, so the padding must stay the shell's job alone.
+      expect(getComputedStyle(scroller as HTMLElement).paddingBottom).toBe("0px");
+    } finally {
+      await screen.unmount();
+    }
+  });
+
   it("gives thread rows a comfortable touch target", async () => {
     if (!host) throw new Error("missing host");
     const screen = await renderPhoneHome(host);

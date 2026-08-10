@@ -2,7 +2,8 @@
 // Purpose: Bottom tab bar for the phone app shell — the root destinations (Home / Settings) plus
 //          the geometry token the shell uses to keep scrollable content clear of the fixed bar.
 // Layer: Phone layout component
-// Exports: PhoneTab, PhoneTabBar, PHONE_TAB_BAR_CONTENT_INSET_CLASS
+// Exports: PhoneTab, PhoneTabBar, PHONE_TAB_BAR_CONTENT_INSET_CLASS,
+//          PHONE_TAB_BAR_FLOATING_OFFSET_CLASS
 // Depends on: ~/lib/central-icons (Home glyph), ~/lib/icons (Settings glyph), ~/lib/utils
 
 import type { ComponentType, ReactElement } from "react";
@@ -26,9 +27,29 @@ const PHONE_TAB_BAR_ROW_HEIGHT_CLASS = "h-14";
 
 /**
  * Bottom padding a scrollable phone surface needs so the fixed tab bar never covers its last
- * row: the bar's own 3.5rem row plus the device's bottom inset (0px wherever there is none).
+ * row: the bar's own 3.5rem row plus the device's bottom inset (0px wherever there is none —
+ * that is the `pb-safe-b` the <nav> carries). The shell applies it ONCE, to the wrapper around
+ * every tab-bar-visible surface; a surface inside that wrapper must not add clearance of its own,
+ * or the two stack and strand its last row above the bar.
+ *
+ * This and {@link PHONE_TAB_BAR_FLOATING_OFFSET_CLASS} are the only places the bar's geometry is
+ * written down. Both are literal strings, for two separate reasons:
+ *  - Same reason as the row height above: Tailwind scans source text, so the calc cannot be
+ *    assembled from a shared template term without the utility vanishing from the stylesheet.
+ *  - The bottom inset is spelled `env(safe-area-inset-bottom)` rather than the design-system
+ *    `--spacing-safe-b` token because the safe-area tokens live in an `@theme inline` block (see
+ *    `index.css`): Tailwind inlines them into utilities like `pb-safe-b` and never emits a
+ *    `--spacing-safe-b` custom property, so `var(--spacing-safe-b)` inside an arbitrary value
+ *    would resolve to nothing and take the whole declaration down with it.
  */
 export const PHONE_TAB_BAR_CONTENT_INSET_CLASS = "pb-[calc(3.5rem+env(safe-area-inset-bottom))]";
+
+/**
+ * Bottom offset for a control that floats clear of the tab bar (the home screen's new-thread
+ * FAB): the bar's full height, as above, plus a 1rem gap.
+ */
+export const PHONE_TAB_BAR_FLOATING_OFFSET_CLASS =
+  "bottom-[calc(3.5rem+env(safe-area-inset-bottom)+1rem)]";
 
 interface PhoneTabDescriptor {
   readonly id: PhoneTab;

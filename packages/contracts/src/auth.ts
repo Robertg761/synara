@@ -66,6 +66,21 @@ export type AuthWebSocketTokenResult = typeof AuthWebSocketTokenResult.Type;
  */
 export const AUTH_WEBSOCKET_TOKEN_QUERY_PARAM = "wsToken";
 
+export const AuthMediaTokenResult = Schema.Struct({
+  token: TrimmedNonEmptyString,
+  expiresAt: Schema.DateTimeUtc,
+});
+export type AuthMediaTokenResult = typeof AuthMediaTokenResult.Type;
+
+/**
+ * Query param carrying the short-lived, read-only media credential. `<img>`, `<a download>` and
+ * the PDF viewer cannot attach an Authorization header, and off a shared origin (the mobile
+ * shell's WebView, the desktop app's custom scheme against a remote server) no session cookie
+ * rides along either — so the URL is the only channel. The credential it names authorizes the
+ * media GET routes and nothing else: never a mutation, never a session.
+ */
+export const AUTH_MEDIA_TOKEN_QUERY_PARAM = "mediaToken";
+
 export const AuthLogoutResult = Schema.Struct({
   revoked: Schema.Boolean,
 });

@@ -9,6 +9,7 @@
 
 import { type ImgHTMLAttributes, type MouseEvent, useState } from "react";
 
+import { useMediaAuthToken } from "~/hooks/useMediaAuthToken";
 import { downloadUrlAsBlob } from "~/lib/browserDownload";
 import { DownloadIcon, Loader2Icon, TriangleAlertIcon } from "~/lib/icons";
 import { buildLocalImageUrl, localImageFileName } from "~/lib/localImageUrls";
@@ -41,6 +42,11 @@ export function useLocalImagePreview(input: {
   onPreviewError?: (() => void) | undefined;
 }): LocalImagePreviewState {
   const { src, cwd, previewGrant } = input;
+  // On the mobile shell these URLs carry a media credential that may arrive after first render
+  // and rotates thereafter. Subscribing rebuilds the URL, and because the load state below is
+  // keyed by URL, a 401 recorded before the credential existed derives straight back to
+  // "loading" instead of latching the error card. A no-op on every other runtime.
+  useMediaAuthToken();
   const previewUrl = buildLocalImageUrl({ src, cwd: cwd ?? undefined, grant: previewGrant });
   const downloadUrl = buildLocalImageUrl({
     src,

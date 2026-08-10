@@ -4,7 +4,10 @@
 // auth routes) resolve through the one precedence chain below so they cannot disagree.
 // Layer: Web utility
 // Depends on: ../shellSession (mobile shell's paired server, hydrated before first use)
-// Exports: resolveServerWsBase, resolveWsHttpUrl, toAttachmentPreviewUrl
+// Exports: resolveServerWsBase, resolveWsHttpUrl
+// Note: this module is a leaf on purpose — the auth modules resolve their URLs through it, so it
+// must not reach back for a credential. Media URLs (which do carry one) are built in
+// ./mediaAssetUrls.
 
 import { getShellServerWsUrl } from "../shellSession";
 
@@ -55,11 +58,4 @@ export function resolveWsHttpUrl(rawPath: string): string {
   } catch {
     return pageOrigin ? new URL(rawPath, pageOrigin).toString() : rawPath;
   }
-}
-
-export function toAttachmentPreviewUrl(rawUrl: string): string {
-  if (rawUrl.startsWith("/")) {
-    return resolveWsHttpUrl(rawUrl);
-  }
-  return rawUrl;
 }

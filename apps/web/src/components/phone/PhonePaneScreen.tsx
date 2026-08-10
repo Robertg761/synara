@@ -3,7 +3,8 @@
 //          RightDock (a nested Sidebar that would become a Sheet under 768px) never mounts.
 // Layer: Phone layout component
 // Exports: PhonePaneScreen
-// Depends on: the host surface's dock pane renderer and the shared chat header row tokens.
+// Depends on: the host surface's dock pane renderer, the shared chat header row tokens, and the
+//             shared phone chrome tokens (./phoneChrome).
 
 import type { ReactNode } from "react";
 
@@ -13,9 +14,7 @@ import type { RightDockPane } from "~/rightDockStore.logic";
 import { cn } from "~/lib/utils";
 import { CHAT_SURFACE_HEADER_ROW_CLASS_NAME } from "../chat/chatHeaderControls";
 import { IconButton } from "../ui/icon-button";
-
-/** Comfortable phone hit target for the only control on this screen. */
-const PHONE_PANE_CLOSE_BUTTON_CLASS = "!size-11 rounded-xl [&_svg]:!size-5";
+import { PHONE_HEADER_ICON_BUTTON_CLASS } from "./phoneChrome";
 
 export function PhonePaneScreen(props: {
   pane: RightDockPane;
@@ -35,6 +34,9 @@ export function PhonePaneScreen(props: {
   return (
     // A pushed screen, not a modal: it is backed by a real history entry and has no
     // focus trap, so it stays a labelled region rather than claiming `role="dialog"`.
+    // What keeps that honest is the host: the chat surface it covers stays mounted, so the host
+    // marks it `inert` while this screen is up (see `SingleChatSurface`). Without that, Tab and
+    // screen-reader swipe walk straight into the composer nobody can see.
     <section
       data-phone-pane-screen
       data-pane-kind={props.pane.kind}
@@ -51,7 +53,7 @@ export function PhonePaneScreen(props: {
           label={`Close ${props.title}`}
           variant="ghost"
           size="icon"
-          className={PHONE_PANE_CLOSE_BUTTON_CLASS}
+          className={PHONE_HEADER_ICON_BUTTON_CLASS}
           onClick={props.onClose}
         >
           <XIcon />

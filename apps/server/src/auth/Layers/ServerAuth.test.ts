@@ -322,4 +322,125 @@ describe("ServerAuthLive", () => {
       }),
     );
   });
+
+  it("accepts a media credential on the media routes and nowhere else", async () => {
+    await runServerAuthTest(
+      Effect.gen(function* () {
+        const serverAuth = yield* ServerAuth;
+        const credential = yield* serverAuth.issuePairingCredential();
+        const exchanged = yield* serverAuth.exchangeBootstrapCredentialForBearerSession(
+          credential.credential,
+          requestMetadata,
+        );
+        const session = yield* serverAuth.authenticateHttpRequest({
+          headers: { authorization: `Bearer ${exchanged.sessionToken}` },
+          cookies: {},
+        });
+        const media = yield* serverAuth.issueMediaToken(session);
+        const mediaRequest: AuthRequest = {
+          headers: {},
+          cookies: {},
+          url: new URL(
+            `http://127.0.0.1:3773/api/project-favicon?cwd=%2Fsrc&mediaToken=${encodeURIComponent(media.token)}`,
+          ),
+        };
+
+        const authenticated = yield* serverAuth.authenticateMediaHttpRequest(mediaRequest);
+        expect(authenticated.sessionId).toBe(session.sessionId);
+        expect(authenticated.role).toBe("client");
+
+        // The same URL against the ordinary HTTP guard — the one every mutation and data route
+        // uses — is an unauthenticated request. That is the whole boundary this credential lives
+        // inside: it is replayable from anywhere it has ever been rendered.
+        expect(
+          (yield* Effect.flip(serverAuth.authenticateHttpRequest(mediaRequest)).pipe(Effect.orDie))
+            .status,
+        ).toBe(401);
+        expect(
+          (yield* Effect.flip(serverAuth.authenticateWebSocketUpgrade(mediaRequest)).pipe(
+            Effect.orDie,
+          )).status,
+        ).toBe(401);
+
+        // Thread export is the GET that matters most here: it is not a mutation, but it returns a
+        // whole transcript archive, so it runs on the session guard rather than the media one.
+        expect(
+          (yield* Effect.flip(
+            serverAuth.authenticateHttpRequest({
+              headers: {},
+              cookies: {},
+              url: new URL(
+                `http://127.0.0.1:3773/api/thread-export?threadId=t1&mediaToken=${encodeURIComponent(media.token)}`,
+              ),
+            }),
+          ).pipe(Effect.orDie)).status,
+        ).toBe(401);
+      }),
+    );
+  });
+
+  it("stops honouring a media credential once its session is revoked", async () => {
+    await runServerAuthTest(
+      Effect.gen(function* () {
+        const serverAuth = yield* ServerAuth;
+        const credential = yield* serverAuth.issuePairingCredential();
+        const exchanged = yield* serverAuth.exchangeBootstrapCredential(
+          credential.credential,
+          requestMetadata,
+        );
+        const session = yield* serverAuth.authenticateHttpRequest(
+          makeCookieRequest(exchanged.sessionToken),
+        );
+        const media = yield* serverAuth.issueMediaToken(session);
+        const mediaRequest: AuthRequest = {
+          headers: {},
+          cookies: {},
+          url: new URL(`http://127.0.0.1:3773/api/attachments/att_v2_1?mediaToken=${media.token}`),
+        };
+
+        expect((yield* serverAuth.authenticateMediaHttpRequest(mediaRequest)).sessionId).toBe(
+          session.sessionId,
+        );
+
+        yield* serverAuth.logoutSession(session.sessionId);
+
+        expect(
+          (yield* Effect.flip(serverAuth.authenticateMediaHttpRequest(mediaRequest)).pipe(
+            Effect.orDie,
+          )).status,
+        ).toBe(401);
+      }),
+    );
+  });
+
+  it("still authenticates a media route by session when no credential is in the query", async () => {
+    await runServerAuthTest(
+      Effect.gen(function* () {
+        const serverAuth = yield* ServerAuth;
+        const credential = yield* serverAuth.issuePairingCredential();
+        const exchanged = yield* serverAuth.exchangeBootstrapCredential(
+          credential.credential,
+          requestMetadata,
+        );
+
+        // Browsers and the desktop window never mint one; the media guard must stay a superset of
+        // the ordinary one rather than a replacement for it.
+        const authenticated = yield* serverAuth.authenticateMediaHttpRequest({
+          ...makeCookieRequest(exchanged.sessionToken),
+          url: new URL("http://127.0.0.1:3773/api/site-favicon?domain=example.com"),
+        });
+        expect(authenticated.role).toBe("client");
+
+        expect(
+          (yield* Effect.flip(
+            serverAuth.authenticateMediaHttpRequest({
+              headers: {},
+              cookies: {},
+              url: new URL("http://127.0.0.1:3773/api/site-favicon?mediaToken=forged.signature"),
+            }),
+          ).pipe(Effect.orDie)).status,
+        ).toBe(401);
+      }),
+    );
+  });
 });

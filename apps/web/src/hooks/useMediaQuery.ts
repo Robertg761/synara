@@ -159,10 +159,19 @@ export function useIsMobile(): boolean {
 }
 
 /**
+ * Already-resolved media text, not the `{ pointer: "coarse" }` shorthand: an object literal is a
+ * fresh allocation on every render AND misses `parsedQueryByShorthand`, so it would re-derive the
+ * query string each time. `parseQuery` returns a string starting with `(` untouched, so this
+ * takes the zero-work path — which matters because `ChatView` reads this hook on every streaming
+ * update.
+ */
+const COARSE_POINTER_QUERY = "(pointer: coarse)";
+
+/**
  * Touch-first input, independent of viewport width: true on phones and tablets,
  * false for mouse/trackpad. Use it for hit targets and hover affordances, not to
  * pick a layout (see `useLayoutMode`).
  */
 export function useIsCoarsePointer(): boolean {
-  return useMediaQuery({ pointer: "coarse" });
+  return useMediaQuery(COARSE_POINTER_QUERY);
 }

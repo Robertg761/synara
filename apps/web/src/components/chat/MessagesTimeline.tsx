@@ -62,6 +62,8 @@ import {
   WorktreeIcon,
 } from "~/lib/icons";
 import { pinActionLabel } from "~/lib/pin";
+import { useMediaAuthToken } from "~/hooks/useMediaAuthToken";
+import { withCurrentMediaCredential } from "~/lib/mediaAssetUrls";
 import { Button } from "../ui/button";
 import { composerOverlayScrollMaskImage } from "./composerOverlay";
 import { CrossTaskOriginLabel, type CrossTaskOrigin } from "./CrossTaskOriginLabel";
@@ -2992,6 +2994,12 @@ const UserImageAttachmentThumbnail = memo(function UserImageAttachmentThumbnail(
   onTimelineImageLoad: () => void;
   resolvedTheme: "light" | "dark";
 }) {
+  // The URL in store state carries no credential (it would go stale sitting there); stamp the
+  // current one on at render, and re-render when it rotates. A no-op off the mobile shell.
+  useMediaAuthToken();
+  const previewSrc = props.image.previewUrl
+    ? withCurrentMediaCredential(props.image.previewUrl)
+    : null;
   return (
     <button
       type="button"
@@ -3004,9 +3012,9 @@ const UserImageAttachmentThumbnail = memo(function UserImageAttachmentThumbnail(
         props.onImageExpand(preview);
       }}
     >
-      {props.image.previewUrl ? (
+      {previewSrc ? (
         <img
-          src={props.image.previewUrl}
+          src={previewSrc}
           alt={props.image.name}
           className="size-full object-cover"
           onLoad={props.onTimelineImageLoad}

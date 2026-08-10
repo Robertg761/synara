@@ -5,22 +5,16 @@
 //          server therefore accepts a short-lived ticket in the upgrade query instead — minted
 //          here over HTTP, where the owner bearer token *can* be sent as a header.
 // Layer: Web auth support
-// Depends on: ~/env (isMobileShell), ~/shellAuthSession (owner bearer token), ~/shellSession
-//             (forgetting a repudiated pairing), ./lib/serverEndpoint, ./appHistoryMode,
-//             ./connectRouteSearch
-// Exports: WS_AUTH_TICKET_PATH, acquireWsTicket, authenticateSocketUrl,
+// Depends on: ~/env (isMobileShell), ~/shellAuthSession (owner bearer token, for cache keying),
+//             ./lib/authenticatedFetch (the bearer header and the one revocation path)
+// Exports: WS_AUTH_TICKET_PATH, acquireWsTicket, noteWsTicketConsumed, authenticateSocketUrl,
 //          resetWsAuthTicketStateForTests
 
 import { AUTH_WEBSOCKET_TOKEN_QUERY_PARAM } from "@synara/contracts";
 
-// Not ./appNavigation: this module sits under the transport, and importing the navigation module
-// would pull in React and construct a router history just to build one href.
-import { appRouteDocumentHref } from "./appHistoryMode";
-import { CONNECT_ROUTE_PATH, connectRouteSearchParams } from "./connectRouteSearch";
 import { isMobileShell } from "./env";
-import { resolveWsHttpUrl } from "./lib/serverEndpoint";
+import { authenticatedServerFetch } from "./lib/authenticatedFetch";
 import { acquireShellBearerToken } from "./shellAuthSession";
-import { clearShellSession } from "./shellSession";
 
 export const WS_AUTH_TICKET_PATH = "/api/auth/ws-token";
 
@@ -39,43 +33,35 @@ const WS_AUTH_TICKET_TIMEOUT_MS = 5_000;
  */
 const MINT_COOLDOWN_MILLIS = 60_000;
 
-// A revoked session fails every socket the transport has open at once. The redirect below is a
-// one-way trip out of the authenticated app, so it must happen exactly once per sign-out no
-// matter how many tickets were in flight when the server said no. Re-armed by the next accepted
-// mint: the redirect is a hash navigation on mobile, so this process outlives re-pairing.
-let signedOutHandled = false;
+/**
+ * How long a minted ticket may be re-offered to a dial. The server consumes a ticket at the
+ * upgrade and the transport says so (`noteWsTicketConsumed`), so in practice this only covers
+ * dials that never opened a socket — the reconnect storm this window exists for, where minting
+ * per attempt would exhaust the session's small outstanding-ticket budget within seconds. Far
+ * inside the server's 5-minute ticket TTL, and short enough that a ticket consumed by an upgrade
+ * the transport did not report costs a bounded number of failed dials rather than wedging.
+ */
+const TICKET_REUSE_MILLIS = 15_000;
 
 // Epoch millis before which minting is pointless (the server answered 429). Zero means no cooldown.
 let mintCooldownUntil = 0;
 
-/**
- * Forget the pairing and send this device back to the connect screen, saying why. Clearing comes
- * first and unconditionally: a token the server has repudiated must not survive on the device
- * even if the navigation is somehow blocked.
- */
-async function handleSessionRevoked(): Promise<void> {
-  if (signedOutHandled) return;
-  signedOutHandled = true;
-  try {
-    await clearShellSession();
-  } catch {
-    // Secure storage refused the delete. `clearShellSession` drops the session from memory before
-    // it touches storage, so the repudiated token is unusable in this process either way, and the
-    // connect screen is the one place that can replace what is still on disk. The navigation is
-    // the user-facing half of this and must happen regardless.
-  }
-  window.location.assign(
-    appRouteDocumentHref(CONNECT_ROUTE_PATH, connectRouteSearchParams("signed-out")),
-  );
-}
+// The last minted ticket no socket has opened with yet. Keyed by the bearer it was minted for, so
+// a cleared or re-paired session can never be handed the previous pairing's ticket.
+let unconsumedTicket: {
+  readonly token: string;
+  readonly bearerToken: string;
+  readonly reusableUntil: number;
+} | null = null;
 
 /**
- * A fresh single-use upgrade ticket, or null when this client does not need one (desktop and
- * plain browsers authenticate the upgrade with their cookie or the desktop bridge's local token)
- * or could not get one right now.
+ * A single-use upgrade ticket, or null when this client does not need one (desktop and plain
+ * browsers authenticate the upgrade with their cookie or the desktop bridge's local token) or
+ * could not get one right now.
  *
- * Never cached: the server consumes a ticket the moment it verifies one, so every socket open —
- * including every reconnect — has to mint its own.
+ * Reused, not re-minted, until a socket actually opens with it or its reuse window lapses: the
+ * URL is resolved per socket acquire, and the acquires the transport does not drive itself (the
+ * RPC protocol's retry loop, each reconnect) would otherwise burn one mint per failed dial.
  *
  * The null-vs-signed-out distinction is the whole point of the error handling here. A request
  * that never got an answer means the server is unreachable, which is exactly the condition the
@@ -84,16 +70,23 @@ async function handleSessionRevoked(): Promise<void> {
  */
 export async function acquireWsTicket(): Promise<string | null> {
   if (!isMobileShell) return null;
-  if (Date.now() < mintCooldownUntil) return null;
   const bearerToken = await acquireShellBearerToken();
   if (!bearerToken) return null;
+  // Ahead of the cooldown check: a ticket already in hand costs the server nothing to reuse, and
+  // load shedding is a reason to stop minting, not a reason to dial unauthenticated.
+  const cached = unconsumedTicket;
+  if (cached && cached.bearerToken === bearerToken && Date.now() < cached.reusableUntil) {
+    return cached.token;
+  }
+  if (Date.now() < mintCooldownUntil) return null;
 
   let response: Response;
   try {
-    response = await fetch(resolveWsHttpUrl(WS_AUTH_TICKET_PATH), {
+    // Shared helper: it attaches the bearer and, on an answered 401, routes the verdict through
+    // the single revocation path — the same treatment every other authenticated HTTP call gets.
+    response = await authenticatedServerFetch(WS_AUTH_TICKET_PATH, {
       method: "POST",
       cache: "no-store",
-      headers: { Authorization: `Bearer ${bearerToken}` },
       signal: AbortSignal.timeout(WS_AUTH_TICKET_TIMEOUT_MS),
     });
   } catch {
@@ -101,7 +94,7 @@ export async function acquireWsTicket(): Promise<string | null> {
   }
 
   if (response.status === 401) {
-    await handleSessionRevoked();
+    unconsumedTicket = null;
     return null;
   }
   if (response.status === 429) {
@@ -112,15 +105,27 @@ export async function acquireWsTicket(): Promise<string | null> {
   }
   if (!response.ok) return null;
 
-  // An accepted mint proves this device is authenticated again, so a later revocation has to be
-  // handled afresh. Without this the latch would survive re-pairing (a hash navigation never
-  // reloads the document) and a second sign-out would 401 every socket forever, silently.
-  signedOutHandled = false;
+  // The server has slots again, so the cooldown has served its purpose. Left standing it would be
+  // process-wide and permanent: nothing else ever lowers it.
+  mintCooldownUntil = 0;
 
   const payload = (await response.json().catch(() => null)) as {
     readonly token?: unknown;
   } | null;
-  return typeof payload?.token === "string" && payload.token.length > 0 ? payload.token : null;
+  const token =
+    typeof payload?.token === "string" && payload.token.length > 0 ? payload.token : null;
+  if (!token) return null;
+  unconsumedTicket = { token, bearerToken, reusableUntil: Date.now() + TICKET_REUSE_MILLIS };
+  return token;
+}
+
+/**
+ * Called by the transport once a dial has opened its socket: the server consumed the ticket at the
+ * upgrade, so the next dial has to mint its own. Total and cheap — a no-op when nothing is cached,
+ * which is every non-mobile client.
+ */
+export function noteWsTicketConsumed(): void {
+  unconsumedTicket = null;
 }
 
 /**
@@ -148,6 +153,6 @@ export async function authenticateSocketUrl(socketUrl: string): Promise<string> 
 }
 
 export function resetWsAuthTicketStateForTests(): void {
-  signedOutHandled = false;
   mintCooldownUntil = 0;
+  unconsumedTicket = null;
 }

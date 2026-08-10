@@ -14,12 +14,27 @@ export const AuthSessionClientMetadataRecord = Schema.Struct({
 });
 export type AuthSessionClientMetadataRecord = typeof AuthSessionClientMetadataRecord.Type;
 
+/**
+ * Whether a session's expiry may slide forward on use, decided once by the issuer and then
+ * persisted. It is deliberately a stored property rather than something re-derived from
+ * `expiresAt - issuedAt`: an inferred rule silently reclassifies every already-issued session
+ * the moment the default TTL constant changes, and the failure mode (sessions quietly stop
+ * renewing) produces no error anywhere.
+ *
+ * - `sliding`: renewal may push `expiresAt` forward, bounded by the absolute lifetime cap.
+ * - `fixed`: the session expires at `expiresAt` and is never extended. Anything issued with an
+ *   explicitly requested TTL is a deliberate hard-expiry contract.
+ */
+export const AuthSessionRenewalPolicy = Schema.Literals(["sliding", "fixed"]);
+export type AuthSessionRenewalPolicy = typeof AuthSessionRenewalPolicy.Type;
+
 export const AuthSessionRecord = Schema.Struct({
   sessionId: AuthSessionId,
   subject: Schema.String,
   role: Schema.Literals(["owner", "client"]),
   method: Schema.Literals(["browser-session-cookie", "bearer-session-token"]),
   client: AuthSessionClientMetadataRecord,
+  renewalPolicy: AuthSessionRenewalPolicy,
   issuedAt: Schema.DateTimeUtcFromString,
   expiresAt: Schema.DateTimeUtcFromString,
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
@@ -33,6 +48,7 @@ export const CreateAuthSessionInput = Schema.Struct({
   role: Schema.Literals(["owner", "client"]),
   method: Schema.Literals(["browser-session-cookie", "bearer-session-token"]),
   client: AuthSessionClientMetadataRecord,
+  renewalPolicy: AuthSessionRenewalPolicy,
   issuedAt: Schema.DateTimeUtcFromString,
   expiresAt: Schema.DateTimeUtcFromString,
 });
@@ -87,6 +103,9 @@ export interface AuthSessionRepositoryShape {
    * live (non-revoked) row whose current expiry is earlier than the requested one, so
    * concurrent renewals can never shrink a session's lifetime. Resolves to `true` when
    * a row was actually extended.
+   *
+   * Whether a session is allowed to be extended at all is the caller's decision, read from
+   * the row's {@link AuthSessionRenewalPolicy}; this operation only enforces monotonicity.
    */
   readonly extendExpiry: (
     input: ExtendAuthSessionExpiryInput,

@@ -21,7 +21,12 @@ import { cn } from "~/lib/utils";
 import { useSpacesUiStore } from "~/spacesUiStore";
 
 import { PhoneHomeScreen } from "./PhoneHomeScreen";
-import { PHONE_TAB_BAR_CONTENT_INSET_CLASS, PhoneTabBar, type PhoneTab } from "./PhoneTabBar";
+import {
+  PHONE_TAB_BAR_CONTENT_INSET_CLASS,
+  PHONE_TAB_BAR_FLOATING_OFFSET_CLASS,
+  PhoneTabBar,
+  type PhoneTab,
+} from "./PhoneTabBar";
 
 /** Route ids the shell branches on. Generated ids, see `routeTree.gen.ts`. */
 const THREAD_ROUTE_ID = "/_chat/$threadId";
@@ -122,7 +127,10 @@ export function PhoneAppShell({
           {surface === "home" && newThreadProjectId ? (
             <button
               aria-label="New thread"
-              className="fixed right-4 bottom-[calc(3.5rem+env(safe-area-inset-bottom)+1rem)] z-40 flex size-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-opacity active:opacity-80"
+              className={cn(
+                "fixed right-4 z-40 flex size-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-opacity active:opacity-80",
+                PHONE_TAB_BAR_FLOATING_OFFSET_CLASS,
+              )}
               data-testid="phone-new-thread-fab"
               onClick={handleNewThreadFromFab}
               type="button"

@@ -1,8 +1,9 @@
 // FILE: PhonePaneScreen.phone.browser.tsx
 // Purpose: Browser regression for the phone pushed pane screen — it covers the whole phone
 //          viewport, hands the pane to the host's dock renderer as the active/visible surface,
-//          mounts no <Sidebar>/Sheet (the trap the desktop dock falls into below 768px), and
-//          closes from a comfortable touch target.
+//          mounts no <Sidebar>/Sheet (the trap the desktop dock falls into below 768px), closes
+//          from a comfortable touch target, and takes the chat surface it covers out of the tab
+//          order (the host's `inert`, exercised through the same surface component).
 // Layer: Phone layout UI test
 // Depends on: ~/test/browserHarness (phone viewport + fullscreen host).
 
@@ -11,6 +12,7 @@ import "../../index.css";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "vitest-browser-react";
 
+import { RouteInsetSurface } from "~/components/RouteInsetSurface";
 import type { RightDockPane } from "~/rightDockStore.logic";
 import { PHONE_VIEWPORT, renderAtPhoneViewport } from "~/test/browserHarness";
 import { PhonePaneScreen } from "./PhonePaneScreen";
@@ -104,6 +106,50 @@ describe("PhonePaneScreen", () => {
 
       await closeButton.click();
       expect(onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      await screen.unmount();
+    }
+  });
+
+  it("leaves the covered chat surface non-focusable while it is up", async () => {
+    host = await renderAtPhoneViewport();
+
+    // The composition `SingleChatSurface` renders on phone: the chat stays MOUNTED under the
+    // pushed screen, so the only thing keeping Tab (and screen-reader swipe) out of the
+    // covered composer is the `inert` the host puts on the surface. This mounts the same
+    // surface component with the same prop, so a refactor that stops forwarding `inert` to a
+    // real DOM node fails here instead of silently shipping.
+    const screen = await render(
+      <>
+        <RouteInsetSurface surfaceClassName="bg-background" inert>
+          <button data-testid="covered-control" type="button">
+            Send
+          </button>
+        </RouteInsetSurface>
+        <PhonePaneScreen
+          pane={TERMINAL_PANE}
+          title="Terminal"
+          runtimeMode="live"
+          onClose={() => {}}
+          renderPane={() => null}
+        />
+      </>,
+      { container: host },
+    );
+
+    try {
+      const covered = document.querySelector<HTMLButtonElement>("[data-testid=covered-control]");
+      expect(covered).not.toBeNull();
+      expect(covered?.closest("main")?.hasAttribute("inert")).toBe(true);
+
+      covered?.focus();
+      expect(document.activeElement).not.toBe(covered);
+
+      // The pushed screen itself is emphatically NOT inert — it is a route, not a modal, and
+      // its own control has to stay reachable.
+      const closeButton = screen.getByRole("button", { name: "Close Terminal" }).element();
+      (closeButton as HTMLElement).focus();
+      expect(document.activeElement).toBe(closeButton);
     } finally {
       await screen.unmount();
     }
