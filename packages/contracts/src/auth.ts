@@ -58,6 +58,14 @@ export const AuthWebSocketTokenResult = Schema.Struct({
 });
 export type AuthWebSocketTokenResult = typeof AuthWebSocketTokenResult.Type;
 
+/**
+ * Upgrade query param carrying the single-use ticket above. A WebSocket handshake cannot carry an
+ * Authorization header, and the mobile shell's WebView origin is foreign to the server so no
+ * cookie rides along either — the ticket in the URL is the only channel both ends share, so both
+ * ends read its name from here.
+ */
+export const AUTH_WEBSOCKET_TOKEN_QUERY_PARAM = "wsToken";
+
 export const AuthLogoutResult = Schema.Struct({
   revoked: Schema.Boolean,
 });

@@ -6,7 +6,7 @@
 //          surface (composer, user bubble, markdown).
 // Layer: UI utilities
 
-import { resolveWsHttpUrl } from "./wsHttpUrl";
+import { resolveWsHttpUrl } from "./serverEndpoint";
 
 /** Per-favicon-src load outcome, shared module-wide to avoid re-probing within a session. */
 export const siteFaviconStatusCache = new Map<string, "ok" | "fail">();

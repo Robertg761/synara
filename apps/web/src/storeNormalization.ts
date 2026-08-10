@@ -18,7 +18,7 @@ import { normalizeModelSlug } from "@synara/shared/model";
 import { deriveThreadSummaryMetadata } from "@synara/shared/threadSummary";
 
 import { isStalePendingRequestFailureDetail } from "./lib/pendingInteraction";
-import { toAttachmentPreviewUrl } from "./lib/wsHttpUrl";
+import { toAttachmentPreviewUrl } from "./lib/serverEndpoint";
 import { hasLiveTurnTailWork } from "./session-logic";
 import { getRememberedProjectUiState, projectCwdKey } from "./storePersistence";
 import type {

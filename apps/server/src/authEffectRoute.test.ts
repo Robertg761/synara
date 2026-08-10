@@ -11,6 +11,7 @@ import {
   ATTACHMENT_CANCEL_ROUTE_PATH,
   ATTACHMENT_UPLOAD_ROUTE_PATH,
 } from "@synara/shared/binaryTransfer";
+import { SYNARA_MOBILE_APP_ORIGIN } from "@synara/shared/mobileIdentity";
 import { DateTime, Effect, Exit, Layer, Scope } from "effect";
 import { HttpRouter } from "effect/unstable/http";
 import { describe, expect, it } from "vitest";
@@ -32,6 +33,8 @@ import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegi
 
 const currentSessionId = AuthSessionId.makeUnsafe("11111111-1111-4111-8111-111111111111");
 const otherSessionId = AuthSessionId.makeUnsafe("22222222-2222-4222-8222-222222222222");
+// Fixed so tests can assert the exact `Expires=` the session route re-stamps onto the cookie.
+const sessionExpiresAt = DateTime.makeUnsafe("2027-03-04T05:06:07.000Z");
 
 function makeSessionCredentialService(): SessionCredentialServiceShape {
   return {
@@ -40,7 +43,7 @@ function makeSessionCredentialService(): SessionCredentialServiceShape {
 }
 
 function makeServerAuth(sideEffects: { count: number }): ServerAuthShape {
-  const expiresAt = DateTime.toUtc(Effect.runSync(DateTime.now));
+  const expiresAt = sessionExpiresAt;
   const descriptor = {
     policy: "remote-reachable" as const,
     bootstrapMethods: ["one-time-token" as const],
@@ -54,7 +57,23 @@ function makeServerAuth(sideEffects: { count: number }): ServerAuthShape {
     });
   return {
     getDescriptor: () => Effect.succeed(descriptor),
-    getSessionState: () => Effect.succeed({ authenticated: false, auth: descriptor }),
+    // Mirrors the real ServerAuth: bearer wins over cookie, either authenticates alone.
+    getSessionState: (request) => {
+      const bearer = request.headers.authorization === "Bearer bearer-token";
+      const cookie = request.cookies.synara_session === "cookie-token";
+      if (!bearer && !cookie) {
+        return Effect.succeed({ authenticated: false, auth: descriptor });
+      }
+      return Effect.succeed({
+        authenticated: true,
+        auth: descriptor,
+        role: "owner" as const,
+        sessionMethod: bearer
+          ? ("bearer-session-token" as const)
+          : ("browser-session-cookie" as const),
+        expiresAt,
+      });
+    },
     exchangeBootstrapCredential: () =>
       mutate({
         response: {
@@ -217,6 +236,108 @@ describe("authEffectRouteLayer", () => {
         headers: { Origin: "http://evil.example.test" },
       });
       expect(untrustedPreflight.status).toBe(403);
+    });
+  });
+
+  it("serves CORS preflight and bearer bootstrap to the trusted mobile shell origin", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "0.0.0.0", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const preflight = await fetch(`${serverOrigin}/api/auth/bootstrap/bearer`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: SYNARA_MOBILE_APP_ORIGIN,
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "authorization, content-type",
+        },
+      });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-origin")).toBe(SYNARA_MOBILE_APP_ORIGIN);
+      expect(preflight.headers.get("access-control-allow-headers")).toContain("Authorization");
+      expect(sideEffects.count).toBe(0);
+
+      const bearerExchange = await fetch(`${serverOrigin}/api/auth/bootstrap/bearer`, {
+        method: "POST",
+        headers: { Origin: SYNARA_MOBILE_APP_ORIGIN, "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: "PAIRINGTOKEN" }),
+      });
+      expect(bearerExchange.status).toBe(200);
+      expect(bearerExchange.headers.get("access-control-allow-origin")).toBe(
+        SYNARA_MOBILE_APP_ORIGIN,
+      );
+      expect(sideEffects.count).toBe(1);
+
+      const lookalikePreflight = await fetch(`${serverOrigin}/api/auth/bootstrap/bearer`, {
+        method: "OPTIONS",
+        headers: { Origin: "https://app.synara.local.evil.example" },
+      });
+      expect(lookalikePreflight.status).toBe(403);
+    });
+  });
+
+  it("re-stamps the cookie with the renewed expiry on cookie-authenticated state probes", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const response = await fetch(`${serverOrigin}/api/auth/session`, {
+        headers: { Cookie: "synara_session=cookie-token" },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      const cookie = response.headers.get("set-cookie") ?? "";
+      expect(cookie).toContain("synara_session=cookie-token");
+      expect(cookie).toContain(`Expires=${DateTime.toDate(sessionExpiresAt).toUTCString()}`);
+      expect(cookie).toContain("HttpOnly");
+      expect(cookie).toContain("Path=/");
+      expect(cookie).toContain("SameSite=Lax");
+      expect(cookie).not.toContain("Secure");
+    });
+  });
+
+  it("stamps Secure on the renewed cookie when the server is publicly reachable", async () => {
+    const sideEffects = { count: 0 };
+    const config = {
+      host: "0.0.0.0",
+      publicUrl: new URL("https://synara.example.test/"),
+    } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const response = await fetch(`${serverOrigin}/api/auth/session`, {
+        headers: { Cookie: "synara_session=cookie-token" },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("set-cookie") ?? "").toContain("Secure");
+    });
+  });
+
+  it("never stamps a cookie on bearer, ambiguous, or unauthenticated state probes", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      // Bearer-authenticated: the reported expiry belongs to the bearer session.
+      const bearerResponse = await fetch(`${serverOrigin}/api/auth/session`, {
+        headers: { Authorization: "Bearer bearer-token" },
+      });
+      expect(bearerResponse.status).toBe(200);
+      expect(bearerResponse.headers.get("cache-control")).toBe("no-store");
+      expect(bearerResponse.headers.get("set-cookie")).toBeNull();
+
+      // Both credentials present: bearer wins auth, so the cookie's own expiry is unknown.
+      const ambiguousResponse = await fetch(`${serverOrigin}/api/auth/session`, {
+        headers: {
+          Authorization: "Bearer bearer-token",
+          Cookie: "synara_session=cookie-token",
+        },
+      });
+      expect(ambiguousResponse.status).toBe(200);
+      expect(ambiguousResponse.headers.get("cache-control")).toBe("no-store");
+      expect(ambiguousResponse.headers.get("set-cookie")).toBeNull();
+
+      // Unauthenticated probe: nothing to renew, and no cookie may be minted from thin air.
+      const anonymousResponse = await fetch(`${serverOrigin}/api/auth/session`);
+      expect(anonymousResponse.status).toBe(200);
+      expect(anonymousResponse.headers.get("cache-control")).toBe("no-store");
+      expect(anonymousResponse.headers.get("set-cookie")).toBeNull();
     });
   });
 

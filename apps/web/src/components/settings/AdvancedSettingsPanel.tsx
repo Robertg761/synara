@@ -6,6 +6,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useMemo, useState } from "react";
 
+import { appRouteDocumentHref } from "~/appNavigation";
 import { logoutCurrentBrowserSession } from "~/authLogout";
 import { APP_VERSION } from "~/branding";
 import { resolveAndPersistPreferredEditor } from "~/editorPreferences";
@@ -121,7 +122,10 @@ export function AdvancedSettingsPanel(props: {
           "Sign out this browser?\n\nIts session and every live connection opened with it will be revoked.",
         ),
       logout: () => api.server.logoutAuthSession(),
-      navigate: (path) => window.location.assign(path),
+      // Browser history: a real navigation the server answers with index.html, which renders
+      // the pre-React signed-out screen. Hash history: a fragment move inside the loaded
+      // document, which the router resolves to the in-app /signed-out route.
+      navigate: (path) => window.location.assign(appRouteDocumentHref(path)),
       onError: (error) =>
         toastManager.add({
           type: "error",

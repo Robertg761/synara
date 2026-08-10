@@ -1,14 +1,29 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { Deferred, Duration, Effect, Fiber, Layer, Ref } from "effect";
+import {
+  Clock,
+  DateTime,
+  Deferred,
+  Duration,
+  Effect,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  Ref,
+  type Scope,
+  Stream,
+} from "effect";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vitest";
 
 import { ServerConfig } from "../../config";
+import { AuthSessionRepository } from "../../persistence/Services/AuthSessions";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite";
 import { ServerSecretStoreLive } from "./ServerSecretStore";
 import {
   SessionCapacityError,
   SessionCredentialService,
+  type SessionCredentialChange,
   type SessionCredentialError,
 } from "../Services/SessionCredentialService";
 import {
@@ -28,8 +43,20 @@ const testLayer = SessionCredentialServiceLive.pipe(
   Layer.provide(NodeServices.layer),
 );
 
-const runSessionTest = <A, E>(effect: Effect.Effect<A, E, SessionCredentialService>) =>
+type SessionTestServices = SessionCredentialService | AuthSessionRepository | Scope.Scope;
+
+const SESSION_TTL_MILLIS = Duration.toMillis(Duration.days(30));
+const SESSION_ABSOLUTE_LIFETIME_MILLIS = Duration.toMillis(Duration.days(365));
+
+const runSessionTest = <A, E>(effect: Effect.Effect<A, E, SessionTestServices>) =>
   effect.pipe(Effect.provide(testLayer), Effect.scoped, Effect.runPromise);
+
+const runSessionTestWithTestClock = <A, E>(effect: Effect.Effect<A, E, SessionTestServices>) =>
+  effect.pipe(
+    Effect.provide(Layer.merge(testLayer, TestClock.layer())),
+    Effect.scoped,
+    Effect.runPromise,
+  );
 
 const makeBlockingConnection = Effect.gen(function* () {
   const started = yield* Deferred.make<void>();
@@ -293,40 +320,257 @@ describe("SessionCredentialServiceLive", () => {
   });
 
   it("rejects websocket tokens once the parent session has expired", async () => {
-    await Effect.gen(function* () {
-      const sessions = yield* SessionCredentialService;
-      const issued = yield* sessions.issue({ ttl: Duration.seconds(1) });
-      const websocket = yield* sessions.issueWebSocketToken(issued.sessionId);
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({ ttl: Duration.seconds(1) });
+        const websocket = yield* sessions.issueWebSocketToken(issued.sessionId);
 
-      yield* TestClock.adjust(Duration.seconds(2));
+        yield* TestClock.adjust(Duration.seconds(2));
 
-      const error = yield* Effect.flip(sessions.verifyWebSocketToken(websocket.token));
-      expect(error.message).toContain("Invalid websocket token");
-    }).pipe(
-      Effect.provide(Layer.merge(testLayer, TestClock.layer())),
-      Effect.scoped,
-      Effect.runPromise,
+        const error = yield* Effect.flip(sessions.verifyWebSocketToken(websocket.token));
+        expect(error.message).toContain("Invalid websocket token");
+      }),
     );
   });
 
   it("interrupts an established connection when its session expires", async () => {
-    await Effect.gen(function* () {
-      const sessions = yield* SessionCredentialService;
-      const issued = yield* sessions.issue({ ttl: Duration.seconds(1) });
-      const connection = yield* makeBlockingConnection;
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({ ttl: Duration.seconds(1) });
+        const connection = yield* makeBlockingConnection;
 
-      yield* Effect.forkChild(
-        sessions.runAuthenticatedConnection(issued.sessionId, connection.effect),
-      );
-      yield* Deferred.await(connection.started);
-      yield* TestClock.adjust(Duration.seconds(2));
-      yield* Deferred.await(connection.closed);
+        yield* Effect.forkChild(
+          sessions.runAuthenticatedConnection(issued.sessionId, connection.effect),
+        );
+        yield* Deferred.await(connection.started);
+        yield* TestClock.adjust(Duration.seconds(2));
+        yield* Deferred.await(connection.closed);
 
-      expect(yield* sessions.listActive()).toHaveLength(0);
-    }).pipe(
-      Effect.provide(Layer.merge(testLayer, TestClock.layer())),
-      Effect.scoped,
-      Effect.runPromise,
+        expect(yield* sessions.listActive()).toHaveLength(0);
+      }),
+    );
+  });
+
+  it("leaves session expiry untouched inside the renewal throttle window", async () => {
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({ method: "bearer-session-token" });
+        const verified = yield* sessions.verify(issued.token);
+
+        expect(DateTime.toEpochMillis(verified.expiresAt!)).toBe(
+          DateTime.toEpochMillis(issued.expiresAt),
+        );
+        const active = yield* sessions.listActive();
+        expect(DateTime.toEpochMillis(active[0]!.expiresAt)).toBe(
+          DateTime.toEpochMillis(issued.expiresAt),
+        );
+      }),
+    );
+  });
+
+  it("slides session expiry forward on use once the renewal throttle has elapsed", async () => {
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({ method: "bearer-session-token" });
+        const changes = yield* Queue.unbounded<SessionCredentialChange>();
+        yield* Effect.forkScoped(
+          sessions.streamChanges.pipe(
+            Stream.runForEach((change) => Queue.offer(changes, change).pipe(Effect.asVoid)),
+          ),
+          { startImmediately: true },
+        );
+
+        yield* TestClock.adjust(Duration.days(2));
+        const verified = yield* sessions.verify(issued.token);
+        const nowMillis = yield* Clock.currentTimeMillis;
+
+        expect(DateTime.toEpochMillis(verified.expiresAt!)).toBe(nowMillis + SESSION_TTL_MILLIS);
+        const active = yield* sessions.listActive();
+        expect(DateTime.toEpochMillis(active[0]!.expiresAt)).toBe(nowMillis + SESSION_TTL_MILLIS);
+
+        const change = yield* Queue.take(changes);
+        expect(change.type).toBe("clientUpserted");
+        if (change.type === "clientUpserted") {
+          expect(change.clientSession.sessionId).toBe(issued.sessionId);
+          expect(DateTime.toEpochMillis(change.clientSession.expiresAt)).toBe(
+            nowMillis + SESSION_TTL_MILLIS,
+          );
+        }
+      }),
+    );
+  });
+
+  it("keeps verifying a bearer token past the expiry stamped into its claims", async () => {
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({ method: "bearer-session-token" });
+
+        yield* TestClock.adjust(Duration.days(29));
+        yield* sessions.verify(issued.token);
+        yield* TestClock.adjust(Duration.days(29));
+
+        const nowMillis = yield* Clock.currentTimeMillis;
+        expect(nowMillis).toBeGreaterThan(DateTime.toEpochMillis(issued.expiresAt));
+
+        const verified = yield* sessions.verify(issued.token);
+        expect(verified.sessionId).toBe(issued.sessionId);
+        expect(DateTime.toEpochMillis(verified.expiresAt!)).toBe(nowMillis + SESSION_TTL_MILLIS);
+      }),
+    );
+  });
+
+  it("expires a session that goes unused for longer than its lifetime", async () => {
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({ method: "bearer-session-token" });
+
+        yield* TestClock.adjust(Duration.days(31));
+
+        const error = yield* Effect.flip(sessions.verify(issued.token));
+        expect(error.message).toContain("Session token expired");
+        expect(yield* sessions.listActive()).toHaveLength(0);
+      }),
+    );
+  });
+
+  it("never renews the session when a websocket ticket is consumed", async () => {
+    // Regression pin: ticket consumption is deliberately not a renewal point. Every ticket is
+    // minted moments earlier by a request that authenticated through `verify`, which renews.
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({ method: "bearer-session-token" });
+
+        yield* TestClock.adjust(Duration.days(2));
+        const websocket = yield* sessions.issueWebSocketToken(issued.sessionId);
+        const verified = yield* sessions.verifyWebSocketToken(websocket.token);
+
+        expect(DateTime.toEpochMillis(verified.expiresAt!)).toBe(
+          DateTime.toEpochMillis(issued.expiresAt),
+        );
+        const active = yield* sessions.listActive();
+        expect(DateTime.toEpochMillis(active[0]!.expiresAt)).toBe(
+          DateTime.toEpochMillis(issued.expiresAt),
+        );
+      }),
+    );
+  });
+
+  it("never renews a session issued with a non-default lifetime", async () => {
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({
+          method: "bearer-session-token",
+          ttl: Duration.days(10),
+        });
+
+        yield* TestClock.adjust(Duration.days(2));
+        const verified = yield* sessions.verify(issued.token);
+
+        expect(DateTime.toEpochMillis(verified.expiresAt!)).toBe(
+          DateTime.toEpochMillis(issued.expiresAt),
+        );
+        const active = yield* sessions.listActive();
+        expect(DateTime.toEpochMillis(active[0]!.expiresAt)).toBe(
+          DateTime.toEpochMillis(issued.expiresAt),
+        );
+      }),
+    );
+  });
+
+  it("stops sliding a continuously used session at its absolute lifetime", async () => {
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const issued = yield* sessions.issue({ method: "bearer-session-token" });
+        const issuedAtMillis = DateTime.toEpochMillis((yield* sessions.listActive())[0]!.issuedAt);
+        const capMillis = issuedAtMillis + SESSION_ABSOLUTE_LIFETIME_MILLIS;
+
+        // Each step clears the one-day renewal throttle and stays inside the 30-day window,
+        // so the session keeps sliding until the cap stops it.
+        for (let step = 0; step < 12; step += 1) {
+          yield* TestClock.adjust(Duration.days(29));
+          const verified = yield* sessions.verify(issued.token);
+          expect(DateTime.toEpochMillis(verified.expiresAt!)).toBeLessThanOrEqual(capMillis);
+          const active = yield* sessions.listActive();
+          expect(DateTime.toEpochMillis(active[0]!.expiresAt)).toBeLessThanOrEqual(capMillis);
+        }
+
+        const nowMillis = yield* Clock.currentTimeMillis;
+        expect(nowMillis).toBeGreaterThan(issuedAtMillis + Duration.toMillis(Duration.days(340)));
+        expect(DateTime.toEpochMillis((yield* sessions.listActive())[0]!.expiresAt)).toBe(
+          capMillis,
+        );
+
+        yield* TestClock.adjust(Duration.millis(capMillis - nowMillis + 1));
+        const error = yield* Effect.flip(sessions.verify(issued.token));
+        expect(error.message).toContain("Session token expired");
+      }),
+    );
+  });
+
+  it("never renews a revoked session", async () => {
+    await runSessionTestWithTestClock(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const repository = yield* AuthSessionRepository;
+        const issued = yield* sessions.issue({ method: "bearer-session-token" });
+        yield* sessions.revoke(issued.sessionId);
+
+        yield* TestClock.adjust(Duration.days(2));
+
+        const error = yield* Effect.flip(sessions.verify(issued.token));
+        expect(error.message).toContain("revoked");
+        const row = yield* repository.getById({ sessionId: issued.sessionId });
+        expect(Option.isSome(row)).toBe(true);
+        if (Option.isSome(row)) {
+          expect(DateTime.toEpochMillis(row.value.expiresAt)).toBe(
+            DateTime.toEpochMillis(issued.expiresAt),
+          );
+        }
+        expect(
+          yield* repository.extendExpiry({
+            sessionId: issued.sessionId,
+            expiresAt: DateTime.addDuration(DateTime.toUtc(issued.expiresAt), Duration.days(10)),
+          }),
+        ).toBe(false);
+      }),
+    );
+  });
+
+  it("moves session expiry monotonically", async () => {
+    await runSessionTest(
+      Effect.gen(function* () {
+        const sessions = yield* SessionCredentialService;
+        const repository = yield* AuthSessionRepository;
+        const issued = yield* sessions.issue({ method: "bearer-session-token" });
+        const expiresAt = DateTime.toUtc(issued.expiresAt);
+
+        expect(
+          yield* repository.extendExpiry({
+            sessionId: issued.sessionId,
+            expiresAt: DateTime.subtractDuration(expiresAt, Duration.days(1)),
+          }),
+        ).toBe(false);
+        expect(
+          yield* repository.extendExpiry({
+            sessionId: issued.sessionId,
+            expiresAt: DateTime.addDuration(expiresAt, Duration.days(1)),
+          }),
+        ).toBe(true);
+
+        const active = yield* sessions.listActive();
+        expect(DateTime.toEpochMillis(active[0]!.expiresAt)).toBe(
+          DateTime.toEpochMillis(expiresAt) + Duration.toMillis(Duration.days(1)),
+        );
+      }),
     );
   });
 });

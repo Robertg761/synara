@@ -48,6 +48,12 @@ export const ListActiveAuthSessionsInput = Schema.Struct({
 });
 export type ListActiveAuthSessionsInput = typeof ListActiveAuthSessionsInput.Type;
 
+export const ExtendAuthSessionExpiryInput = Schema.Struct({
+  sessionId: AuthSessionId,
+  expiresAt: Schema.DateTimeUtcFromString,
+});
+export type ExtendAuthSessionExpiryInput = typeof ExtendAuthSessionExpiryInput.Type;
+
 export const RevokeAuthSessionInput = Schema.Struct({
   sessionId: AuthSessionId,
   revokedAt: Schema.DateTimeUtcFromString,
@@ -76,6 +82,15 @@ export interface AuthSessionRepositoryShape {
   readonly listActive: (
     input: ListActiveAuthSessionsInput,
   ) => Effect.Effect<ReadonlyArray<AuthSessionRecord>, AuthSessionRepositoryError>;
+  /**
+   * Pushes a session's expiry forward. The update is monotonic: it only applies to a
+   * live (non-revoked) row whose current expiry is earlier than the requested one, so
+   * concurrent renewals can never shrink a session's lifetime. Resolves to `true` when
+   * a row was actually extended.
+   */
+  readonly extendExpiry: (
+    input: ExtendAuthSessionExpiryInput,
+  ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
   readonly revoke: (
     input: RevokeAuthSessionInput,
   ) => Effect.Effect<boolean, AuthSessionRepositoryError>;

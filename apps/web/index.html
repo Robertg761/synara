@@ -2,15 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <link rel="icon" href="/favicon.ico" sizes="48x48" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Cal+Sans&family=DM+Sans:ital,opsz,wght@0,9..40,300..800;1,9..40,300..800&family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&family=Inter:opsz,wght@14..32,100..900&display=swap"
-      rel="stylesheet"
-    />
+    <!-- Fonts are self-hosted through @fontsource(-variable) and imported from the bundle
+         (src/bootstrap.ts for the pre-React screens, src/main.tsx for the app) so booting
+         never depends on the network. -->
     <title>Synara</title>
     <style>
       /* Boot splash — shown while the JS bundle is parsing and React mounts.

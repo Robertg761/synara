@@ -72,6 +72,10 @@
       "types": "./src/desktopIdentity.ts",
       "import": "./src/desktopIdentity.ts"
     },
+    "./mobileIdentity": {
+      "types": "./src/mobileIdentity.ts",
+      "import": "./src/mobileIdentity.ts"
+    },
     "./Net": {
       "types": "./src/Net.ts",
       "import": "./src/Net.ts"

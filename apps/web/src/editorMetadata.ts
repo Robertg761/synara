@@ -34,7 +34,7 @@ import {
 import { FolderClosed } from "./components/FolderClosed";
 import { AppsIcon } from "./lib/icons";
 import { isMacPlatform, isWindowsPlatform } from "./lib/utils";
-import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
+import { resolveWsHttpUrl } from "./lib/serverEndpoint";
 
 export interface EditorOption {
   readonly value: EditorId;

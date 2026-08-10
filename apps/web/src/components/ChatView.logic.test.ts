@@ -72,6 +72,8 @@ import {
   shouldRenderTerminalWorkspace,
   worktreeSetupHasError,
 } from "./ChatView.logic";
+import { shouldComposerEnterSend } from "./chat/composerEnterBehavior";
+import { COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME } from "./chat/composerPickerStyles";
 
 describe("composer strip work-log derivation", () => {
   it("reuses the active derivation unless a subagent view needs its parent source", () => {
@@ -2907,5 +2909,46 @@ describe("thread detail hydration", () => {
         detailSyncState: "failed",
       }),
     ).toBe("failed");
+  });
+});
+
+describe("composer Enter behavior", () => {
+  it("sends on plain Enter with a fine pointer", () => {
+    expect(shouldComposerEnterSend({ shiftKey: false, isCoarsePointer: false })).toBe(true);
+  });
+
+  it("inserts a newline on plain Enter with a coarse pointer", () => {
+    expect(shouldComposerEnterSend({ shiftKey: false, isCoarsePointer: true })).toBe(false);
+  });
+
+  it("never sends on Shift+Enter, on either pointer", () => {
+    expect(shouldComposerEnterSend({ shiftKey: true, isCoarsePointer: false })).toBe(false);
+    expect(shouldComposerEnterSend({ shiftKey: true, isCoarsePointer: true })).toBe(false);
+  });
+
+  it("depends only on the pointer axis, so both keyboard cases stay decidable", () => {
+    // Guards the three-axis rule: the decision must be reproducible from the pointer
+    // flag alone — no viewport size, no shell platform, no other hidden input.
+    const decisions = [false, true].flatMap((isCoarsePointer) =>
+      [false, true].map((shiftKey) => shouldComposerEnterSend({ shiftKey, isCoarsePointer })),
+    );
+    expect(decisions).toEqual([true, false, false, false]);
+  });
+});
+
+describe("phone command menu height cap", () => {
+  it("caps both command-menu scroll bodies at 40dvh", () => {
+    expect(COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME).toContain(
+      "[data-slot=command-list]]:max-h-[40dvh]",
+    );
+    expect(COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME).toContain(
+      "[data-slot=menu-popup-body]]:max-h-[40dvh]",
+    );
+  });
+
+  it("stays scoped to the phone layout so desktop keeps its own max height", () => {
+    for (const candidate of COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME.split(" ")) {
+      expect(candidate.startsWith("[html[data-layout=phone]_&")).toBe(true);
+    }
   });
 });

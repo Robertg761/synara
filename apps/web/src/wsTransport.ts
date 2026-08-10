@@ -62,13 +62,15 @@ import {
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
 
-import { APP_VERSION } from "./branding";
+import { resolveClientBuild } from "./branding";
 import { useDeviceStateStore } from "./deviceStateStore";
+import { resolveServerWsBase } from "./lib/serverEndpoint";
 import {
   buildThreadSubscribeInput,
   clearThreadDetailResumeCursor,
   resetThreadDetailResumeCursors,
 } from "./threadDetailResumeCursors";
+import { authenticateSocketUrl } from "./wsAuthTicket";
 import type { WsTransportState } from "./wsTransportEvents";
 
 type PushListener<C extends WsPushChannel> = (message: WsPushMessage<C>) => void;
@@ -208,7 +210,17 @@ export function getReconnectRetryDelayMs(attempt: number): number {
   return Math.min(INITIAL_RECONNECT_RETRY_MS * 2 ** exponent, MAX_RECONNECT_RETRY_MS);
 }
 
-function delayWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+/**
+ * A sleep with two exits. `signal` ends it by rejecting (the caller is being torn
+ * down). `registerSkip`, when supplied, hands back a function that ends it early
+ * and *successfully*, for when waiting out the rest of the delay has stopped
+ * buying anything; it is handed `null` once the sleep is over.
+ */
+function delayWithAbort(
+  ms: number,
+  signal: AbortSignal,
+  registerSkip?: (skip: (() => void) | null) => void,
+): Promise<void> {
   if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise<void>((resolve, reject) => {
     const timeoutId = window.setTimeout(() => {
@@ -222,8 +234,13 @@ function delayWithAbort(ms: number, signal: AbortSignal): Promise<void> {
     const cleanup = () => {
       window.clearTimeout(timeoutId);
       signal.removeEventListener("abort", onAbort);
+      registerSkip?.(null);
     };
     signal.addEventListener("abort", onAbort, { once: true });
+    registerSkip?.(() => {
+      cleanup();
+      resolve();
+    });
   });
 }
 
@@ -233,19 +250,8 @@ function resolveRpcUrl(rawUrl: string, path: string): string {
   return url.toString();
 }
 
-function rawSocketUrl(explicitUrl: string | null): string {
-  if (explicitUrl) return explicitUrl;
-  const bridgeUrl = window.desktopBridge?.getWsUrl();
-  const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
-  return bridgeUrl && bridgeUrl.length > 0
-    ? bridgeUrl
-    : envUrl && envUrl.length > 0
-      ? envUrl
-      : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:${window.location.port}`;
-}
-
 export function makeSocketUrl(explicitUrl: string | null, path: string): string {
-  return resolveRpcUrl(rawSocketUrl(explicitUrl), path);
+  return resolveRpcUrl(resolveServerWsBase(explicitUrl), path);
 }
 
 export function makeFeatureSocketUrl(
@@ -253,7 +259,7 @@ export function makeFeatureSocketUrl(
   compatibility: WsBootstrapNegotiateResult,
 ): string {
   const url = new URL(makeSocketUrl(explicitUrl, WS_FEATURE_PATH));
-  url.searchParams.set(WS_COMPATIBILITY_QUERY.clientBuild, APP_VERSION);
+  url.searchParams.set(WS_COMPATIBILITY_QUERY.clientBuild, resolveClientBuild());
   url.searchParams.set(WS_COMPATIBILITY_QUERY.protocolEpoch, String(compatibility.protocolEpoch));
   url.searchParams.set(
     WS_COMPATIBILITY_QUERY.protocolRevision,
@@ -266,7 +272,7 @@ export function makeFeatureSocketUrl(
 export function makeNegotiateHttpUrl(explicitUrl: string | null): string {
   const url = new URL(makeSocketUrl(explicitUrl, WS_NEGOTIATE_HTTP_PATH));
   url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-  url.searchParams.set(WS_NEGOTIATE_QUERY.clientBuild, APP_VERSION);
+  url.searchParams.set(WS_NEGOTIATE_QUERY.clientBuild, resolveClientBuild());
   url.searchParams.set(WS_NEGOTIATE_QUERY.protocolEpoch, String(WS_PROTOCOL_EPOCH));
   url.searchParams.set(WS_NEGOTIATE_QUERY.minRevision, String(WS_PROTOCOL_MIN_REVISION));
   url.searchParams.set(WS_NEGOTIATE_QUERY.maxRevision, String(WS_PROTOCOL_MAX_REVISION));
@@ -315,7 +321,18 @@ export async function negotiateOverHttp(
   return Option.isSome(result) ? result.value : null;
 }
 
-function makeProtocolLayer(url: string) {
+/**
+ * The URL to dial, resolved per socket open rather than once per session. `Socket.layerWebSocket`
+ * re-runs an Effect URL on every acquire, and there are two acquires the transport does not drive
+ * itself: the RPC protocol's own retry loop reopens the socket on a transient close, and each
+ * reconnect builds a new runtime. A mobile upgrade ticket is consumed by the server the moment it
+ * verifies one, so a URL resolved once and replayed would authenticate exactly the first dial.
+ */
+function makeAuthenticatedSocketUrl(url: string): Effect.Effect<string> {
+  return Effect.promise(() => authenticateSocketUrl(url));
+}
+
+function makeProtocolLayer(url: string | Effect.Effect<string>) {
   const socketLayer = Socket.layerWebSocket(url).pipe(
     Layer.provide(Socket.layerWebSocketConstructorGlobal),
   );
@@ -710,6 +727,11 @@ export class WsTransport {
   private clientPromise: Promise<RpcClientInstance>;
   private reconnectPromise: Promise<RpcClientInstance> | null = null;
   private reconnectFailures = 0;
+  // Set while a reconnect attempt sleeps its backoff delay; wakeUp() invokes it
+  // so a connectivity signal (online, tab became visible) skips the remaining
+  // wait instead of letting a maxed-out backoff sit on a now-reachable network.
+  private skipReconnectBackoff: (() => void) | null = null;
+  private wakeProbeInFlight = false;
   private readonly streamCleanups = new Map<string, () => void>();
   private readonly streamSettled = new Map<string, Promise<void>>();
   private readonly streamCapacityRetries = new Map<string, number>();
@@ -979,6 +1001,49 @@ export class WsTransport {
   }
 
   /**
+   * Signals that connectivity may have just returned (network came back online,
+   * tab became visible). Resets the reconnect backoff and skips any backoff
+   * sleep already in progress so the retry happens now, kicks a closed
+   * transport into reconnecting, and probes an ostensibly open connection:
+   * after an interface change the TCP connection can be silently dead with the
+   * socket still reporting open, which otherwise leaves stale data on screen
+   * until kernel timeouts fire minutes later.
+   */
+  wakeUp(): void {
+    if (this.disposed) return;
+    this.reconnectFailures = 0;
+    this.skipReconnectBackoff?.();
+    if (this.state === "closed") {
+      void this.reconnect().catch(() => undefined);
+      return;
+    }
+    if (this.state === "open") {
+      void this.verifyLiveConnection();
+    }
+  }
+
+  /**
+   * Confirms an open connection is actually alive by running the same no-op
+   * probe used for cached-negotiation sessions. A failed probe clears the
+   * negotiation cache (the server may have restarted while we were offline)
+   * and forces a full reconnect.
+   */
+  private async verifyLiveConnection(): Promise<void> {
+    if (this.wakeProbeInFlight) return;
+    this.wakeProbeInFlight = true;
+    try {
+      const client = await this.clientPromise;
+      await this.probeFeatureConnection(client, this.getClientRuntime(client));
+    } catch {
+      if (!this.disposed) {
+        void this.reconnect().catch(() => undefined);
+      }
+    } finally {
+      this.wakeProbeInFlight = false;
+    }
+  }
+
+  /**
    * Resolves negotiation without burning a WebSocket handshake: the HTTP
    * endpoint answers directly on current servers, and only servers predating
    * it fall back to the legacy `/ws/bootstrap` socket round trip.
@@ -991,6 +1056,9 @@ export class WsTransport {
     if (this.disposed) {
       throw new Error("WebSocket transport was disposed during negotiation.");
     }
+    // Deliberately unauthenticated: the legacy bootstrap socket only negotiates protocol
+    // compatibility and the server admits it on origin trust alone, so spending a single-use
+    // upgrade ticket here would buy nothing and put one in a URL for no reason.
     const runtime = ManagedRuntime.make(
       makeProtocolLayer(makeSocketUrl(this.explicitUrl, WS_BOOTSTRAP_PATH)),
     );
@@ -1007,7 +1075,7 @@ export class WsTransport {
           protocolEpoch: WS_PROTOCOL_EPOCH,
           minRevision: WS_PROTOCOL_MIN_REVISION,
           maxRevision: WS_PROTOCOL_MAX_REVISION,
-          clientBuild: APP_VERSION,
+          clientBuild: resolveClientBuild(),
           requiredCapabilities: [...WS_CLIENT_REQUIRED_CAPABILITIES],
         }),
       );
@@ -1082,7 +1150,9 @@ export class WsTransport {
       }
 
       const featureRuntime = ManagedRuntime.make(
-        makeProtocolLayer(makeFeatureSocketUrl(this.explicitUrl, compatibility)),
+        makeProtocolLayer(
+          makeAuthenticatedSocketUrl(makeFeatureSocketUrl(this.explicitUrl, compatibility)),
+        ),
       );
       const featureScope = featureRuntime.runSync(Scope.make());
       this.runtime = featureRuntime;
@@ -1316,7 +1386,9 @@ export class WsTransport {
       this.setState("connecting");
       const delayMs = getReconnectRetryDelayMs(this.reconnectFailures);
       this.reconnectFailures += 1;
-      await delayWithAbort(delayMs, this.lifetime.signal);
+      await delayWithAbort(delayMs, this.lifetime.signal, (skip) => {
+        this.skipReconnectBackoff = skip;
+      });
 
       const session = this.createSession();
       this.clientPromise = session.clientPromise;

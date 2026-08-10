@@ -1,3 +1,4 @@
+import { AUTH_WEBSOCKET_TOKEN_QUERY_PARAM } from "@synara/contracts";
 import type {
   AuthBearerBootstrapResult,
   AuthBootstrapResult,
@@ -33,7 +34,6 @@ type BootstrapExchangeResult = {
 };
 
 const AUTHORIZATION_PREFIX = "Bearer ";
-const WEBSOCKET_TOKEN_QUERY_PARAM = "wsToken";
 
 export function toBootstrapExchangeAuthError(cause: BootstrapCredentialError): AuthError {
   if (cause.status === 500) {
@@ -372,7 +372,7 @@ export const makeServerAuth = Effect.gen(function* () {
   const authenticateWebSocketUpgrade: ServerAuthShape["authenticateWebSocketUpgrade"] = (
     request,
   ) => {
-    const websocketToken = request.url?.searchParams.get(WEBSOCKET_TOKEN_QUERY_PARAM);
+    const websocketToken = request.url?.searchParams.get(AUTH_WEBSOCKET_TOKEN_QUERY_PARAM);
     if (websocketToken && websocketToken.trim().length > 0) {
       return sessions.verifyWebSocketToken(websocketToken).pipe(
         Effect.map(toAuthenticatedSession),
