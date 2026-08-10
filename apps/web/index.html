@@ -2,6 +2,17 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- `viewport-fit=cover` lets the app paint into the display cutout / home-indicator area and
+         is what makes `env(safe-area-inset-*)` non-zero.
+
+         `interactive-widget=resizes-content` is half of the on-screen keyboard story, and only
+         half: Chrome / Android WebView honour it and shrink the LAYOUT viewport (and with it
+         `dvh` and `window.innerHeight`) to the space above the keyboard, so phone surfaces need
+         no extra padding there. iOS Safari / WKWebView ignore it, and the other half —
+         `src/hooks/useVisualViewportInset.ts` — publishes the visual-viewport overlap as
+         `--app-keyboard-inset` for those. The two mechanisms are alternatives, not a sum: see
+         that file's `computeViewportInset` doc and the `pb-keyboard-safe` utility in
+         `src/index.css`. -->
     <meta
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"

@@ -62,7 +62,7 @@ import {
   buildThreadSubscribeInput,
   resetThreadDetailResumeCursors,
 } from "./threadDetailResumeCursors";
-import { authenticateSocketUrl } from "./wsAuthTicket";
+import { authenticateSocketUrl, noteWsTicketConsumed } from "./wsAuthTicket";
 import type { WsTransportState } from "./wsTransportEvents";
 
 type PushListener<C extends WsPushChannel> = (message: WsPushMessage<C>) => void;
@@ -165,6 +165,12 @@ const makeRpcClient = RpcClient.make(WsFeatureRpcGroup);
 const makeBootstrapRpcClient = RpcClient.make(WsBootstrapRpcGroup);
 const REQUEST_TIMEOUT_MS = 60_000;
 const FEATURE_CONNECTION_PROBE_TIMEOUT_MS = 10_000;
+/**
+ * Minimum gap between two wake signals that are allowed to clear the reconnect backoff. Above the
+ * backoff cap, so a server that is simply down settles at the capped retry interval no matter how
+ * many connectivity signals the platform emits meanwhile.
+ */
+const WAKE_BACKOFF_RESET_THROTTLE_MS = 5_000;
 
 function resolveRpcUrl(rawUrl: string, path: string): string {
   const url = new URL(rawUrl);
@@ -570,6 +576,8 @@ export class WsTransport {
   // so a connectivity signal (online, tab became visible) skips the remaining
   // wait instead of letting a maxed-out backoff sit on a now-reachable network.
   private skipReconnectBackoff: (() => void) | null = null;
+  // Epoch millis of the last wake signal that was allowed to reset the backoff. See wakeUp().
+  private lastWakeBackoffResetAt = 0;
   private wakeProbeInFlight = false;
   private readonly streamCleanups = new Map<string, () => void>();
   private readonly streamSettled = new Map<string, Promise<void>>();
@@ -830,11 +838,21 @@ export class WsTransport {
    * after an interface change the TCP connection can be silently dead with the
    * socket still reporting open, which otherwise leaves stale data on screen
    * until kernel timeouts fire minutes later.
+   *
+   * The backoff reset is throttled: signals arrive in bursts (a flapping
+   * mobile radio raises `online`/`visibilitychange` repeatedly), and resetting
+   * on each one pins a dead server at the 500ms retry floor forever. The first
+   * wake after a quiet period still reconnects immediately, which is the case
+   * this exists for.
    */
   wakeUp(): void {
     if (this.disposed) return;
-    this.reconnectFailures = 0;
-    this.skipReconnectBackoff?.();
+    const now = Date.now();
+    if (now - this.lastWakeBackoffResetAt >= WAKE_BACKOFF_RESET_THROTTLE_MS) {
+      this.lastWakeBackoffResetAt = now;
+      this.reconnectFailures = 0;
+      this.skipReconnectBackoff?.();
+    }
     if (this.state === "closed") {
       void this.reconnect().catch(() => undefined);
       return;
@@ -975,6 +993,10 @@ export class WsTransport {
       this.runtime = featureRuntime;
       this.clientScope = featureScope;
       const client = await featureRuntime.runPromise(Scope.provide(featureScope)(makeRpcClient));
+      // This dial got as far as a socket, and the server consumes a mobile upgrade ticket at the
+      // upgrade, so whatever ticket authenticated it is spent. Reporting it here rather than at
+      // "open" errs toward one extra mint instead of replaying a spent ticket on the next dial.
+      noteWsTicketConsumed();
       this.runtimeByClient.set(client, featureRuntime);
       if (cachedCompatibility) {
         await this.probeFeatureConnection(client, featureRuntime);

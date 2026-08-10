@@ -1,16 +1,19 @@
 // FILE: wsAuthTicket.test.ts
-// Purpose: Verifies the mobile upgrade-ticket mint: the off-mobile no-op, freshness per call,
-//          the unreachable-vs-revoked split, the signed-out redirect (once per sign-out, but
-//          re-armed after re-pairing), and the rate-limit cooldown.
+// Purpose: Verifies the mobile upgrade-ticket mint: the off-mobile no-op, reuse of an unconsumed
+//          ticket across dials, the unreachable-vs-revoked split, the signed-out redirect (once
+//          per pairing, but re-armed by re-pairing), and the rate-limit cooldown.
 // Layer: Web auth support tests
 // Depends on: mocked ~/env, ~/shellAuthSession, ~/shellSession and ~/appHistoryMode (the history
 //             mode is irrelevant here — only the href it would build for the connect route).
+//             ~/shellSessionExit runs for real: the revocation latch is what is under test.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { resetShellSessionExitStateForTests } from "./shellSessionExit";
 import {
   acquireWsTicket,
   authenticateSocketUrl,
+  noteWsTicketConsumed,
   resetWsAuthTicketStateForTests,
   WS_AUTH_TICKET_PATH,
 } from "./wsAuthTicket";
@@ -37,8 +40,12 @@ vi.mock("./shellAuthSession", () => ({
 }));
 
 const clearSession = vi.fn<() => Promise<void>>(() => Promise.resolve());
+// Only a successful pairing advances this; `clearShellSession` deliberately does not, so the
+// revocation latch holds until the device really pairs again.
+let pairingGeneration = 0;
 vi.mock("./shellSession", () => ({
   clearShellSession: () => clearSession(),
+  getShellPairingGeneration: () => pairingGeneration,
 }));
 
 vi.mock("./appHistoryMode", () => ({
@@ -62,6 +69,7 @@ function jsonResponse(status: number, body: unknown): Response {
 
 beforeEach(() => {
   mobileShell = true;
+  pairingGeneration = 1;
   bearerToken.mockResolvedValue("owner-token");
   clearSession.mockResolvedValue(undefined);
   vi.stubGlobal("window", { location: { assign } });
@@ -69,28 +77,84 @@ beforeEach(() => {
 
 afterEach(() => {
   resetWsAuthTicketStateForTests();
+  resetShellSessionExitStateForTests();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
 
 describe("acquireWsTicket", () => {
-  it("mints a fresh ticket per call with the owner bearer token", async () => {
+  it("mints with the owner bearer token", async () => {
     const fetchMock = vi
       .fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-1", expiresAt: "2026-01-01" }))
-      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-2", expiresAt: "2026-01-01" }));
+      .mockResolvedValue(jsonResponse(200, { token: "ticket-1", expiresAt: "2026-01-01" }));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(acquireWsTicket()).resolves.toBe("ticket-1");
-    await expect(acquireWsTicket()).resolves.toBe("ticket-2");
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe(`http://192.168.1.5:3773${WS_AUTH_TICKET_PATH}`);
     expect(init?.method).toBe("POST");
     expect(init?.headers).toEqual({ Authorization: "Bearer owner-token" });
     // Bounded: the socket cannot be dialed until this settles.
     expect(init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("reuses the unconsumed ticket across dials that never opened a socket", async () => {
+    const fetchMock = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-1" }))
+      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-2" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    // A failed dial leaves the ticket outstanding server-side. Minting per attempt would exhaust
+    // the session's ticket budget within one reconnect storm.
+    await expect(acquireWsTicket()).resolves.toBe("ticket-1");
+    await expect(acquireWsTicket()).resolves.toBe("ticket-1");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The server consumes the ticket at the upgrade, so the next dial has to mint its own.
+    noteWsTicketConsumed();
+    await expect(acquireWsTicket()).resolves.toBe("ticket-2");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("mints again once the reuse window lapses", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-1" }))
+      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-2" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      await expect(acquireWsTicket()).resolves.toBe("ticket-1");
+      vi.advanceTimersByTime(14_000);
+      await expect(acquireWsTicket()).resolves.toBe("ticket-1");
+      // Well inside the server's ticket TTL, so a stale reuse can never be the reason a dial is
+      // refused for long.
+      vi.advanceTimersByTime(1_000);
+      await expect(acquireWsTicket()).resolves.toBe("ticket-2");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never offers a ticket minted for a different bearer", async () => {
+    const fetchMock = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-old" }))
+      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-new" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(acquireWsTicket()).resolves.toBe("ticket-old");
+
+    // Re-paired (or signed out and back in): the cached ticket belongs to a session this device
+    // no longer holds.
+    bearerToken.mockResolvedValue("owner-token-2");
+    await expect(acquireWsTicket()).resolves.toBe("ticket-new");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("returns null without touching the network off the mobile shell", async () => {
@@ -169,25 +233,24 @@ describe("acquireWsTicket", () => {
     expect(assign).toHaveBeenCalledWith("#/connect?reason=signed-out");
   });
 
-  it("handles a second revocation after the device re-pairs", async () => {
-    const fetchMock = vi
-      .fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(jsonResponse(401, {}))
-      .mockResolvedValueOnce(jsonResponse(200, { token: "ticket-after-repair" }))
-      .mockResolvedValueOnce(jsonResponse(401, {}));
-    vi.stubGlobal("fetch", fetchMock);
+  it("re-arms the redirect for a pairing that is revoked before its first successful mint", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse(401, {}))),
+    );
 
     await expect(acquireWsTicket()).resolves.toBeNull();
     expect(assign).toHaveBeenCalledTimes(1);
 
-    // The signed-out redirect is a hash navigation, so this module's state survives re-pairing.
-    // An accepted mint proves the device authenticated again and must re-arm the one-shot, or a
-    // later revocation would 401 every socket forever with nothing sending the user to connect.
-    await expect(acquireWsTicket()).resolves.toBe("ticket-after-repair");
+    // Re-paired against a server that immediately refuses this device (link already revoked
+    // server-side). Nothing minted successfully in between, so a latch re-armed only by an
+    // accepted mint would leave this device stranded on a signed-out app.
+    pairingGeneration += 1;
     await expect(acquireWsTicket()).resolves.toBeNull();
 
     expect(clearSession).toHaveBeenCalledTimes(2);
     expect(assign).toHaveBeenCalledTimes(2);
+    expect(assign).toHaveBeenLastCalledWith("#/connect?reason=signed-out");
   });
 
   it("keeps the pairing when the mint is rate limited", async () => {
@@ -226,6 +289,18 @@ describe("acquireWsTicket", () => {
       fetchMock.mockResolvedValue(jsonResponse(200, { token: "ticket-after-cooldown" }));
       await expect(acquireWsTicket()).resolves.toBe("ticket-after-cooldown");
       expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // The accepted mint retires that cooldown rather than leaving a stale deadline behind: a
+      // later 429 has to arm a fresh window measured from when the server shed load again.
+      noteWsTicketConsumed();
+      vi.advanceTimersByTime(120_000);
+      fetchMock.mockResolvedValue(jsonResponse(429, { error: "Too many ticket requests." }));
+      await expect(acquireWsTicket()).resolves.toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+
+      vi.advanceTimersByTime(59_000);
+      await expect(acquireWsTicket()).resolves.toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
     }

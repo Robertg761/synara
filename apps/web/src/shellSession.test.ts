@@ -1,6 +1,7 @@
 // FILE: shellSession.test.ts
 // Purpose: Verifies the mobile shell's hydrate-once session cache: URL conversion, single-flight
-// hydration, the off-mobile no-op, and the pair/clear write paths.
+// hydration and how it reports a storage read that never answered, the off-mobile no-op, and the
+// pair/clear write paths.
 // Layer: Web shell integration tests
 // Depends on: an injected fake MobileBridge (no Capacitor global involved).
 
@@ -9,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearShellSession,
+  getShellPairingGeneration,
   getShellServerWsUrl,
   getShellSessionToken,
   hydrateShellSession,
@@ -81,8 +83,10 @@ describe("toShellServerWsBase", () => {
 });
 
 describe("hydrateShellSession", () => {
-  it("is a no-op without a bridge (browser and desktop runtimes)", async () => {
-    await hydrateShellSession(null);
+  it("reports storage as unavailable without a bridge instead of unpaired", async () => {
+    // No bridge is not evidence about what is on the device: off the mobile shell nobody asks,
+    // and on it a null bridge means the plugin has not attached yet.
+    await expect(hydrateShellSession(null)).resolves.toBe("unavailable");
     expect(isShellPaired()).toBe(false);
     expect(getShellSessionToken()).toBeNull();
     expect(getShellServerWsUrl()).toBeNull();
@@ -90,7 +94,7 @@ describe("hydrateShellSession", () => {
 
   it("exposes the stored session synchronously once hydrated", async () => {
     const { bridge } = makeBridge({ serverUrl: "https://box.ts.net", sessionToken: "tok-1" });
-    await hydrateShellSession(bridge);
+    await expect(hydrateShellSession(bridge)).resolves.toBe("paired");
     expect(isShellPaired()).toBe(true);
     expect(getShellSessionToken()).toBe("tok-1");
     expect(getShellServerWsUrl()).toBe("wss://box.ts.net");
@@ -98,13 +102,13 @@ describe("hydrateShellSession", () => {
 
   it("stays unpaired when the device has never paired", async () => {
     const { bridge } = makeBridge(null);
-    await hydrateShellSession(bridge);
+    await expect(hydrateShellSession(bridge)).resolves.toBe("unpaired");
     expect(isShellPaired()).toBe(false);
   });
 
   it("treats a stored session with an unusable server URL as unpaired", async () => {
     const { bridge } = makeBridge({ serverUrl: "not a url", sessionToken: "tok-1" });
-    await hydrateShellSession(bridge);
+    await expect(hydrateShellSession(bridge)).resolves.toBe("unpaired");
     expect(isShellPaired()).toBe(false);
     expect(getShellSessionToken()).toBeNull();
     expect(getShellServerWsUrl()).toBeNull();
@@ -117,7 +121,10 @@ describe("hydrateShellSession", () => {
     expect(get).toHaveBeenCalledTimes(1);
   });
 
-  it("retries after a failed read instead of caching the failure", async () => {
+  it("retries a failed read within the same hydration", async () => {
+    // The keystore can still be locked, and the bridge still attaching, for a moment after a cold
+    // start. Retrying costs a route load a few hundred milliseconds and saves a paired device
+    // from being told it has never paired.
     const get = vi
       .fn<() => Promise<MobileShellSession | null>>()
       .mockRejectedValueOnce(new Error("keystore locked"))
@@ -128,10 +135,30 @@ describe("hydrateShellSession", () => {
       addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
     } as unknown as MobileBridge;
 
-    await hydrateShellSession(bridge);
-    expect(isShellPaired()).toBe(false);
-    await hydrateShellSession(bridge);
+    await expect(hydrateShellSession(bridge)).resolves.toBe("paired");
     expect(get).toHaveBeenCalledTimes(2);
+    expect(getShellSessionToken()).toBe("t");
+  });
+
+  it("reports unavailable — never unpaired — when storage keeps refusing, and does not cache it", async () => {
+    const get = vi
+      .fn<() => Promise<MobileShellSession | null>>()
+      .mockRejectedValue(new Error("keystore locked"));
+    const bridge = {
+      session: { get, set: vi.fn(), clear: vi.fn() },
+      consumePendingThreadOpen: () => Promise.resolve(null),
+      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
+    } as unknown as MobileBridge;
+
+    await expect(hydrateShellSession(bridge)).resolves.toBe("unavailable");
+    expect(isShellPaired()).toBe(false);
+    expect(get).toHaveBeenCalledTimes(3);
+
+    // A read that never answered is not an answer to cache: the next caller tries again, and once
+    // storage recovers the device is paired without a relaunch.
+    get.mockResolvedValue({ serverUrl: "http://localhost:3020", sessionToken: "t" });
+    await expect(hydrateShellSession(bridge)).resolves.toBe("paired");
+    expect(get).toHaveBeenCalledTimes(4);
     expect(getShellSessionToken()).toBe("t");
   });
 
@@ -164,6 +191,38 @@ describe("pairFromCredential", () => {
     expect(set).toHaveBeenCalledWith({ serverUrl: "http://10.0.0.2:3020", sessionToken: "tok-2" });
     expect(getShellServerWsUrl()).toBe("ws://10.0.0.2:3020");
     expect(getShellSessionToken()).toBe("tok-2");
+  });
+
+  it("advances the pairing generation, which clearing does not", async () => {
+    // What state latched against a repudiated session keys off: signing out must not re-arm it,
+    // pairing again must.
+    const { bridge } = makeBridge(null);
+    const initial = getShellPairingGeneration();
+
+    await pairFromCredential({ serverUrl: "https://box.ts.net", sessionToken: "tok" }, bridge);
+    const afterPairing = getShellPairingGeneration();
+    expect(afterPairing).not.toBe(initial);
+
+    await clearShellSession(bridge);
+    expect(getShellPairingGeneration()).toBe(afterPairing);
+
+    await pairFromCredential({ serverUrl: "https://box.ts.net", sessionToken: "tok-2" }, bridge);
+    expect(getShellPairingGeneration()).not.toBe(afterPairing);
+  });
+
+  it("does not advance the pairing generation when the write fails", async () => {
+    const set = vi.fn(() => Promise.reject(new Error("keystore write failed")));
+    const bridge = {
+      session: { get: vi.fn(() => Promise.resolve(null)), set, clear: vi.fn() },
+      consumePendingThreadOpen: () => Promise.resolve(null),
+      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
+    } as unknown as MobileBridge;
+
+    const initial = getShellPairingGeneration();
+    await expect(
+      pairFromCredential({ serverUrl: "https://box.ts.net", sessionToken: "tok" }, bridge),
+    ).rejects.toThrow(/write failed/);
+    expect(getShellPairingGeneration()).toBe(initial);
   });
 
   it("rejects an unusable server URL without persisting anything", async () => {

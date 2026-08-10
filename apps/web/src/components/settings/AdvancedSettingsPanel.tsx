@@ -18,6 +18,7 @@ import { ensureNativeApi, readNativeApi } from "~/nativeApi";
 import { serverAuthSessionQueryOptions, serverConfigQueryOptions } from "~/lib/serverReactQuery";
 import { cn } from "~/lib/utils";
 import { SETTINGS_INSET_LIST_CLASS_NAME } from "~/settingsPanelStyles";
+import { signedOutRoutePath } from "~/shellSessionExit";
 import { useStore } from "~/store";
 import { createAllThreadsMessagelessSelector, createThreadShellsSelector } from "~/storeSelectors";
 import { useSettingsRestoreSignal } from "./SettingControls";
@@ -124,8 +125,10 @@ export function AdvancedSettingsPanel(props: {
       logout: () => api.server.logoutAuthSession(),
       // Browser history: a real navigation the server answers with index.html, which renders
       // the pre-React signed-out screen. Hash history: a fragment move inside the loaded
-      // document, which the router resolves to the in-app /signed-out route.
-      navigate: (path) => window.location.assign(appRouteDocumentHref(path)),
+      // document, which the router resolves to the in-app /signed-out route. On the mobile
+      // shell the destination is the connect screen instead: `logoutAuthSession` has already
+      // dropped the pairing this device stored, and pairing again is the only way back in.
+      navigate: (path) => window.location.assign(appRouteDocumentHref(signedOutRoutePath(path))),
       onError: (error) =>
         toastManager.add({
           type: "error",

@@ -259,7 +259,29 @@ export function makeHealthEffectRouteLayer(readiness: ServerReadiness) {
   );
 }
 
-const requireAuthenticatedRequest = Effect.gen(function* () {
+/**
+ * Authentication for the read-only media GET routes: a session (cookie or bearer) as usual, plus
+ * a media credential in the query string. That query channel is the only one available to
+ * `<img src>`, `<a download>` and the PDF viewer, none of which can set an Authorization header,
+ * and none of which get a session cookie when the page origin is foreign to the server (the
+ * mobile shell's WebView, the desktop app's custom scheme). Never reach for this outside a media
+ * GET: the credential is replayable from any URL the client has rendered, which is precisely why
+ * it authorizes nothing else.
+ */
+const requireAuthenticatedMediaRequest = Effect.gen(function* () {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const serverAuth = yield* ServerAuth;
+  yield* serverAuth.authenticateMediaHttpRequest(makeEffectAuthRequest(request));
+});
+
+/**
+ * Authentication for GET routes that a media credential must NOT open: a session, and nothing
+ * else. Thread export is the case that matters — it returns a whole transcript archive, which is
+ * categorically more sensitive than the images the media credential exists to render, and that
+ * credential is stamped into every image URL on the mobile shell (query strings leak into logs,
+ * screenshots and intermediary caches). One captured favicon URL must not become a transcript.
+ */
+const requireAuthenticatedSessionRequest = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const serverAuth = yield* ServerAuth;
   yield* serverAuth.authenticateHttpRequest(makeEffectAuthRequest(request));
@@ -302,7 +324,10 @@ function trustedMutationCorsHeaders(input: {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Credentials": "true",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    // Authorization rides along because off-origin clients (the mobile shell, the desktop app
+    // against a remote server) hold a bearer session rather than a cookie; without it the
+    // preflight fails and every upload 401s before the request body is ever sent.
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
     Vary: "Origin",
   };
 }
@@ -522,6 +547,14 @@ const authRouteResponse = Effect.gen(function* () {
     return HttpServerResponse.jsonUnsafe(yield* serverAuth.issueWebSocketToken(session));
   }
 
+  if (request.method === "POST" && url.pathname === "/api/auth/media-token") {
+    const session = yield* authenticatedMutationSession;
+    return HttpServerResponse.jsonUnsafe(yield* serverAuth.issueMediaToken(session), {
+      // A bearer capability in a response body: never cacheable, by us or by anything between us.
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
+
   if (request.method === "POST" && url.pathname === "/api/auth/pairing-token") {
     const session = yield* authenticatedMutationSession;
     if (session.role !== "owner")
@@ -668,7 +701,7 @@ export const projectFaviconEffectRouteLayer = HttpRouter.add(
   "GET",
   "/api/project-favicon",
   Effect.gen(function* () {
-    yield* requireAuthenticatedRequest.pipe(
+    yield* requireAuthenticatedMediaRequest.pipe(
       Effect.catchTag("AuthError", (error) => Effect.fail(error)),
     );
     const request = yield* HttpServerRequest.HttpServerRequest;
@@ -722,7 +755,7 @@ const siteFaviconEffectRouteLayer = HttpRouter.add(
     // load in local dev without a session cookie.
     const config = yield* ServerConfig;
     if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
-      yield* requireAuthenticatedRequest;
+      yield* requireAuthenticatedMediaRequest;
     }
 
     const domainParam = url.searchParams.get("domain") ?? url.searchParams.get("url");
@@ -756,9 +789,12 @@ const siteFaviconEffectRouteLayer = HttpRouter.add(
 
 // Builds a ZIP export of a single thread (thread.json + transcript.md) and streams
 // it back as a download. Loads only the requested thread detail so the export cost
-// scales with that thread rather than the whole projection; mirrors the auth shape
-// of the other binary GET routes (favicon/attachments).
-const threadExportEffectRouteLayer = HttpRouter.add(
+// scales with that thread rather than the whole projection.
+//
+// Unlike the image routes this one demands a real session: the client fetches it and saves the
+// blob itself, so it has a header to put a credential in and no need for the replayable
+// query-string one.
+export const threadExportEffectRouteLayer = HttpRouter.add(
   "GET",
   "/api/thread-export",
   Effect.gen(function* () {
@@ -768,7 +804,7 @@ const threadExportEffectRouteLayer = HttpRouter.add(
 
     const config = yield* ServerConfig;
     if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
-      yield* requireAuthenticatedRequest;
+      yield* requireAuthenticatedSessionRequest;
     }
 
     // Error responses need the trusted-origin CORS headers too: the desktop
@@ -810,7 +846,21 @@ const threadExportEffectRouteLayer = HttpRouter.add(
         },
       },
     );
-  }).pipe(Effect.catchTag("AuthError", (error) => Effect.succeed(authErrorResponse(error)))),
+  }).pipe(
+    Effect.catchTag("AuthError", (error) =>
+      // The 401 has to be readable by the caller for the same reason the 409 does — more so, since
+      // an unreadable one is what keeps a revoked device from noticing it has been revoked.
+      Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const url = HttpServerRequest.toURL(request);
+        const config = yield* ServerConfig;
+        return authErrorResponse(
+          error,
+          url ? localPreviewCorsHeaders({ config, request, url }) : {},
+        );
+      }),
+    ),
+  ),
 );
 
 export const editorIconEffectRouteLayer = HttpRouter.add(
@@ -823,7 +873,7 @@ export const editorIconEffectRouteLayer = HttpRouter.add(
 
     const config = yield* ServerConfig;
     if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
-      yield* requireAuthenticatedRequest;
+      yield* requireAuthenticatedMediaRequest;
     }
 
     const fileSystem = yield* FileSystem.FileSystem;
@@ -866,7 +916,7 @@ export const localImageEffectRouteLayer = HttpRouter.add(
 
     const config = yield* ServerConfig;
     if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
-      yield* requireAuthenticatedRequest;
+      yield* requireAuthenticatedMediaRequest;
     }
 
     const previewFile = yield* Effect.promise(() =>
@@ -1084,24 +1134,31 @@ const binaryUploadEffectHandler = Effect.gen(function* () {
   return HttpServerResponse.text("Not Found", { status: 404, headers: corsHeaders });
 }).pipe(
   Effect.catch((error) =>
-    Effect.succeed(
-      error instanceof AuthError
-        ? authErrorResponse(error)
-        : HttpServerResponse.jsonUnsafe(
-            {
-              error:
-                error instanceof Error
-                  ? error.message
-                  : String((error as { readonly message?: unknown }).message ?? error),
-            },
-            {
-              status:
-                typeof (error as { readonly status?: unknown }).status === "number"
-                  ? (error as { readonly status: number }).status
-                  : 500,
-            },
-          ),
-    ),
+    // Failures need the same CORS headers the success path sends. Without them a cross-origin
+    // caller cannot read the status off the response: a 401 arrives as an opaque network error,
+    // and the client that would have dropped a repudiated pairing instead retries forever.
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const url = HttpServerRequest.toURL(request);
+      const config = yield* ServerConfig;
+      const corsHeaders = url ? (trustedMutationCorsHeaders({ request, url, config }) ?? {}) : {};
+      if (error instanceof AuthError) return authErrorResponse(error, corsHeaders);
+      return HttpServerResponse.jsonUnsafe(
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : String((error as { readonly message?: unknown }).message ?? error),
+        },
+        {
+          status:
+            typeof (error as { readonly status?: unknown }).status === "number"
+              ? (error as { readonly status: number }).status
+              : 500,
+          ...(Object.keys(corsHeaders).length > 0 ? { headers: corsHeaders } : {}),
+        },
+      );
+    }),
   ),
 );
 
@@ -1125,7 +1182,7 @@ export const attachmentsEffectRouteLayer = HttpRouter.add(
     // Desktop image tags cannot attach Authorization headers; preserve the same
     // startup token rule that the WebSocket route already accepts.
     if (!isLegacyTokenAuthorized({ config, url, remoteAddress: request.remoteAddress })) {
-      yield* requireAuthenticatedRequest;
+      yield* requireAuthenticatedMediaRequest;
     }
 
     const rawRelativePath = url.pathname.slice(ATTACHMENTS_ROUTE_PREFIX.length);

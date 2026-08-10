@@ -536,7 +536,10 @@ import {
   CHAT_COLUMN_GUTTER_CLASS_NAME,
   ENVIRONMENT_CONTENT_INSET_MOTION_CLASS,
 } from "./chat/composerPickerStyles";
-import { shouldComposerEnterSend } from "./chat/composerEnterBehavior";
+import {
+  shouldComposerEnterSend,
+  shouldComposerEnterUseOppositeFollowUp,
+} from "./chat/composerEnterBehavior";
 import { getComposerTraitSelection } from "./chat/composerTraits";
 import { resolveRuntimeModelDescriptor } from "./chat/runtimeModelCapabilities";
 import { ProjectPicker } from "./chat/ProjectPicker";
@@ -10258,6 +10261,10 @@ export default function ChatView({
     key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab" | "Slash",
     event: KeyboardEvent,
   ) => {
+    // The composer's one Enter modifier, read the same way by both Enter branches below: it
+    // forces a send on a coarse pointer (the hardware-keyboard escape hatch) and picks the
+    // opposite follow-up dispatch on a fine one. See `composerEnterBehavior`.
+    const enterModifierKey = event.metaKey || event.ctrlKey;
     if (key === "Slash" && !event.metaKey && !event.ctrlKey && !event.altKey) {
       const { snapshot, trigger } = resolveActiveComposerTrigger();
       const slashTriggerText =
@@ -10287,7 +10294,11 @@ export default function ChatView({
     const menuIsActive = composerMenuOpenRef.current || trigger !== null;
     if (
       key === "Enter" &&
-      shouldComposerEnterSend({ shiftKey: event.shiftKey, isCoarsePointer }) &&
+      shouldComposerEnterSend({
+        shiftKey: event.shiftKey,
+        isCoarsePointer,
+        modifierKey: enterModifierKey,
+      }) &&
       !menuIsActive &&
       extractChatAutomationInvocation(snapshot.value) !== null
     ) {
@@ -10296,7 +10307,10 @@ export default function ChatView({
         resolveFollowUpDispatchMode({
           behavior: settings.followUpBehavior,
           hasLiveTurn,
-          useOppositeBehavior: event.metaKey || event.ctrlKey,
+          useOppositeBehavior: shouldComposerEnterUseOppositeFollowUp({
+            isCoarsePointer,
+            modifierKey: enterModifierKey,
+          }),
         }),
       );
       return true;
@@ -10394,8 +10408,15 @@ export default function ChatView({
 
     // Returning false leaves Enter to the editor, which inserts a newline (PlainText
     // plugin default) — that is the coarse-pointer path, where sending is the send
-    // button's job. See `shouldComposerEnterSend`.
-    if (key === "Enter" && shouldComposerEnterSend({ shiftKey: event.shiftKey, isCoarsePointer })) {
+    // button's (or Ctrl/Cmd+Enter's) job. See `shouldComposerEnterSend`.
+    if (
+      key === "Enter" &&
+      shouldComposerEnterSend({
+        shiftKey: event.shiftKey,
+        isCoarsePointer,
+        modifierKey: enterModifierKey,
+      })
+    ) {
       if (promptHistoryNavigationRef.current !== null) {
         // Sending commits the recalled text as the prompt; drop the saved
         // draft here (not just in the send path) so it cannot linger and
@@ -10409,7 +10430,10 @@ export default function ChatView({
         resolveFollowUpDispatchMode({
           behavior: settings.followUpBehavior,
           hasLiveTurn,
-          useOppositeBehavior: event.metaKey || event.ctrlKey,
+          useOppositeBehavior: shouldComposerEnterUseOppositeFollowUp({
+            isCoarsePointer,
+            modifierKey: enterModifierKey,
+          }),
         }),
       );
       return true;

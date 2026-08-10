@@ -1,8 +1,9 @@
-import { AUTH_WEBSOCKET_TOKEN_QUERY_PARAM } from "@synara/contracts";
+import { AUTH_MEDIA_TOKEN_QUERY_PARAM, AUTH_WEBSOCKET_TOKEN_QUERY_PARAM } from "@synara/contracts";
 import type {
   AuthBearerBootstrapResult,
   AuthBootstrapResult,
   AuthClientSession,
+  AuthMediaTokenResult,
   AuthPairingCredentialResult,
   AuthSessionState,
   AuthWebSocketTokenResult,
@@ -369,6 +370,54 @@ export const makeServerAuth = Effect.gen(function* () {
       ),
     );
 
+  const issueMediaToken: ServerAuthShape["issueMediaToken"] = (session) =>
+    sessions.issueMediaToken(session.sessionId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new AuthError({
+            message: "Failed to issue media token.",
+            status: 500,
+            cause,
+          }),
+      ),
+      Effect.map(
+        (issued) =>
+          ({
+            token: issued.token,
+            expiresAt: DateTime.toUtc(issued.expiresAt),
+          }) satisfies AuthMediaTokenResult,
+      ),
+    );
+
+  const authenticateMediaHttpRequest: ServerAuthShape["authenticateMediaHttpRequest"] = (
+    request,
+  ) => {
+    const mediaToken = request.url?.searchParams.get(AUTH_MEDIA_TOKEN_QUERY_PARAM);
+    if (mediaToken && mediaToken.trim().length > 0) {
+      return sessions.verifyMediaToken(mediaToken).pipe(
+        Effect.tapError((cause: SessionCredentialError) =>
+          // The reason, never the credential: these URLs are the one place a Synara token
+          // travels in a query string, and a log line is exactly the kind of place it must
+          // not be copied into.
+          Effect.logWarning("Rejected media access credential.").pipe(
+            Effect.annotateLogs({ reason: cause.message }),
+          ),
+        ),
+        Effect.map(toAuthenticatedSession),
+        Effect.mapError(
+          (cause) =>
+            new AuthError({
+              message: "Unauthorized request.",
+              status: 401,
+              cause,
+            }),
+        ),
+      );
+    }
+
+    return authenticateRequest(request);
+  };
+
   const authenticateWebSocketUpgrade: ServerAuthShape["authenticateWebSocketUpgrade"] = (
     request,
   ) => {
@@ -414,8 +463,10 @@ export const makeServerAuth = Effect.gen(function* () {
     revokeOtherClientSessions,
     logoutSession,
     authenticateHttpRequest: authenticateRequest,
+    authenticateMediaHttpRequest,
     authenticateWebSocketUpgrade,
     issueWebSocketToken,
+    issueMediaToken,
     issueStartupPairingUrl,
   } satisfies ServerAuthShape;
 });

@@ -54,11 +54,11 @@ export async function acquireShellBearerToken(): Promise<string | null> {
 }
 
 /**
- * Drops the cached token so the next request re-bootstraps (session revoked/expired). No-op on
- * mobile: that token is not a cache we can re-mint, so a retry reuses it and the 401 surfaces to
- * the caller. (Revocation on mobile is handled at the transport layer instead: a definitive 401
- * from the ws-ticket mint in `wsAuthTicket.ts` clears the stored session and sends the device to
- * the connect screen.)
+ * Drops the cached token so the next request re-bootstraps (session revoked/expired). Desktop only
+ * — the mobile token comes from pairing and cannot be re-minted here, so callers must not retry
+ * with it. Mobile revocation runs through `shellSessionExit.ts` instead: an answered 401 (from the
+ * ws-ticket mint or any auth route) clears the stored session and sends the device to the connect
+ * screen once.
  */
 export function invalidateShellBearerToken(): void {
   bearerToken = null;

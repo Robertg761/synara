@@ -6,11 +6,13 @@
 // Exports: Route for `/connect`
 // Depends on: ~/lib/pairingUrl (parse/normalize), ~/lib/bearerBootstrap (the exchange),
 //             ~/shellSession (persist), ~/lib/serverEndpoint (saved server origin),
-//             ~/connectRouteSearch (why the app sent this device here)
+//             ~/connectRouteSearch (why the app sent this device here),
+//             ~/appRelaunch (restart the app against the newly paired server)
 
 import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 import { useEffect, useId, useState, type FormEvent } from "react";
 
+import { relaunchAppAtRoot } from "~/appRelaunch";
 import { APP_DISPLAY_NAME } from "~/branding";
 import { parseConnectRouteSearch, type ConnectRouteSearch } from "~/connectRouteSearch";
 import { isMobileShell } from "~/env";
@@ -161,9 +163,13 @@ function ConnectRouteView() {
       setError(MESSAGES.storeFailed);
       return;
     }
-    // The credential and token only ever lived in memory and in secure storage; nothing to scrub
-    // from the URL, and the paired route replaces this one so Back cannot return to a used form.
-    void navigate({ to: "/", replace: true });
+    // Relaunch rather than navigate. This device may already have a transport connected to a
+    // different server, and it is a singleton that resolved its endpoint once: an in-place
+    // navigation would leave WebSocket traffic on the old server while HTTP goes to the new one,
+    // with credentials straddling both. The session is persisted above, so the fresh document
+    // comes back paired. The credential and token only ever lived in memory and in secure
+    // storage, so there is nothing to scrub from the URL.
+    relaunchAppAtRoot();
   }
 
   return (

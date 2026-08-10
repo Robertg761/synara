@@ -108,6 +108,7 @@ import {
 } from "../pullRequest/pullRequestDetail.logic";
 import { usePullRequestPaneStateIcon } from "../pullRequest/usePullRequestPaneStateIcon";
 import { RouteInsetSurface } from "../RouteInsetSurface";
+import { PHONE_HEADER_ICON_BUTTON_CLASS } from "../phone/phoneChrome";
 import { PhonePaneScreen } from "../phone/PhonePaneScreen";
 import { usePhonePaneRouteSync } from "../phone/usePhonePaneRoute";
 import { IconButton } from "../ui/icon-button";
@@ -1087,7 +1088,15 @@ export function SingleChatSurface(props: {
           onDrop={handleDropThread}
           className="flex h-full min-h-0 min-w-0 flex-1"
         >
-          <RouteInsetSurface surfaceClassName={CHAT_BACKGROUND_CLASS_NAME}>
+          <RouteInsetSurface
+            surfaceClassName={CHAT_BACKGROUND_CLASS_NAME}
+            // The phone pane screen is `fixed inset-0` over a chat surface that stays mounted, so
+            // without this Tab and screen-reader swipe would walk into the covered composer and
+            // header. `inert` (not a focus trap) is the right tool: the pane is a pushed route,
+            // not a modal, and this keeps the covered surface out of the a11y tree and the tab
+            // order for exactly as long as it is covered.
+            inert={phonePaneScreenPane !== null}
+          >
             <DeferredChatView
               threadId={props.threadId}
               paneScopeId={SINGLE_CHAT_PANE_SCOPE_ID}
@@ -1110,7 +1119,7 @@ export function SingleChatSurface(props: {
                         label="Back to chats"
                         variant="ghost"
                         size="icon"
-                        className="!size-11 rounded-xl [&_svg]:!size-5"
+                        className={PHONE_HEADER_ICON_BUTTON_CLASS}
                         onClick={handlePhoneLeaveThread}
                       >
                         <ChevronLeftIcon />

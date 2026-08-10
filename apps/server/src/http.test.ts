@@ -95,15 +95,20 @@ const readiness: ServerReadiness = {
   }),
 };
 
+const authenticatedTestSession = () =>
+  Effect.succeed({
+    sessionId: "11111111-1111-4111-8111-111111111111" as never,
+    subject: "test-owner",
+    method: "browser-session-cookie" as const,
+    role: "owner" as const,
+    credentialSource: "cookie" as const,
+  });
+
 const serverAuth = {
-  authenticateHttpRequest: () =>
-    Effect.succeed({
-      sessionId: "11111111-1111-4111-8111-111111111111" as never,
-      subject: "test-owner",
-      method: "browser-session-cookie" as const,
-      role: "owner" as const,
-      credentialSource: "cookie" as const,
-    }),
+  authenticateHttpRequest: authenticatedTestSession,
+  // The media GET routes go through their own guard, which additionally accepts the short-lived
+  // read-only credential from the query string.
+  authenticateMediaHttpRequest: authenticatedTestSession,
 } as unknown as ServerAuthShape;
 
 const projectFaviconResolver: ProjectFaviconResolverShape = {

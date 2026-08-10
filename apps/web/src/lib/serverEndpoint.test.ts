@@ -9,7 +9,7 @@ import type { MobileBridge, MobileShellSession } from "@synara/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { hydrateShellSession, resetShellSessionForTests } from "../shellSession";
-import { resolveServerWsBase, resolveWsHttpUrl, toAttachmentPreviewUrl } from "./serverEndpoint";
+import { resolveServerWsBase, resolveWsHttpUrl } from "./serverEndpoint";
 
 /** Pairs the shell session cache with `serverUrl` the way a hydrated mobile shell would be. */
 async function pairShellWith(serverUrl: string): Promise<void> {
@@ -147,20 +147,5 @@ describe("resolveWsHttpUrl", () => {
   it("falls back to the page origin when the configured WS URL is unparsable", () => {
     stubWindow({ bridgeWsUrl: "not a url" });
     expect(resolveWsHttpUrl("/api/attachments/1")).toBe("http://localhost:3020/api/attachments/1");
-  });
-});
-
-describe("toAttachmentPreviewUrl", () => {
-  it("resolves server-relative paths through the endpoint chain", () => {
-    stubWindow({ bridgeWsUrl: "ws://bridge:9000/ws" });
-    expect(toAttachmentPreviewUrl("/api/attachments/1/preview")).toBe(
-      "http://bridge:9000/api/attachments/1/preview",
-    );
-  });
-
-  it("passes fully-qualified URLs through untouched", () => {
-    expect(toAttachmentPreviewUrl("https://example.com/image.png")).toBe(
-      "https://example.com/image.png",
-    );
   });
 });

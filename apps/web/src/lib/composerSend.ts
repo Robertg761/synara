@@ -34,7 +34,7 @@ import {
 } from "./composerImagePreparation";
 import { normalizeComposerImageSource } from "./composerImageSource";
 import { randomUUID } from "./utils";
-import { resolveWsHttpUrl } from "./serverEndpoint";
+import { authenticatedServerFetch } from "./authenticatedFetch";
 
 const ATTACHMENT_CANCEL_CONCURRENCY = 2;
 const ATTACHMENT_CANCEL_BODY_MAX_BYTES = 512;
@@ -261,7 +261,7 @@ async function cancelManagedAttachments(attachmentIds: readonly string[]): Promi
       const body = JSON.stringify({ attachmentId });
       if (new TextEncoder().encode(body).byteLength > ATTACHMENT_CANCEL_BODY_MAX_BYTES) continue;
       try {
-        await fetch(resolveWsHttpUrl(ATTACHMENT_CANCEL_ROUTE_PATH), {
+        await authenticatedServerFetch(ATTACHMENT_CANCEL_ROUTE_PATH, {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
@@ -304,8 +304,8 @@ export async function stageUploadComposerAttachments(input: {
         name: attachment.name,
         mimeType: attachment.mimeType,
       });
-      const response = await fetch(
-        resolveWsHttpUrl(`${ATTACHMENT_UPLOAD_ROUTE_PATH}?${params.toString()}`),
+      const response = await authenticatedServerFetch(
+        `${ATTACHMENT_UPLOAD_ROUTE_PATH}?${params.toString()}`,
         {
           method: "POST",
           credentials: "include",

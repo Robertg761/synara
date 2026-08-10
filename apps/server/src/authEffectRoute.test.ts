@@ -5,17 +5,20 @@ import path from "node:path";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AuthSessionId } from "@synara/contracts";
+import { AUTH_MEDIA_TOKEN_QUERY_PARAM, AuthSessionId } from "@synara/contracts";
 import { SYNARA_DESKTOP_ORIGIN } from "@synara/shared/desktopIdentity";
 import {
   ATTACHMENT_CANCEL_ROUTE_PATH,
   ATTACHMENT_UPLOAD_ROUTE_PATH,
 } from "@synara/shared/binaryTransfer";
 import { SYNARA_MOBILE_APP_ORIGIN } from "@synara/shared/mobileIdentity";
-import { DateTime, Effect, Exit, Layer, Scope } from "effect";
+import { DateTime, Duration, Effect, Exit, Layer, Option, Scope } from "effect";
 import { HttpRouter } from "effect/unstable/http";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { describe, expect, it } from "vitest";
 
+import { ServerSecretStoreLive } from "./auth/Layers/ServerSecretStore";
+import { SessionCredentialServiceLive } from "./auth/Layers/SessionCredentialService";
 import { AuthError, ServerAuth, type ServerAuthShape } from "./auth/Services/ServerAuth";
 import {
   SessionCredentialService,
@@ -28,7 +31,12 @@ import {
   AUTH_JSON_BODY_MAX_BYTES,
   authEffectRouteLayer,
   binaryUploadEffectRouteLayer,
+  threadExportEffectRouteLayer,
 } from "./http";
+import {
+  ProjectionSnapshotQuery,
+  type ProjectionSnapshotQueryShape,
+} from "./orchestration/Services/ProjectionSnapshotQuery";
 import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegistry";
 
 const currentSessionId = AuthSessionId.makeUnsafe("11111111-1111-4111-8111-111111111111");
@@ -42,19 +50,46 @@ function makeSessionCredentialService(): SessionCredentialServiceShape {
   } as SessionCredentialServiceShape;
 }
 
+// A real session stack (signing key, database, renewal) for the one route test that must
+// exercise renewal end to end rather than assert against a stubbed expiry.
+const sessionCredentialTestLayer = SessionCredentialServiceLive.pipe(
+  Layer.provideMerge(SqlitePersistenceMemory),
+  Layer.provide(ServerSecretStoreLive),
+  Layer.provide(
+    ServerConfig.layerTest(process.cwd(), { prefix: "synara-auth-route-session-test-" }),
+  ),
+  Layer.provide(NodeServices.layer),
+);
+
+const descriptor = {
+  policy: "remote-reachable" as const,
+  bootstrapMethods: ["one-time-token" as const],
+  sessionMethods: ["browser-session-cookie" as const, "bearer-session-token" as const],
+  sessionCookieName: "synara_session",
+};
+
 function makeServerAuth(sideEffects: { count: number }): ServerAuthShape {
   const expiresAt = sessionExpiresAt;
-  const descriptor = {
-    policy: "remote-reachable" as const,
-    bootstrapMethods: ["one-time-token" as const],
-    sessionMethods: ["browser-session-cookie" as const, "bearer-session-token" as const],
-    sessionCookieName: "synara_session",
-  };
   const mutate = <A>(value: A) =>
     Effect.sync(() => {
       sideEffects.count += 1;
       return value;
     });
+  const authenticateHttpRequest: ServerAuthShape["authenticateHttpRequest"] = (request) => {
+    const bearer = request.headers.authorization === "Bearer bearer-token";
+    const cookie = request.cookies.synara_session === "cookie-token";
+    if (!bearer && !cookie) {
+      return Effect.fail(new AuthError({ message: "Authentication required.", status: 401 }));
+    }
+    return Effect.succeed({
+      sessionId: currentSessionId,
+      subject: "owner",
+      method: bearer ? "bearer-session-token" : "browser-session-cookie",
+      role: "owner",
+      expiresAt,
+      credentialSource: bearer ? "bearer" : "cookie",
+    });
+  };
   return {
     getDescriptor: () => Effect.succeed(descriptor),
     // Mirrors the real ServerAuth: bearer wins over cookie, either authenticates alone.
@@ -100,24 +135,26 @@ function makeServerAuth(sideEffects: { count: number }): ServerAuthShape {
     revokeClientSession: () => mutate(true),
     revokeOtherClientSessions: () => mutate(1),
     logoutSession: () => mutate(true),
-    authenticateHttpRequest: (request) => {
-      const bearer = request.headers.authorization === "Bearer bearer-token";
-      const cookie = request.cookies.synara_session === "cookie-token";
-      if (!bearer && !cookie) {
-        return Effect.fail(new AuthError({ message: "Authentication required.", status: 401 }));
-      }
-      return Effect.succeed({
-        sessionId: currentSessionId,
-        subject: "owner",
-        method: bearer ? "bearer-session-token" : "browser-session-cookie",
-        role: "owner",
-        expiresAt,
-        credentialSource: bearer ? "bearer" : "cookie",
-      });
-    },
+    authenticateHttpRequest,
     authenticateWebSocketUpgrade: () =>
       Effect.fail(new AuthError({ message: "Not used in auth route tests.", status: 401 })),
+    // Mirrors the real media guard: a `mediaToken` query parameter authenticates on its own, and
+    // otherwise it falls through to the session. Deliberately more permissive than
+    // `authenticateHttpRequest` so the thread-export tests below can prove which guard that route
+    // actually runs.
+    authenticateMediaHttpRequest: (request) =>
+      request.url?.searchParams.get(AUTH_MEDIA_TOKEN_QUERY_PARAM) === "media-token"
+        ? Effect.succeed({
+            sessionId: currentSessionId,
+            subject: "owner",
+            method: "bearer-session-token",
+            role: "client",
+            expiresAt,
+            credentialSource: "bearer",
+          })
+        : authenticateHttpRequest(request),
     issueWebSocketToken: () => mutate({ token: "ws-token", expiresAt }),
+    issueMediaToken: () => mutate({ token: "media-token", expiresAt }),
     issueStartupPairingUrl: () =>
       Effect.succeed("https://synara.example.test/pair#token=PAIRINGTOKEN"),
   } satisfies ServerAuthShape;
@@ -129,7 +166,8 @@ async function withAuthEffectServer(
   run: (origin: string) => Promise<void>,
   routeLayer:
     | typeof authEffectRouteLayer
-    | typeof binaryUploadEffectRouteLayer = authEffectRouteLayer,
+    | typeof binaryUploadEffectRouteLayer
+    | typeof threadExportEffectRouteLayer = authEffectRouteLayer,
 ): Promise<void> {
   const scope = await Effect.runPromise(Scope.make("sequential"));
   let nodeServer: http.Server | null = null;
@@ -144,6 +182,11 @@ async function withAuthEffectServer(
             getByProvider: () => Effect.die("voice adapter not used in this test"),
             listProviders: () => Effect.succeed([]),
           }),
+          // Every thread is absent: these tests are about which credential opens the route, and a
+          // 404 already proves the request got past the guard.
+          Layer.succeed(ProjectionSnapshotQuery, {
+            getThreadDetailForExportById: () => Effect.succeed(Option.none()),
+          } as unknown as ProjectionSnapshotQueryShape),
           ManagedAttachmentRepositoryLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
           NodeServices.layer,
         ),
@@ -162,8 +205,10 @@ async function withAuthEffectServer(
           );
           if (routeLayer === authEffectRouteLayer) {
             yield* httpServer.serve(yield* HttpRouter.toHttpEffect(authEffectRouteLayer));
-          } else {
+          } else if (routeLayer === binaryUploadEffectRouteLayer) {
             yield* httpServer.serve(yield* HttpRouter.toHttpEffect(binaryUploadEffectRouteLayer));
+          } else {
+            yield* httpServer.serve(yield* HttpRouter.toHttpEffect(threadExportEffectRouteLayer));
           }
         }).pipe(Effect.provideServices(services)),
         scope,
@@ -179,6 +224,7 @@ async function withAuthEffectServer(
 
 const mutationRoutes: ReadonlyArray<{ readonly path: string; readonly body?: unknown }> = [
   { path: "/api/auth/ws-token" },
+  { path: "/api/auth/media-token" },
   { path: "/api/auth/pairing-token" },
   { path: "/api/auth/pairing-links/revoke", body: { id: "pairing-id" } },
   { path: "/api/auth/clients/revoke", body: { sessionId: otherSessionId } },
@@ -292,6 +338,86 @@ describe("authEffectRouteLayer", () => {
       expect(cookie).toContain("SameSite=Lax");
       expect(cookie).not.toContain("Secure");
     });
+  });
+
+  it("re-stamps the cookie with the expiry a real cookie session slid to", async () => {
+    // End-to-end counterpart to the stubbed probe above: a genuine browser-session-cookie
+    // credential, verified by the real SessionCredentialService, must renew on this probe and
+    // the route must hand the browser the renewed `Expires` — otherwise the cookie jar evicts
+    // a session the server still considers live.
+    const scope = await Effect.runPromise(Scope.make("sequential"));
+    try {
+      const sessionServices = await Effect.runPromise(
+        Layer.buildWithScope(sessionCredentialTestLayer, scope),
+      );
+      const provideSessionServices = <A, E>(
+        effect: Effect.Effect<A, E, SessionCredentialService | SqlClient.SqlClient>,
+      ) => Effect.runPromise(Effect.provideServices(effect, sessionServices));
+
+      const { sessions, issued, agedExpiresAtMillis } = await provideSessionServices(
+        Effect.gen(function* () {
+          const sessions = yield* SessionCredentialService;
+          const sql = yield* SqlClient.SqlClient;
+          const issued = yield* sessions.issue({ method: "browser-session-cookie" });
+          // Ages the row so the next use clears the renewal throttle. Only raw SQL can move an
+          // expiry backwards — `extendExpiry` is monotonic by design — and this is exactly what
+          // a session issued weeks ago looks like on disk.
+          const agedExpiresAt = DateTime.addDuration(yield* DateTime.now, Duration.days(1));
+          yield* sql`
+            UPDATE auth_sessions
+            SET expires_at = ${DateTime.formatIso(agedExpiresAt)}
+            WHERE session_id = ${issued.sessionId}
+          `;
+          return {
+            sessions,
+            issued,
+            agedExpiresAtMillis: DateTime.toEpochMillis(agedExpiresAt),
+          };
+        }),
+      );
+
+      const serverAuth: ServerAuthShape = {
+        ...makeServerAuth({ count: 0 }),
+        getSessionState: (request) => {
+          const cookieToken = request.cookies.synara_session;
+          if (cookieToken === undefined) {
+            return Effect.succeed({ authenticated: false, auth: descriptor });
+          }
+          return sessions.verify(cookieToken).pipe(
+            Effect.map((verified) =>
+              verified.expiresAt === undefined
+                ? { authenticated: false, auth: descriptor }
+                : {
+                    authenticated: true,
+                    auth: descriptor,
+                    role: verified.role,
+                    sessionMethod: verified.method,
+                    expiresAt: DateTime.toUtc(verified.expiresAt),
+                  },
+            ),
+            Effect.catchCause(() => Effect.succeed({ authenticated: false, auth: descriptor })),
+          );
+        },
+      };
+
+      const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+      await withAuthEffectServer(config, serverAuth, async (serverOrigin) => {
+        const response = await fetch(`${serverOrigin}/api/auth/session`, {
+          headers: { Cookie: `synara_session=${issued.token}` },
+        });
+        expect(response.status).toBe(200);
+
+        const [active] = await Effect.runPromise(sessions.listActive());
+        expect(DateTime.toEpochMillis(active!.expiresAt)).toBeGreaterThan(
+          agedExpiresAtMillis + Duration.toMillis(Duration.days(20)),
+        );
+        const cookie = response.headers.get("set-cookie") ?? "";
+        expect(cookie).toContain(`synara_session=${encodeURIComponent(issued.token)}`);
+        expect(cookie).toContain(`Expires=${DateTime.toDate(active!.expiresAt).toUTCString()}`);
+      });
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void));
+    }
   });
 
   it("stamps Secure on the renewed cookie when the server is publicly reachable", async () => {
@@ -467,6 +593,29 @@ describe("authEffectRouteLayer", () => {
     });
   });
 
+  it("mints media credentials only for an authenticated session, and never caches them", async () => {
+    const sideEffects = { count: 0 };
+    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
+    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
+      const anonymous = await fetch(`${serverOrigin}/api/auth/media-token`, {
+        method: "POST",
+        headers: { Origin: serverOrigin },
+      });
+      expect(anonymous.status).toBe(401);
+      expect(sideEffects.count).toBe(0);
+
+      const authenticated = await fetch(
+        `${serverOrigin}/api/auth/media-token`,
+        mutationRequest({ credential: "bearer" }),
+      );
+      expect(authenticated.status).toBe(200);
+      await expect(authenticated.json()).resolves.toMatchObject({ token: "media-token" });
+      // A bearer capability in a body: no proxy, and no browser, gets to keep a copy.
+      expect(authenticated.headers.get("cache-control")).toBe("no-store");
+      expect(sideEffects.count).toBe(1);
+    });
+  });
+
   it("logs out either role and clears the exact cookie with secure public-mode attributes", async () => {
     const sideEffects = { count: 0 };
     const config = {
@@ -513,7 +662,7 @@ describe("binaryUploadEffectRouteLayer", () => {
             headers: {
               Origin: "synara-canary://app",
               "Access-Control-Request-Method": "POST",
-              "Access-Control-Request-Headers": "content-type",
+              "Access-Control-Request-Headers": "authorization, content-type",
             },
           });
 
@@ -521,9 +670,11 @@ describe("binaryUploadEffectRouteLayer", () => {
           expect(response.headers.get("access-control-allow-origin")).toBe("synara-canary://app");
           expect(response.headers.get("access-control-allow-credentials")).toBe("true");
           expect(response.headers.get("access-control-allow-methods")).toContain("POST");
-          expect(response.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
-            "content-type",
-          );
+          const allowedHeaders =
+            response.headers.get("access-control-allow-headers")?.toLowerCase() ?? "";
+          expect(allowedHeaders).toContain("content-type");
+          // The mobile shell has no cookie for this origin, so its upload carries a bearer.
+          expect(allowedHeaders).toContain("authorization");
         },
         binaryUploadEffectRouteLayer,
       );
@@ -618,5 +769,92 @@ describe("binaryUploadEffectRouteLayer", () => {
     } finally {
       fs.rmSync(attachmentsDir, { recursive: true, force: true });
     }
+  });
+
+  it("returns a readable 401 to the mobile shell instead of an opaque failure", async () => {
+    // A rejected upload must carry the same CORS headers the success path does. Without
+    // Access-Control-Allow-Origin the WebView's fetch() rejects with a network error and never
+    // sees the 401 — so the client that should drop a repudiated pairing retries forever instead.
+    const attachmentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "synara-upload-401-cors-"));
+    const config = {
+      host: "0.0.0.0",
+      publicUrl: new URL("https://synara.example.test/"),
+      attachmentsDir,
+    } as ServerConfigShape;
+    try {
+      await withAuthEffectServer(
+        config,
+        makeServerAuth({ count: 0 }),
+        async (serverOrigin) => {
+          const params = new URLSearchParams({
+            type: "image",
+            threadId: "thread-1",
+            name: "screen.png",
+            mimeType: "image/png",
+          });
+          const response = await fetch(
+            `${serverOrigin}${ATTACHMENT_UPLOAD_ROUTE_PATH}?${params.toString()}`,
+            {
+              method: "POST",
+              headers: {
+                Origin: SYNARA_MOBILE_APP_ORIGIN,
+                Authorization: "Bearer revoked-token",
+              },
+              body: Uint8Array.from([1]),
+            },
+          );
+
+          expect(response.status).toBe(401);
+          expect(response.headers.get("access-control-allow-origin")).toBe(
+            SYNARA_MOBILE_APP_ORIGIN,
+          );
+          expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+          await expect(response.json()).resolves.toMatchObject({ error: expect.any(String) });
+          expect(fs.readdirSync(attachmentsDir)).toEqual([]);
+        },
+        binaryUploadEffectRouteLayer,
+      );
+    } finally {
+      fs.rmSync(attachmentsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("threadExportEffectRouteLayer", () => {
+  const exportConfig = {
+    host: "0.0.0.0",
+    publicUrl: new URL("https://synara.example.test/"),
+  } as ServerConfigShape;
+
+  it("refuses a media credential and demands a session", async () => {
+    // The media credential is stamped into every <img> URL the mobile shell renders, where query
+    // strings leak into logs, screenshots and intermediary caches. A captured favicon URL must not
+    // be re-pointable at the transcript archive.
+    await withAuthEffectServer(
+      exportConfig,
+      makeServerAuth({ count: 0 }),
+      async (serverOrigin) => {
+        const mediaCredentialed = await fetch(
+          `${serverOrigin}/api/thread-export?threadId=thread-1&${AUTH_MEDIA_TOKEN_QUERY_PARAM}=media-token`,
+          { headers: { Origin: SYNARA_MOBILE_APP_ORIGIN } },
+        );
+        expect(mediaCredentialed.status).toBe(401);
+        // Readable cross-origin, so a revoked device learns it was revoked.
+        expect(mediaCredentialed.headers.get("access-control-allow-origin")).toBe(
+          SYNARA_MOBILE_APP_ORIGIN,
+        );
+
+        const anonymous = await fetch(`${serverOrigin}/api/thread-export?threadId=thread-1`);
+        expect(anonymous.status).toBe(401);
+
+        // The same request with a real session gets past the guard — 404 because the stubbed
+        // projection holds no threads, which is the point: authentication is no longer the answer.
+        const session = await fetch(`${serverOrigin}/api/thread-export?threadId=thread-1`, {
+          headers: { Authorization: "Bearer bearer-token" },
+        });
+        expect(session.status).toBe(404);
+      },
+      threadExportEffectRouteLayer,
+    );
   });
 });

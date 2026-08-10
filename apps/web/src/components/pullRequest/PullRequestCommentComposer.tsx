@@ -2,9 +2,11 @@
 // Purpose: Inline "Leave a comment" pill at the bottom of the detail panel's Comments section.
 //          Posts an issue comment through the gh-backed comment RPC as the authenticated GitHub
 //          user (hence the GitHub glyph in the leading slot), then invalidates the detail query
-//          so the new comment appears on the next refetch. Enter submits; Shift+Enter breaks a
-//          line (comments accept markdown). Successful or ambiguous submissions revalidate both
-//          the detail and repository list scopes so comment data and updated ordering converge.
+//          so the new comment appears on the next refetch. Enter submits on a fine pointer;
+//          Shift+Enter breaks a line, and on touch Enter is the newline while Ctrl/Cmd+Enter
+//          submits (comments accept markdown) — the shared composer rule, see
+//          `shouldComposerEnterSend`. Successful or ambiguous submissions revalidate both the
+//          detail and repository list scopes so comment data and updated ordering converge.
 // Layer: Pull request presentation
 // Exports: PullRequestCommentComposer
 
@@ -12,7 +14,9 @@ import type { PullRequestDetail } from "@synara/contracts";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 
+import { shouldComposerEnterSend } from "~/components/chat/composerEnterBehavior";
 import { toastManager } from "~/components/ui/toast";
+import { useIsCoarsePointer } from "~/hooks/useMediaQuery";
 import { ArrowUpIcon, GitHubIcon } from "~/lib/icons";
 import { pullRequestCommentMutationOptions } from "~/lib/pullRequestReactQuery";
 import { PR_BODY_TEXT_CLASS_NAME } from "./pullRequestText";
@@ -20,6 +24,7 @@ import { cn } from "~/lib/utils";
 
 export function PullRequestCommentComposer({ detail }: { detail: PullRequestDetail }) {
   const queryClient = useQueryClient();
+  const isCoarsePointer = useIsCoarsePointer();
   const mutation = useMutation(pullRequestCommentMutationOptions(queryClient));
   const [body, setBody] = useState("");
   // Synchronous re-entrancy lock: mutation.isPending updates on React's schedule, which is
@@ -72,11 +77,22 @@ export function PullRequestCommentComposer({ detail }: { detail: PullRequestDeta
         aria-label="Leave a comment"
         onChange={(event) => setBody(event.target.value)}
         onKeyDown={(event) => {
+          if (event.key !== "Enter") return;
           // Enter during IME composition confirms the composition, not the comment.
-          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-            event.preventDefault();
-            void submit();
+          if (event.nativeEvent.isComposing) return;
+          // The one composer Enter rule, shared with the chat composer: on touch, Enter is the
+          // only newline a finger has, so it must never post the comment by itself.
+          if (
+            !shouldComposerEnterSend({
+              shiftKey: event.shiftKey,
+              isCoarsePointer,
+              modifierKey: event.metaKey || event.ctrlKey,
+            })
+          ) {
+            return;
           }
+          event.preventDefault();
+          void submit();
         }}
         // font-system-ui overrides the global `textarea { font-family: mono }` reset — this is
         // UI chrome, not code, exactly like the chat composer's editor.

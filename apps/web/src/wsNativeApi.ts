@@ -49,11 +49,11 @@ import { VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH } from "@synara/shared/binaryTran
 
 import { showConfirmDialogFallback } from "./confirmDialogFallback";
 import { showContextMenuFallback } from "./contextMenuFallback";
-import { acquireShellBearerToken, invalidateShellBearerToken } from "./shellAuthSession";
+import { forgetShellSession } from "./shellSessionExit";
 import { requireHttpExternalUrl } from "./lib/externalUrl";
 import { WsTransport, type WsThreadStreamFailure } from "./wsTransport";
 import { emitWsCompatibilityIssue, emitWsTransportState } from "./wsTransportEvents";
-import { resolveWsHttpUrl } from "./lib/serverEndpoint";
+import { authenticatedServerFetch } from "./lib/authenticatedFetch";
 
 export type { WsThreadStreamFailure } from "./wsTransport";
 
@@ -241,37 +241,14 @@ async function requestAuthJson<T>(
   } = {},
 ): Promise<T> {
   const hasBody = options.body !== undefined;
-  // Resolved against the WS bridge host: the desktop window runs on a custom
-  // scheme (and the mobile shell on a local WebView origin) where relative paths
-  // never reach the server. Browsers resolve to the page origin and keep
-  // authenticating with the session cookie; native shells attach their owner
-  // bearer session instead.
-  const url = resolveWsHttpUrl(path);
-  const attempt = async (bearerToken: string | null) =>
-    fetch(url, {
-      method: options.method ?? "GET",
-      credentials: "same-origin",
-      ...(hasBody || bearerToken
-        ? {
-            headers: {
-              ...(hasBody ? { "Content-Type": "application/json" } : {}),
-              ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
-            },
-          }
-        : {}),
-      ...(hasBody ? { body: JSON.stringify(options.body) } : {}),
-    });
-
-  let bearerToken = await acquireShellBearerToken();
-  let response = await attempt(bearerToken);
-  if (response.status === 401 && bearerToken) {
-    // The bearer session was revoked or expired; re-bootstrap once from the
-    // desktop shell's launch credential (a no-op on mobile, whose token comes
-    // from pairing and can only be replaced by pairing again).
-    invalidateShellBearerToken();
-    bearerToken = await acquireShellBearerToken();
-    response = await attempt(bearerToken);
-  }
+  // Credential selection, the 401 re-bootstrap and the mobile revocation verdict all live in
+  // `authenticatedServerFetch`, which every authenticated HTTP call in the app shares.
+  const response = await authenticatedServerFetch(path, {
+    method: options.method ?? "GET",
+    ...(hasBody
+      ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(options.body) }
+      : {}),
+  });
   const payload = (await response.json().catch(() => null)) as unknown;
   if (!response.ok) {
     const message =
@@ -302,8 +279,8 @@ async function requestVoiceTranscriptionUpload(
   for (let index = 0; index < decoded.length; index += 1) {
     bytes[index] = decoded.charCodeAt(index);
   }
-  const response = await fetch(
-    resolveWsHttpUrl(`${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}?${params.toString()}`),
+  const response = await authenticatedServerFetch(
+    `${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}?${params.toString()}`,
     { method: "POST", credentials: "include", body: bytes },
   );
   const payload = (await response.json().catch(() => null)) as
@@ -475,6 +452,10 @@ export function createWsNativeApi(): NativeApi {
     if (instance.transport.getState() !== "disposed") {
       return instance.api;
     }
+    // The discarded instance's wake listeners only self-detach on their next
+    // signal; dropping the reference without this strands them on the window
+    // holding a dead transport.
+    instance.detachWakeListeners();
     instance = null;
   }
 
@@ -715,7 +696,14 @@ export function createWsNativeApi(): NativeApi {
         const result = await requestAuthJson<AuthLogoutResult>("/api/auth/logout", {
           method: "POST",
         });
+        // Detach before disposing: the wake listeners only self-detach on their
+        // next signal, and this transport is never coming back.
+        detachWakeListeners();
         await transport.dispose();
+        // The mobile shell keeps this session's bearer in secure storage, and the
+        // server has just revoked it, so it must not survive on the device. The
+        // caller owns the navigation that follows (see `signedOutRoutePath`).
+        await forgetShellSession();
         return result;
       },
       listExternalMcpIntegrations: () =>

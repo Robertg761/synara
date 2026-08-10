@@ -39,7 +39,8 @@ import { useSpacesUiStore } from "../spacesUiStore";
 import { selectThreadTerminalState, useTerminalStateStore } from "../terminalStateStore";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { onServerMaintenanceUpdated } from "../wsNativeApi";
-import { hydrateShellSession, isShellPaired } from "../shellSession";
+import { resolveShellPairingEntry } from "../shellPairingGate";
+import { isShellPaired } from "../shellSession";
 import { useWorkspacePathsStore } from "../workspacePathsStore";
 import { useProviderStatusesForLocalConfig } from "~/hooks/useProviderStatusesForLocalConfig";
 import { useRefreshProviderStatusesNow } from "~/hooks/useProviderStatusRefresh";
@@ -637,13 +638,14 @@ function ChatRouteLayout() {
  * costs nothing — desktop and browser sessions have no pairing to check.
  *
  * The paired session lives in async secure storage, so a first navigation can arrive before
- * startup hydration has finished; `hydrateShellSession` is single-flight and a no-op once hydrated,
- * so awaiting it here only ever costs the very first navigation.
+ * startup hydration has finished; hydration is single-flight and a no-op once hydrated, so
+ * awaiting it here only ever costs the very first navigation. The decision itself — including
+ * what to do about storage that never answered — lives in `shellPairingGate`.
  */
 function requireMobilePairing(): void | Promise<void> {
   if (!isMobileShell || isShellPaired()) return;
-  return hydrateShellSession().then(() => {
-    if (!isShellPaired()) throw redirect({ to: "/connect" });
+  return resolveShellPairingEntry().then((entry) => {
+    if (entry === "connect") throw redirect({ to: "/connect" });
   });
 }
 

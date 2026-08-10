@@ -145,6 +145,7 @@ interface WsTransportInternals {
   sessionVersion: number;
   state: string;
   reconnectFailures: number;
+  lastWakeBackoffResetAt: number;
   skipReconnectBackoff: (() => void) | null;
   clientPromise: Promise<unknown>;
   probeFeatureConnection(client: unknown, runtime: unknown): Promise<void>;
@@ -186,6 +187,8 @@ function makeBareTransport(): {
     threadStreamFailureListeners: new Set(),
     disposed: false,
     sessionVersion: 1,
+    reconnectFailures: 0,
+    lastWakeBackoffResetAt: 0,
     getClientRuntime: () => ({
       runCallback: (
         effect: Effect.Effect<unknown, Error>,
@@ -1105,6 +1108,61 @@ describe("WsTransport", () => {
     expect(internals.reconnect).not.toHaveBeenCalled();
   });
 
+  it("wakeUp resets the backoff at most once per throttle window", () => {
+    vi.useFakeTimers();
+    try {
+      const { transport, internals } = makeBareTransport();
+      const skip = vi.fn();
+      Object.assign(internals, {
+        state: "connecting",
+        reconnectFailures: 6,
+        skipReconnectBackoff: skip,
+      });
+
+      // First wake after a quiet period: reconnect now, which is what this exists for.
+      transport.wakeUp();
+      expect(internals.reconnectFailures).toBe(0);
+      expect(skip).toHaveBeenCalledTimes(1);
+
+      // A flapping radio raises online/visibilitychange in bursts. Honouring each one would pin a
+      // server that is simply down at the 500ms retry floor forever.
+      internals.reconnectFailures = 6;
+      vi.advanceTimersByTime(1_000);
+      transport.wakeUp();
+      vi.advanceTimersByTime(1_000);
+      transport.wakeUp();
+      expect(internals.reconnectFailures).toBe(6);
+      expect(skip).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(3_000);
+      transport.wakeUp();
+      expect(internals.reconnectFailures).toBe(0);
+      expect(skip).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("wakeUp still redials a closed transport while the backoff reset is throttled", () => {
+    vi.useFakeTimers();
+    try {
+      const { transport, internals } = makeBareTransport();
+      Object.assign(internals, { state: "closed", reconnectFailures: 3 });
+
+      transport.wakeUp();
+      internals.reconnectFailures = 3;
+      vi.advanceTimersByTime(500);
+      transport.wakeUp();
+
+      // The throttle only governs how fast the retry is allowed to come back, never whether a
+      // closed transport tries at all.
+      expect(internals.reconnect).toHaveBeenCalledTimes(2);
+      expect(internals.reconnectFailures).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("wakeUp is a no-op after dispose", () => {
     const { transport, internals } = makeBareTransport();
     Object.assign(internals, { state: "closed", reconnectFailures: 3, disposed: true });
@@ -1174,17 +1232,18 @@ describe("WsTransport", () => {
     );
   });
 
-  it("dials every feature socket with a freshly minted upgrade ticket", async () => {
+  it("dials every feature socket with its own upgrade ticket and reports the one it spent", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT))),
     );
-    // Loaded through a mocked ticket module: the mint itself is covered in wsAuthTicket.test.ts,
-    // what matters here is that the transport asks for a new one per socket open. Tickets are
-    // consumed server-side on verify, so a reconnect replaying the first URL would never
-    // authenticate.
+    // Loaded through a mocked ticket module: minting and reuse are covered in
+    // wsAuthTicket.test.ts, what matters here is that the transport resolves a URL per socket
+    // open and tells the ticket module when a dial got as far as a socket. Tickets are consumed
+    // server-side at the upgrade, so a reconnect replaying a spent one would never authenticate.
     vi.resetModules();
     let issued = 0;
+    const noteConsumed = vi.fn();
     vi.doMock("./wsAuthTicket", () => ({
       authenticateSocketUrl: (url: string) => {
         issued += 1;
@@ -1192,6 +1251,7 @@ describe("WsTransport", () => {
         ticketed.searchParams.set(AUTH_WEBSOCKET_TOKEN_QUERY_PARAM, `ticket-${issued}`);
         return Promise.resolve(ticketed.toString());
       },
+      noteWsTicketConsumed: noteConsumed,
     }));
 
     try {
@@ -1201,6 +1261,7 @@ describe("WsTransport", () => {
       expect(new URL(sockets[0]!.url).searchParams.get(AUTH_WEBSOCKET_TOKEN_QUERY_PARAM)).toBe(
         "ticket-1",
       );
+      expect(noteConsumed).toHaveBeenCalledTimes(1);
 
       void (transport as unknown as WsTransportInternals).reconnect();
       transport.wakeUp();
@@ -1208,6 +1269,7 @@ describe("WsTransport", () => {
       expect(new URL(sockets[1]!.url).searchParams.get(AUTH_WEBSOCKET_TOKEN_QUERY_PARAM)).toBe(
         "ticket-2",
       );
+      expect(noteConsumed).toHaveBeenCalledTimes(2);
 
       await transport.dispose();
     } finally {

@@ -66,7 +66,10 @@ import {
   shouldRenderTerminalWorkspace,
   worktreeSetupHasError,
 } from "./ChatView.logic";
-import { shouldComposerEnterSend } from "./chat/composerEnterBehavior";
+import {
+  shouldComposerEnterSend,
+  shouldComposerEnterUseOppositeFollowUp,
+} from "./chat/composerEnterBehavior";
 import { COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME } from "./chat/composerPickerStyles";
 
 describe("composer strip work-log derivation", () => {
@@ -2636,25 +2639,74 @@ describe("thread detail hydration", () => {
 
 describe("composer Enter behavior", () => {
   it("sends on plain Enter with a fine pointer", () => {
-    expect(shouldComposerEnterSend({ shiftKey: false, isCoarsePointer: false })).toBe(true);
+    expect(
+      shouldComposerEnterSend({ shiftKey: false, isCoarsePointer: false, modifierKey: false }),
+    ).toBe(true);
   });
 
   it("inserts a newline on plain Enter with a coarse pointer", () => {
-    expect(shouldComposerEnterSend({ shiftKey: false, isCoarsePointer: true })).toBe(false);
+    expect(
+      shouldComposerEnterSend({ shiftKey: false, isCoarsePointer: true, modifierKey: false }),
+    ).toBe(false);
   });
 
   it("never sends on Shift+Enter, on either pointer", () => {
-    expect(shouldComposerEnterSend({ shiftKey: true, isCoarsePointer: false })).toBe(false);
-    expect(shouldComposerEnterSend({ shiftKey: true, isCoarsePointer: true })).toBe(false);
+    expect(
+      shouldComposerEnterSend({ shiftKey: true, isCoarsePointer: false, modifierKey: false }),
+    ).toBe(false);
+    expect(
+      shouldComposerEnterSend({ shiftKey: true, isCoarsePointer: true, modifierKey: false }),
+    ).toBe(false);
   });
 
-  it("depends only on the pointer axis, so both keyboard cases stay decidable", () => {
-    // Guards the three-axis rule: the decision must be reproducible from the pointer
-    // flag alone — no viewport size, no shell platform, no other hidden input.
+  it("sends on Ctrl/Cmd+Enter on a coarse pointer, so hardware keyboards keep a path", () => {
+    // An iPad with a Magic Keyboard still reports a coarse pointer, and hardware keyboards
+    // are deliberately not auto-detected: this modifier is the entire escape hatch.
+    expect(
+      shouldComposerEnterSend({ shiftKey: false, isCoarsePointer: true, modifierKey: true }),
+    ).toBe(true);
+    expect(
+      shouldComposerEnterSend({ shiftKey: false, isCoarsePointer: false, modifierKey: true }),
+    ).toBe(true);
+  });
+
+  it("keeps Shift ahead of the modifier, so Shift+Ctrl+Enter still breaks a line", () => {
+    expect(
+      shouldComposerEnterSend({ shiftKey: true, isCoarsePointer: true, modifierKey: true }),
+    ).toBe(false);
+    expect(
+      shouldComposerEnterSend({ shiftKey: true, isCoarsePointer: false, modifierKey: true }),
+    ).toBe(false);
+  });
+
+  it("depends only on the pointer and keyboard axes, so every case stays decidable", () => {
+    // Guards the rule: the decision must be reproducible from (pointer, Shift, Ctrl/Cmd)
+    // alone — no viewport size, no shell platform, no other hidden input.
     const decisions = [false, true].flatMap((isCoarsePointer) =>
-      [false, true].map((shiftKey) => shouldComposerEnterSend({ shiftKey, isCoarsePointer })),
+      [false, true].flatMap((shiftKey) =>
+        [false, true].map((modifierKey) =>
+          shouldComposerEnterSend({ shiftKey, isCoarsePointer, modifierKey }),
+        ),
+      ),
     );
-    expect(decisions).toEqual([true, false, false, false]);
+    expect(decisions).toEqual([true, true, false, false, false, true, false, false]);
+  });
+
+  it("reserves Ctrl/Cmd for the opposite follow-up dispatch on fine pointers only", () => {
+    // On a coarse pointer the modifier is already spoken for as "send at all", so it must not
+    // also flip the user's configured queue/interrupt behavior.
+    expect(
+      shouldComposerEnterUseOppositeFollowUp({ isCoarsePointer: false, modifierKey: true }),
+    ).toBe(true);
+    expect(
+      shouldComposerEnterUseOppositeFollowUp({ isCoarsePointer: true, modifierKey: true }),
+    ).toBe(false);
+    expect(
+      shouldComposerEnterUseOppositeFollowUp({ isCoarsePointer: false, modifierKey: false }),
+    ).toBe(false);
+    expect(
+      shouldComposerEnterUseOppositeFollowUp({ isCoarsePointer: true, modifierKey: false }),
+    ).toBe(false);
   });
 });
 
