@@ -6,6 +6,7 @@
 import { Cause, Effect, Exit, Stream } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AUTH_WEBSOCKET_TOKEN_QUERY_PARAM,
   ORCHESTRATION_WS_METHODS,
   WS_CHANNELS,
   WS_METHODS,
@@ -40,6 +41,8 @@ import {
   WsTransport,
   type WsThreadStreamFailure,
 } from "./wsTransport";
+import { APP_VERSION } from "./branding";
+import { authenticateSocketUrl } from "./wsAuthTicket";
 import {
   addWsCompatibilityIssueListener,
   emitWsCompatibilityIssue,
@@ -140,6 +143,11 @@ interface WsTransportInternals {
   readonly threadStreamFailureListeners: Set<(failure: WsThreadStreamFailure) => void>;
   disposed: boolean;
   sessionVersion: number;
+  state: string;
+  reconnectFailures: number;
+  skipReconnectBackoff: (() => void) | null;
+  clientPromise: Promise<unknown>;
+  probeFeatureConnection(client: unknown, runtime: unknown): Promise<void>;
   reconnect(): Promise<unknown>;
   startStream<T>(
     client: unknown,
@@ -1035,6 +1043,78 @@ describe("WsTransport", () => {
     await transport.dispose();
   });
 
+  it("wakeUp kicks a closed transport into reconnecting and resets the backoff", () => {
+    const { transport, internals } = makeBareTransport();
+    Object.assign(internals, { state: "closed", reconnectFailures: 7 });
+
+    transport.wakeUp();
+
+    expect(internals.reconnectFailures).toBe(0);
+    expect(internals.reconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("wakeUp skips a reconnect backoff sleep already in progress", () => {
+    const { transport, internals } = makeBareTransport();
+    const skip = vi.fn();
+    Object.assign(internals, {
+      state: "connecting",
+      reconnectFailures: 4,
+      skipReconnectBackoff: skip,
+    });
+
+    transport.wakeUp();
+
+    expect(skip).toHaveBeenCalledTimes(1);
+    expect(internals.reconnectFailures).toBe(0);
+    // The in-flight reconnect attempt owns the retry; wakeUp must not stack a
+    // second one on top of it.
+    expect(internals.reconnect).not.toHaveBeenCalled();
+  });
+
+  it("wakeUp probes an open connection and reconnects when the probe fails", async () => {
+    const { transport, internals } = makeBareTransport();
+    const probe = vi.fn(async () => {
+      throw new Error("dead socket");
+    });
+    Object.assign(internals, {
+      state: "open",
+      clientPromise: Promise.resolve({}),
+      probeFeatureConnection: probe,
+    });
+
+    transport.wakeUp();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(internals.reconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("wakeUp leaves an open connection alone when the probe succeeds", async () => {
+    const { transport, internals } = makeBareTransport();
+    const probe = vi.fn(async () => undefined);
+    Object.assign(internals, {
+      state: "open",
+      clientPromise: Promise.resolve({}),
+      probeFeatureConnection: probe,
+    });
+
+    transport.wakeUp();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(internals.reconnect).not.toHaveBeenCalled();
+  });
+
+  it("wakeUp is a no-op after dispose", () => {
+    const { transport, internals } = makeBareTransport();
+    Object.assign(internals, { state: "closed", reconnectFailures: 3, disposed: true });
+
+    transport.wakeUp();
+
+    expect(internals.reconnectFailures).toBe(3);
+    expect(internals.reconnect).not.toHaveBeenCalled();
+  });
+
   it("mirrors the negotiate endpoint onto the WS host with an HTTP scheme", () => {
     const url = new URL(makeNegotiateHttpUrl("wss://remote.example:8443/?token=old"));
 
@@ -1069,6 +1149,71 @@ describe("WsTransport", () => {
     expect(resolved.searchParams.get(WS_COMPATIBILITY_QUERY.serverInstanceId)).toBe(
       "server-instance",
     );
+  });
+
+  it("leaves the feature socket URL untouched off the mobile shell", async () => {
+    const featureUrl = makeFeatureSocketUrl("ws://127.0.0.1:53036/?token=old", {
+      protocolEpoch: WS_PROTOCOL_EPOCH,
+      negotiatedRevision: WS_PROTOCOL_MAX_REVISION,
+      serverBuild: "0.5.2",
+      serverInstanceId: "server-instance",
+      capabilities: ["orchestration.cursor-safe-streams"],
+    });
+
+    // Desktop and browser upgrades authenticate by cookie or the desktop bridge's local token,
+    // so the mobile ticket must add nothing at all to the URL they dial — byte for byte, and
+    // without a mint request: the ticket path must add no network round trip to their dial.
+    const fetchMock = vi.fn<typeof globalThis.fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(new URL(featureUrl).searchParams.has(AUTH_WEBSOCKET_TOKEN_QUERY_PARAM)).toBe(false);
+    await expect(authenticateSocketUrl(featureUrl)).resolves.toBe(featureUrl);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(makeFeatureSocketUrl("ws://127.0.0.1:53036/", NEGOTIATION_RESULT)).toContain(
+      `${WS_COMPATIBILITY_QUERY.clientBuild}=${APP_VERSION}`,
+    );
+  });
+
+  it("dials every feature socket with a freshly minted upgrade ticket", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT))),
+    );
+    // Loaded through a mocked ticket module: the mint itself is covered in wsAuthTicket.test.ts,
+    // what matters here is that the transport asks for a new one per socket open. Tickets are
+    // consumed server-side on verify, so a reconnect replaying the first URL would never
+    // authenticate.
+    vi.resetModules();
+    let issued = 0;
+    vi.doMock("./wsAuthTicket", () => ({
+      authenticateSocketUrl: (url: string) => {
+        issued += 1;
+        const ticketed = new URL(url);
+        ticketed.searchParams.set(AUTH_WEBSOCKET_TOKEN_QUERY_PARAM, `ticket-${issued}`);
+        return Promise.resolve(ticketed.toString());
+      },
+    }));
+
+    try {
+      const { WsTransport: TicketedWsTransport } = await import("./wsTransport");
+      const transport = new TicketedWsTransport("ws://localhost:3020");
+      await waitForSockets(1);
+      expect(new URL(sockets[0]!.url).searchParams.get(AUTH_WEBSOCKET_TOKEN_QUERY_PARAM)).toBe(
+        "ticket-1",
+      );
+
+      void (transport as unknown as WsTransportInternals).reconnect();
+      transport.wakeUp();
+      await waitForSockets(2);
+      expect(new URL(sockets[1]!.url).searchParams.get(AUTH_WEBSOCKET_TOKEN_QUERY_PARAM)).toBe(
+        "ticket-2",
+      );
+
+      await transport.dispose();
+    } finally {
+      vi.doUnmock("./wsAuthTicket");
+      vi.resetModules();
+    }
   });
 
   it("notifies state listeners and replays the current state on demand", async () => {

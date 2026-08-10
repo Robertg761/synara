@@ -108,7 +108,10 @@ export function DeferredChatView(props: {
   panelState: SplitViewPanePanelState;
   onToggleDiff: () => void;
   onToggleRightDock?: () => void;
-  onToggleBrowser: () => void;
+  // Optional so the phone layout can withhold the browser-panel affordance entirely.
+  onToggleBrowser?: () => void;
+  headerLeadingControl?: ReactNode;
+  hideSidebarControls?: boolean;
   onOpenBrowserUrl: (url: string) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onSplitSurface?: () => void;
@@ -163,7 +166,13 @@ export function DeferredChatView(props: {
       panelState={props.panelState}
       onToggleDiffPanel={props.onToggleDiff}
       {...(props.onToggleRightDock ? { onToggleRightDock: props.onToggleRightDock } : {})}
-      onToggleBrowserPanel={props.onToggleBrowser}
+      {...(props.onToggleBrowser ? { onToggleBrowserPanel: props.onToggleBrowser } : {})}
+      {...(props.headerLeadingControl !== undefined
+        ? { headerLeadingControl: props.headerLeadingControl }
+        : {})}
+      {...(props.hideSidebarControls !== undefined
+        ? { hideSidebarControls: props.hideSidebarControls }
+        : {})}
       onOpenBrowserUrl={props.onOpenBrowserUrl}
       onOpenTurnDiffPanel={props.onOpenTurnDiff}
       {...(props.onSplitSurface ? { onSplitSurface: props.onSplitSurface } : {})}

@@ -9,6 +9,7 @@ import {
   AuthSessionRepository,
   type AuthSessionRepositoryShape,
   CreateAuthSessionInput,
+  ExtendAuthSessionExpiryInput,
   GetAuthSessionByIdInput,
   ListActiveAuthSessionsInput,
   RevokeAuthSessionInput,
@@ -159,6 +160,19 @@ const makeAuthSessionRepository = Effect.gen(function* () {
     `,
   });
 
+  const extendSessionExpiryRows = SqlSchema.findAll({
+    Request: ExtendAuthSessionExpiryInput,
+    Result: Schema.Struct({ sessionId: AuthSessionId }),
+    execute: ({ sessionId, expiresAt }) => sql`
+      UPDATE auth_sessions
+      SET expires_at = ${toIsoDateTime(expiresAt)}
+      WHERE session_id = ${sessionId}
+        AND revoked_at IS NULL
+        AND expires_at < ${toIsoDateTime(expiresAt)}
+      RETURNING session_id AS "sessionId"
+    `,
+  });
+
   const revokeSessionRows = SqlSchema.findAll({
     Request: RevokeAuthSessionInput,
     Result: Schema.Struct({ sessionId: AuthSessionId }),
@@ -215,6 +229,17 @@ const makeAuthSessionRepository = Effect.gen(function* () {
       Effect.map((rows) => rows.map(toAuthSessionRecord)),
     );
 
+  const extendExpiry: AuthSessionRepositoryShape["extendExpiry"] = (input) =>
+    extendSessionExpiryRows(input as unknown as Parameters<typeof extendSessionExpiryRows>[0]).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "AuthSessionRepository.extendExpiry:query",
+          "AuthSessionRepository.extendExpiry:decodeRows",
+        ),
+      ),
+      Effect.map((rows) => rows.length > 0),
+    );
+
   const revoke: AuthSessionRepositoryShape["revoke"] = (input) =>
     revokeSessionRows(input as unknown as Parameters<typeof revokeSessionRows>[0]).pipe(
       Effect.mapError(
@@ -247,7 +272,15 @@ const makeAuthSessionRepository = Effect.gen(function* () {
       ),
     );
 
-  return { create, getById, listActive, revoke, revokeAllExcept, setLastConnectedAt };
+  return {
+    create,
+    getById,
+    listActive,
+    extendExpiry,
+    revoke,
+    revokeAllExcept,
+    setLastConnectedAt,
+  };
 });
 
 export const AuthSessionRepositoryLive = Layer.effect(

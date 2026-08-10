@@ -2,7 +2,8 @@
 // Purpose: Owns the TanStack history instance and browser-style app navigation controls.
 // Layer: Web app routing utility
 // Exports: appHistory, route navigation helpers, and navigation availability state
-// Depends on: TanStack Router history and the Electron environment flag
+// Depends on: TanStack Router history and ./appHistoryMode (the mode + document href builder,
+//             kept React-free so non-UI modules can build route hrefs without a history)
 
 import {
   createBrowserHistory,
@@ -11,7 +12,10 @@ import {
 } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
-import { isElectron } from "./env";
+import { appHistoryMode } from "./appHistoryMode";
+
+// Re-exported so route-href callers keep one import site regardless of which module owns them.
+export { appHistoryMode, appRouteDocumentHref } from "./appHistoryMode";
 
 type RouterHistory = ReturnType<typeof createBrowserHistory>;
 type HistorySubscriberEvent = Parameters<Parameters<RouterHistory["subscribe"]>[0]>[0];
@@ -23,8 +27,7 @@ function createAppHistory(): RouterHistory {
   if (typeof window === "undefined") {
     return createMemoryHistory({ initialEntries: ["/"] });
   }
-  // Electron loads the app from a file-backed shell, so hash history avoids path resolution issues.
-  return isElectron ? createHashHistory() : createBrowserHistory();
+  return appHistoryMode === "hash" ? createHashHistory() : createBrowserHistory();
 }
 
 export const appHistory: RouterHistory = createAppHistory();

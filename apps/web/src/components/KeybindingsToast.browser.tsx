@@ -28,11 +28,14 @@ import {
   type EffectRpcWebSocketClient,
 } from "../test/effectRpcWebSocketMock";
 import { createBrowserTestServerConfig, createFullscreenTestHost } from "../test/browserHarness";
+import { settleInFlightTransportWork } from "../test/transportTeardown";
 import { resetWsNativeApiForTest } from "../wsNativeApi";
 
 const THREAD_ID = "thread-kb-toast-test" as ThreadId;
 const PROJECT_ID = "project-1" as ProjectId;
 const NOW_ISO = "2026-03-04T12:00:00.000Z";
+/** Budget for the one-off cold transform of the chat route graph (see `beforeAll`). */
+const WARMUP_TIMEOUT_MS = 240_000;
 
 interface TestFixture {
   snapshot: OrchestrationReadModel;
@@ -318,6 +321,7 @@ async function mountApp(): Promise<{ cleanup: () => Promise<void> }> {
       cleanedUp = true;
       await screen.unmount();
       if (host.isConnected) host.remove();
+      await settleInFlightTransportWork();
     },
   };
 }
@@ -330,7 +334,34 @@ describe("Keybindings update toast", () => {
       quiet: true,
       serviceWorker: { url: "/mockServiceWorker.js" },
     });
-  });
+
+    // The first mount of the chat route graph makes the Vite dev server transform the whole
+    // desktop chat surface (ChatView, sidebar, and their lazy chunks), which can take well over
+    // a minute on a cold cache and blows past `mountApp`'s own budget. Pay it once here so the
+    // tests below only measure toast behavior. Same pattern as
+    // `phone/PhoneAppShell.phone.browser.tsx`.
+    const warmupHost = createFullscreenTestHost();
+    const warmupRouter = getRouter(createMemoryHistory({ initialEntries: [`/${THREAD_ID}`] }));
+    const warmupScreen = await render(<RouterProvider router={warmupRouter} />, {
+      container: warmupHost,
+    });
+    try {
+      await vi.waitFor(
+        () => {
+          expect(document.querySelector('[data-slot="sidebar"]')).not.toBeNull();
+        },
+        { timeout: WARMUP_TIMEOUT_MS, interval: 50 },
+      );
+    } finally {
+      await warmupScreen.unmount();
+      if (warmupHost.isConnected) warmupHost.remove();
+      await settleInFlightTransportWork();
+      await resetWsNativeApiForTest();
+      serverConfigStreamClient = null;
+      serverConfigStreamRequestId = null;
+      document.body.innerHTML = "";
+    }
+  }, WARMUP_TIMEOUT_MS + 60_000);
 
   afterAll(async () => {
     await resetWsNativeApiForTest();

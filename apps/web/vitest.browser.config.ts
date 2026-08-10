@@ -25,6 +25,12 @@ export default mergeConfig(
         provider: playwright(),
         instances: [{ browser: "chromium" }],
         headless: true,
+        // Vitest's own default is 414x896 — a PHONE viewport. Since the `/_chat` route tree
+        // swaps to `PhoneAppShell` below 768px, that default silently puts every test that
+        // mounts the route graph without resizing into the phone layout. Pin a desktop
+        // viewport here; phone-layout suites opt in explicitly via `renderAtPhoneViewport()`
+        // (see `src/test/browserHarness.ts`).
+        viewport: { width: 1_280, height: 800 },
         api: {
           // Vitest's default 63315 falls inside common Windows/Hyper-V
           // excluded-port ranges. Keep the local browser harness on IPv4 and

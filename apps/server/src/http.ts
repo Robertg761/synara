@@ -448,7 +448,33 @@ const authRouteResponse = Effect.gen(function* () {
   const authRequest = makeEffectAuthRequest(request);
 
   if (request.method === "GET" && url.pathname === "/api/auth/session") {
-    return HttpServerResponse.jsonUnsafe(yield* serverAuth.getSessionState(authRequest));
+    const state = yield* serverAuth.getSessionState(authRequest);
+    // Sessions renew server-side on active use, but the browser still evicts the cookie at the
+    // `Expires` stamped when it was issued. Re-stamp it on this probe — the request every tab
+    // makes on load — so the cookie jar tracks the renewed expiry. Only when the cookie itself
+    // authenticated the request: with an Authorization header present, bearer wins and the
+    // reported expiry belongs to the bearer session, not the cookie's.
+    const cookieToken = request.cookies[sessions.cookieName];
+    const renewedCookie =
+      state.authenticated &&
+      state.expiresAt !== undefined &&
+      cookieToken !== undefined &&
+      request.headers.authorization === undefined
+        ? encodeCookie({
+            name: sessions.cookieName,
+            value: cookieToken,
+            expiresAt: state.expiresAt,
+            secure: config.publicUrl !== undefined,
+          })
+        : null;
+    return HttpServerResponse.jsonUnsafe(state, {
+      // Per-user credential state that can carry a Set-Cookie: never let a shared proxy or
+      // the browser's own cache replay it.
+      headers: {
+        "Cache-Control": "no-store",
+        ...(renewedCookie === null ? {} : { "Set-Cookie": renewedCookie }),
+      },
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/api/auth/bootstrap") {

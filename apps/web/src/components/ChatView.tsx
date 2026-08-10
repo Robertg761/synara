@@ -449,7 +449,8 @@ import {
 import { useNowMs } from "~/hooks/useNowMs";
 import { useThreadRecap } from "~/hooks/useThreadRecap";
 import { useRepoDiffTotals } from "~/hooks/useRepoDiffTotals";
-import { useIsMobile } from "~/hooks/useMediaQuery";
+import { useIsCoarsePointer, useIsMobile } from "~/hooks/useMediaQuery";
+import { useLayoutMode } from "~/lib/layoutMode";
 import {
   acknowledgedRiskIdsForFormWarnings,
   AutomationDialog,
@@ -524,6 +525,7 @@ import {
 import { getComposerProviderState } from "./chat/composerProviderRegistry";
 import {
   COMPOSER_COMMAND_MENU_FLOATING_WRAPPER_CLASS_NAME,
+  COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME,
   COMPOSER_INPUT_SHELL_CLASS_NAME,
   COMPOSER_INPUT_SURFACE_CLASS_NAME,
   COMPOSER_COLUMN_FRAME_CLASS_NAME,
@@ -534,6 +536,7 @@ import {
   CHAT_COLUMN_GUTTER_CLASS_NAME,
   ENVIRONMENT_CONTENT_INSET_MOTION_CLASS,
 } from "./chat/composerPickerStyles";
+import { shouldComposerEnterSend } from "./chat/composerEnterBehavior";
 import { getComposerTraitSelection } from "./chat/composerTraits";
 import { resolveRuntimeModelDescriptor } from "./chat/runtimeModelCapabilities";
 import { ProjectPicker } from "./chat/ProjectPicker";
@@ -1106,6 +1109,18 @@ interface ChatViewProps {
   } | null;
   onChangeThreadInSplitPane?: () => void;
   onCloseThreadPane?: () => void;
+  /**
+   * Control rendered at the very start of the chat header, before the thread title
+   * (the phone shell's drawer/back button). Passed straight through to
+   * `ChatHeader.leadingControl`; ChatView never decides what goes in it.
+   */
+  headerLeadingControl?: ReactNode;
+  /**
+   * Forces the header's sidebar-toggle controls off. The phone shell mounts no
+   * sidebar, so its toggle would be a dead control; ChatView itself still hides
+   * the controls in the editor rail regardless of this prop.
+   */
+  hideSidebarControls?: boolean;
 }
 
 function normalizeRestoredQueuedPrompt(value: string): string {
@@ -1165,6 +1180,8 @@ export default function ChatView({
   viewModeAction: viewModeActionProp,
   onChangeThreadInSplitPane,
   onCloseThreadPane,
+  headerLeadingControl,
+  hideSidebarControls: hideSidebarControlsProp,
 }: ChatViewProps) {
   // Prop defaults are resolved here instead of in the destructuring pattern: an
   // AssignmentPattern in the parameter list makes React Compiler bail out (silently —
@@ -2608,10 +2625,7 @@ export default function ChatView({
   const nextUserInputResponseReclaimAt = useMemo(() => {
     let earliest: string | null = null;
     for (const interaction of activeThread?.pendingInteractions ?? []) {
-      if (
-        interaction.interactionKind !== "userInput" ||
-        interaction.status !== "responding"
-      ) {
+      if (interaction.interactionKind !== "userInput" || interaction.status !== "responding") {
         continue;
       }
       if (interaction.responseRequestedAt === null) {
@@ -4390,6 +4404,12 @@ export default function ChatView({
   // or hides the side panel only when this thread already has a pane to show.
   const rightDockOpen = useRightDockStore((store) => selectRightDockState(threadId)(store).open);
   const isMobileViewport = useIsMobile();
+  // Two deliberately separate axes (see `lib/layoutMode.ts`): `layoutMode` is viewport
+  // size and drives phone LAYOUT (keyboard clearance under the composer), while
+  // `isCoarsePointer` is input hardware and drives touch AFFORDANCES (Enter inserts a
+  // newline instead of sending). Neither may stand in for the other.
+  const layoutMode = useLayoutMode();
+  const isCoarsePointer = useIsCoarsePointer();
   // Temporary threads are visually identical to regular chats — they use the same
   // Environment panel + header controls. "Temporary" is purely a sidebar badge +
   // auto-delete-on-leave concern, never a stripped-down chat UI.
@@ -10267,7 +10287,7 @@ export default function ChatView({
     const menuIsActive = composerMenuOpenRef.current || trigger !== null;
     if (
       key === "Enter" &&
-      !event.shiftKey &&
+      shouldComposerEnterSend({ shiftKey: event.shiftKey, isCoarsePointer }) &&
       !menuIsActive &&
       extractChatAutomationInvocation(snapshot.value) !== null
     ) {
@@ -10372,7 +10392,10 @@ export default function ChatView({
       }
     }
 
-    if (key === "Enter" && !event.shiftKey) {
+    // Returning false leaves Enter to the editor, which inserts a newline (PlainText
+    // plugin default) — that is the coarse-pointer path, where sending is the send
+    // button's job. See `shouldComposerEnterSend`.
+    if (key === "Enter" && shouldComposerEnterSend({ shiftKey: event.shiftKey, isCoarsePointer })) {
       if (promptHistoryNavigationRef.current !== null) {
         // Sending commits the recalled text as the prompt; drop the saved
         // draft here (not just in the send path) so it cannot linger and
@@ -11088,7 +11111,12 @@ export default function ChatView({
                   )}
                 >
                   {composerMenuOpen && !isComposerApprovalState ? (
-                    <div className={COMPOSER_COMMAND_MENU_FLOATING_WRAPPER_CLASS_NAME}>
+                    <div
+                      className={cn(
+                        COMPOSER_COMMAND_MENU_FLOATING_WRAPPER_CLASS_NAME,
+                        COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME,
+                      )}
+                    >
                       {isLocalFolderBrowserOpen ? (
                         <ComposerLocalDirectoryMenu
                           mentionQuery={mentionTriggerQuery}
@@ -11522,7 +11550,7 @@ export default function ChatView({
             ? { className: cn(CHAT_SURFACE_HEADER_PADDING_X_CLASS, "h-full") }
             : {})}
           isSidechat={Boolean(activeThread.sidechatSourceThreadId)}
-          hideSidebarControls={isEditorRail}
+          hideSidebarControls={(hideSidebarControlsProp ?? false) || isEditorRail}
           hideHandoffControls={terminalWorkspaceTerminalTabActive || isEditorRail}
           isGitRepo={isGitRepo}
           openInTarget={threadWorkspaceCwd}
@@ -11599,6 +11627,7 @@ export default function ChatView({
           onNavigateToThread={onNavigateToThread}
           onRenameThread={() => setRenameDialogOpen(true)}
           {...(onCloseThreadPane ? { onCloseThreadPane } : {})}
+          {...(headerLeadingControl ? { leadingControl: headerLeadingControl } : {})}
         />
       </header>
 
@@ -11826,6 +11855,15 @@ export default function ChatView({
                   }
                 >
                   {composerSection}
+                  {/* Phone keyboard clearance. Sits INSIDE the composer's outer wrapper, as the
+                      last child, so the spacer grows below the composer while the wrapper's own
+                      -mt-5 overlap with the transcript above is untouched. It is a spacer rather
+                      than `pb-keyboard-safe` on the wrapper itself because that utility resolves
+                      to max(safe-area, keyboard-inset) and would REPLACE the wrapper's pb-3/sm:pb-4
+                      comfort margin — collapsing to 0 on phones with no bottom inset and no
+                      keyboard. As a spacer the two add up instead. Height is 0 whenever no
+                      keyboard/safe-area inset applies. */}
+                  {layoutMode === "phone" ? <div aria-hidden className="pb-keyboard-safe" /> : null}
                 </div>
                 {secondaryChromeReady &&
                 ((isGitRepo && !environmentEnabled) || relocateComposerLeadingControls) ? (

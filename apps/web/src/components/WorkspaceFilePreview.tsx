@@ -610,9 +610,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
       })
       .catch((error: unknown) => {
         setEditBuffer((current) =>
-          current?.key === documentKey
-            ? { ...current, error: readFileSaveError(error) }
-            : current,
+          current?.key === documentKey ? { ...current, error: readFileSaveError(error) } : current,
         );
       });
   };
@@ -686,6 +684,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
       !current ||
       current.truncated ||
       current.version === null ||
+      current.relativePath === null ||
       current.encoding === null ||
       current.lineEnding === null ||
       current.lineEnding === "mixed"
@@ -696,6 +695,10 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
     if (nextContents === null) {
       return;
     }
+    // Capture the null-narrowed metadata here: property narrowing does not
+    // survive into the queued async closure below, and the write requires
+    // non-null encoding/line-ending values.
+    const { encoding, lineEnding, version } = current;
     // No API means no write can happen — bail before the optimistic update
     // so the preview never shows a toggle that was silently dropped.
     const api = readNativeApi();
@@ -712,7 +715,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
     // checkbox write must never land after a newer toggle and erase it.
     const fileKey = `${workspaceRoot}\0${filePath}`;
     if (!taskFileDiskVersionRef.current.has(fileKey)) {
-      taskFileDiskVersionRef.current.set(fileKey, current.version);
+      taskFileDiskVersionRef.current.set(fileKey, version);
     }
     const writeVersion = latestTaskWriteVersionRef.current.next + 1;
     latestTaskWriteVersionRef.current.next = writeVersion;
@@ -724,9 +727,9 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
           cwd: workspaceRoot,
           relativePath: writeRelativePath,
           contents: nextContents,
-          expectedVersion: taskFileDiskVersionRef.current.get(fileKey) ?? current.version,
-          encoding: current.encoding,
-          lineEnding: current.lineEnding,
+          expectedVersion: taskFileDiskVersionRef.current.get(fileKey) ?? version,
+          encoding,
+          lineEnding,
         });
         taskFileDiskVersionRef.current.set(fileKey, result.version);
         queryClient.setQueryData<ProjectReadFileResult>(options.queryKey, (cached) =>

@@ -121,7 +121,6 @@ import {
 } from "../keybindings";
 import {
   createAllThreadsSelector,
-  createProjectLastActivityAtSelector,
   createSidebarDisplayThreadsSelector,
   createSidebarThreadSummariesSelector,
   createSidebarTreeThreadsSelector,
@@ -132,11 +131,7 @@ import {
   providerComposerCapabilitiesQueryOptions,
   supportsThreadImport,
 } from "../lib/providerDiscoveryReactQuery";
-import {
-  resolveCurrentProjectTargetId,
-  resolveLatestProjectTargetIdWithFallback,
-  resolveNewThreadTarget,
-} from "../lib/projectShortcutTargets";
+import { usePrimaryNewThreadTarget } from "../hooks/usePrimaryNewThreadTarget";
 import {
   pullRequestQueryKeys,
   pullRequestReviewRequestCountQueryOptions,
@@ -159,7 +154,6 @@ import {
   prewarmStudioProject,
 } from "../lib/studioProjects";
 import { useComposerDraftStore } from "../composerDraftStore";
-import { useLatestProjectStore } from "../latestProjectStore";
 import { resolveThreadEnvironmentPresentation } from "../lib/threadEnvironment";
 import { dispatchThreadRename } from "../lib/threadRename";
 import { quotePosixShellArgument } from "../lib/shellQuote";
@@ -468,6 +462,24 @@ const DebugFeatureFlagsMenu = import.meta.env.DEV
       })),
     )
   : null;
+
+/**
+ * The debug feature-flags entry point, with the one gate every chrome must apply: the module
+ * only exists in dev builds, the menu is opt-in at runtime (`readDebugFeatureFlagsMenuVisibility`),
+ * and it stays hidden on the settings route where the same controls already live. Shared so the
+ * desktop footer and the phone footer can never drift apart on when debug UI is allowed.
+ */
+function SidebarDebugFeatureFlagsSlot({ visible }: { visible: boolean }) {
+  if (!DebugFeatureFlagsMenu || !visible) {
+    return null;
+  }
+
+  return (
+    <Suspense fallback={null}>
+      <DebugFeatureFlagsMenu />
+    </Suspense>
+  );
+}
 
 type ProjectContextMenuId =
   | "open-in-finder"
@@ -1343,7 +1355,69 @@ export function SidebarSurfacePicker({
   );
 }
 
-export default function Sidebar() {
+/**
+ * Which host chrome the sidebar's content renders inside.
+ *
+ * - `desktop`: the `<Sidebar>` shell in `_chat.tsx` — collapse rail, off-canvas state,
+ *   and (below `md`) the shell's own Sheet.
+ * - `phone`: no sidebar primitive at all. The content is the phone home screen, laid
+ *   out full-width in normal document flow, so every affordance that only means
+ *   something to the shell (wordmark + `SidebarTrigger` row, Electron titlebar
+ *   branches, the desktop footer) is suppressed.
+ *
+ * This is deliberately a prop and never a viewport/pointer read: the caller decides
+ * the arrangement (see `useLayoutMode`), the sidebar only renders it.
+ */
+export type SidebarChrome = "desktop" | "phone";
+
+/**
+ * Coarse-pointer sizing for the rows the phone chrome hosts. 44px is the minimum
+ * comfortable touch target; expressed as `min-h` on the row primitives so the shared
+ * row JSX keeps its desktop heights and only grows under the phone chrome.
+ *
+ * Keyed off `data-sidebar`, not `data-slot`: thread rows render through a `TooltipTrigger`,
+ * whose own `data-slot` wins the merge, while `data-sidebar` survives on every row.
+ */
+const PHONE_ROW_TOUCH_TARGET_CLASS_NAME =
+  "[&_[data-sidebar=menu-button]]:min-h-11 [&_[data-sidebar=menu-sub-button]]:min-h-11";
+
+/**
+ * Same 44px rule for the phone footer's icon triggers. `SidebarIconButton` is a fixed square
+ * (`size-5` for the help menu), so min-height alone would leave a 20px tap target — the box is
+ * grown instead. Scoped to the footer row on purpose: upsizing every `.sidebar-icon-button` in
+ * the body would blow out the project/section header rows that pack several of them per line.
+ */
+const PHONE_FOOTER_TOUCH_TARGET_CLASS_NAME = "[&_.sidebar-icon-button]:size-11";
+
+/**
+ * Host for the sidebar's scrollable body. Desktop keeps `<SidebarContent>` (the shell's
+ * scroller); phone renders the very same children in normal flow and leaves scrolling
+ * plus safe-area padding to the screen that mounts it (`PhoneHomeScreen`), so a phone
+ * surface has exactly one scroll container instead of a scroller inside a scroller.
+ */
+function SidebarBody({ chrome, children }: { chrome: SidebarChrome; children: ReactNode }) {
+  if (chrome === "phone") {
+    return (
+      <div
+        className={cn(
+          "flex w-full min-w-0 flex-col gap-0 font-system-ui",
+          PHONE_ROW_TOUCH_TARGET_CLASS_NAME,
+        )}
+      >
+        {children}
+      </div>
+    );
+  }
+
+  return <SidebarContent className="gap-0 font-system-ui">{children}</SidebarContent>;
+}
+
+export default function Sidebar(props: { chrome?: SidebarChrome }) {
+  // The default is resolved here instead of in the parameter list: an
+  // AssignmentPattern there makes React Compiler bail out on the entire
+  // component (see chatHotPath.compiler.test.ts, same rule as ChatView).
+  const chrome = props.chrome ?? "desktop";
+  const isPhoneChrome = chrome === "phone";
   const githubProvisioningAvailable = useSyncExternalStore(
     subscribeGitHubProvisioningCapability,
     readGitHubProvisioningCapability,
@@ -1582,7 +1656,6 @@ export default function Sidebar() {
     (isMacPlatform(navigator.platform) ? "⇧⌘O" : "Ctrl+Shift+O");
   const usageSettingsShortcutLabel = shortcutLabelForCommand(keybindings, "settings.usage");
   const { activeProjectId: focusedProjectId } = useFocusedChatContext();
-  const latestProjectId = useLatestProjectStore((state) => state.latestProjectId);
   const [createProjectDialogOpen, setCreateProjectDialogOpen] = useState(false);
   const [searchPaletteOpen, setSearchPaletteOpen] = useState(false);
   const openFeedbackDialog = useFeedbackDialogStore((state) => state.openDialog);
@@ -1678,8 +1751,6 @@ export default function Sidebar() {
   const selectSidebarTreeThreads = useMemo(() => createSidebarTreeThreadsSelector(), []);
   const sidebarThreads = useStore(selectSidebarThreads);
   const sidebarTreeThreads = useStore(selectSidebarTreeThreads);
-  const selectProjectLastActivityAt = useMemo(() => createProjectLastActivityAtSelector(), []);
-  const projectLastActivityAt = useStore(selectProjectLastActivityAt);
   const studioProjectIdSet = useMemo(
     () => collectStudioProjectIds(projects, { homeDir, chatWorkspaceRoot, studioWorkspaceRoot }),
     [chatWorkspaceRoot, homeDir, projects, studioWorkspaceRoot],
@@ -2601,31 +2672,17 @@ export default function Sidebar() {
     setCreateProjectDialogOpen(true);
   }, []);
 
-  const activeSpaceProjects = useMemo(
-    () => ordinarySpaceProjects.filter((project) => (project.spaceId ?? null) === activeSpaceId),
-    [activeSpaceId, ordinarySpaceProjects],
-  );
-  const currentProjectShortcutTargetId = useMemo(
-    () => resolveCurrentProjectTargetId(activeSpaceProjects, focusedProjectId),
-    [activeSpaceProjects, focusedProjectId],
-  );
-  const latestUsableProjectId = useMemo(
-    () =>
-      resolveLatestProjectTargetIdWithFallback(
-        activeSpaceProjects,
-        latestProjectId,
-        projectLastActivityAt,
-      ),
-    [activeSpaceProjects, latestProjectId, projectLastActivityAt],
-  );
-  const primaryNewThreadTarget = useMemo(
-    () =>
-      resolveNewThreadTarget({
-        currentProjectId: currentProjectShortcutTargetId,
-        latestUsableProjectId,
-      }),
-    [currentProjectShortcutTargetId, latestUsableProjectId],
-  );
+  // Which project a global "new thread" action targets, Space-scoped so the action never
+  // jumps you out of the Space you are looking at. One hook shared with the chat route's
+  // shortcuts and the phone shell, so the three entry points can't disagree on the fallback.
+  const { currentProjectId: currentProjectShortcutTargetId, target: primaryNewThreadTarget } =
+    usePrimaryNewThreadTarget({
+      projects,
+      focusedProjectId,
+      // The sidebar's Space selection is optimistic (a pending switch wins over the stored
+      // id), so it passes its own resolved id instead of letting the hook read the store.
+      activeSpaceId,
+    });
 
   // Warm model discovery before ChatView mounts so new-thread composers skip
   // the "Loading models" skeleton when React Query already has a fresh cache hit.
@@ -5843,9 +5900,24 @@ export default function Sidebar() {
   const projectContextMenuHasOpenServer =
     projectContextMenuServer !== null && firstLocalServerUrl(projectContextMenuServer) !== null;
 
+  // Keyboard shortcuts and Send feedback have no other entry point in the app, so every chrome
+  // has to host this menu somewhere. Built once and handed to whichever footer renders (the
+  // desktop update pill takes its slot while an update is pending; phone always shows it).
+  const helpMenu = (
+    <SidebarHelpMenu
+      onOpenShortcuts={() => void navigate({ to: "/settings", search: { section: "shortcuts" } })}
+      onOpenFeedback={openFeedbackDialog}
+    />
+  );
+  // Debug-only affordance; the gate lives in SidebarDebugFeatureFlagsSlot.
+  const debugFeatureFlagsVisible = showDebugFeatureFlagsMenu && !isOnSettings;
+
   return (
     <>
-      {isElectron ? (
+      {/* Header chrome belongs to the sidebar shell: the wordmark row exists to host
+          `SidebarTrigger`, and the Electron branch draws the drag region/traffic-light
+          gutter. The phone home screen has neither shell nor titlebar. */}
+      {isPhoneChrome ? null : isElectron ? (
         <>
           <SidebarHeader
             className={cn(
@@ -5863,7 +5935,7 @@ export default function Sidebar() {
         </SidebarHeader>
       )}
 
-      <SidebarContent className="gap-0 font-system-ui">
+      <SidebarBody chrome={chrome}>
         {showArm64IntelBuildWarning && arm64IntelBuildWarningDescription ? (
           <SidebarGroup className="px-2 pt-2 pb-0">
             <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8">
@@ -6316,80 +6388,94 @@ export default function Sidebar() {
             </div>
           </SidebarGroup>
         ) : null}
-      </SidebarContent>
 
-      <SidebarFooter className="gap-2 border-sidebar-border border-t p-2 font-system-ui">
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <div className="flex flex-col gap-1">
-              {DebugFeatureFlagsMenu && showDebugFeatureFlagsMenu && !isOnSettings ? (
-                <Suspense fallback={null}>
-                  <DebugFeatureFlagsMenu />
-                </Suspense>
-              ) : null}
-              <div className="flex items-center gap-2">
-                {!isOnSettings && (
-                  <SidebarMenuButton
-                    size="sm"
-                    className={cn(
-                      SIDEBAR_HEADER_ROW_CLASS_NAME,
-                      SIDEBAR_ROW_IDLE_TEXT_CLASS_NAME,
-                      SIDEBAR_ROW_HOVER_CLASS_NAME,
-                      "flex-1",
-                    )}
-                    onClick={() => void navigate({ to: "/settings" })}
-                  >
-                    <SidebarLeadingIcon size="sm" tone={SIDEBAR_ROW_LABEL_TEXT_CLASS_NAME}>
-                      <SidebarGlyph icon={SettingsIcon} variant="leading" />
-                    </SidebarLeadingIcon>
-                    <span>Settings</span>
-                  </SidebarMenuButton>
-                )}
-                {showDesktopUpdateButton ? (
-                  <Tooltip>
-                    <TooltipTrigger
-                      render={
-                        <button
-                          type="button"
-                          aria-label={desktopUpdateTooltip}
-                          aria-disabled={desktopUpdateButtonDisabled || undefined}
-                          disabled={desktopUpdateButtonDisabled}
-                          className={desktopUpdateRowButtonClasses}
-                          onClick={handleDesktopUpdateButtonClick}
-                        >
-                          <span className="flex min-w-0 flex-1 items-center justify-between gap-1.5 leading-tight">
-                            <span className="min-w-0 truncate text-center">
-                              {desktopUpdateButtonPresentation.label}
+        {/* Phone footer: not the `SidebarFooter` primitive and not pinned — a plain row at the
+            end of the scrolled content. It carries only the capabilities the tab bar does not
+            re-provide (help/shortcuts/feedback, and debug flags in dev); Settings belongs to the
+            tab bar and the desktop updater is an Electron-only affordance. */}
+        {isPhoneChrome ? (
+          <div
+            data-testid="phone-sidebar-footer"
+            className={cn(
+              "mt-1 flex items-center justify-end gap-2 border-sidebar-border border-t px-2 py-2",
+              PHONE_FOOTER_TOUCH_TARGET_CLASS_NAME,
+            )}
+          >
+            <SidebarDebugFeatureFlagsSlot visible={debugFeatureFlagsVisible} />
+            {helpMenu}
+          </div>
+        ) : null}
+      </SidebarBody>
+
+      {/* Footer chrome (Settings row, desktop updater, help menu) is desktop-shell
+          navigation. On phone the bottom tab bar owns app-level navigation, so a second
+          navigation stack pinned under the thread list would only compete with it — the
+          capabilities the tab bar does not carry move to the in-flow phone footer above. */}
+      {isPhoneChrome ? null : (
+        <SidebarFooter className="gap-2 border-sidebar-border border-t p-2 font-system-ui">
+          <SidebarMenu>
+            <SidebarMenuItem>
+              <div className="flex flex-col gap-1">
+                <SidebarDebugFeatureFlagsSlot visible={debugFeatureFlagsVisible} />
+                <div className="flex items-center gap-2">
+                  {!isOnSettings && (
+                    <SidebarMenuButton
+                      size="sm"
+                      className={cn(
+                        SIDEBAR_HEADER_ROW_CLASS_NAME,
+                        SIDEBAR_ROW_IDLE_TEXT_CLASS_NAME,
+                        SIDEBAR_ROW_HOVER_CLASS_NAME,
+                        "flex-1",
+                      )}
+                      onClick={() => void navigate({ to: "/settings" })}
+                    >
+                      <SidebarLeadingIcon size="sm" tone={SIDEBAR_ROW_LABEL_TEXT_CLASS_NAME}>
+                        <SidebarGlyph icon={SettingsIcon} variant="leading" />
+                      </SidebarLeadingIcon>
+                      <span>Settings</span>
+                    </SidebarMenuButton>
+                  )}
+                  {showDesktopUpdateButton ? (
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <button
+                            type="button"
+                            aria-label={desktopUpdateTooltip}
+                            aria-disabled={desktopUpdateButtonDisabled || undefined}
+                            disabled={desktopUpdateButtonDisabled}
+                            className={desktopUpdateRowButtonClasses}
+                            onClick={handleDesktopUpdateButtonClick}
+                          >
+                            <span className="flex min-w-0 flex-1 items-center justify-between gap-1.5 leading-tight">
+                              <span className="min-w-0 truncate text-center">
+                                {desktopUpdateButtonPresentation.label}
+                              </span>
+                              {desktopUpdateButtonPresentation.secondaryLabel ? (
+                                <span className="min-w-0 truncate text-center text-[length:var(--app-font-size-ui-xs,10px)] text-white/80">
+                                  {desktopUpdateButtonPresentation.secondaryLabel}
+                                </span>
+                              ) : null}
                             </span>
-                            {desktopUpdateButtonPresentation.secondaryLabel ? (
-                              <span className="min-w-0 truncate text-center text-[length:var(--app-font-size-ui-xs,10px)] text-white/80">
-                                {desktopUpdateButtonPresentation.secondaryLabel}
+                            {desktopUpdateDownloadPercent !== null ? (
+                              <span className="rounded-full bg-white/20 px-1.5 py-0.5 text-[9px] font-semibold tabular-nums text-white/95">
+                                {desktopUpdateDownloadPercent}%
                               </span>
                             ) : null}
-                          </span>
-                          {desktopUpdateDownloadPercent !== null ? (
-                            <span className="rounded-full bg-white/20 px-1.5 py-0.5 text-[9px] font-semibold tabular-nums text-white/95">
-                              {desktopUpdateDownloadPercent}%
-                            </span>
-                          ) : null}
-                        </button>
-                      }
-                    />
-                    <TooltipPopup side="top">{desktopUpdateTooltip}</TooltipPopup>
-                  </Tooltip>
-                ) : (
-                  <SidebarHelpMenu
-                    onOpenShortcuts={() =>
-                      void navigate({ to: "/settings", search: { section: "shortcuts" } })
-                    }
-                    onOpenFeedback={openFeedbackDialog}
-                  />
-                )}
+                          </button>
+                        }
+                      />
+                      <TooltipPopup side="top">{desktopUpdateTooltip}</TooltipPopup>
+                    </Tooltip>
+                  ) : (
+                    helpMenu
+                  )}
+                </div>
               </div>
-            </div>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarFooter>
+            </SidebarMenuItem>
+          </SidebarMenu>
+        </SidebarFooter>
+      )}
 
       <CreateProjectDialog
         open={createProjectDialogOpen}

@@ -1,7 +1,13 @@
 import type { ResolvedKeybindingsConfig } from "@synara/contracts";
 import { useQuery } from "@tanstack/react-query";
-import { Outlet, createFileRoute, useLocation, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Outlet,
+  createFileRoute,
+  redirect,
+  useLocation,
+  useNavigate,
+} from "@tanstack/react-router";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   goBackInAppHistory,
@@ -12,31 +18,28 @@ import ShortcutsDialog from "../components/ShortcutsDialog";
 import { RecentViewSwitcher } from "../components/RecentViewSwitcher";
 import { shouldRenderTerminalWorkspace } from "../components/ChatView.logic";
 import ThreadSidebar from "../components/Sidebar";
-import { isElectron } from "../env";
+import { PhoneAppShell } from "../components/phone/PhoneAppShell";
+import { isMobileShell, isNativeShell } from "../env";
 import { useHandleNewChat } from "../hooks/useHandleNewChat";
 import { useHandleNewStudioChat } from "../hooks/useHandleNewStudioChat";
 import { useTemporaryThreadLifecycle } from "../hooks/useTemporaryThreadLifecycle";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useRecentViewSwitcher } from "../hooks/useRecentViewSwitcher";
 import { useLatestProjectStore } from "../latestProjectStore";
-import {
-  resolveCurrentProjectTargetId,
-  resolveLatestProjectTargetId,
-  resolveLatestProjectTargetIdWithFallback,
-  resolveNewThreadTarget,
-} from "../lib/projectShortcutTargets";
+import { resolveLatestProjectTargetId } from "../lib/projectShortcutTargets";
+import { usePrimaryNewThreadTarget } from "../hooks/usePrimaryNewThreadTarget";
+import { useLayoutMode } from "../lib/layoutMode";
 import { resolveInheritedThreadContext } from "../lib/threadBootstrap";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import { serverConfigQueryOptions } from "../lib/serverReactQuery";
 import { startFreshChatForActiveSurface } from "../lib/startContainerChat";
-import { isOrdinarySpaceProject } from "../lib/spaces";
 import { isKeyboardShortcutsHelpShortcut, resolveShortcutCommand } from "../keybindings";
 import { useStore } from "../store";
-import { createProjectLastActivityAtSelector } from "../storeSelectors";
 import { useSpacesUiStore } from "../spacesUiStore";
 import { selectThreadTerminalState, useTerminalStateStore } from "../terminalStateStore";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { onServerMaintenanceUpdated } from "../wsNativeApi";
+import { hydrateShellSession, isShellPaired } from "../shellSession";
 import { useWorkspacePathsStore } from "../workspacePathsStore";
 import { useProviderStatusesForLocalConfig } from "~/hooks/useProviderStatusesForLocalConfig";
 import { useRefreshProviderStatusesNow } from "~/hooks/useProviderStatusRefresh";
@@ -51,6 +54,7 @@ import {
   useSidebar,
 } from "~/components/ui/sidebar";
 import type { SidebarResizableOptions } from "~/components/ui/sidebar";
+import { APP_VIEWPORT_HEIGHT_CLASS_NAME } from "~/components/chat/composerPickerStyles";
 import { cn } from "~/lib/utils";
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
@@ -240,8 +244,6 @@ function ChatRouteGlobalShortcuts() {
   const setLatestProjectId = useLatestProjectStore((state) => state.setLatestProjectId);
   const clearLatestProjectId = useLatestProjectStore((state) => state.clearLatestProjectId);
   const threadsHydrated = useStore((state) => state.threadsHydrated);
-  const selectProjectLastActivityAt = useMemo(() => createProjectLastActivityAtSelector(), []);
-  const projectLastActivityAt = useStore(selectProjectLastActivityAt);
   const activeSpaceId = useSpacesUiStore((state) => state.activeSpaceId);
   useTemporaryThreadLifecycle(activeContextThreadId);
   const serverConfigQuery = useQuery(serverConfigQueryOptions());
@@ -262,33 +264,18 @@ function ChatRouteGlobalShortcuts() {
     presentationMode: activeThreadTerminalState?.presentationMode ?? "drawer",
     terminalOpen,
   });
-  // Shortcuts that target "a project" must stay inside the Space you are looking at, or
-  // mod+alt+arrow would switch Space and the next new-thread shortcut would drop you back
-  // out of it.
-  const activeSpaceProjects = useMemo(
-    () =>
-      projects.filter(
-        (project) =>
-          isOrdinarySpaceProject(project, { homeDir, chatWorkspaceRoot, studioWorkspaceRoot }) &&
-          (project.spaceId ?? null) === activeSpaceId,
-      ),
-    [activeSpaceId, chatWorkspaceRoot, homeDir, projects, studioWorkspaceRoot],
-  );
-  const currentProjectId = resolveCurrentProjectTargetId(
-    activeSpaceProjects,
-    activeProject?.id ?? null,
-  );
-  // The remembered project is global, so it is unusable the moment you switch Space. Fall
-  // back to this Space's most recently touched project rather than to nothing.
-  const latestUsableProjectId = useMemo(
-    () =>
-      resolveLatestProjectTargetIdWithFallback(
-        activeSpaceProjects,
-        latestProjectId,
-        projectLastActivityAt,
-      ),
-    [activeSpaceProjects, latestProjectId, projectLastActivityAt],
-  );
+  // Shared with the sidebar's primary new-thread button and the phone FAB — one wiring for
+  // "which project does a global new-thread action target", including the Space scoping that
+  // keeps `mod+alt+arrow` from switching Space and stranding the next new-thread shortcut.
+  const {
+    currentProjectId,
+    latestUsableProjectId,
+    target: primaryNewThreadTarget,
+  } = usePrimaryNewThreadTarget({
+    activeSpaceId,
+    focusedProjectId: activeProject?.id ?? null,
+    projects,
+  });
   // Deliberately unscoped: the persisted id is only cleared once the project is gone from
   // the app entirely, not merely absent from the Space you happen to be in.
   const persistedLatestProjectStillExists = resolveLatestProjectTargetId(projects, latestProjectId);
@@ -355,7 +342,7 @@ function ChatRouteGlobalShortcuts() {
         return;
       }
 
-      const appNavigationShortcut = isElectron
+      const appNavigationShortcut = isNativeShell
         ? resolveBrowserNavigationShortcut(event, platform)
         : null;
       if (appNavigationShortcut) {
@@ -412,7 +399,7 @@ function ChatRouteGlobalShortcuts() {
       }
 
       if (command === "chat.newTerminal") {
-        const target = resolveNewThreadTarget({ currentProjectId, latestUsableProjectId });
+        const target = primaryNewThreadTarget;
         if (!target) return;
         event.preventDefault();
         event.stopPropagation();
@@ -436,7 +423,7 @@ function ChatRouteGlobalShortcuts() {
             : command === "chat.newCodex"
               ? "codex"
               : "cursor";
-        const target = resolveNewThreadTarget({ currentProjectId, latestUsableProjectId });
+        const target = primaryNewThreadTarget;
         if (!target) return;
         event.preventDefault();
         event.stopPropagation();
@@ -467,8 +454,8 @@ function ChatRouteGlobalShortcuts() {
       // Falls back to the most recent project when none is focused (e.g. the landing
       // view) so the primary "new thread" chord always creates a thread; on that
       // fallback the active branch/worktree context belongs to the absent project, so
-      // `resolveNewThreadTarget` omits it and we defer to the target's defaults.
-      const target = resolveNewThreadTarget({ currentProjectId, latestUsableProjectId });
+      // `usePrimaryNewThreadTarget` omits it and we defer to the target's defaults.
+      const target = primaryNewThreadTarget;
       if (!target) return;
       event.preventDefault();
       event.stopPropagation();
@@ -490,13 +477,13 @@ function ChatRouteGlobalShortcuts() {
     cancelRecentSwitcher,
     clearSelection,
     commitRecentSwitcherSelection,
-    currentProjectId,
     handleNewChatForActiveSurface,
     handleNewThread,
     keybindings,
     latestUsableProjectId,
     openOrAdvanceRecentSwitcher,
     platform,
+    primaryNewThreadTarget,
     providerStatuses,
     refreshProviderStatuses,
     recentSwitcherState,
@@ -563,8 +550,36 @@ function ChatRouteLayout() {
   const isEditorView = useLocation({
     select: (location) => (location.search as { view?: unknown }).view === "editor",
   });
+  const layoutMode = useLayoutMode();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const resolvedSidebarOpen = isEditorView ? false : sidebarOpen;
+
+  // Pane arrangement reads the viewport axis and nothing else (never `isMobileShell` or pointer
+  // coarseness): a narrow desktop window gets the phone shell, a touch laptop does not.
+  // The shell owns its own SidebarProvider, so the desktop tree below stays untouched.
+  //
+  // ACCEPTED TRADEOFF (M3): this is an early return, so the two layouts are different element
+  // types at the same position and React cannot reconcile them. Crossing 768px in either
+  // direction therefore UNMOUNTS the entire chat tree and mounts the other one — component
+  // identity changes for everything below this line.
+  //   Survives the swap: anything stored outside the React tree — zustand stores (thread/store,
+  //   composer drafts, terminal + right-dock state), the router (URL, matches, loader data),
+  //   React Query's cache, and the WebSocket subscriptions those own.
+  //   Does NOT survive: component-local state and refs (useState/useRef), in-flight transitions,
+  //   scroll positions, focus, uncontrolled DOM state (e.g. an editor's selection), and any
+  //   effect that only runs on mount.
+  // Resizing across the breakpoint is a rare, deliberate act on a real device, so paying a
+  // remount buys us two independent, simple layout trees instead of one that must be correct in
+  // both modes at once. Tests that resize across 768px must re-query DOM nodes afterwards; nodes
+  // captured before the crossing are detached and measure as 0x0.
+  if (layoutMode === "phone") {
+    return (
+      <PhoneAppShell>
+        <ThreadRetentionMaintenanceToast />
+        <ChatRouteGlobalShortcuts />
+      </PhoneAppShell>
+    );
+  }
 
   // The thread sidebar always lives on the left; the right dock is a separate surface.
   const sidebarElement = (
@@ -590,7 +605,7 @@ function ChatRouteLayout() {
   // would have gotten inside <Sidebar> (otherwise dragging to resize stops working).
   // `data-sidebar-side` on the provider selects the seam geometry.
   const mainContentShell = (
-    <div className="relative flex h-svh min-h-0 min-w-0 flex-1">
+    <div className={`relative flex ${APP_VIEWPORT_HEIGHT_CLASS_NAME} min-h-0 min-w-0 flex-1`}>
       {isEditorView ? null : (
         <SidebarInstanceProvider side="left" resizable={THREAD_SIDEBAR_RESIZABLE}>
           <SidebarRail placement="content-seam" />
@@ -616,6 +631,23 @@ function ChatRouteLayout() {
   );
 }
 
+/**
+ * The whole app under `/_chat` talks to a paired server, so an unpaired mobile shell is sent to
+ * the connect screen before any of it loads. Off the mobile shell this returns synchronously and
+ * costs nothing — desktop and browser sessions have no pairing to check.
+ *
+ * The paired session lives in async secure storage, so a first navigation can arrive before
+ * startup hydration has finished; `hydrateShellSession` is single-flight and a no-op once hydrated,
+ * so awaiting it here only ever costs the very first navigation.
+ */
+function requireMobilePairing(): void | Promise<void> {
+  if (!isMobileShell || isShellPaired()) return;
+  return hydrateShellSession().then(() => {
+    if (!isShellPaired()) throw redirect({ to: "/connect" });
+  });
+}
+
 export const Route = createFileRoute("/_chat")({
+  beforeLoad: requireMobilePairing,
   component: ChatRouteLayout,
 });

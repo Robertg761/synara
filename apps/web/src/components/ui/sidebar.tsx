@@ -130,7 +130,14 @@ function SidebarProvider({
         _setOpen(openState);
       }
 
-      // This sets the cookie to keep the sidebar state.
+      // This sets the cookie to keep the sidebar state. The Cookie Store API is absent
+      // in iOS WKWebView and older Android WebViews, where an unguarded call throws, so
+      // fall back to `document.cookie` with the same name/value/path/max-age semantics.
+      if (typeof cookieStore === "undefined") {
+        document.cookie = `${SIDEBAR_COOKIE_NAME}=${String(openState)}; path=/; max-age=${SIDEBAR_COOKIE_MAX_AGE}`;
+        return;
+      }
+
       await cookieStore.set({
         expires: Date.now() + SIDEBAR_COOKIE_MAX_AGE * 1000,
         name: SIDEBAR_COOKIE_NAME,

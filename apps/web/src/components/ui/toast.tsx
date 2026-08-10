@@ -28,6 +28,8 @@ import {
 import { useDiffRouteSearch } from "../../hooks/useDiffRouteSearch";
 import { selectSplitView, useSplitViewStore } from "../../splitViewStore";
 import { selectRightDockState, useRightDockStore } from "../../rightDockStore";
+import { resolveDockVisibility } from "../../rightDockStore.logic";
+import { useLayoutMode } from "../../lib/layoutMode";
 import {
   resolveVisibleToastThreadIds,
   shouldRenderToastForVisibleThreads,
@@ -137,11 +139,16 @@ function useVisibleThreadIdsFromRoute(): ReadonlySet<ThreadId> {
   const rightDockState = useRightDockStore(
     useMemo(() => selectRightDockState(activeThreadId), [activeThreadId]),
   );
+  const layoutMode = useLayoutMode();
 
   return resolveVisibleToastThreadIds({
     activeThreadId,
     splitView,
-    rightDockRendered: routeSearch.view !== "editor",
+    dockVisibility: resolveDockVisibility({
+      layoutMode,
+      view: routeSearch.view,
+      urlPaneId: routeSearch.pane ?? null,
+    }),
     rightDockState,
   });
 }

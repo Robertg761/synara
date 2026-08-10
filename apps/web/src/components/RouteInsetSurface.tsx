@@ -7,12 +7,13 @@
 import { type ComponentProps } from "react";
 
 import {
+  APP_VIEWPORT_HEIGHT_CLASS_NAME,
   CHAT_MAIN_CONTENT_SURFACE_CLASS_NAME,
   CHAT_ROUTE_INSET_SHELL_CLASS_NAME,
 } from "./chat/composerPickerStyles";
 import { SidebarInset } from "./ui/sidebar";
 
-const CARD_SURFACE_ROUTE_INSET_CLASS_NAME = "h-dvh min-h-0 overscroll-y-none text-foreground";
+const CARD_SURFACE_ROUTE_INSET_CLASS_NAME = `${APP_VIEWPORT_HEIGHT_CLASS_NAME} min-h-0 overscroll-y-none text-foreground`;
 
 // Default route surfaces keep SidebarInset as the sidebar peer while letting the
 // inner seam shadow bleed past the unclipped outer inset.

@@ -101,6 +101,7 @@ import { usePreloadRouteChunks } from "../hooks/usePreloadRouteChunks";
 import { useSyncDesktopTopBarTrafficLightGutterZoom } from "../hooks/useDesktopTopBarGutter";
 import { useTheme } from "../hooks/useTheme";
 import { useNativeFontSmoothing } from "../hooks/useNativeFontSmoothing";
+import { useLayoutMode, useLayoutModeEffects } from "../lib/layoutMode";
 import { invalidateGitQueries, invalidateGitQueriesForCwds } from "../lib/gitReactQuery";
 import { hasLiveThreadsWithMissingProjects } from "../lib/desktopProjectRecovery";
 import { useDiffRouteSearch } from "../hooks/useDiffRouteSearch";
@@ -111,7 +112,10 @@ import {
 import { useProviderStatusRefresh } from "../hooks/useProviderStatusRefresh";
 import { resolveSplitViewThreadIds, selectSplitView, useSplitViewStore } from "../splitViewStore";
 import { useRightDockStore } from "../rightDockStore";
-import { resolveVisibleDockSidechatThreadIds } from "../rightDockStore.logic";
+import {
+  resolveDockVisibility,
+  resolveVisibleDockSidechatThreadIds,
+} from "../rightDockStore.logic";
 import { arraysShallowEqual } from "../storeNormalization";
 import { providerModelDiscoveryInvalidationFingerprint } from "../lib/providerDiscoveryInvalidation";
 import { providerDiscoveryQueryKeys } from "../lib/providerDiscoveryReactQuery";
@@ -194,6 +198,7 @@ function RootRouteView() {
   useAppDensity();
   usePreloadRouteChunks();
   useNativeFontSmoothing();
+  useLayoutModeEffects();
   useSyncDesktopTopBarTrafficLightGutterZoom();
   useTheme();
   const [compatibilityIssue, setCompatibilityIssue] = useState<WsCompatibilityError | null>(() =>
@@ -1031,6 +1036,7 @@ function EventRouter() {
     select: (params) => (params.threadId ? ThreadId.makeUnsafe(params.threadId) : null),
   });
   const routeSearch = useDiffRouteSearch();
+  const layoutMode = useLayoutMode();
   const activeSplitView = useSplitViewStore(
     useMemo(() => selectSplitView(routeSearch.splitViewId ?? null), [routeSearch.splitViewId]),
   );
@@ -1046,17 +1052,23 @@ function EventRouter() {
   // Right-dock sidechat panes render a full ChatView for their embedded thread,
   // so they need a detail lease exactly like split-view panes: without one the
   // sidechat's snapshot never syncs and its transcript stays on the loading state.
+  // This holds on phone too, where the pane is a full-screen `?pane=` screen
+  // rather than a dock tab.
   const dockStateByThreadId = useRightDockStore((store) => store.dockStateByThreadId);
   const visibleThreadIds = useMemo(
     () => [
       ...hostThreadIds,
       ...resolveVisibleDockSidechatThreadIds({
-        dockRendered: routeSearch.view !== "editor",
+        visibility: resolveDockVisibility({
+          layoutMode,
+          view: routeSearch.view,
+          urlPaneId: routeSearch.pane ?? null,
+        }),
         dockStateByThreadId,
         hostThreadIds,
       }),
     ],
-    [dockStateByThreadId, hostThreadIds, routeSearch.view],
+    [dockStateByThreadId, hostThreadIds, layoutMode, routeSearch.pane, routeSearch.view],
   );
   const retainedThreadIds = useRetainedThreadDetailIds();
   const serverThreadIds = new Set(serverThreads.map((thread) => thread.id));
@@ -1354,7 +1366,12 @@ function EventRouter() {
       const refresh = (async () => {
         shellSnapshotSequence = -1;
         pendingShellEvents = [];
-        await api.orchestration.subscribeShell().catch(() => loadShellSnapshotOnce());
+        // The snapshot fallback must not reject the (fire-and-forget) refresh:
+        // transport dispose during teardown or reconnect is expected, and the
+        // next reconnect re-runs this refresh from scratch anyway.
+        await api.orchestration
+          .subscribeShell()
+          .catch(() => loadShellSnapshotOnce().catch(() => undefined));
         await enqueueThreadSubscriptionOperation(async () => {
           threadSnapshotSequenceById.clear();
           pendingThreadEventsById.clear();

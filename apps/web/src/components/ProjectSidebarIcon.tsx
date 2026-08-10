@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from "react";
 
-import { resolveWsHttpUrl } from "~/lib/wsHttpUrl";
+import { resolveWsHttpUrl } from "~/lib/serverEndpoint";
 import { FolderClosed, FolderOpen } from "./FolderClosed";
 
 const projectFaviconPresence = new Map<string, boolean>();

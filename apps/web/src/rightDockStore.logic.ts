@@ -1,9 +1,11 @@
 // FILE: rightDockStore.logic.ts
 // Purpose: Pure, testable transitions for the right dock (tabbed multi-pane right sidebar).
 // Layer: UI state helpers
-// Exports: dock pane types, default-state factory, and immutable open/close/activate helpers.
+// Exports: dock pane types, default-state factory, immutable open/close/activate helpers, and the
+//          shared dock-visibility resolvers (desktop dock vs phone `?pane=` screen).
 
 import type { ProjectId, ThreadId, TurnId } from "@synara/contracts";
+import type { LayoutMode } from "./lib/layoutMode";
 import { isPlainObject, sanitizeStringKeyedRecord } from "./persistedRecord";
 
 // Single source of truth for the dock pane kinds. The union type, the runtime
@@ -399,33 +401,92 @@ export function findMissingSidechatPaneIds(
   );
 }
 
+/**
+ * What the dock is showing on screen right now, in the two shapes it can take.
+ *
+ * - `dockRendered` is about the *desktop* dock component: when it is mounted, the
+ *   visible pane is whatever the store says is active (`open` + `activePaneId`).
+ * - `phonePaneId` is the phone shape: there is no dock, a single pane is pushed
+ *   full screen and the URL (`?pane=`) is the only authority for which one.
+ *
+ * Exactly one of them is ever meaningful, which is why they travel together: a
+ * consumer that reads only `dockRendered` silently treats every phone pane as
+ * invisible (no detail lease, wrong toast suppression).
+ */
+export interface DockVisibility {
+  readonly dockRendered: boolean;
+  readonly phonePaneId: string | null;
+}
+
+/**
+ * Single source of truth for "is a dock pane on screen, and which one".
+ * Every consumer (detail leases, toast visibility, ...) derives from this rather
+ * than re-deriving `view !== "editor"` locally.
+ */
+export function resolveDockVisibility(input: {
+  layoutMode: LayoutMode;
+  view: "editor" | undefined;
+  urlPaneId: string | null | undefined;
+}): DockVisibility {
+  // The editor view replaces the whole chat surface: no dock, no pane screen.
+  if (input.view === "editor") {
+    return { dockRendered: false, phonePaneId: null };
+  }
+  if (input.layoutMode === "phone") {
+    // The desktop dock genuinely is not mounted on phone; visibility is the URL.
+    return { dockRendered: false, phonePaneId: input.urlPaneId ?? null };
+  }
+  return { dockRendered: true, phonePaneId: null };
+}
+
+/**
+ * The pane a host thread currently shows, or null when nothing of it is on screen.
+ * Phone resolves the pushed screen straight from the URL pane id (the store's
+ * `open`/`activePaneId` follow it asynchronously and must not gate visibility);
+ * desktop keeps the store as the authority.
+ */
+export function resolveVisibleDockPane(
+  visibility: DockVisibility,
+  state: RightDockThreadState | null | undefined,
+): RightDockPane | null {
+  if (!state) {
+    return null;
+  }
+  if (visibility.phonePaneId !== null) {
+    return state.panes.find((pane) => pane.id === visibility.phonePaneId) ?? null;
+  }
+  if (!visibility.dockRendered) {
+    return null;
+  }
+  return resolveActivePane(state);
+}
+
 // An active sidechat embeds a full chat, so it needs a detail lease just like a
 // split-view pane. Persisted inactive or currently unrendered docks stay out of
 // the scarce live-stream budget.
 export function resolveVisibleDockSidechatThreadIds(input: {
-  dockRendered: boolean;
+  visibility: DockVisibility;
   dockStateByThreadId: Record<string, RightDockThreadState | undefined>;
   hostThreadIds: readonly ThreadId[];
 }): ThreadId[] {
-  if (!input.dockRendered) {
+  if (!input.visibility.dockRendered && input.visibility.phonePaneId === null) {
     return [];
   }
 
   const sidechatThreadIds: ThreadId[] = [];
   const seenThreadIds = new Set<ThreadId>(input.hostThreadIds);
   for (const hostThreadId of input.hostThreadIds) {
-    const dockState = input.dockStateByThreadId[hostThreadId];
-    if (!dockState) {
-      continue;
-    }
-    const activePane = resolveActivePane(dockState);
+    const visiblePane = resolveVisibleDockPane(
+      input.visibility,
+      input.dockStateByThreadId[hostThreadId],
+    );
     if (
-      activePane?.kind === "sidechat" &&
-      activePane.threadId &&
-      !seenThreadIds.has(activePane.threadId)
+      visiblePane?.kind === "sidechat" &&
+      visiblePane.threadId &&
+      !seenThreadIds.has(visiblePane.threadId)
     ) {
-      seenThreadIds.add(activePane.threadId);
-      sidechatThreadIds.push(activePane.threadId);
+      seenThreadIds.add(visiblePane.threadId);
+      sidechatThreadIds.push(visiblePane.threadId);
     }
   }
   return sidechatThreadIds;

@@ -34,7 +34,7 @@ import { type SplitViewId } from "../splitViewStore";
 import { useRightDockStore } from "../rightDockStore";
 import { registerSidechatCreator } from "../lib/sidechatCreatorRegistry";
 import { downloadUrlAsBlob } from "../lib/browserDownload";
-import { resolveWsHttpUrl } from "../lib/wsHttpUrl";
+import { resolveWsHttpUrl } from "../lib/serverEndpoint";
 import { useFeedbackDialogStore } from "../feedbackDialogStore";
 import {
   createOrJoinSidechat,

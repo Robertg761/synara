@@ -63,8 +63,9 @@ export interface FlushBeforePageHideEnv {
  * Flush a debounced/deferred storage before the page goes away, so at most one
  * debounce window of changes can be lost. Wires `beforeunload`, `pagehide`, and
  * `visibilitychange`→hidden — the latter two fire on mobile/bfcache navigations
- * where `beforeunload` does not. No-ops when the DOM globals are unavailable
- * (SSR / non-browser test environments), and is injectable for testing.
+ * where `beforeunload` does not. No-ops per target whenever it cannot subscribe
+ * (SSR / non-browser test environments / partially stubbed globals), and is
+ * injectable for testing.
  */
 export function flushStorageBeforePageHide(
   flush: () => void,
@@ -73,11 +74,22 @@ export function flushStorageBeforePageHide(
     document: typeof document !== "undefined" ? document : undefined,
   },
 ): void {
-  env.window?.addEventListener("beforeunload", flush);
-  env.window?.addEventListener("pagehide", flush);
+  const subscribe = (
+    target: PageHideEventTarget | undefined,
+    type: string,
+    listener: () => void,
+  ) => {
+    if (typeof target?.addEventListener !== "function") {
+      return;
+    }
+    target.addEventListener(type, listener);
+  };
+
+  subscribe(env.window, "beforeunload", flush);
+  subscribe(env.window, "pagehide", flush);
   const doc = env.document;
-  doc?.addEventListener("visibilitychange", () => {
-    if (doc.visibilityState === "hidden") {
+  subscribe(doc, "visibilitychange", () => {
+    if (doc?.visibilityState === "hidden") {
       flush();
     }
   });

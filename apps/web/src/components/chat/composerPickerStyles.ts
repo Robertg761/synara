@@ -91,14 +91,17 @@ export const CHAT_CONTENT_CARD_CLASS_NAME = "chat-content-card relative z-[15] o
  *  `CHAT_CONTENT_CARD_CLASS_NAME` with their own background token instead. */
 export const CHAT_MAIN_CONTENT_SURFACE_CLASS_NAME = `${CHAT_BACKGROUND_CLASS_NAME} ${CHAT_CONTENT_CARD_CLASS_NAME}`;
 
+/** The one viewport-height class for full-height app shells. `dvh` tracks the *dynamic*
+ *  viewport (mobile URL bar collapsed or not) while `svh` is pinned to the smallest one,
+ *  so mixing them makes a child taller than its parent on mobile — everything uses `dvh`. */
+export const APP_VIEWPORT_HEIGHT_CLASS_NAME = "h-dvh";
+
 /** Clipped full-height inset shell for routes that already own an outer card wrapper.
  *  Default RouteInsetSurface card routes use an unclipped inset so seam shadows can bleed. */
-export const CHAT_ROUTE_INSET_SHELL_CLASS_NAME =
-  "h-dvh min-h-0 overflow-hidden overscroll-y-none text-foreground";
+export const CHAT_ROUTE_INSET_SHELL_CLASS_NAME = `${APP_VIEWPORT_HEIGHT_CLASS_NAME} min-h-0 overflow-hidden overscroll-y-none text-foreground`;
 
 /** Outer viewport shell for the split/single thread content wrapper that carries the card. */
-export const CHAT_MAIN_VIEWPORT_SHELL_CLASS_NAME =
-  "flex h-dvh min-h-0 min-w-0 flex-1 overflow-hidden";
+export const CHAT_MAIN_VIEWPORT_SHELL_CLASS_NAME = `flex ${APP_VIEWPORT_HEIGHT_CLASS_NAME} min-h-0 min-w-0 flex-1 overflow-hidden`;
 
 /** Horizontal padding shared by the transcript and composer columns. */
 export const CHAT_COLUMN_GUTTER_CLASS_NAME =
@@ -211,6 +214,25 @@ export const ENVIRONMENT_CONTENT_INSET_MOTION_CLASS =
 /** Anchors the command menu above the composer editor without shifting layout. */
 export const COMPOSER_COMMAND_MENU_FLOATING_WRAPPER_CLASS_NAME =
   "pointer-events-auto absolute inset-x-0 bottom-full z-20 mb-2 overflow-visible px-1 pt-2";
+
+/**
+ * Phone-only height cap for whatever mounts in the floating command-menu slot. The menu
+ * opens directly above the composer, so on a phone it shares the viewport with the
+ * on-screen keyboard: capping its scroll body at 40dvh (desktop keeps its own `max-h-72`)
+ * guarantees keyboard + menu never exceed the viewport.
+ *
+ * Scoped to the phone LAYOUT axis through the `<html data-layout>` attribute published by
+ * `useLayoutModeEffects`. Written as an ancestor-attribute variant rather than `max-md:`
+ * on purpose: `html[data-layout=phone] .wrapper [data-slot=…]` outranks the inner
+ * `max-h-72` on specificity, so the cap does not depend on utility order in the sheet
+ * (a bare `max-md:` utility loses to `sm:`-prefixed utilities in the 640–767px band).
+ *
+ * Both menus that render in this slot expose a scroll body: `ComposerCommandMenu` via
+ * `CommandList` (`data-slot=command-list`) and `ComposerLocalDirectoryMenu` via its picker
+ * popup body (`data-slot=menu-popup-body`).
+ */
+export const COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME =
+  "[html[data-layout=phone]_&_[data-slot=command-list]]:max-h-[40dvh] [html[data-layout=phone]_&_[data-slot=menu-popup-body]]:max-h-[40dvh]";
 
 /** Inline command menu slot for compact composers rendered near the top of a scrollable dialog. */
 export const COMPOSER_COMMAND_MENU_INLINE_WRAPPER_CLASS_NAME =

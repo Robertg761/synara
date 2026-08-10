@@ -34,7 +34,7 @@ import {
 } from "./composerImagePreparation";
 import { normalizeComposerImageSource } from "./composerImageSource";
 import { randomUUID } from "./utils";
-import { resolveWsHttpUrl } from "./wsHttpUrl";
+import { resolveWsHttpUrl } from "./serverEndpoint";
 
 const ATTACHMENT_CANCEL_CONCURRENCY = 2;
 const ATTACHMENT_CANCEL_BODY_MAX_BYTES = 512;

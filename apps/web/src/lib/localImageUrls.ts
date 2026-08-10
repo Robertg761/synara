@@ -2,7 +2,7 @@
 // Purpose: Builds authenticated local-image URLs for markdown image previews and downloads.
 // Layer: Web utility
 // Exports: local image URL detection and builders
-// Depends on: wsHttpUrl (so desktop requests carry the legacy startup token used by attachments)
+// Depends on: serverEndpoint (so desktop requests carry the legacy startup token used by attachments)
 //             and @synara/shared/localPreviewFiles for the canonical route + extension allowlist.
 
 import {
@@ -11,7 +11,7 @@ import {
 } from "@synara/shared/localPreviewFiles";
 import { isWindowsAbsolutePath } from "@synara/shared/path";
 
-import { resolveWsHttpUrl } from "./wsHttpUrl";
+import { resolveWsHttpUrl } from "./serverEndpoint";
 
 function normalizeMarkdownImagePath(src: string): string {
   const trimmed = src.trim();

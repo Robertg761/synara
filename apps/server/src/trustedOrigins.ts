@@ -2,20 +2,24 @@
 // Purpose: Shared origin checks for browser-facing HTTP/WS routes that expose
 //          local machine data only to Synara's own app surfaces.
 // Layer: Server HTTP/security utility
-// Exports: normalizeCorsOrigin, isTrustedAppOrigin,
-//          shouldRejectUntrustedRequestOrigin
+// Exports: TRUSTED_APP_ORIGINS, normalizeCorsOrigin, isTrustedAppOrigin,
+//          shouldRejectUntrustedRequestOrigin, shouldRejectAuthMutationOrigin,
+//          requiresWebSocketAuthentication
 
 import {
   SYNARA_CANARY_DESKTOP_ORIGIN,
   SYNARA_DESKTOP_ORIGIN,
 } from "@synara/shared/desktopIdentity";
+import { SYNARA_MOBILE_APP_ORIGIN } from "@synara/shared/mobileIdentity";
 
 import type { ServerConfigShape } from "./config";
 import { isLoopbackHost, isWildcardHost } from "./startupAccess";
 
-export const DESKTOP_APP_CORS_ORIGINS: ReadonlySet<string> = new Set([
+/** Origins of Synara's own packaged app shells (desktop schemes, mobile https). */
+export const TRUSTED_APP_ORIGINS: ReadonlySet<string> = new Set([
   SYNARA_DESKTOP_ORIGIN,
   SYNARA_CANARY_DESKTOP_ORIGIN,
+  SYNARA_MOBILE_APP_ORIGIN,
 ]);
 
 export function normalizeCorsOrigin(rawOrigin: string | ReadonlyArray<string> | undefined) {
@@ -24,9 +28,12 @@ export function normalizeCorsOrigin(rawOrigin: string | ReadonlyArray<string> | 
   if (!trimmed || trimmed === "null") {
     return null;
   }
-  const normalizedDesktopOrigin = trimmed.replace(/\/+$/, "");
-  if (DESKTOP_APP_CORS_ORIGINS.has(normalizedDesktopOrigin)) {
-    return normalizedDesktopOrigin;
+  // Checked before `new URL()` because custom-scheme desktop origins
+  // (`synara://app`) do not round-trip through `URL.origin`; https app origins
+  // parse normally and match either way.
+  const normalizedAppOrigin = trimmed.replace(/\/+$/, "");
+  if (TRUSTED_APP_ORIGINS.has(normalizedAppOrigin)) {
+    return normalizedAppOrigin;
   }
   try {
     const origin = new URL(trimmed).origin;
@@ -77,7 +84,7 @@ export function isTrustedAppOrigin(input: {
     (input.origin === input.requestOrigin &&
       isTrustedRequestOriginHost(input.requestOrigin, input.config)) ||
     input.origin === input.config.devUrl?.origin ||
-    DESKTOP_APP_CORS_ORIGINS.has(input.origin)
+    TRUSTED_APP_ORIGINS.has(input.origin)
   );
 }
 
