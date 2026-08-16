@@ -163,6 +163,15 @@ import type {
   DeviceTypeTextInput,
   ThreadDeviceState,
 } from "./device";
+import type {
+  ComputerEvent,
+  ComputerGetScreenSizeInput,
+  ComputerGetScreenSizeResult,
+  ComputerListWindowsInput,
+  ComputerListWindowsResult,
+  ComputerThreadInput,
+  ThreadComputerState,
+} from "./computer";
 import type { StudioListThreadOutputsInput, StudioListThreadOutputsResult } from "./studio";
 import type {
   ServerConfig,
@@ -864,5 +873,11 @@ export interface NativeApi {
     describeUi: (input: DeviceDescribeUiInput) => Promise<DeviceDescribeUiResult>;
     scrollToElement: (input: DeviceScrollToElementInput) => Promise<DeviceScrollToElementResult>;
     onEvent: (callback: (event: DeviceEvent) => void) => () => void;
+  };
+  computer: {
+    getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
+    listWindows: (input: ComputerListWindowsInput) => Promise<ComputerListWindowsResult>;
+    getScreenSize: (input: ComputerGetScreenSizeInput) => Promise<ComputerGetScreenSizeResult>;
+    onEvent: (callback: (event: ComputerEvent) => void) => () => void;
   };
 }
