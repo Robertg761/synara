@@ -2,8 +2,13 @@ import type { ComputerFrameHeader, ThreadComputerState, ThreadId } from "@synara
 import { describe, expect, it } from "vitest";
 
 import {
+  COMPUTER_SCROLL_DELTA_LIMIT,
   computerContainRect,
   computerCursorPosition,
+  computerKeyCommand,
+  computerStreamRegion,
+  computerViewportPointToDesktop,
+  computerWheelScrollDelta,
   createComputerFrameGateState,
   resolveComputerAvailabilityView,
   shouldSubscribeToComputerStream,
@@ -132,3 +137,143 @@ describe("computer panel state helpers", () => {
     ).toEqual({ left: 400, top: 250 });
   });
 });
+
+describe("computer pane pointer mapping", () => {
+  const screenSize = { width: 1_920, height: 1_080 };
+  const paneRect = computerContainRect({
+    source: screenSize,
+    containerWidth: 800,
+    containerHeight: 600,
+  });
+
+  function toDesktop(x: number, y: number) {
+    return computerViewportPointToDesktop({
+      pointer: { x, y },
+      containRect: paneRect,
+      region: computerStreamRegion(screenSize),
+    });
+  }
+
+  it("derives the streamed region from the screen size and passes an explicit one through", () => {
+    expect(computerStreamRegion(screenSize)).toEqual({ x: 0, y: 0, width: 1_920, height: 1_080 });
+    expect(computerStreamRegion(undefined)).toBeNull();
+    const region = { x: 1_920, y: 0, width: 1_920, height: 1_080 };
+    expect(computerStreamRegion(screenSize, region)).toBe(region);
+  });
+
+  it("maps pane pixels to desktop pixels across the letterboxed image", () => {
+    // 800x600 pane, 16:9 desktop: the image is 800x450 with 75px bars.
+    expect(paneRect).toEqual({ left: 0, top: 75, width: 800, height: 450 });
+    expect(toDesktop(0, 75)).toEqual({ x: 0, y: 0 });
+    expect(toDesktop(400, 300)).toEqual({ x: 960, y: 540 });
+    // The far edge lands on the last pixel, never one past the screen.
+    expect(toDesktop(800, 525)).toEqual({ x: 1_919, y: 1_079 });
+  });
+
+  it("ignores the letterbox padding on either side of the image", () => {
+    expect(toDesktop(400, 74)).toBeNull();
+    expect(toDesktop(400, 526)).toBeNull();
+    expect(toDesktop(-1, 300)).toBeNull();
+    expect(toDesktop(801, 300)).toBeNull();
+  });
+
+  it("applies a region offset and rounds to whole desktop pixels", () => {
+    const region = { x: 1_920, y: 0, width: 1_920, height: 1_080 };
+    const containRect = { left: 10, top: 20, width: 480, height: 270 };
+
+    expect(
+      computerViewportPointToDesktop({ pointer: { x: 250, y: 155 }, containRect, region }),
+    ).toEqual({ x: 2_880, y: 540 });
+    // Four desktop pixels per pane pixel: sub-pixel offsets round, not truncate.
+    expect(
+      computerViewportPointToDesktop({ pointer: { x: 10.6, y: 20.2 }, containRect, region }),
+    ).toEqual({ x: 1_922, y: 1 });
+  });
+
+  it("maps nothing without geometry", () => {
+    const region = computerStreamRegion(screenSize);
+    expect(
+      computerViewportPointToDesktop({ pointer: { x: 1, y: 1 }, containRect: null, region }),
+    ).toBeNull();
+    expect(
+      computerViewportPointToDesktop({
+        pointer: { x: 1, y: 1 },
+        containRect: paneRect,
+        region: null,
+      }),
+    ).toBeNull();
+    expect(
+      computerViewportPointToDesktop({
+        pointer: { x: Number.NaN, y: 1 },
+        containRect: paneRect,
+        region,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("computer pane wheel and key mapping", () => {
+  it("converts wheel deltas to pixels and clamps a runaway burst", () => {
+    expect(computerWheelScrollDelta({ deltaX: -12, deltaY: 48, deltaMode: 0 })).toEqual({
+      deltaX: -12,
+      deltaY: 48,
+    });
+    expect(computerWheelScrollDelta({ deltaX: 0, deltaY: 3, deltaMode: 1 })).toEqual({
+      deltaX: 0,
+      deltaY: 48,
+    });
+    expect(computerWheelScrollDelta({ deltaX: 0, deltaY: -2, deltaMode: 2 })).toEqual({
+      deltaX: 0,
+      deltaY: -800,
+    });
+    expect(computerWheelScrollDelta({ deltaX: 1e9, deltaY: -1e9, deltaMode: 0 })).toEqual({
+      deltaX: COMPUTER_SCROLL_DELTA_LIMIT,
+      deltaY: -COMPUTER_SCROLL_DELTA_LIMIT,
+    });
+    expect(computerWheelScrollDelta({ deltaX: Number.NaN, deltaY: 0, deltaMode: 0 })).toEqual({
+      deltaX: 0,
+      deltaY: 0,
+    });
+  });
+
+  it("translates keydowns into backend key presses", () => {
+    expect(keyEvent("a")).toEqual({ key: "a", modifiers: [] });
+    expect(keyEvent(" ")).toEqual({ key: "space", modifiers: [] });
+    expect(keyEvent("ArrowLeft")).toEqual({ key: "arrowleft", modifiers: [] });
+    expect(keyEvent("F5")).toEqual({ key: "f5", modifiers: [] });
+    // A printable character carries its own shift state.
+    expect(keyEvent("A", { shiftKey: true })).toEqual({ key: "A", modifiers: [] });
+    expect(keyEvent("c", { ctrlKey: true })).toEqual({ key: "c", modifiers: ["ctrl"] });
+    expect(keyEvent("Tab", { shiftKey: true })).toEqual({ key: "tab", modifiers: ["shift"] });
+    expect(keyEvent("Tab", { ctrlKey: true, altKey: true, shiftKey: true, metaKey: true })).toEqual(
+      { key: "tab", modifiers: ["ctrl", "alt", "shift", "meta"] },
+    );
+  });
+
+  it("leaves keys the seat cannot express to the browser", () => {
+    expect(keyEvent("Shift", { shiftKey: true })).toBeNull();
+    expect(keyEvent("Control", { ctrlKey: true })).toBeNull();
+    expect(keyEvent("Dead")).toBeNull();
+    expect(keyEvent("Unidentified")).toBeNull();
+    expect(keyEvent("é")).toBeNull();
+    expect(keyEvent("F13")).toBeNull();
+  });
+});
+
+function keyEvent(
+  key: string,
+  modifiers: {
+    readonly ctrlKey?: boolean;
+    readonly altKey?: boolean;
+    readonly shiftKey?: boolean;
+    readonly metaKey?: boolean;
+  } = {},
+) {
+  return computerKeyCommand({
+    key,
+    ctrlKey: modifiers.ctrlKey ?? false,
+    altKey: modifiers.altKey ?? false,
+    shiftKey: modifiers.shiftKey ?? false,
+    metaKey: modifiers.metaKey ?? false,
+  });
+}

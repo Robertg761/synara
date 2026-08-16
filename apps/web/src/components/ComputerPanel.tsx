@@ -1,21 +1,41 @@
-import type { ComputerScreenSize, ThreadId } from "@synara/contracts";
-import { useEffect, useMemo, useRef, useState } from "react";
+import type { ComputerActionResult, ComputerScreenSize, ThreadId } from "@synara/contracts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useThreadComputerStateSeed } from "~/hooks/useThreadComputerStateSeed";
 import type { DockPaneRuntimeMode } from "~/lib/dockPaneActivation";
-import { LoaderCircleIcon, MonitorIcon, XIcon } from "~/lib/icons";
+import { CursorClickIcon, LoaderCircleIcon, MonitorIcon, XIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
+import { ensureNativeApi } from "~/nativeApi";
 
 import { selectThreadComputerState, useComputerStateStore } from "../computerStateStore";
 import {
+  clampComputerScrollDelta,
   computerContainRect,
   computerCursorPosition,
+  computerKeyCommand,
+  computerStreamRegion,
+  computerViewportPointToDesktop,
+  computerWheelScrollDelta,
   resolveComputerAvailabilityView,
   shouldSubscribeToComputerStream,
 } from "./ComputerPanel.logic";
+import { createComputerInputQueue } from "./computer/computerInputQueue";
 import { useComputerImageStream } from "./computer/useComputerImageStream";
 import { DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
 import { Button } from "./ui/button";
+
+/**
+ * Wheel events arrive far faster than the seat can inject them, so a burst is
+ * summed and sent once per window. Long enough to coalesce a trackpad flick,
+ * short enough that scrolling still tracks the hand.
+ */
+const COMPUTER_SCROLL_FLUSH_MS = 50;
+
+function inputErrorMessage(error: unknown): string {
+  return error instanceof Error && error.message.length > 0
+    ? error.message
+    : "The desktop did not accept that input.";
+}
 
 export default function ComputerPanel(props: {
   mode: DiffPanelMode;
@@ -76,6 +96,164 @@ export default function ComputerPanel(props: {
     containRect,
   });
 
+  // ── User input ─────────────────────────────────────────────────────
+  //
+  // Input is opt-in: a pane that forwarded clicks while it was merely being
+  // watched would fight the agent for the same seat, and a stray click on a
+  // live desktop is not undoable.
+  const [interactive, setInteractive] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
+  const [inputError, setInputError] = useState<string | null>(null);
+  const canInteract = streamEnabled;
+
+  const inputQueue = useMemo(
+    () =>
+      createComputerInputQueue({
+        onError: (error) => setInputError(inputErrorMessage(error)),
+      }),
+    [],
+  );
+
+  const sendInput = useCallback(
+    (send: () => Promise<ComputerActionResult>) => {
+      inputQueue.push(async () => {
+        await send();
+        setInputError(null);
+      });
+    },
+    [inputQueue],
+  );
+
+  const region = useMemo(() => computerStreamRegion(screenSize), [screenSize]);
+  // offsetX/offsetY are in the canvas's own box, which is the letterbox
+  // geometry `containRect` describes, so no bounding-rect arithmetic is needed.
+  const desktopPointFromEvent = useCallback(
+    (event: { readonly offsetX: number; readonly offsetY: number }) =>
+      computerViewportPointToDesktop({
+        pointer: { x: event.offsetX, y: event.offsetY },
+        containRect,
+        region,
+      }),
+    [containRect, region],
+  );
+
+  useEffect(() => {
+    if (canInteract) return;
+    setInteractive(false);
+    setInputError(null);
+  }, [canInteract]);
+
+  useEffect(() => {
+    if (interactive) canvasRef.current?.focus();
+  }, [interactive]);
+
+  const handlePointerDown = useCallback(
+    (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!interactive) return;
+      // Focus on press so keyboard passthrough follows the click.
+      event.currentTarget.focus();
+    },
+    [interactive],
+  );
+
+  const handleClick = useCallback(
+    (event: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!interactive) return;
+      const point = desktopPointFromEvent(event.nativeEvent);
+      if (!point) return;
+      // `detail` is the browser's own double-click pairing. Two separate single
+      // clicks cannot substitute: each pays a round trip and a pointer glide,
+      // which lands them too far apart for a toolkit to pair them.
+      const isDoubleClick = event.detail === 2;
+      sendInput(() =>
+        ensureNativeApi().computer.inputClick({
+          x: point.x,
+          y: point.y,
+          ...(isDoubleClick ? { clickCount: 2 } : {}),
+        }),
+      );
+    },
+    [desktopPointFromEvent, interactive, sendInput],
+  );
+
+  const handleContextMenu = useCallback(
+    (event: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!interactive) return;
+      // The desktop gets the right click, so the browser menu must not open on
+      // top of it.
+      event.preventDefault();
+      const point = desktopPointFromEvent(event.nativeEvent);
+      if (!point) return;
+      event.currentTarget.focus();
+      sendInput(() =>
+        ensureNativeApi().computer.inputClick({ x: point.x, y: point.y, button: "right" }),
+      );
+    },
+    [desktopPointFromEvent, interactive, sendInput],
+  );
+
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLCanvasElement>) => {
+      if (!interactive) return;
+      const command = computerKeyCommand(event);
+      // A key the seat cannot express is left to the browser rather than
+      // silently swallowed.
+      if (!command) return;
+      event.preventDefault();
+      event.stopPropagation();
+      sendInput(() =>
+        ensureNativeApi().computer.inputKey({
+          key: command.key,
+          ...(command.modifiers.length > 0 ? { modifiers: command.modifiers } : {}),
+        }),
+      );
+    },
+    [interactive, sendInput],
+  );
+
+  // Wheel is registered natively: React's root listener is passive, so
+  // `preventDefault` there cannot stop the page from scrolling behind the pane.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !interactive) return;
+
+    let batch: { x: number; y: number; deltaX: number; deltaY: number } | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const flush = () => {
+      timer = null;
+      const pending = batch;
+      batch = null;
+      if (!pending) return;
+      const deltaX = clampComputerScrollDelta(pending.deltaX);
+      const deltaY = clampComputerScrollDelta(pending.deltaY);
+      if (deltaX === 0 && deltaY === 0) return;
+      sendInput(() =>
+        ensureNativeApi().computer.inputScroll({ x: pending.x, y: pending.y, deltaX, deltaY }),
+      );
+    };
+
+    const onWheel = (event: WheelEvent) => {
+      const point = desktopPointFromEvent(event);
+      if (!point) return;
+      event.preventDefault();
+      const delta = computerWheelScrollDelta(event);
+      batch = {
+        x: point.x,
+        y: point.y,
+        deltaX: (batch?.deltaX ?? 0) + delta.deltaX,
+        deltaY: (batch?.deltaY ?? 0) + delta.deltaY,
+      };
+      timer ??= setTimeout(flush, COMPUTER_SCROLL_FLUSH_MS);
+    };
+
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      canvas.removeEventListener("wheel", onWheel);
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [desktopPointFromEvent, interactive, sendInput]);
+
   const header = (
     <div className="flex h-full w-full min-w-0 items-center gap-2">
       <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
@@ -87,6 +265,17 @@ export default function ComputerPanel(props: {
         </span>
       ) : null}
       <div className="ml-auto flex shrink-0 items-center gap-0.5">
+        <Button
+          variant={interactive ? "outline" : "ghost"}
+          size="icon-sm"
+          aria-pressed={interactive}
+          disabled={!canInteract}
+          onClick={() => setInteractive((current) => !current)}
+          title={interactive ? "Stop controlling the desktop" : "Control the desktop"}
+          aria-label={interactive ? "Stop controlling the desktop" : "Control the desktop"}
+        >
+          <CursorClickIcon />
+        </Button>
         <Button
           variant="ghost"
           size="icon-sm"
@@ -121,11 +310,36 @@ export default function ComputerPanel(props: {
           </button>
         ) : (
           <>
+            {/*
+              biome-ignore lint/a11y/noNoninteractiveElementInteractions: the
+              canvas is the desktop surface; pointer and key handlers are the
+              feature.
+            */}
             <canvas
               ref={canvasRef}
               aria-label="Linux desktop"
-              className="absolute inset-0 h-full w-full object-contain"
+              tabIndex={interactive ? 0 : -1}
+              className={cn(
+                "absolute inset-0 h-full w-full object-contain outline-none ring-inset",
+                interactive
+                  ? "cursor-crosshair focus-visible:ring-2 focus-visible:ring-ring/70"
+                  : "cursor-default",
+              )}
+              onPointerDown={handlePointerDown}
+              onClick={handleClick}
+              onContextMenu={handleContextMenu}
+              onKeyDown={handleKeyDown}
+              onFocus={() => setInputFocused(true)}
+              onBlur={() => setInputFocused(false)}
             />
+            <p
+              className={cn(
+                "pointer-events-none absolute inset-x-0 bottom-3 text-center text-[10px] text-white/70 transition-opacity duration-220 motion-reduce:transition-none",
+                interactive && !inputFocused ? "opacity-100" : "opacity-0",
+              )}
+            >
+              Click the desktop to send keystrokes
+            </p>
             {streamStatus.kind !== "streaming" ? (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-8 text-center">
                 <ComputerStreamStatus status={streamStatus} />
@@ -148,13 +362,13 @@ export default function ComputerPanel(props: {
         role="status"
         className={cn(
           "line-clamp-2 flex shrink-0 items-center px-3 text-destructive text-xs transition-opacity duration-220 motion-reduce:transition-none",
-          threadState?.lastError
+          (inputError ?? threadState?.lastError)
             ? "border-border border-t opacity-100"
             : "border-transparent border-t opacity-0",
         )}
         style={{ height: "1.875rem" }}
       >
-        {threadState?.lastError ?? ""}
+        {inputError ?? threadState?.lastError ?? ""}
       </p>
     </DiffPanelShell>
   );

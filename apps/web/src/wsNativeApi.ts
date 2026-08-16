@@ -846,6 +846,9 @@ export function createWsNativeApi(): NativeApi {
       getThreadState: (input) => transport.request(COMPUTER_WS_METHODS.getThreadState, input),
       listWindows: (input) => transport.request(COMPUTER_WS_METHODS.listWindows, input),
       getScreenSize: (input) => transport.request(COMPUTER_WS_METHODS.getScreenSize, input),
+      inputClick: (input) => transport.request(COMPUTER_WS_METHODS.inputClick, input),
+      inputScroll: (input) => transport.request(COMPUTER_WS_METHODS.inputScroll, input),
+      inputKey: (input) => transport.request(COMPUTER_WS_METHODS.inputKey, input),
       onEvent: computerEventListeners.subscribe,
     },
     browser: {

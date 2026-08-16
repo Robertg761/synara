@@ -9,6 +9,9 @@ import {
   type ComputerGetScreenSizeResult,
   type ComputerGetStateInput,
   type ComputerHotkeyInput,
+  type ComputerInputClickInput,
+  type ComputerInputKeyInput,
+  type ComputerInputScrollInput,
   type ComputerLaunchAppInput,
   type ComputerLaunchAppResult,
   type ComputerListWindowsInput,
@@ -27,6 +30,7 @@ import {
 } from "@synara/contracts";
 import { Effect } from "effect";
 
+import type { ComputerManager } from "./ComputerManager.ts";
 import type { ComputerServiceShape } from "./Services/ComputerService.ts";
 
 const UNSUPPORTED_MESSAGE =
@@ -98,6 +102,15 @@ export interface WsComputerHandlers {
   readonly [COMPUTER_WS_METHODS.getThreadState]: (
     input: ComputerThreadInput,
   ) => Effect.Effect<ThreadComputerState, WsRpcError>;
+  readonly [COMPUTER_WS_METHODS.inputClick]: (
+    input: ComputerInputClickInput,
+  ) => Effect.Effect<ComputerActionResult, WsRpcError>;
+  readonly [COMPUTER_WS_METHODS.inputScroll]: (
+    input: ComputerInputScrollInput,
+  ) => Effect.Effect<ComputerActionResult, WsRpcError>;
+  readonly [COMPUTER_WS_METHODS.inputKey]: (
+    input: ComputerInputKeyInput,
+  ) => Effect.Effect<ComputerActionResult, WsRpcError>;
 }
 
 export function makeWsComputerHandlers(
@@ -137,6 +150,9 @@ export function makeWsComputerHandlers(
       [COMPUTER_WS_METHODS.setValue]: () => unsupported(),
       [COMPUTER_WS_METHODS.performAction]: () => unsupported(),
       [COMPUTER_WS_METHODS.getThreadState]: unsupportedState,
+      [COMPUTER_WS_METHODS.inputClick]: () => unsupported(),
+      [COMPUTER_WS_METHODS.inputScroll]: () => unsupported(),
+      [COMPUTER_WS_METHODS.inputKey]: () => unsupported(),
     };
   }
 
@@ -198,7 +214,43 @@ export function makeWsComputerHandlers(
       ),
     [COMPUTER_WS_METHODS.getThreadState]: (input) =>
       attempt(() => manager.getThreadState(input.threadId), "Failed to read computer state"),
+    [COMPUTER_WS_METHODS.inputClick]: (input) =>
+      attempt(() => userInputClick(manager, input), "Failed to click on computer"),
+    [COMPUTER_WS_METHODS.inputScroll]: (input) =>
+      attempt(
+        () => manager.scroll(undefined, { x: input.x, y: input.y }, input.deltaX, input.deltaY),
+        "Failed to scroll on computer",
+      ),
+    [COMPUTER_WS_METHODS.inputKey]: (input) =>
+      attempt(() => userInputKey(manager, input), "Failed to press computer key"),
   };
+}
+
+/**
+ * A pane click carries a resolved desktop point, so it goes straight to the
+ * coordinate path of the manager — no AT-SPI tree read, no semantic matching.
+ */
+function userInputClick(
+  manager: ComputerManager,
+  input: ComputerInputClickInput,
+): Promise<ComputerActionResult> {
+  const target = { x: input.x, y: input.y };
+  if (input.button === "right") return manager.rightClick(undefined, target);
+  return (input.clickCount ?? 1) >= 2
+    ? manager.doubleClick(undefined, target)
+    : manager.click(undefined, target);
+}
+
+function userInputKey(
+  manager: ComputerManager,
+  input: ComputerInputKeyInput,
+): Promise<ComputerActionResult> {
+  // A repeated modifier would be pressed twice and released twice, which reads
+  // as a tap of that modifier on the way out of the chord.
+  const modifiers = [...new Set(input.modifiers ?? [])];
+  return modifiers.length === 0
+    ? manager.pressKey(undefined, input.key)
+    : manager.hotkey(undefined, [...modifiers, input.key]);
 }
 
 function scrollTarget(input: ComputerScrollInput) {

@@ -164,9 +164,13 @@ import type {
   ThreadDeviceState,
 } from "./device";
 import type {
+  ComputerActionResult,
   ComputerEvent,
   ComputerGetScreenSizeInput,
   ComputerGetScreenSizeResult,
+  ComputerInputClickInput,
+  ComputerInputKeyInput,
+  ComputerInputScrollInput,
   ComputerListWindowsInput,
   ComputerListWindowsResult,
   ComputerThreadInput,
@@ -878,6 +882,10 @@ export interface NativeApi {
     getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
     listWindows: (input: ComputerListWindowsInput) => Promise<ComputerListWindowsResult>;
     getScreenSize: (input: ComputerGetScreenSizeInput) => Promise<ComputerGetScreenSizeResult>;
+    /** User input from the computer dock pane; needs no agent turn in flight. */
+    inputClick: (input: ComputerInputClickInput) => Promise<ComputerActionResult>;
+    inputScroll: (input: ComputerInputScrollInput) => Promise<ComputerActionResult>;
+    inputKey: (input: ComputerInputKeyInput) => Promise<ComputerActionResult>;
     onEvent: (callback: (event: ComputerEvent) => void) => () => void;
   };
 }

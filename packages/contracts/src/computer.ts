@@ -22,6 +22,13 @@ export const COMPUTER_WS_METHODS = {
   performAction: "computer.performAction",
   getThreadState: "computer.getThreadState",
   subscribeEvents: "computer.subscribeEvents",
+  // User-driven input from the computer dock pane. Separate from the tool
+  // surface above because it must work with no agent turn in flight, and
+  // because a pane only ever sends resolved desktop coordinates — never the
+  // semantic (label/role) targets the agent tools resolve through AT-SPI.
+  inputClick: "computer.input.click",
+  inputScroll: "computer.input.scroll",
+  inputKey: "computer.input.key",
 } as const;
 
 export const COMPUTER_WS_CHANNELS = {
@@ -275,6 +282,70 @@ export const ComputerPerformActionInput = Schema.Struct({
   action: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
 });
 export type ComputerPerformActionInput = typeof ComputerPerformActionInput.Type;
+
+// ── User input from the computer dock pane ──────────────────────────
+
+/** Largest desktop coordinate a pane may address, matching `ComputerScreenSize`. */
+const COMPUTER_INPUT_COORDINATE_MAX = 32_767;
+/**
+ * Per-event scroll ceiling. A wheel notch is tens of pixels; anything past this
+ * is a runaway accumulator rather than a gesture, and forwarding it would spin
+ * the desktop through thousands of lines.
+ */
+const COMPUTER_INPUT_SCROLL_LIMIT = 4_096;
+
+/**
+ * Desktop logical pixels, the same space as window bounds. Integers only: the
+ * pane resolves a pointer to exactly one desktop pixel, and a fractional
+ * coordinate would round differently on each hop.
+ */
+const ComputerInputCoordinate = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: COMPUTER_INPUT_COORDINATE_MAX }),
+);
+
+const ComputerInputDelta = Schema.Finite.check(
+  Schema.isBetween({ minimum: -COMPUTER_INPUT_SCROLL_LIMIT, maximum: COMPUTER_INPUT_SCROLL_LIMIT }),
+);
+
+/** Only the buttons the seat can synthesize as a complete press/release pair. */
+export const ComputerInputButton = Schema.Literals(["left", "right"]);
+export type ComputerInputButton = typeof ComputerInputButton.Type;
+
+export const ComputerInputModifier = Schema.Literals(["ctrl", "alt", "shift", "meta"]);
+export type ComputerInputModifier = typeof ComputerInputModifier.Type;
+
+export const ComputerInputClickInput = Schema.Struct({
+  x: ComputerInputCoordinate,
+  y: ComputerInputCoordinate,
+  /** Defaults to the left button. */
+  button: Schema.optional(ComputerInputButton),
+  /**
+   * `2` issues the backend's double click, whose two presses are spaced closely
+   * enough for a toolkit to pair them; two separate single clicks cannot be,
+   * because each one pays a browser round trip and a pointer glide.
+   */
+  clickCount: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 2 }))),
+});
+export type ComputerInputClickInput = typeof ComputerInputClickInput.Type;
+
+export const ComputerInputScrollInput = Schema.Struct({
+  x: ComputerInputCoordinate,
+  y: ComputerInputCoordinate,
+  deltaX: ComputerInputDelta,
+  deltaY: ComputerInputDelta,
+});
+export type ComputerInputScrollInput = typeof ComputerInputScrollInput.Type;
+
+export const ComputerInputKeyInput = Schema.Struct({
+  /**
+   * One key in the backend's vocabulary: a single printable character, or a
+   * name such as `enter`, `escape`, `arrowleft`, `f5`, `space`.
+   */
+  key: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+  /** Held for the duration of the key press, in the order given. */
+  modifiers: Schema.optional(Schema.Array(ComputerInputModifier).check(Schema.isMaxLength(4))),
+});
+export type ComputerInputKeyInput = typeof ComputerInputKeyInput.Type;
 
 export const ComputerActionResult = Schema.Struct({
   computerId: ComputerId,

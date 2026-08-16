@@ -74,6 +74,9 @@ import {
   ComputerGetScreenSizeResult,
   ComputerGetStateInput,
   ComputerHotkeyInput,
+  ComputerInputClickInput,
+  ComputerInputKeyInput,
+  ComputerInputScrollInput,
   ComputerLaunchAppInput,
   ComputerLaunchAppResult,
   ComputerListWindowsInput,
@@ -762,6 +765,24 @@ export const WsComputerGetThreadStateRpc = Rpc.make(COMPUTER_WS_METHODS.getThrea
   error: WsRpcError,
 });
 
+export const WsComputerInputClickRpc = Rpc.make(COMPUTER_WS_METHODS.inputClick, {
+  payload: ComputerInputClickInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerInputScrollRpc = Rpc.make(COMPUTER_WS_METHODS.inputScroll, {
+  payload: ComputerInputScrollInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerInputKeyRpc = Rpc.make(COMPUTER_WS_METHODS.inputKey, {
+  payload: ComputerInputKeyInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
 export const WsSubscribeComputerEventsRpc = Rpc.make(COMPUTER_WS_METHODS.subscribeEvents, {
   payload: Schema.Struct({}),
   success: ComputerEvent,
@@ -787,6 +808,9 @@ export const WsComputerRpcGroup = RpcGroup.make(
   WsComputerSetValueRpc,
   WsComputerPerformActionRpc,
   WsComputerGetThreadStateRpc,
+  WsComputerInputClickRpc,
+  WsComputerInputScrollRpc,
+  WsComputerInputKeyRpc,
   WsSubscribeComputerEventsRpc,
 );
 
