@@ -166,7 +166,9 @@ It must not join the blanket default in `PROVIDER_SESSION_CAPABILITIES` (`Layers
 
 Perception, read-only, no approval, still behind `computer:control`:
 
-- `computer_list_windows`, `computer_get_state { include_screenshot?, include_text? }`, `computer_get_screen_size`, `computer_launch_app`.
+- `computer_list_windows`, `computer_get_state { include_screenshot?, include_text? }`, `computer_screenshot { window_id? | x?, y?, width?, height?, max_dimension? }`, `computer_get_screen_size`, `computer_launch_app`.
+
+`computer_get_state` returns one downscaled shot of the whole multi-monitor workspace, which is too coarse to read small text. `computer_screenshot` is the zoom: one window or one desktop rect captured against the same `max_dimension` budget, carrying the identical `region` + `scale` mapping so the agent transfers its coordinate skill between the two.
 
 Action, approval-required:
 

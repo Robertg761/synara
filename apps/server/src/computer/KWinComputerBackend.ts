@@ -16,9 +16,12 @@ import type {
 
 import {
   ComputerBackendError,
+  DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
+  intersectComputerRects,
   type ComputerBackend,
   type ComputerBackendActionResult,
   type ComputerBackendEventListener,
+  type ComputerCaptureRequest,
   type ComputerFrameListener,
   type ComputerResolvedTarget,
 } from "./ComputerBackend.ts";
@@ -46,7 +49,7 @@ import {
 const DEFAULT_COMPUTER_ID = "desktop";
 const DEFAULT_GLIDE_DURATION_MS = 180;
 const DEFAULT_STILL_INTERVAL_MS = 500;
-const DEFAULT_CAPTURE_MAX_DIMENSION = 2_048;
+const DEFAULT_CAPTURE_MAX_DIMENSION = DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION;
 const POINTER_CLAMP_TOLERANCE_PX = 2;
 const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 const KWIN_RECONNECT_BASE_DELAY_MS = 250;
@@ -501,6 +504,70 @@ export class KWinComputerBackend implements ComputerBackend {
     );
   }
 
+  /**
+   * Zoomed perception for the agent. The workspace shot in `getState` is one
+   * downscaled image of every monitor, so small text is unreadable; this
+   * captures a single window or region, which spends the same pixel budget on a
+   * fraction of the desktop.
+   *
+   * The returned `region` is always what KWin actually captured: the plugin
+   * clips both forms to the workspace geometry, and a window capture uses the
+   * window's `frameGeometry`, which is the same rect `windowsJson` reports. The
+   * scale is derived from the encoded PNG rather than assumed, because the
+   * plugin renders at the output's device pixel ratio and only then downscales
+   * to `maxDimension`.
+   */
+  async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
+    const maxDimension = request.maxDimension ?? this.captureMaxDimension;
+    if (request.kind === "window") {
+      const windows = await this.listWindows();
+      const window = windows.find((candidate) => candidate.id === request.windowId);
+      if (!window) {
+        throw new ComputerBackendError(
+          `No desktop window has id ${JSON.stringify(request.windowId)}. ` +
+            "Call computer_list_windows for the current window ids.",
+        );
+      }
+      const region = intersectComputerRects(
+        window.bounds,
+        workspaceRectFromWindows(windows, this.health?.workspace),
+      );
+      if (!region) {
+        throw new ComputerBackendError(
+          `Window ${JSON.stringify(request.windowId)} sits outside the desktop workspace and has nothing to capture.`,
+        );
+      }
+      return this.screenshotFromPng(
+        await this.captureWindow(request.windowId, maxDimension),
+        region,
+      );
+    }
+
+    const requested = request.region;
+    if (
+      ![requested.x, requested.y, requested.width, requested.height].every((value) =>
+        Number.isFinite(value),
+      ) ||
+      requested.width <= 0 ||
+      requested.height <= 0
+    ) {
+      throw new ComputerBackendError(
+        "A screenshot region needs finite x/y and a positive width and height.",
+      );
+    }
+    const region = intersectComputerRects(alignRect(requested), await this.workspaceRect());
+    if (!region) {
+      throw new ComputerBackendError(
+        `Region ${formatRect(requested)} does not overlap the desktop workspace. ` +
+          "Regions use global desktop logical pixels, the same space as window bounds.",
+      );
+    }
+    return this.screenshotFromPng(
+      await this.captureRegion(region.x, region.y, region.width, region.height, maxDimension),
+      region,
+    );
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
@@ -720,6 +787,15 @@ export class KWinComputerBackend implements ComputerBackend {
   ): Promise<ComputerScreenshot> {
     const region = workspaceRectFromWindows(windows, this.health?.workspace);
     const bytes = await this.captureRegion(region.x, region.y, region.width, region.height);
+    return this.screenshotFromPng(bytes, region);
+  }
+
+  /**
+   * The screenshot payload is only useful to a model when the desktop rect it
+   * covers travels with it, so every capture path builds it the same way:
+   * `desktop = region.origin + screenshot_pixel / scale`.
+   */
+  private screenshotFromPng(bytes: Uint8Array, region: ComputerRect): ComputerScreenshot {
     const dimensions = readPngDimensions(bytes);
     return {
       mimeType: "image/png",
@@ -731,6 +807,15 @@ export class KWinComputerBackend implements ComputerBackend {
       scale: dimensions.width / region.width,
       capturedAt: new Date(this.now()).toISOString(),
     };
+  }
+
+  /** Workspace geometry without a window round trip when KWin reported it. */
+  private async workspaceRect(): Promise<ComputerRect> {
+    const workspace = this.health?.workspace;
+    if (workspace && workspace.width > 0 && workspace.height > 0) {
+      return workspaceRectFromWindows([], workspace);
+    }
+    return workspaceRectFromWindows(await this.listWindows());
   }
 
   private async publishStillFrame(): Promise<void> {
@@ -1053,6 +1138,26 @@ export function workspaceRectFromWindows(
     ...windows.map((window) => Math.ceil(window.bounds.y + window.bounds.height)),
   );
   return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+/**
+ * Snaps a requested region onto whole logical pixels without losing coverage:
+ * the D-Bus capture signature only takes integers, so a fractional rect must
+ * grow outward instead of cropping the edge the caller asked for.
+ */
+function alignRect(rect: ComputerRect): ComputerRect {
+  const x = Math.floor(rect.x);
+  const y = Math.floor(rect.y);
+  return {
+    x,
+    y,
+    width: Math.max(1, Math.ceil(rect.x + rect.width) - x),
+    height: Math.max(1, Math.ceil(rect.y + rect.height) - y),
+  };
+}
+
+function formatRect(rect: ComputerRect): string {
+  return `${rect.width}x${rect.height} at (${rect.x}, ${rect.y})`;
 }
 
 export function screenSizeFromWindows(

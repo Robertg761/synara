@@ -6,6 +6,7 @@ import {
   type ComputerActionResult,
   type ComputerAvailability,
   type ComputerEvent,
+  type ComputerScreenshot,
   type ComputerGetScreenSizeResult,
   type ComputerListWindowsResult,
   type ComputerLaunchAppResult,
@@ -22,6 +23,7 @@ import {
   ComputerBackendError,
   type ComputerBackend,
   type ComputerBackendActionResult,
+  type ComputerCaptureRequest,
   type ComputerStreamFrame,
   type ComputerResolvedTarget,
 } from "./ComputerBackend.ts";
@@ -123,6 +125,11 @@ export class ComputerManager {
     } = {},
   ): Promise<ComputerState> {
     return await this.backend.getState(options);
+  }
+
+  /** Zoomed capture of one window or desktop region, with its pixel mapping. */
+  async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
+    return await this.backend.captureScreenshot(request);
   }
 
   async getScreenSize(): Promise<ComputerGetScreenSizeResult> {

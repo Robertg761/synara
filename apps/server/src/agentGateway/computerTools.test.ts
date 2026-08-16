@@ -56,6 +56,7 @@ describe("agent gateway computer tools", () => {
     expect(tools.map((tool) => tool.definition.name)).toEqual([
       "computer_list_windows",
       "computer_get_state",
+      "computer_screenshot",
       "computer_get_screen_size",
       "computer_launch_app",
       "computer_click",
@@ -119,6 +120,11 @@ describe("agent gateway computer tools", () => {
     expect(byName.get("computer_get_state")?.definition.description).toContain(
       "region.x + screenshot_x / scale",
     );
+    // Both perception tools must spell the mapping out identically so the model
+    // carries the same skill from the workspace shot to the zoomed one.
+    expect(byName.get("computer_screenshot")?.definition.description).toContain(
+      "region.x + screenshot_x / scale",
+    );
     for (const name of [
       "computer_click",
       "computer_double_click",
@@ -129,6 +135,119 @@ describe("agent gateway computer tools", () => {
     ]) {
       expect(byName.get(name)?.definition.description).toContain("global desktop coordinates");
     }
+  });
+
+  it("zooms into a window and maps the capture back to desktop coordinates", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_screenshot", { window_id: "fake-calculator" });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content.map((entry) => entry.type)).toEqual(["text", "image"]);
+    expect(result.content.find((entry) => entry.type === "image")).toMatchObject({
+      mimeType: "image/png",
+    });
+    // The calculator window sits at (1050, 120) and is 420x620 logical pixels,
+    // which fits the default budget, so the capture is not downscaled.
+    const text = result.content.find((entry) => entry.type === "text");
+    expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
+      windowId: "fake-calculator",
+      screenshot: {
+        mimeType: "image/png",
+        width: 420,
+        height: 620,
+        region: { x: 1_050, y: 120, width: 420, height: 620 },
+        scale: 1,
+      },
+    });
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-calculator",
+    });
+  });
+
+  it("zooms into a region and reports the downscaled pixel mapping", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_screenshot", {
+      x: 1_050,
+      y: 120,
+      width: 400,
+      height: 800,
+      max_dimension: 400,
+    });
+
+    expect(result.isError).not.toBe(true);
+    const text = result.content.find((entry) => entry.type === "text");
+    const payload = JSON.parse(text?.type === "text" ? text.text : "{}");
+    // 800 logical pixels squeezed into 400 screenshot pixels halves the scale,
+    // so screenshot pixel (100, 100) is desktop point (1250, 320).
+    expect(payload).toMatchObject({
+      screenshot: {
+        width: 200,
+        height: 400,
+        region: { x: 1_050, y: 120, width: 400, height: 800 },
+        scale: 0.5,
+      },
+    });
+    expect(payload.windowId).toBeUndefined();
+    const { region, scale } = payload.screenshot;
+    expect([region.x + 100 / scale, region.y + 100 / scale]).toEqual([1_250, 320]);
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "region",
+      region: { x: 1_050, y: 120, width: 400, height: 800 },
+      maxDimension: 400,
+    });
+  });
+
+  it("refuses an ambiguous or incomplete screenshot request without capturing", async () => {
+    const { backend, call } = await setup();
+
+    const both = await call("computer_screenshot", { window_id: "fake-calculator", x: 0 });
+    expect(both.isError).toBe(true);
+    expect(both.content[0]).toMatchObject({ text: expect.stringContaining("never both") });
+
+    const neither = await call("computer_screenshot", {});
+    expect(neither.isError).toBe(true);
+    expect(neither.content[0]).toMatchObject({ text: expect.stringContaining("window_id") });
+
+    const partial = await call("computer_screenshot", { x: 10, y: 20, width: 30 });
+    expect(partial.isError).toBe(true);
+    expect(partial.content[0]).toMatchObject({ text: expect.stringContaining("height") });
+
+    const empty = await call("computer_screenshot", { x: 10, y: 20, width: 0, height: 30 });
+    expect(empty.isError).toBe(true);
+    expect(empty.content[0]).toMatchObject({ text: expect.stringContaining("greater than zero") });
+
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(0);
+  });
+
+  it("surfaces a compositor capture failure as a readable error result", async () => {
+    const { backend, call } = await setup();
+    backend.failNext(
+      "captureScreenshot",
+      new Error("org.synara.ComputerUse.Error.CaptureFailed: window not visible"),
+    );
+
+    const result = await call("computer_screenshot", { window_id: "fake-calculator" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]).toMatchObject({
+      text: expect.stringContaining("window not visible"),
+    });
+  });
+
+  it("keeps the zoom tool read-only and free of an approval gate", async () => {
+    const { backend, byName, call } = await setup();
+    expect(computerToolRequiresApproval("computer_screenshot")).toBe(false);
+    expect(byName.get("computer_screenshot")?.definition.annotations).toMatchObject({
+      readOnlyHint: true,
+    });
+    // Antigravity has no approval gate, so a read-only tool must still run.
+    const result = await call(
+      "computer_screenshot",
+      { window_id: "fake-calculator" },
+      "antigravity",
+    );
+    expect(result.isError).not.toBe(true);
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(1);
   });
 
   it("passes a clamped pointer landing point back to the caller", async () => {

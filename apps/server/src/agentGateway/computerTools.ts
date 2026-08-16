@@ -1,9 +1,14 @@
 /** Agent-facing Linux computer perception and control tools. */
 import { Effect } from "effect";
 
-import type { ComputerTarget, ComputerState } from "@synara/contracts";
+import type { ComputerScreenshot, ComputerTarget, ComputerState } from "@synara/contracts";
 
 import { ComputerTargetError } from "../computer/uiTreeTargeting.ts";
+import {
+  DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
+  MAX_COMPUTER_CAPTURE_MAX_DIMENSION,
+  type ComputerCaptureRequest,
+} from "../computer/ComputerBackend.ts";
 import { ComputerManager } from "../computer/ComputerManager.ts";
 import { mcpToolResultError, mcpToolResultJson, type McpToolCallResult } from "./protocol.ts";
 import {
@@ -48,6 +53,13 @@ export function computerToolRequiresApproval(name: string): boolean {
 export interface AgentGatewayComputerToolsOptions {
   readonly manager: ComputerManager;
 }
+
+/**
+ * One wording for the screenshot mapping, shared by every tool that returns an
+ * image, so the model transfers the same skill between them.
+ */
+const SCREENSHOT_MAPPING_NOTE =
+  "convert a screenshot pixel to a desktop point with region.x + screenshot_x / scale and region.y + screenshot_y / scale, using the screenshot region and scale returned alongside it";
 
 const POINTER_COORDINATE_NOTE =
   "Coordinates are global desktop coordinates in logical pixels, the same space as window bounds and the screenshot region mapping. On multi-monitor layouts some coordinate ranges fall outside every monitor, and the display server moves the pointer to the nearest monitor edge instead.";
@@ -129,18 +141,94 @@ function readRequiredText(args: Record<string, unknown>): string {
   return value;
 }
 
+/**
+ * PNG bytes travel as MCP image content, and the mapping metadata travels as
+ * the text part, so a model reading either tool's result maps pixels back to
+ * desktop coordinates the same way.
+ */
+function screenshotResult(payload: unknown, bytesBase64: string): McpToolCallResult {
+  return {
+    content: [
+      { type: "text", text: JSON.stringify(payload, null, 2) },
+      { type: "image", data: bytesBase64, mimeType: "image/png" },
+    ],
+  };
+}
+
 function imageStateResult(state: ComputerState): McpToolCallResult {
   const screenshot = state.screenshot;
   if (!screenshot) return mcpToolResultJson(state);
   const { bytesBase64, ...metadata } = screenshot;
-  const result = { ...state, screenshot: metadata };
-  return {
-    ...mcpToolResultJson(result),
-    content: [
-      { type: "text", text: JSON.stringify(result, null, 2) },
-      { type: "image", data: bytesBase64, mimeType: "image/png" },
-    ],
+  return screenshotResult({ ...state, screenshot: metadata }, bytesBase64);
+}
+
+function capturedScreenshotResult(
+  computerId: string,
+  request: ComputerCaptureRequest,
+  screenshot: ComputerScreenshot,
+): McpToolCallResult {
+  const { bytesBase64, ...metadata } = screenshot;
+  return screenshotResult(
+    {
+      computerId,
+      ...(request.kind === "window" ? { windowId: request.windowId } : {}),
+      screenshot: metadata,
+    },
+    bytesBase64,
+  );
+}
+
+const CAPTURE_REGION_KEYS = ["x", "y", "width", "height"] as const;
+
+/**
+ * The two request forms are mutually exclusive on purpose: a window id and a
+ * loose rect disagree about what "the region" is, and silently preferring one
+ * would hand the model a screenshot it cannot map.
+ */
+function readCaptureRequest(args: Record<string, unknown>): ComputerCaptureRequest {
+  const windowId = readStringArg(args, "window_id") ?? readStringArg(args, "windowId");
+  const present = CAPTURE_REGION_KEYS.filter(
+    (key) => args[key] !== undefined && args[key] !== null,
+  );
+  const maxDimension = readCaptureMaxDimension(args);
+  const limit = maxDimension === undefined ? {} : { maxDimension };
+
+  if (windowId !== undefined) {
+    if (present.length > 0) {
+      throw new ToolInputError(
+        'Pass either "window_id" or the region arguments "x", "y", "width" and "height", never both.',
+      );
+    }
+    return { kind: "window", windowId, ...limit };
+  }
+  if (present.length === 0) {
+    throw new ToolInputError(
+      'Pass either "window_id" from computer_list_windows or all of "x", "y", "width" and "height" in global desktop logical pixels.',
+    );
+  }
+  if (present.length < CAPTURE_REGION_KEYS.length) {
+    const missing = CAPTURE_REGION_KEYS.filter((key) => !present.includes(key));
+    throw new ToolInputError(
+      `A screenshot region needs "x", "y", "width" and "height". Missing: ${missing.join(", ")}.`,
+    );
+  }
+  const region = {
+    x: readNumberArg(args, "x")!,
+    y: readNumberArg(args, "y")!,
+    width: readNumberArg(args, "width")!,
+    height: readNumberArg(args, "height")!,
   };
+  if (region.width <= 0 || region.height <= 0) {
+    throw new ToolInputError('Arguments "width" and "height" must be greater than zero.');
+  }
+  return { kind: "region", region, ...limit };
+}
+
+function readCaptureMaxDimension(args: Record<string, unknown>): number | undefined {
+  const value = readNumberArg(args, "max_dimension");
+  if (value === undefined) return undefined;
+  if (value < 1) throw new ToolInputError('Argument "max_dimension" must be at least 1.');
+  return Math.min(MAX_COMPUTER_CAPTURE_MAX_DIMENSION, Math.floor(value));
 }
 
 function isToolResult(value: unknown): value is McpToolCallResult {
@@ -226,8 +314,7 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_get_state",
-        description:
-          "Read the current desktop state. The screenshot covers the entire desktop workspace across every monitor, scaled down: convert a screenshot pixel to a desktop point with region.x + screenshot_x / scale and region.y + screenshot_y / scale, using the screenshot region and scale returned alongside it. Window bounds and cursor positions in the JSON are already desktop coordinates. Request a screenshot or accessibility text only when needed because both increase payload size.",
+        description: `Read the current desktop state. The screenshot covers the entire desktop workspace across every monitor, scaled down: ${SCREENSHOT_MAPPING_NOTE}. Window bounds and cursor positions in the JSON are already desktop coordinates. Use computer_screenshot when workspace detail is too small to read. Request a screenshot or accessibility text only when needed because both increase payload size.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -246,6 +333,47 @@ export function makeAgentGatewayComputerTools(
           }),
         ),
       ),
+    },
+    {
+      requiredCapability: COMPUTER_CONTROL_CAPABILITY,
+      requiresActiveTurn: true,
+      definition: {
+        name: "computer_screenshot",
+        description: `Zoom into one part of the desktop when detail is too small to read in the downscaled computer_get_state screenshot. Capture either a single window by "window_id" from computer_list_windows, or a rectangle given as "x", "y", "width" and "height" in global desktop logical pixels; pass exactly one of the two forms. The same mapping applies as in computer_get_state: ${SCREENSHOT_MAPPING_NOTE}. The capture is clipped to the desktop workspace, so read the returned region rather than assuming it matches the request.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            window_id: {
+              type: "string",
+              description:
+                "Window id from computer_list_windows. Mutually exclusive with x/y/width/height.",
+            },
+            x: {
+              type: "number",
+              description: "Region left edge in global desktop logical pixels.",
+            },
+            y: { type: "number", description: "Region top edge in global desktop logical pixels." },
+            width: { type: "number", description: "Region width in logical pixels." },
+            height: { type: "number", description: "Region height in logical pixels." },
+            max_dimension: {
+              type: "integer",
+              minimum: 1,
+              maximum: MAX_COMPUTER_CAPTURE_MAX_DIMENSION,
+              description: `Longest screenshot side in pixels before downscaling. Defaults to ${DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION}, the same budget computer_get_state spends on the whole workspace.`,
+            },
+          },
+          additionalProperties: false,
+        },
+        annotations: { title: "Capture computer screenshot", ...READ_ONLY_TOOL_ANNOTATIONS },
+      },
+      handler: handle("computer_screenshot", async (args) => {
+        const request = readCaptureRequest(args);
+        return capturedScreenshotResult(
+          manager.computerId,
+          request,
+          await manager.captureScreenshot(request),
+        );
+      }),
     },
     {
       requiredCapability: COMPUTER_CONTROL_CAPABILITY,

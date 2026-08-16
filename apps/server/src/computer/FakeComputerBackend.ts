@@ -3,7 +3,9 @@ import type {
   ComputerId,
   ComputerLaunchAppResult,
   ComputerPoint,
+  ComputerRect,
   ComputerScreenSize,
+  ComputerScreenshot,
   ComputerState,
   ComputerUiNode,
   ComputerWindow,
@@ -11,10 +13,13 @@ import type {
 
 import {
   ComputerBackendError,
+  DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
+  intersectComputerRects,
   type ComputerBackend,
   type ComputerBackendActionResult,
   type ComputerBackendEvent,
   type ComputerBackendEventListener,
+  type ComputerCaptureRequest,
   type ComputerFrameListener,
   type ComputerResolvedTarget,
   type ComputerStreamFrame,
@@ -89,21 +94,7 @@ export class FakeComputerBackend implements ComputerBackend {
     this.record("getState", options);
     this.throwIfFailed("getState");
     const screenshot = options.includeScreenshot
-      ? {
-          mimeType: "image/png" as const,
-          width: this.currentScreenSize.width,
-          height: this.currentScreenSize.height,
-          sizeBytes: Buffer.from(FAKE_SCREENSHOT_BASE64, "base64").byteLength,
-          bytesBase64: FAKE_SCREENSHOT_BASE64,
-          region: {
-            x: 0,
-            y: 0,
-            width: this.currentScreenSize.width,
-            height: this.currentScreenSize.height,
-          },
-          scale: 1,
-          capturedAt: this.now(),
-        }
+      ? this.screenshotOfRegion(this.workspaceRect())
       : undefined;
     return {
       computerId: this.computerId,
@@ -114,6 +105,16 @@ export class FakeComputerBackend implements ComputerBackend {
       ...(screenshot ? { screenshot } : {}),
       capturedAt: this.now(),
     } as ComputerState;
+  }
+
+  async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
+    this.record("captureScreenshot", request);
+    this.throwIfFailed("captureScreenshot");
+    const region = intersectComputerRects(this.captureRect(request), this.workspaceRect());
+    if (!region) {
+      throw new ComputerBackendError("The capture request does not overlap the fake workspace.");
+    }
+    return this.screenshotOfRegion(region, request.maxDimension);
   }
 
   async launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult> {
@@ -280,6 +281,46 @@ export class FakeComputerBackend implements ComputerBackend {
 
   callsFor(method: string): readonly FakeComputerCall[] {
     return this.calls.filter((call) => call.method === method);
+  }
+
+  private captureRect(request: ComputerCaptureRequest): ComputerRect {
+    if (request.kind !== "window") return request.region;
+    const window = this.currentWindows.find((candidate) => candidate.id === request.windowId);
+    if (!window) {
+      throw new ComputerBackendError(
+        `No desktop window has id ${JSON.stringify(request.windowId)}.`,
+      );
+    }
+    return window.bounds;
+  }
+
+  private workspaceRect(): ComputerRect {
+    return {
+      x: 0,
+      y: 0,
+      width: this.currentScreenSize.width,
+      height: this.currentScreenSize.height,
+    };
+  }
+
+  /**
+   * Mirrors the real backend's contract: the reported region is the rect that
+   * was captured, and the scale is the screenshot's pixels per logical pixel
+   * after `maxDimension` downscaling.
+   */
+  private screenshotOfRegion(region: ComputerRect, maxDimension?: number): ComputerScreenshot {
+    const limit = maxDimension ?? DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION;
+    const scale = Math.min(1, limit / Math.max(region.width, region.height));
+    return {
+      mimeType: "image/png",
+      width: Math.max(1, Math.round(region.width * scale)),
+      height: Math.max(1, Math.round(region.height * scale)),
+      sizeBytes: Buffer.from(FAKE_SCREENSHOT_BASE64, "base64").byteLength,
+      bytesBase64: FAKE_SCREENSHOT_BASE64,
+      region,
+      scale,
+      capturedAt: this.now(),
+    };
   }
 
   private async pointerAction(

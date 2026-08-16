@@ -4,12 +4,27 @@ import type {
   ComputerId,
   ComputerLaunchAppResult,
   ComputerPoint,
+  ComputerRect,
   ComputerScreenSize,
+  ComputerScreenshot,
   ComputerState,
   ComputerTarget,
   ComputerUiNode,
   ComputerWindow,
 } from "@synara/contracts";
+
+/** Longest screenshot side in pixels before a capture is downscaled. */
+export const DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION = 2_048;
+/** Native per-side image limit enforced by the KWin capture path. */
+export const MAX_COMPUTER_CAPTURE_MAX_DIMENSION = 16_384;
+
+/**
+ * A zoomed capture request: one window, or one rect of the global desktop
+ * coordinate space that window bounds and pointer actions already use.
+ */
+export type ComputerCaptureRequest =
+  | { readonly kind: "window"; readonly windowId: string; readonly maxDimension?: number }
+  | { readonly kind: "region"; readonly region: ComputerRect; readonly maxDimension?: number };
 
 export interface ComputerStreamFrame {
   readonly sequence: number;
@@ -67,6 +82,13 @@ export interface ComputerBackend {
     readonly includeScreenshot?: boolean;
     readonly includeText?: boolean;
   }): Promise<ComputerState>;
+  /**
+   * Zoomed perception. `getState` downscales the whole multi-monitor workspace
+   * into one screenshot, which loses small text; this captures a single window
+   * or region at a far higher effective resolution and returns the same
+   * `region` + `scale` mapping so pixels still convert to desktop coordinates.
+   */
+  captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot>;
   /** Pin or release the plugin's per-seat target window when supported. */
   focusWindow?(windowId: string): Promise<void>;
   clearFocusWindow?(): Promise<void>;
@@ -101,6 +123,23 @@ export interface ComputerBackend {
   detachStream(): Promise<void>;
   requestKeyframe?(): Promise<void>;
   dispose(): Promise<void> | void;
+}
+
+/**
+ * Overlap of two desktop rects, or `undefined` when they do not overlap. Both
+ * backends clip a capture request to what actually exists on the workspace, so
+ * the region metadata describes the pixels the caller really received.
+ */
+export function intersectComputerRects(
+  first: ComputerRect,
+  second: ComputerRect,
+): ComputerRect | undefined {
+  const left = Math.max(first.x, second.x);
+  const top = Math.max(first.y, second.y);
+  const right = Math.min(first.x + first.width, second.x + second.width);
+  const bottom = Math.min(first.y + first.height, second.y + second.height);
+  if (right <= left || bottom <= top) return undefined;
+  return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
 export function computerBackendActionResult(

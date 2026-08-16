@@ -20,9 +20,22 @@ const PNG_1X1 = Uint8Array.from(
   ),
 );
 
+/**
+ * A PNG header carrying the requested dimensions. Only the IHDR size fields are
+ * read back, which is what the region/scale mapping is derived from.
+ */
+function pngOfSize(width: number, height: number): Uint8Array {
+  const bytes = Uint8Array.from(PNG_1X1);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  return bytes;
+}
+
 class FakePlugin implements KWinComputerPluginApi {
   readonly calls: Array<{ readonly method: string; readonly args: readonly unknown[] }> = [];
   capture = true;
+  captureBytes: Uint8Array = PNG_1X1;
   running = false;
   workspace:
     | { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
@@ -94,7 +107,7 @@ class FakePlugin implements KWinComputerPluginApi {
   captureWindow = async (windowId: string, maxDimension: number) => {
     this.calls.push({ method: "captureWindow", args: [windowId, maxDimension] });
     if (this.captureFailure) throw this.captureFailure;
-    return this.capture ? PNG_1X1 : Uint8Array.of();
+    return this.capture ? this.captureBytes : Uint8Array.of();
   };
   captureRegion = async (
     x: number,
@@ -105,7 +118,7 @@ class FakePlugin implements KWinComputerPluginApi {
   ) => {
     this.calls.push({ method: "captureRegion", args: [x, y, width, height, maxDimension] });
     if (this.captureFailure) throw this.captureFailure;
-    return this.capture ? PNG_1X1 : Uint8Array.of();
+    return this.capture ? this.captureBytes : Uint8Array.of();
   };
 
   private recordResult(method: string, ...args: readonly unknown[]): true {
@@ -391,6 +404,145 @@ describe("KWinComputerBackend", () => {
       args: [0, 0, 1_604, 2_037, 2_048],
     });
     expect(state.screenshot?.region).toEqual({ x: 0, y: 0, width: 1_604, height: 2_037 });
+    await backend.dispose();
+  });
+
+  it("maps a window capture through the window's bounds", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    // The compositor renders at the output's device pixel ratio, so a window
+    // capture can come back larger than its logical size.
+    dbus.plugin.captureBytes = pngOfSize(1_296, 1_036);
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    // The single fake window is 648x518 logical pixels at (956, 1519).
+    await expect(
+      backend.captureScreenshot({ kind: "window", windowId: "window-1" }),
+    ).resolves.toMatchObject({
+      width: 1_296,
+      height: 1_036,
+      region: { x: 956, y: 1_519, width: 648, height: 518 },
+      scale: 2,
+    });
+    expect(dbus.plugin.calls).toContainEqual({
+      method: "captureWindow",
+      args: ["window-1", 2_048],
+    });
+    await backend.dispose();
+  });
+
+  it("clips a window capture to the workspace, the way the plugin does", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 1_200, height: 1_800 };
+    dbus.plugin.captureBytes = pngOfSize(244, 281);
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    await expect(
+      backend.captureScreenshot({ kind: "window", windowId: "window-1", maxDimension: 512 }),
+    ).resolves.toMatchObject({
+      region: { x: 956, y: 1_519, width: 244, height: 281 },
+      scale: 1,
+    });
+    expect(dbus.plugin.calls).toContainEqual({ method: "captureWindow", args: ["window-1", 512] });
+    await backend.dispose();
+  });
+
+  it("refuses an unknown window id before spending a capture", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    await expect(
+      backend.captureScreenshot({ kind: "window", windowId: "window-404" }),
+    ).rejects.toThrow('No desktop window has id "window-404"');
+    expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
+    await backend.dispose();
+  });
+
+  it("aligns a fractional region and forwards the requested max dimension", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    dbus.plugin.captureBytes = pngOfSize(301, 102);
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    const screenshot = await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 100.4, y: 200.6, width: 300.2, height: 100.9 },
+      maxDimension: 512,
+    });
+    // D-Bus takes integers, so the rect grows outward instead of cropping.
+    expect(dbus.plugin.calls).toContainEqual({
+      method: "captureRegion",
+      args: [100, 200, 301, 102, 512],
+    });
+    expect(screenshot).toMatchObject({
+      region: { x: 100, y: 200, width: 301, height: 102 },
+      scale: 1,
+    });
+    await backend.dispose();
+  });
+
+  it("clips a region to the workspace and reports the clipped mapping", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    dbus.plugin.captureBytes = pngOfSize(150, 125);
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    await expect(
+      backend.captureScreenshot({
+        kind: "region",
+        region: { x: -100, y: -50, width: 400, height: 300 },
+      }),
+    ).resolves.toMatchObject({
+      region: { x: 0, y: 0, width: 300, height: 250 },
+      scale: 0.5,
+    });
+    expect(dbus.plugin.calls).toContainEqual({
+      method: "captureRegion",
+      args: [0, 0, 300, 250, 2_048],
+    });
+    await backend.dispose();
+  });
+
+  it("refuses a region that misses the workspace entirely", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    await expect(
+      backend.captureScreenshot({
+        kind: "region",
+        region: { x: 9_000, y: 0, width: 10, height: 10 },
+      }),
+    ).rejects.toThrow("does not overlap the desktop workspace");
+    await expect(
+      backend.captureScreenshot({ kind: "region", region: { x: 0, y: 0, width: 0, height: 10 } }),
+    ).rejects.toThrow("positive width and height");
+    expect(dbus.plugin.calls.some((call) => call.method === "captureRegion")).toBe(false);
+    await backend.dispose();
+  });
+
+  it("propagates the compositor's capture failure reason to the caller", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    const backend = makeBackend(dbus);
+    await backend.availability();
+    dbus.plugin.captureFailure = dbusError(
+      "org.synara.ComputerUse.Error.CaptureFailed",
+      "window not visible",
+    );
+
+    await expect(
+      backend.captureScreenshot({ kind: "window", windowId: "window-1" }),
+    ).rejects.toThrow("window not visible");
+    await expect(
+      backend.captureScreenshot({ kind: "region", region: { x: 0, y: 0, width: 10, height: 10 } }),
+    ).rejects.toThrow("window not visible");
     await backend.dispose();
   });
 
