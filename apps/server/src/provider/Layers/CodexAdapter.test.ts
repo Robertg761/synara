@@ -1117,6 +1117,71 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("maps MCP tool-call approval elicitations to tool approvals", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      lifecycleManager.emit("event", {
+        id: asEventId("evt-mcp-tool-approval"),
+        kind: "request",
+        provider: "codex",
+        threadId: asThreadId("thread-1"),
+        createdAt: new Date().toISOString(),
+        method: "mcpServer/elicitation/request",
+        requestId: ApprovalRequestId.makeUnsafe("req-mcp-tool-1"),
+        requestKind: "tool",
+        payload: {
+          message: "Allow the tool call?",
+          _meta: {
+            tool_name: "computer_launch_app",
+            tool_params_display: [{ name: "app", value: "kcalc" }],
+          },
+        },
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      assert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some" || firstEvent.value.type !== "request.opened") return;
+      assert.equal(firstEvent.value.payload.requestType, "tool_approval");
+      assert.equal(firstEvent.value.payload.detail, "Allow the tool call?");
+      assert.deepEqual(firstEvent.value.payload.args, {
+        message: "Allow the tool call?",
+        _meta: {
+          tool_name: "computer_launch_app",
+          tool_params_display: [{ name: "app", value: "kcalc" }],
+        },
+      });
+    }),
+  );
+
+  it.effect("maps unrenderable MCP elicitations to runtime warnings", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      lifecycleManager.emit("event", {
+        id: asEventId("evt-mcp-elicitation-warning"),
+        kind: "error",
+        provider: "codex",
+        threadId: asThreadId("thread-1"),
+        createdAt: new Date().toISOString(),
+        method: "mcpServer/elicitation/request/unrenderable",
+        message: "Synara declined an MCP elicitation it cannot render yet.",
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      assert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") return;
+      assert.equal(firstEvent.value.type, "runtime.warning");
+      if (firstEvent.value.type !== "runtime.warning") return;
+      assert.equal(
+        firstEvent.value.payload.message,
+        "Synara declined an MCP elicitation it cannot render yet.",
+      );
+    }),
+  );
+
   it.effect("preserves file-read request type when mapping serverRequest/resolved", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;

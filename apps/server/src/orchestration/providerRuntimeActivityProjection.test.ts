@@ -472,6 +472,35 @@ describe("provider runtime activity projection", () => {
       },
     });
 
+    const toolApproval = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "request.opened",
+        eventId: "tool-approval-request",
+        requestId: ApprovalRequestId.makeUnsafe("tool-request-1"),
+        payload: {
+          requestType: "tool_approval",
+          detail: "Allow Synara to launch the calculator?",
+          args: {
+            _meta: {
+              tool_name: "computer_launch_app",
+              tool_params_display: [{ name: "app", value: "kcalc", display_name: "app" }],
+            },
+          },
+        },
+      }),
+    )[0];
+    expect(toolApproval).toMatchObject({
+      kind: "approval.requested",
+      summary: "Tool approval requested",
+      payload: {
+        requestKind: "tool",
+        requestType: "tool_approval",
+        detail: "Allow Synara to launch the calculator?",
+        toolName: "computer_launch_app",
+        toolParamsDisplay: [{ name: "app", value: "kcalc", display_name: "app" }],
+      },
+    });
+
     const userInput = [
       runtimeEvent({
         type: "user-input.requested",

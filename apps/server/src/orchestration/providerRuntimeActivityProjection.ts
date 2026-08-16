@@ -435,11 +435,12 @@ export function runtimeTurnState(
 
 function requestKindFromCanonicalRequestType(
   requestType: string | undefined,
-): "command" | "file-read" | "file-change" | "permissions" | undefined {
+): "command" | "file-read" | "file-change" | "permissions" | "tool" | undefined {
   if (requestType === "command_execution_approval" || requestType === "exec_command_approval")
     return "command";
   if (requestType === "file_read_approval") return "file-read";
   if (requestType === "permissions_approval") return "permissions";
+  if (requestType === "tool_approval") return "tool";
   return requestType === "file_change_approval" || requestType === "apply_patch_approval"
     ? "file-change"
     : undefined;
@@ -465,6 +466,24 @@ function sessionApprovalAvailable(
   return typeof args?.sessionApprovalAvailable === "boolean"
     ? args.sessionApprovalAvailable
     : undefined;
+}
+
+function requestedMcpToolCallPresentation(
+  event: Extract<ProviderRuntimeEvent, { type: "request.opened" }>,
+): { toolName?: string; toolParamsDisplay?: unknown } {
+  if (event.payload.requestType !== "tool_approval") {
+    return {};
+  }
+  const args = asObject(event.payload.args);
+  const metadata = asObject(args?._meta);
+  const toolName = asString(metadata?.tool_name);
+  const toolParamsDisplay = Array.isArray(metadata?.tool_params_display)
+    ? boundActivityData(metadata.tool_params_display)
+    : undefined;
+  return {
+    ...(toolName ? { toolName } : {}),
+    ...(toolParamsDisplay !== undefined ? { toolParamsDisplay } : {}),
+  };
 }
 
 export function projectProviderRuntimeActivities(
@@ -538,6 +557,8 @@ export function projectProviderRuntimeActivities(
         event.type === "request.opened" ? requestedPermissionProfile(event) : undefined;
       const canApproveForSession =
         event.type === "request.opened" ? sessionApprovalAvailable(event) : undefined;
+      const toolCallPresentation =
+        event.type === "request.opened" ? requestedMcpToolCallPresentation(event) : {};
       const requestId = nonEmptyTrimmed(event.requestId);
       return [
         {
@@ -556,7 +577,9 @@ export function projectProviderRuntimeActivities(
                     ? "File-change approval requested"
                     : requestKind === "permissions"
                       ? "Permission approval requested"
-                      : "Approval requested",
+                      : requestKind === "tool"
+                        ? "Tool approval requested"
+                        : "Approval requested",
           payload: toActivityPayload({
             // Omitted, never `undefined`: `Schema.Json` rejects a member that is
             // explicitly present and undefined.
@@ -570,6 +593,7 @@ export function projectProviderRuntimeActivities(
               ? { detail: truncateDetail(event.payload.detail) }
               : {}),
             ...(permissionProfile ? { permissionProfile } : {}),
+            ...toolCallPresentation,
             ...(canApproveForSession !== undefined
               ? { sessionApprovalAvailable: canApproveForSession }
               : {}),
