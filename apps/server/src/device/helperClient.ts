@@ -31,6 +31,12 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 
 import { decodeDeviceFrame } from "@synara/shared/deviceFrame";
+import {
+  JsonRpcStdioFramer,
+  JsonRpcStdioRequestRegistry,
+  JsonRpcStdioTransportError,
+  JsonRpcStdioWriter,
+} from "@synara/shared/jsonrpc-stdio";
 
 import type { DeviceStreamFrame } from "./DeviceBackend.ts";
 import { describeSandboxSuspicion, type HelperSandboxCommand } from "./helperSandbox.ts";
@@ -80,12 +86,6 @@ export interface DeviceHelperAttachment {
   readonly scale: number;
   readonly inputAvailable: boolean;
   readonly accessibilityAvailable: boolean;
-}
-
-interface PendingRequest {
-  readonly resolve: (value: unknown) => void;
-  readonly reject: (error: Error) => void;
-  readonly timer: NodeJS.Timeout;
 }
 
 export interface HelperClientOptions {
@@ -191,9 +191,9 @@ export function encodeFrameRecord(payload: Uint8Array): Buffer {
  */
 export class HelperClient {
   private process: ChildProcessWithoutNullStreams | null = null;
-  private stdoutBuffer = "";
-  private nextRequestId = 1;
-  private readonly pending = new Map<number, PendingRequest>();
+  private stdoutFramer: JsonRpcStdioFramer | null = null;
+  private stdinWriter: JsonRpcStdioWriter | null = null;
+  private requestRegistry: JsonRpcStdioRequestRegistry | null = null;
   private readonly requestTimeoutMs: number;
   private stderrTail = "";
   private exited = false;
@@ -228,9 +228,27 @@ export class HelperClient {
     });
     this.process = child;
     this.exited = false;
+    this.stdoutFramer = new JsonRpcStdioFramer(MAX_CONTROL_LINE_BYTES);
+    this.stdinWriter = new JsonRpcStdioWriter(child.stdin);
+    this.requestRegistry = new JsonRpcStdioRequestRegistry({
+      requestTimeoutMs: this.requestTimeoutMs,
+      includeJsonRpcVersion: true,
+      timeoutError: (method) =>
+        new DeviceHelperError(
+          "helper_timeout",
+          `Device helper ${method} timed out.${describeSandboxSuspicion(
+            this.options.launch?.profilePath ?? null,
+          )}`,
+        ),
+      responseError: ({ error }) =>
+        new DeviceHelperError(
+          typeof error.code === "number" ? `helper_${error.code}` : "helper_error",
+          typeof error.message === "string" ? error.message : "Device helper reported an error",
+        ),
+    });
+    this.requestRegistry.processStarted();
 
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.consumeStdout(chunk));
+    child.stdout.on("data", (chunk: Buffer) => this.consumeStdout(chunk));
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       // Keep only a tail: helper diagnostics belong in the failure message but
@@ -258,35 +276,21 @@ export class HelperClient {
       throw new DeviceHelperError("helper_unavailable", "Device helper is not running");
     }
 
-    const id = this.nextRequestId++;
-    const payload = `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`;
-    return await new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        // A denied sandbox rule does not raise: CoreSimulator swallows it and
-        // the helper simply never answers, which is indistinguishable from a
-        // hang. Name the profile here so that is the first thing checked.
-        reject(
-          new DeviceHelperError(
-            "helper_timeout",
-            `Device helper ${method} timed out.${describeSandboxSuspicion(
-              this.options.launch?.profilePath ?? null,
-            )}`,
-          ),
-        );
-      }, this.requestTimeoutMs);
-      // `unref` so a stuck request cannot hold the process open at exit.
-      timer.unref?.();
-      this.pending.set(id, { resolve, reject, timer });
-      child.stdin.write(payload, (error) => {
-        if (!error) return;
-        const request = this.pending.get(id);
-        if (!request) return;
-        this.pending.delete(id);
-        clearTimeout(request.timer);
-        reject(new DeviceHelperError("helper_write_failed", error.message));
-      });
-    });
+    const registry = this.requestRegistry;
+    const writer = this.stdinWriter;
+    if (!registry || !writer) {
+      throw new DeviceHelperError("helper_unavailable", "Device helper transport is not ready");
+    }
+    try {
+      return await registry.request(method, params, (message) => writer.write(message));
+    } catch (error) {
+      if (error instanceof DeviceHelperError) throw error;
+      throw new DeviceHelperError(
+        "helper_write_failed",
+        error instanceof Error ? error.message : String(error),
+        { cause: error },
+      );
+    }
   }
 
   /**
@@ -464,21 +468,27 @@ export class HelperClient {
     if (directory) await rm(directory, { recursive: true, force: true }).catch(() => undefined);
   }
 
-  private consumeStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    if (this.stdoutBuffer.length > MAX_CONTROL_LINE_BYTES) {
-      this.stdoutBuffer = "";
-      this.fail(
-        new DeviceHelperError("helper_protocol_error", "Device helper control line exceeded limit"),
-      );
-      return;
-    }
-    let newline = this.stdoutBuffer.indexOf("\n");
-    while (newline !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
-      if (line.length > 0) this.handleControlLine(line);
-      newline = this.stdoutBuffer.indexOf("\n");
+  private consumeStdout(chunk: Buffer): void {
+    const framer = this.stdoutFramer;
+    if (!framer) return;
+    try {
+      for (const line of framer.push(chunk)) {
+        const trimmed = line.trim();
+        if (trimmed.length > 0) this.handleControlLine(trimmed);
+      }
+    } catch (error) {
+      if (error instanceof JsonRpcStdioTransportError && error.reason === "invalid-utf8") {
+        // Malformed control output is ignored, as non-JSON helper diagnostics
+        // are. The framer still owns the fatal UTF-8 decision.
+        return;
+      }
+      const message =
+        error instanceof JsonRpcStdioTransportError && error.reason === "frame-too-large"
+          ? "Device helper control line exceeded limit"
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      this.fail(new DeviceHelperError("helper_protocol_error", message, { cause: error }));
     }
   }
 
@@ -493,29 +503,25 @@ export class HelperClient {
     const record = asRecord(message);
     // Notifications (`ready`, diagnostics) carry no id and need no reply.
     if (typeof record.id !== "number") return;
-    const request = this.pending.get(record.id);
-    if (!request) return;
-    this.pending.delete(record.id);
-    clearTimeout(request.timer);
-    if (record.error !== undefined && record.error !== null) {
-      const error = asRecord(record.error);
-      request.reject(
-        new DeviceHelperError(
-          typeof error.code === "number" ? `helper_${error.code}` : "helper_error",
-          typeof error.message === "string" ? error.message : "Device helper reported an error",
-        ),
-      );
-      return;
-    }
-    request.resolve(record.result ?? null);
+    const error =
+      record.error === undefined || record.error === null ? undefined : asRecord(record.error);
+    this.requestRegistry?.handleResponse({
+      id: record.id,
+      result: record.result ?? null,
+      ...(error
+        ? {
+            error: {
+              ...(typeof error.code === "number" ? { code: error.code } : {}),
+              ...(typeof error.message === "string" ? { message: error.message } : {}),
+            },
+          }
+        : {}),
+    });
   }
 
   /** Reject everything in flight; used on exit, spawn failure, and disposal. */
   private fail(error: DeviceHelperError): void {
-    for (const [, request] of this.pending) {
-      clearTimeout(request.timer);
-      request.reject(error);
-    }
-    this.pending.clear();
+    this.requestRegistry?.processExited(error);
+    this.stdinWriter?.close(error);
   }
 }
