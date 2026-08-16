@@ -95,6 +95,13 @@ export class FakeComputerBackend implements ComputerBackend {
           height: this.currentScreenSize.height,
           sizeBytes: Buffer.from(FAKE_SCREENSHOT_BASE64, "base64").byteLength,
           bytesBase64: FAKE_SCREENSHOT_BASE64,
+          region: {
+            x: 0,
+            y: 0,
+            width: this.currentScreenSize.width,
+            height: this.currentScreenSize.height,
+          },
+          scale: 1,
           capturedAt: this.now(),
         }
       : undefined;

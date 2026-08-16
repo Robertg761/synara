@@ -7,6 +7,7 @@ import type {
   ComputerLaunchAppResult,
   ComputerPoint,
   ComputerRect,
+  ComputerScreenshot,
   ComputerScreenSize,
   ComputerState,
   ComputerUiNode,
@@ -46,6 +47,7 @@ const DEFAULT_COMPUTER_ID = "desktop";
 const DEFAULT_GLIDE_DURATION_MS = 180;
 const DEFAULT_STILL_INTERVAL_MS = 500;
 const DEFAULT_CAPTURE_MAX_DIMENSION = 2_048;
+const POINTER_CLAMP_TOLERANCE_PX = 2;
 const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 const KWIN_RECONNECT_BASE_DELAY_MS = 250;
 const KWIN_RECONNECT_MAX_DELAY_MS = 5_000;
@@ -207,11 +209,10 @@ export class KWinComputerBackend implements ComputerBackend {
     readonly includeScreenshot?: boolean;
     readonly includeText?: boolean;
   }): Promise<ComputerState> {
-    const plugin = await this.ensurePlugin({ start: false });
-    const [windows, pluginState] = await Promise.all([
-      this.listWindows(),
-      this.readPluginState(plugin),
-    ]);
+    await this.ensurePlugin({ start: false });
+    // listWindows already reads the plugin state to resolve the focused window,
+    // so a second stateJson round trip here would only add latency.
+    const windows = await this.listWindows();
     const screenSize = screenSizeFromWindows(windows, this.health?.workspace);
     let root: ComputerUiNode | undefined;
     if (options.includeText) {
@@ -227,7 +228,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
     const screenshot =
       options.includeScreenshot && this.health?.capture === true
-        ? await this.captureFocusedWindow(windows, pluginState).catch(() => undefined)
+        ? await this.captureWorkspaceScreenshot(windows).catch(() => undefined)
         : undefined;
     return {
       computerId: this.computerId,
@@ -285,23 +286,23 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async click(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    await this.moveCursor(point);
+    const moved = await this.moveCursor(point);
     await this.pressButton(EVDEV_BUTTON_CODES.left);
-    return { point };
+    return moved;
   }
 
   async doubleClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    await this.moveCursor(point);
+    const moved = await this.moveCursor(point);
     await this.pressButton(EVDEV_BUTTON_CODES.left);
     await this.sleep(60);
     await this.pressButton(EVDEV_BUTTON_CODES.left);
-    return { point };
+    return moved;
   }
 
   async rightClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    await this.moveCursor(point);
+    const moved = await this.moveCursor(point);
     await this.pressButton(EVDEV_BUTTON_CODES.right);
-    return { point };
+    return moved;
   }
 
   async moveCursor(point: ComputerPoint): Promise<ComputerBackendActionResult> {
@@ -314,7 +315,7 @@ export class KWinComputerBackend implements ComputerBackend {
       if (next.x !== point.x || next.y !== point.y) await this.sleep(8);
     }
     this.currentPoint = point;
-    return { point };
+    return await this.pointerResult(plugin, point);
   }
 
   async drag(
@@ -342,7 +343,7 @@ export class KWinComputerBackend implements ComputerBackend {
       }
     }
     this.currentPoint = to;
-    return { point: to };
+    return await this.pointerResult(plugin, to);
   }
 
   async scroll(
@@ -351,9 +352,9 @@ export class KWinComputerBackend implements ComputerBackend {
     deltaY: number,
   ): Promise<ComputerBackendActionResult> {
     const plugin = await this.ensurePlugin();
-    if (point) await this.moveCursor(point);
+    const moved = point ? await this.moveCursor(point) : {};
     await this.pluginSuccess("axis", () => plugin.axis(deltaX, deltaY));
-    return point ? { point } : {};
+    return moved;
   }
 
   async typeText(text: string): Promise<ComputerBackendActionResult> {
@@ -395,9 +396,10 @@ export class KWinComputerBackend implements ComputerBackend {
     target: ComputerResolvedTarget,
     value: string,
   ): Promise<ComputerBackendActionResult> {
-    await this.click(target.point);
+    const clicked = await this.click(target.point);
     await this.typeText(value);
     return {
+      ...clicked,
       point: target.point,
       ...(target.node.windowId ? { windowId: target.node.windowId } : {}),
       value,
@@ -409,8 +411,9 @@ export class KWinComputerBackend implements ComputerBackend {
     action: string,
   ): Promise<ComputerBackendActionResult> {
     if (action === "activate" || action === "click") {
-      await this.click(target.point);
+      const clicked = await this.click(target.point);
       return {
+        ...clicked,
         point: target.point,
         ...(target.node.windowId ? { windowId: target.node.windowId } : {}),
         value: action,
@@ -666,16 +669,40 @@ export class KWinComputerBackend implements ComputerBackend {
     return { position, targetWindowId };
   }
 
-  private async captureFocusedWindow(
+  /**
+   * Pointer requests are advisory: KWin clamps a move to the nearest output
+   * when the global coordinate lands in a gap between monitors. One state read
+   * after the final move tells the caller where the pointer really is without
+   * paying a round trip for every intermediate glide step.
+   */
+  private async pointerResult(
+    plugin: KWinComputerPluginApi,
+    point: ComputerPoint,
+  ): Promise<ComputerBackendActionResult> {
+    const actual = await this.readPluginState(plugin)
+      .then((state) => state.position)
+      .catch(() => null);
+    if (
+      !actual ||
+      (Math.abs(actual.x - point.x) <= POINTER_CLAMP_TOLERANCE_PX &&
+        Math.abs(actual.y - point.y) <= POINTER_CLAMP_TOLERANCE_PX)
+    ) {
+      return { point };
+    }
+    return { point, clampedTo: actual };
+  }
+
+  /**
+   * Captures the whole workspace instead of one window. A window capture cannot
+   * tell the model where anything sits in the global coordinate space that the
+   * pointer tools use, and the focused-window fallback silently resolved to the
+   * desktop wallpaper whenever KWin had no better candidate.
+   */
+  private async captureWorkspaceScreenshot(
     windows: readonly ComputerWindow[],
-    state: KWinPluginState,
-  ): Promise<ComputerState["screenshot"]> {
-    const target =
-      windows.find((window) => window.id === state.targetWindowId) ??
-      windows.find((window) => window.focused) ??
-      windows.find((window) => window.visible && !window.minimized);
-    if (!target) return undefined;
-    const bytes = await this.captureWindow(target.id);
+  ): Promise<ComputerScreenshot> {
+    const region = workspaceRectFromWindows(windows, this.health?.workspace);
+    const bytes = await this.captureRegion(region.x, region.y, region.width, region.height);
     const dimensions = readPngDimensions(bytes);
     return {
       mimeType: "image/png",
@@ -683,6 +710,8 @@ export class KWinComputerBackend implements ComputerBackend {
       height: dimensions.height,
       sizeBytes: bytes.byteLength,
       bytesBase64: Buffer.from(bytes).toString("base64"),
+      region,
+      scale: dimensions.width / region.width,
       capturedAt: new Date(this.now()).toISOString(),
     };
   }
@@ -693,13 +722,9 @@ export class KWinComputerBackend implements ComputerBackend {
       return;
     this.stillInFlight = true;
     try {
-      const [windows, state] = await Promise.all([
-        this.listWindows(),
-        this.readPluginState(await this.ensurePlugin()),
-      ]);
+      const windows = await this.listWindows();
       if (this.capturePending > 0) return;
-      const screenshot = await this.captureFocusedWindow(windows, state);
-      if (!screenshot) return;
+      const screenshot = await this.captureWorkspaceScreenshot(windows);
       if (this.streamListener !== listener) return;
       const frame = {
         sequence: this.nextSequence++,
@@ -964,26 +989,42 @@ function parseWindows(value: unknown, focusedWindowId: string | null): ComputerW
   return windows;
 }
 
+/**
+ * Resolves the global desktop rect. KWin's reported workspace geometry is the
+ * source of truth; the window bounding box is the fallback for a plugin build
+ * that does not report it yet.
+ */
+export function workspaceRectFromWindows(
+  windows: readonly ComputerWindow[],
+  workspace?: ComputerRect | null,
+): ComputerRect {
+  if (workspace && workspace.width > 0 && workspace.height > 0) {
+    return {
+      x: Math.floor(workspace.x),
+      y: Math.floor(workspace.y),
+      width: Math.max(1, Math.ceil(workspace.width)),
+      height: Math.max(1, Math.ceil(workspace.height)),
+    };
+  }
+  const left = Math.min(0, ...windows.map((window) => Math.floor(window.bounds.x)));
+  const top = Math.min(0, ...windows.map((window) => Math.floor(window.bounds.y)));
+  const right = Math.max(
+    left + 1,
+    ...windows.map((window) => Math.ceil(window.bounds.x + window.bounds.width)),
+  );
+  const bottom = Math.max(
+    top + 1,
+    ...windows.map((window) => Math.ceil(window.bounds.y + window.bounds.height)),
+  );
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
 export function screenSizeFromWindows(
   windows: readonly ComputerWindow[],
   workspace?: ComputerRect | null,
 ): ComputerScreenSize {
-  if (workspace && workspace.width > 0 && workspace.height > 0) {
-    return {
-      width: Math.max(1, Math.ceil(workspace.width)),
-      height: Math.max(1, Math.ceil(workspace.height)),
-      scale: 1,
-    };
-  }
-  const width = Math.max(
-    1,
-    ...windows.map((window) => Math.ceil(window.bounds.x + window.bounds.width)),
-  );
-  const height = Math.max(
-    1,
-    ...windows.map((window) => Math.ceil(window.bounds.y + window.bounds.height)),
-  );
-  return { width, height, scale: 1 };
+  const rect = workspaceRectFromWindows(windows, workspace);
+  return { width: rect.width, height: rect.height, scale: 1 };
 }
 
 function parseJson(value: unknown): unknown {

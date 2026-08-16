@@ -106,6 +106,43 @@ describe("agent gateway computer tools", () => {
     expect(state.content.find((entry) => entry.type === "image")).toMatchObject({
       mimeType: "image/png",
     });
+    // The model can only turn screenshot pixels into pointer coordinates when
+    // the region and scale travel with the image.
+    const text = state.content.find((entry) => entry.type === "text");
+    expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
+      screenshot: { region: { x: 0, y: 0, width: 1_920, height: 1_080 }, scale: 1 },
+    });
+  });
+
+  it("describes the screenshot-to-desktop coordinate mapping for the model", async () => {
+    const { byName } = await setup();
+    expect(byName.get("computer_get_state")?.definition.description).toContain(
+      "region.x + screenshot_x / scale",
+    );
+    for (const name of [
+      "computer_click",
+      "computer_double_click",
+      "computer_right_click",
+      "computer_move_cursor",
+      "computer_drag",
+      "computer_scroll",
+    ]) {
+      expect(byName.get(name)?.definition.description).toContain("global desktop coordinates");
+    }
+  });
+
+  it("passes a clamped pointer landing point back to the caller", async () => {
+    const backend = new FakeComputerBackend();
+    backend.click = async (point) => ({ point, clampedTo: { x: point.x, y: 1_080 } });
+    const { call } = await setup(backend);
+
+    const result = await call("computer_click", { x: 44, y: 44 });
+    expect(result.isError).not.toBe(true);
+    const entry = result.content[0];
+    expect(JSON.parse(entry?.type === "text" ? entry.text : "{}")).toMatchObject({
+      point: { x: 44, y: 44 },
+      clampedTo: { x: 44, y: 1_080 },
+    });
   });
 
   it("resolves semantic actions from a fresh snapshot and reports backend calls", async () => {

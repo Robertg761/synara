@@ -28,6 +28,9 @@ class FakePlugin implements KWinComputerPluginApi {
     | { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
     | undefined;
   captureFailure: Error | undefined;
+  position: { readonly x: number; readonly y: number } = { x: 0, y: 0 };
+  /** Mirrors KWin clamping a pointer move to the nearest output. */
+  clampPointer: ((x: number, y: number) => { readonly x: number; readonly y: number }) | undefined;
   windows: readonly ComputerWindow[] = [
     {
       id: "window-1",
@@ -49,7 +52,7 @@ class FakePlugin implements KWinComputerPluginApi {
       kwinVersion: "6.7.3",
       ...(this.workspace ? { workspaceGeometry: this.workspace } : {}),
     });
-  stateJson = async () => JSON.stringify({ position: { x: 0, y: 0 }, targetWindowId: "window-1" });
+  stateJson = async () => JSON.stringify({ position: this.position, targetWindowId: "window-1" });
   windowsJson = async () => JSON.stringify(this.windows);
   start = async () => {
     this.running = true;
@@ -61,7 +64,10 @@ class FakePlugin implements KWinComputerPluginApi {
   };
   focusWindow = async (windowId: string) => this.recordResult("focusWindow", windowId);
   clearFocusWindow = async () => this.recordResult("clearFocusWindow");
-  movePointer = async (x: number, y: number) => this.recordResult("movePointer", x, y);
+  movePointer = async (x: number, y: number) => {
+    this.position = this.clampPointer?.(x, y) ?? { x, y };
+    return this.recordResult("movePointer", x, y);
+  };
   button = async (code: number, pressed: boolean) => this.recordResult("button", code, pressed);
   axis = async (horizontal: number, vertical: number) =>
     this.recordResult("axis", horizontal, vertical);
@@ -79,7 +85,8 @@ class FakePlugin implements KWinComputerPluginApi {
     maxDimension: number,
   ) => {
     this.calls.push({ method: "captureRegion", args: [x, y, width, height, maxDimension] });
-    return PNG_1X1;
+    if (this.captureFailure) throw this.captureFailure;
+    return this.capture ? PNG_1X1 : Uint8Array.of();
   };
 
   private recordResult(method: string, ...args: readonly unknown[]): true {
@@ -259,6 +266,90 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
+  it("captures the whole workspace and reports the region and scale", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    const state = await backend.getState({ includeScreenshot: true });
+    expect(dbus.plugin.calls).toContainEqual({
+      method: "captureRegion",
+      args: [0, 0, 5_120, 2_520, 2_048],
+    });
+    expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
+    expect(state.screenshot).toMatchObject({
+      width: 1,
+      height: 1,
+      region: { x: 0, y: 0, width: 5_120, height: 2_520 },
+      scale: 1 / 5_120,
+    });
+    await backend.dispose();
+  });
+
+  it("falls back to the window bounding box when KWin reports no workspace", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = undefined;
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    const state = await backend.getState({ includeScreenshot: true });
+    // The single fake window spans (956, 1519) to (1604, 2037).
+    expect(dbus.plugin.calls).toContainEqual({
+      method: "captureRegion",
+      args: [0, 0, 1_604, 2_037, 2_048],
+    });
+    expect(state.screenshot?.region).toEqual({ x: 0, y: 0, width: 1_604, height: 2_037 });
+    await backend.dispose();
+  });
+
+  it("streams workspace stills to the panel instead of one window", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    const backend = makeBackend(dbus);
+    await backend.attachStream(() => undefined);
+
+    expect(dbus.plugin.calls).toContainEqual({
+      method: "captureRegion",
+      args: [0, 0, 5_120, 2_520, 2_048],
+    });
+    expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
+    await backend.dispose();
+  });
+
+  it("reports the clamped landing point when KWin refuses a pointer move", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.clampPointer = (x, y) => ({ x, y: Math.max(y, 1_080) });
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.availability();
+
+    await expect(backend.click({ x: 44, y: 44 })).resolves.toEqual({
+      point: { x: 44, y: 44 },
+      clampedTo: { x: 44, y: 1_080 },
+    });
+    await expect(backend.moveCursor({ x: 44, y: 1_080 })).resolves.toEqual({
+      point: { x: 44, y: 1_080 },
+    });
+    await backend.dispose();
+  });
+
+  it("omits clamp feedback when the pointer lands on the requested point", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.availability();
+
+    await expect(backend.doubleClick({ x: 300, y: 400 })).resolves.toEqual({
+      point: { x: 300, y: 400 },
+    });
+    await expect(backend.drag({ x: 10, y: 10 }, { x: 20, y: 20 }, 0)).resolves.toEqual({
+      point: { x: 20, y: 20 },
+    });
+    await expect(backend.scroll({ x: 30, y: 30 }, 1, 1)).resolves.toEqual({
+      point: { x: 30, y: 30 },
+    });
+    await backend.dispose();
+  });
+
   it("serializes window and region captures through one queue", async () => {
     const dbus = new FakeDbus();
     const backend = makeBackend(dbus);
@@ -304,6 +395,9 @@ describe("KWinComputerBackend", () => {
       const dbus = new FakeDbus();
       const backend = makeBackend(dbus, { stillIntervalMs: 100 });
       await backend.attachStream(() => undefined);
+      const stillCaptures = () =>
+        dbus.plugin.calls.filter((call) => call.method === "captureRegion").length;
+      expect(stillCaptures()).toBe(1);
 
       const gate = deferred<Uint8Array<ArrayBuffer>>();
       let captureCalls = 0;
@@ -319,6 +413,7 @@ describe("KWinComputerBackend", () => {
 
       await vi.advanceTimersByTimeAsync(500);
       expect(captureCalls).toBe(1);
+      expect(stillCaptures()).toBe(1);
       gate.resolve(PNG_1X1);
       await agentCapture;
       await backend.dispose();

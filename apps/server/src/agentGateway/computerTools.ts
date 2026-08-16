@@ -49,9 +49,12 @@ export interface AgentGatewayComputerToolsOptions {
   readonly manager: ComputerManager;
 }
 
+const POINTER_COORDINATE_NOTE =
+  "Coordinates are global desktop coordinates in logical pixels, the same space as window bounds and the screenshot region mapping. On multi-monitor layouts some coordinate ranges fall outside every monitor, and the display server moves the pointer to the nearest monitor edge instead.";
+
 const TARGET_PROPERTIES = {
-  x: { type: "number", description: "Horizontal screen coordinate in logical pixels." },
-  y: { type: "number", description: "Vertical screen coordinate in logical pixels." },
+  x: { type: "number", description: "Global desktop x coordinate in logical pixels." },
+  y: { type: "number", description: "Global desktop y coordinate in logical pixels." },
   label: { type: "string", description: "Accessible label to resolve from a fresh UI snapshot." },
   role: { type: "string", description: "Optional accessible role used to disambiguate a label." },
   window_id: { type: "string", description: "Optional window id used to disambiguate a label." },
@@ -224,7 +227,7 @@ export function makeAgentGatewayComputerTools(
       definition: {
         name: "computer_get_state",
         description:
-          "Read the current desktop state. Request a screenshot or accessibility text only when needed because both increase payload size.",
+          "Read the current desktop state. The screenshot covers the entire desktop workspace across every monitor, scaled down: convert a screenshot pixel to a desktop point with region.x + screenshot_x / scale and region.y + screenshot_y / scale, using the screenshot region and scale returned alongside it. Window bounds and cursor positions in the JSON are already desktop coordinates. Request a screenshot or accessibility text only when needed because both increase payload size.",
         inputSchema: {
           type: "object",
           properties: {
@@ -277,35 +280,35 @@ export function makeAgentGatewayComputerTools(
     actionEntry(
       "computer_click",
       "Click",
-      "Click a coordinate or a uniquely labelled visible control. Ambiguous and off-screen targets are refused.",
+      `Click a coordinate or a uniquely labelled visible control. Ambiguous and off-screen targets are refused. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.click(context.callerThreadId, readTarget(args)),
     ),
     actionEntry(
       "computer_double_click",
       "Double click",
-      "Double-click a coordinate or a uniquely labelled visible control.",
+      `Double-click a coordinate or a uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.doubleClick(context.callerThreadId, readTarget(args)),
     ),
     actionEntry(
       "computer_right_click",
       "Right click",
-      "Right-click a coordinate or a uniquely labelled visible control.",
+      `Right-click a coordinate or a uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.rightClick(context.callerThreadId, readTarget(args)),
     ),
     actionEntry(
       "computer_move_cursor",
       "Move cursor",
-      "Move the dedicated computer-use cursor to a coordinate or uniquely labelled visible control.",
+      `Move the dedicated computer-use cursor to a coordinate or uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.moveCursor(context.callerThreadId, readTarget(args)),
     ),
     actionEntry(
       "computer_drag",
       "Drag",
-      "Drag between two coordinates or uniquely labelled visible controls.",
+      `Drag between two coordinates or uniquely labelled visible controls. ${POINTER_COORDINATE_NOTE}`,
       {
         type: "object",
         properties: {
@@ -327,7 +330,7 @@ export function makeAgentGatewayComputerTools(
     actionEntry(
       "computer_scroll",
       "Scroll",
-      "Scroll at an optional target. The target is resolved before the gesture and is never guessed.",
+      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. ${POINTER_COORDINATE_NOTE}`,
       {
         type: "object",
         properties: {

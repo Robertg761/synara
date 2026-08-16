@@ -27,6 +27,12 @@ export interface ComputerResolvedTarget {
 
 export interface ComputerBackendActionResult {
   readonly point?: ComputerPoint;
+  /**
+   * Set when the display server refused the requested point and moved the
+   * pointer elsewhere, which happens on multi-monitor layouts whose global
+   * coordinate space has gaps between outputs.
+   */
+  readonly clampedTo?: ComputerPoint;
   readonly windowId?: string;
   readonly value?: string;
 }
@@ -106,6 +112,7 @@ export function computerBackendActionResult(
     computerId,
     action,
     ...(result?.point ? { point: result.point } : {}),
+    ...(result?.clampedTo ? { clampedTo: result.clampedTo } : {}),
     ...(result?.windowId ? { windowId: result.windowId } : {}),
     ...(result?.value !== undefined ? { value: result.value } : {}),
   } as ComputerActionResult;

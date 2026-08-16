@@ -132,6 +132,10 @@ export const ComputerScreenshot = Schema.Struct({
   height: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 32_768 })),
   sizeBytes: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 64 * 1024 * 1024 })),
   bytesBase64: TrimmedNonEmptyString.check(Schema.isMaxLength(88 * 1024 * 1024)),
+  /** Desktop rect the capture covers, in the same global space as window bounds. */
+  region: Schema.optional(ComputerRect),
+  /** Screenshot pixels per desktop pixel, so `desktop = region.origin + pixel / scale`. */
+  scale: Schema.optional(Schema.Finite.check(Schema.isGreaterThan(0))),
   capturedAt: IsoDateTime,
 });
 export type ComputerScreenshot = typeof ComputerScreenshot.Type;
@@ -276,6 +280,8 @@ export const ComputerActionResult = Schema.Struct({
   computerId: ComputerId,
   action: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
   point: Schema.optional(ComputerPoint),
+  /** Where the pointer actually landed when the display server clamped the request. */
+  clampedTo: Schema.optional(ComputerPoint),
   windowId: Schema.optional(ComputerWindowId),
   value: Schema.optional(Schema.String.check(Schema.isMaxLength(COMPUTER_TEXT_MAX_LENGTH))),
 });
