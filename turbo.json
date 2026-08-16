@@ -25,6 +25,12 @@
     "SYNARA_HOST",
     "SYNARA_AUTO_BOOTSTRAP_PROJECT_FROM_CWD"
   ],
+  "globalPassThroughEnv": [
+    "XDG_SESSION_TYPE",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR"
+  ],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
