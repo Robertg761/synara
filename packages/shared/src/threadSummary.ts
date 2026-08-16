@@ -103,6 +103,12 @@ export function approvalRequestKindFromRequestType(
       return "permissions";
     case "tool_approval":
       return "tool";
+    // Adapters historically classified generic/MCP tool approvals by item type
+    // instead of the canonical "tool_approval". A request.opened is always an
+    // approval, and an approval without a kind is unrenderable — the turn hangs
+    // with no way to respond — so map the legacy value rather than dropping it.
+    case "dynamic_tool_call":
+      return "tool";
     default:
       return null;
   }
