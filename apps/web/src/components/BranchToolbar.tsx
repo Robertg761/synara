@@ -60,6 +60,7 @@ import { Collapsible, CollapsiblePanel } from "./ui/collapsible";
 import { DisclosureChevron } from "./ui/DisclosureChevron";
 import {
   Menu,
+  MenuCheckboxItem,
   MenuGroup,
   MenuGroupLabel,
   MenuItem,
@@ -173,6 +174,10 @@ export interface RuntimeUsageControlsProps {
   providerStatus?: ServerProviderStatus | null | undefined;
   runtimeMode?: RuntimeMode | undefined;
   onRuntimeModeChange?: ((mode: RuntimeMode) => void) | undefined;
+  computerControlEnabled?: boolean | undefined;
+  computerControlAvailable?: boolean | undefined;
+  computerControlDisabledReason?: string | undefined;
+  onComputerControlChange?: ((enabled: boolean) => void) | undefined;
   contextWindow?: ContextWindowSnapshot | null | undefined;
   cumulativeCostUsd?: number | null | undefined;
   activeContextWindowLabel?: string | null | undefined;
@@ -190,6 +195,10 @@ export function RuntimeUsageControls({
   providerStatus,
   runtimeMode,
   onRuntimeModeChange,
+  computerControlEnabled = false,
+  computerControlAvailable = false,
+  computerControlDisabledReason = "Checking computer availability.",
+  onComputerControlChange,
   className,
   hideLabel: hideLabelProp,
 }: RuntimeUsageControlsProps) {
@@ -277,6 +286,27 @@ export function RuntimeUsageControls({
                 icon={<CentralIcon name="shield-access" className="size-4 shrink-0" />}
               />
             </MenuRadioGroup>
+            {onComputerControlChange ? (
+              <>
+                <MenuSeparator />
+                <MenuCheckboxItem
+                  variant="switch"
+                  checked={computerControlEnabled}
+                  disabled={!computerControlAvailable}
+                  onCheckedChange={(checked) => onComputerControlChange(checked === true)}
+                  title={computerControlAvailable ? undefined : computerControlDisabledReason}
+                >
+                  <span className="flex min-w-0 flex-col gap-0.5 py-0.5">
+                    <span className="font-medium text-xs">Computer control</span>
+                    <span className="text-[11px] leading-4 text-muted-foreground">
+                      {computerControlAvailable
+                        ? "Lets the agent see and control the desktop with a separate cursor."
+                        : computerControlDisabledReason}
+                    </span>
+                  </span>
+                </MenuCheckboxItem>
+              </>
+            ) : null}
           </ComposerPickerMenuPopup>
         </Menu>
       ) : null}

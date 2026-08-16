@@ -1041,6 +1041,32 @@ export const createComposerDraftStoreState =
         return { draftsByThreadId: nextDraftsByThreadId };
       });
     },
+    setEnableComputerControl: (threadId, enabled) => {
+      if (threadId.length === 0) {
+        return;
+      }
+      set((state) => {
+        const existing = state.draftsByThreadId[threadId];
+        if (!existing && !enabled) {
+          return state;
+        }
+        const base = existing ?? createEmptyThreadDraft();
+        if (base.enableComputerControl === enabled) {
+          return state;
+        }
+        const nextDraft: ComposerThreadDraftState = {
+          ...base,
+          enableComputerControl: enabled,
+        };
+        const nextDraftsByThreadId = { ...state.draftsByThreadId };
+        if (shouldRemoveDraft(nextDraft)) {
+          delete nextDraftsByThreadId[threadId];
+        } else {
+          nextDraftsByThreadId[threadId] = nextDraft;
+        }
+        return { draftsByThreadId: nextDraftsByThreadId };
+      });
+    },
     // Keep queued follow-ups with the thread draft so route changes do not hide them.
     enqueueQueuedTurn: (threadId, queuedTurn) => {
       if (threadId.length === 0) {
