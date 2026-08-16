@@ -1,0 +1,196 @@
+# Synara KWin computer-use plugin
+
+A binary KWin plugin that gives Synara native compositor integration for computer
+use on Linux/KDE. It paints a separate visible agent cursor (`synara-agent`),
+routes synthetic pointer and keyboard events through KWin's compositor seat so
+real Wayland clients receive them, and exposes a small D-Bus control API.
+
+This is the Tier 1 backend described in `docs/computer-use-design.md`. It is
+intentionally KWin-specific: a generic unprivileged Wayland client cannot inject
+input into another client with an independent cursor. That requires running
+inside the compositor, which is exactly the privilege level macOS computer use
+uses on its side (WindowServer). See the design doc for the full rationale and
+the macOS comparison.
+
+## How it works
+
+- Runs inside KWin as a `KWin::Plugin`, so it has the compositor's authority over
+  input routing.
+- The agent cursor is a KWin scene overlay `Item` (`ShapeCursorSource` +
+  `ImageItem`, z=1000, parented to `effects->scene()->overlayItem()`), not a
+  separate client window. This mirrors KWin's own `CursorItem`.
+- The plugin creates a dedicated `SeatInterface` named `synara-agent` and
+  delivers all agent input on it: pointer focus/motion/buttons via
+  `notifyPointerEnter` / `notifyPointerMotion` / `notifyPointerButton`, keys via
+  `notifyKeyboardKey`. The agent seat mirrors the real keyboard's xkb keymap and
+  tracks its own `xkb_state` for modifier events. The user's real seat is never
+  touched in either direction, so agent and user can point and type at the same
+  time without crossover, and the real system cursor never moves.
+- Pressed buttons and keys are tracked and released on stop/destroy, so a crash
+  or stop mid-action cannot latch a stuck modifier.
+
+## D-Bus API
+
+Service `org.synara.ComputerUse`, path `/org/synara/ComputerUse`, interface
+`org.synara.ComputerUse1`. Methods: `healthJson`, `stateJson`, `windowsJson`,
+`start`, `stop`, `focusWindow`, `clearFocusWindow`, `movePointer`, `button`,
+`axis`, `key`, `captureWindow(s windowId, u maxDimension) -> ay`, and
+`captureRegion(i x, i y, u width, u height, u maxDimension) -> ay`.
+
+Capture requests are rendered at the next safe compositor render opportunity.
+`maxDimension = 0` keeps native pixels; otherwise the PNG is downscaled so its
+largest dimension is at most `maxDimension`. The plugin reads back the native
+resolution first, then applies `maxDimension` during PNG encoding. Both the
+workspace cursor and the Synara agent cursor are excluded from the pixels.
+
+Only one capture may be in flight. A second concurrent call fails with
+`org.synara.ComputerUse.Error.CaptureFailed` and the reason `capture already in
+flight`. The render deadline is 2 seconds. The PNG encode deadline is 5 seconds.
+If encoding times out, the reply fails and a late worker result is discarded.
+
+Captures work whether the input seat is running or stopped. `stop()` cancels an
+in-flight capture. A region request is first clamped to the workspace geometry.
+After applying the output scale, the native image must be no larger than 16,384
+pixels on either side and 64 megapixels total. Requests above either limit fail
+with `CaptureFailed` before the render target is allocated.
+
+Capture failures are returned as the D-Bus error
+`org.synara.ComputerUse.Error.CaptureFailed` with a one-line reason. The methods
+never use an empty `ay` as a failure response.
+
+## Build (Fedora KDE)
+
+Dependencies:
+
+```sh
+sudo dnf -y --setopt=install_weak_deps=False install \
+  cmake ninja-build extra-cmake-modules kwin-devel kf6-kcoreaddons-devel \
+  qt6-qtbase-devel libepoxy-devel libdrm-devel
+```
+
+Build, install, unload older Synara plugin ids, load the new versioned id, and
+print `healthJson`:
+
+```sh
+apps/server/native/computer-use-kwin/scripts/install-and-load.sh
+```
+
+The installer keeps its build cache under `~/.cache/synara/` and its signature
+under `~/.local/state/synara/`. It uses `sudo install` for the root-owned KWin
+plugin directory. Use `--force` when you deliberately want another versioned
+load of the same source and KWin build. `--noninteractive` is for the systemd
+unit and uses `sudo -n`.
+
+For a compile-only build that does not install or load anything:
+
+```sh
+cmake -S apps/server/native/computer-use-kwin \
+  -B /tmp/synara-kwin-infra-build \
+  -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build /tmp/synara-kwin-infra-build
+```
+
+Verify (read-only, does not act on the desktop):
+
+```sh
+busctl --user call org.synara.ComputerUse /org/synara/ComputerUse \
+  org.synara.ComputerUse1 healthJson
+```
+
+Unload:
+
+```sh
+busctl --user call org.kde.KWin /Plugins org.kde.KWin.Plugins UnloadPlugin s SynaraComputerUsePluginV1
+```
+
+The loaded id is normally `SynaraComputerUsePluginV1`, `V2`, and so on. The
+installer (and the server backend) query the `LoadedPlugins` property on
+`org.kde.KWin.Plugins` — on KWin 6.7 the loaded-plugin list is a property, not
+a method, and `UnloadPlugin` returns void rather than a boolean. Both fall back
+to a `loadedPlugins` method for KWin variants that expose one; if neither
+exists, the installer tries the base id and every matching installed versioned
+filename. To unload and remove every installed Synara plugin file, use:
+
+```sh
+apps/server/native/computer-use-kwin/scripts/uninstall.sh
+```
+
+## Version stamping
+
+CMake generates a private build header containing the Git short hash, the UTC
+configure timestamp, and the KWin package version found by `find_package(KWin)`.
+`healthJson` keeps all of its original fields and adds:
+
+- `build`: `<git-short-hash>-<UTC-build-timestamp>`
+- `gitHash`: the short Git hash used by the configure step
+- `buildTimestamp`: the UTC timestamp from that configure step
+- `kwinVersion`: the KWin version compiled against
+
+The `healthJson` `capture` field is true only when KWin has an effects handler,
+OpenGL compositing is active, and an OpenGL context is available. It does not
+depend on whether `start()` has been called.
+
+When KWin's workspace is available, `healthJson` also includes
+`workspaceGeometry` with `x`, `y`, `width`, and `height` fields. Consumers can
+use that geometry when no client windows are currently enumerable.
+
+The build identifier is diagnostic data. The plugin filename carries the reload
+identity because KWin can keep a shared library mapped after `UnloadPlugin`.
+
+## Versioned plugin filenames
+
+The installer writes the first changed build as
+`SynaraComputerUsePluginV1.so`, then scans the KWin plugin directory and uses
+the next higher `Vn` filename for a later changed build. It never overwrites an
+older version. This is required on Wayland: unloading a plugin destroys its
+instance, but KWin can still return the old mapped library when the same plugin
+id is loaded again.
+
+The installer records the source and KWin signature. Repeating it with the same
+signature reuses the installed id, so the periodic systemd check does not create
+an unbounded stream of identical plugin files. A source change, KWin upgrade,
+or `--force` creates a new versioned id.
+
+## KWin ABI
+
+A binary KWin plugin must be built against the exact running KWin version. KWin
+refuses to load a plugin whose embedded `PluginFactoryInterface<version>` does
+not match. The factory IID comes from the installed `kwin-devel` headers, and
+the generated health fields record the KWin package version used at configure
+time. Rebuild after every KWin upgrade. The installer reports a clear error for
+KWin's `has mismatching plugin version` refusal.
+
+## Reload caveat (dev loop)
+
+KWin never unloads a plugin's shared library. `UnloadPlugin` destroys the
+plugin instance, but reloading the same plugin id serves the still-mapped old
+binary, so a rebuilt `.so` under the same name silently does nothing. On
+Wayland, KWin is the session, so restarting the compositor is not an option.
+During development, install each rebuild under a versioned filename
+(`SynaraComputerUsePluginV2.so`, `V3`, ...) and load that id instead.
+
+## Automatic rebuild after KWin upgrades
+
+`systemd/` contains a user service, a path unit, a periodic timer, and an
+`enable.sh` helper. The path unit watches the stable `/usr/lib64/libkwin.so*`
+symlinks and KWin CMake package files. The timer checks every six hours. The
+installer also includes the KWin RPM query and library metadata in its
+signature, so an unchanged system is a no-op.
+
+The units are install-ready but are not enabled or started by this source tree.
+To opt in later, run the helper from the repository root:
+
+```sh
+apps/server/native/computer-use-kwin/systemd/enable.sh
+```
+
+The helper enables the path and timer without starting either one. The service
+passes `--noninteractive`, so unattended installation needs a narrow sudo rule
+for the plugin copy or another policy that permits `sudo -n install`.
+
+## Provenance
+
+Seeded from a proven prior implementation in the sibling `Androdex-Desktop`
+project by the same author, then renamed to Synara and updated for KWin 6.7.3
+(the `ItemRenderer::createImageItem()` factory was removed upstream; `ImageItem`
+now has a public constructor).

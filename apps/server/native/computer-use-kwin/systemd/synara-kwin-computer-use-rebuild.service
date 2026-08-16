@@ -1,0 +1,9 @@
+[Unit]
+Description=Rebuild and install the Synara KWin computer-use plugin
+Documentation=file:%h/Projects/synara/apps/server/native/computer-use-kwin/README.md
+After=graphical-session.target
+ConditionPathExists=%h/Projects/synara/apps/server/native/computer-use-kwin/scripts/install-and-load.sh
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/synara/apps/server/native/computer-use-kwin/scripts/install-and-load.sh --noninteractive

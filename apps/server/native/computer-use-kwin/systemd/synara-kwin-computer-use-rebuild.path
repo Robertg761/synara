@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch KWin ABI files for Synara KWin computer-use rebuilds
+
+[Path]
+# These are the stable symlinks covered by /usr/lib64/libkwin.so*.
+PathChanged=/usr/lib64/libkwin.so
+PathChanged=/usr/lib64/libkwin.so.6
+PathChanged=/usr/lib64/cmake/KWin/KWinConfig.cmake
+PathChanged=/usr/lib64/cmake/KWin/KWinConfigVersion.cmake
+PathChanged=/usr/lib64/cmake/KWin/KWinTargets.cmake
+Unit=synara-kwin-computer-use-rebuild.service
+
+[Install]
+WantedBy=paths.target
