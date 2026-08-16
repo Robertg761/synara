@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   acquireAgentGatewaySessionLease,
   cancelAgentGatewayTurn,
+  computerControlSessionLeaseOptions,
   releaseAgentGatewaySessionLeaseOnInterrupt,
   startAgentGatewaySessionLeaseExitWatcher,
   withAgentGatewayTurnCancellation,
@@ -269,6 +270,24 @@ describe("AgentGatewaySessionLease", () => {
 
     expect(revokeSessionToken).toHaveBeenCalledOnce();
     expect(revokeSessionToken).toHaveBeenCalledWith("gateway-token");
+  });
+
+  it("passes the explicit computer capability into the issued connection", () => {
+    const connectionForThread = vi.fn(() => ({
+      url: "http://127.0.0.1:48123/mcp",
+      bearerToken: "computer-token",
+    }));
+    const lease = acquireAgentGatewaySessionLease(
+      { connectionForThread, revokeSessionToken: vi.fn() },
+      ThreadId.makeUnsafe("thread-computer"),
+      "codex",
+      computerControlSessionLeaseOptions(true),
+    );
+
+    expect(connectionForThread).toHaveBeenCalledWith("thread-computer", "codex", {
+      additionalCapabilities: ["computer:control"],
+    });
+    lease?.release();
   });
 
   it("keeps replacement runtimes on independent leases", () => {

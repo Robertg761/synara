@@ -50,6 +50,7 @@ import { PROVIDER_ADAPTER_RUNTIME_EVENT_BUFFER_CAPACITY } from "../Services/Prov
 import {
   acquireAgentGatewaySessionLease,
   cancelAgentGatewayTurn,
+  computerControlSessionLeaseOptions,
   startAgentGatewaySessionLeaseExitWatcher,
   type AgentGatewaySessionLease,
   withAgentGatewayTurnCancellation,
@@ -701,6 +702,7 @@ export function makeCursorAdapter(
             agentGatewayCredentials,
             input.threadId,
             PROVIDER,
+            computerControlSessionLeaseOptions(input.enableComputerControl),
           );
           yield* Effect.addFinalizer(() =>
             sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),

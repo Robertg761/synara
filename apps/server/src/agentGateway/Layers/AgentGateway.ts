@@ -72,6 +72,8 @@ import { makeAgentGatewayAutomationTools } from "../automationTools.ts";
 import { makeAgentGatewayBrowserTools } from "../browserTools.ts";
 import { makeAgentGatewayDeviceTools } from "../deviceTools.ts";
 import { DeviceService } from "../../device/Services/DeviceService.ts";
+import { makeAgentGatewayComputerTools } from "../computerTools.ts";
+import { ComputerService } from "../../computer/Services/ComputerService.ts";
 import { BrowserAutomationHost } from "../../browserAutomation/Services/BrowserAutomationHost.ts";
 import { makeBrowserAutomationHost } from "../../browserAutomation/Layers/BrowserAutomationHost.ts";
 import { makeThreadReadTools } from "../threadReadTools.ts";
@@ -130,6 +132,7 @@ export const makeAgentGateway = Effect.gen(function* () {
   // it) the agent never sees the device_* tools at all, rather than being
   // offered eleven tools that can only report an unsupported platform.
   const deviceService = Option.getOrUndefined(yield* Effect.serviceOption(DeviceService));
+  const computerService = Option.getOrUndefined(yield* Effect.serviceOption(ComputerService));
   const loadProviderAvailabilities = Effect.gen(function* () {
     const [settings, statuses] = yield* Effect.all([
       serverSettings.getSettings,
@@ -731,6 +734,9 @@ export const makeAgentGateway = Effect.gen(function* () {
     ...browserTools,
     ...(deviceService?.supported === true
       ? makeAgentGatewayDeviceTools({ manager: deviceService.manager })
+      : []),
+    ...(computerService?.supported === true
+      ? makeAgentGatewayComputerTools({ manager: computerService.manager })
       : []),
   ];
   return {

@@ -223,6 +223,7 @@ function toRuntimePayloadFromSession(
   extra?: {
     readonly modelSelection?: unknown;
     readonly providerOptions?: unknown;
+    readonly enableComputerControl?: boolean;
     readonly lastRuntimeEvent?: string;
     readonly lastRuntimeEventAt?: string;
     readonly lifecycleGeneration?: string;
@@ -238,6 +239,9 @@ function toRuntimePayloadFromSession(
     lastError: nonEmptyTrimmed(session.lastError) ?? null,
     ...(extra?.modelSelection !== undefined ? { modelSelection: extra.modelSelection } : {}),
     ...(extra?.providerOptions !== undefined ? { providerOptions: extra.providerOptions } : {}),
+    ...(extra?.enableComputerControl !== undefined
+      ? { enableComputerControl: extra.enableComputerControl }
+      : {}),
     ...(extra?.lastRuntimeEvent !== undefined ? { lastRuntimeEvent: extra.lastRuntimeEvent } : {}),
     ...(extra?.lastRuntimeEventAt !== undefined
       ? { lastRuntimeEventAt: extra.lastRuntimeEventAt }
@@ -260,6 +264,12 @@ function readPersistedProviderOptions(
 ): ProviderStartOptions | undefined {
   const raw = runtimePayloadRecord(runtimePayload).providerOptions;
   return Option.getOrUndefined(Schema.decodeUnknownOption(ProviderStartOptions)(raw));
+}
+
+function readPersistedComputerControl(
+  runtimePayload: ProviderRuntimeBinding["runtimePayload"],
+): boolean {
+  return runtimePayloadRecord(runtimePayload).enableComputerControl === true;
 }
 
 function readPersistedCwd(
@@ -706,6 +716,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         readonly lifecycleGeneration?: string;
         readonly modelSelection?: unknown;
         readonly providerOptions?: unknown;
+        readonly enableComputerControl?: boolean;
         readonly lastRuntimeEvent?: string;
         readonly lastRuntimeEventAt?: string;
       },
@@ -916,6 +927,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           if (getDispatchState(input.threadId).latestGeneration !== input.generation) {
             return;
           }
+          const existingBinding = yield* directory.getBinding(input.threadId);
+          const enableComputerControl =
+            Option.isSome(existingBinding) &&
+            readPersistedComputerControl(existingBinding.value.runtimePayload);
           const completedBeforePersistence = consumeRecentlyCompletedTurn(
             input.threadId,
             input.turnId,
@@ -929,7 +944,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             // the delayed result must not overwrite any of its metadata. With
             // no row, preserve the live-fallback behavior by creating an
             // explicitly stopped binding from the settled dispatch result.
-            if (Option.isSome(yield* directory.getBinding(input.threadId))) {
+            if (Option.isSome(existingBinding)) {
               markPersistenceSucceeded(false);
               return;
             }
@@ -938,8 +953,15 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               provider: input.provider,
               status: "stopped",
               ...(input.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
-              ...(input.modelSelection !== undefined
-                ? { runtimePayload: { modelSelection: input.modelSelection } }
+              ...(input.modelSelection !== undefined || enableComputerControl
+                ? {
+                    runtimePayload: {
+                      ...(input.modelSelection !== undefined
+                        ? { modelSelection: input.modelSelection }
+                        : {}),
+                      ...(enableComputerControl ? { enableComputerControl: true } : {}),
+                    },
+                  }
                 : {}),
             });
             markPersistenceSucceeded(false);
@@ -959,6 +981,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               ...(input.modelSelection !== undefined
                 ? { modelSelection: input.modelSelection }
                 : {}),
+              ...(enableComputerControl ? { enableComputerControl: true } : {}),
               activeTurnId: input.turnId,
               lastRuntimeEvent: input.lastRuntimeEvent,
               lastRuntimeEventAt: new Date().toISOString(),
@@ -1155,6 +1178,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             status: runtimeStatusForEvent(event, activeTurnId),
             ...(resumeCursor !== undefined ? { resumeCursor } : {}),
             runtimePayload: {
+              ...(readPersistedComputerControl(binding.runtimePayload)
+                ? { enableComputerControl: true }
+                : {}),
               activeTurnId,
               lastRuntimeEvent: event.type,
               lastRuntimeEventAt: event.createdAt,
@@ -1407,6 +1433,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             const persistedCwd = readPersistedCwd(binding.runtimePayload);
             const persistedModelSelection = readPersistedModelSelection(binding.runtimePayload);
             const persistedProviderOptions = readPersistedProviderOptions(binding.runtimePayload);
+            const persistedComputerControl = readPersistedComputerControl(binding.runtimePayload);
             yield* validateAutoRuntimeMode(
               input.operation,
               binding.provider,
@@ -1420,6 +1447,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               ...(persistedCwd ? { cwd: persistedCwd } : {}),
               ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
               ...(persistedProviderOptions ? { providerOptions: persistedProviderOptions } : {}),
+              ...(persistedComputerControl ? { enableComputerControl: true } : {}),
               ...(hasPersistedResumeCursor ? { resumeCursor: binding.resumeCursor } : {}),
               runtimeMode: binding.runtimeMode ?? "full-access",
             });
@@ -1434,6 +1462,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               threadId,
               upsertSessionBinding(resumed, threadId, {
                 lifecycleGeneration: lease.generation,
+                ...(persistedComputerControl ? { enableComputerControl: true } : {}),
               }).pipe(
                 Effect.andThen(
                   requiresCredentialRotation
@@ -1442,6 +1471,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                         provider: binding.provider,
                         runtimePayload: {
                           [AGENT_GATEWAY_CREDENTIAL_ROTATION_REQUIRED]: false,
+                          ...(persistedComputerControl ? { enableComputerControl: true } : {}),
                         },
                       })
                     : Effect.void,
@@ -1650,6 +1680,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               (persistedBinding?.provider === input.provider
                 ? readPersistedProviderOptions(persistedBinding.runtimePayload)
                 : undefined);
+            const effectiveComputerControl =
+              input.enableComputerControl ??
+              (persistedBinding?.provider === input.provider
+                ? readPersistedComputerControl(persistedBinding.runtimePayload)
+                : false);
             const adapter = yield* registry.getByProvider(input.provider);
             let replacementStarted = false;
             const startAndPersistReplacement = Effect.gen(function* () {
@@ -1660,6 +1695,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               const started = yield* adapter
                 .startSession({
                   ...adapterStartInput,
+                  enableComputerControl: effectiveComputerControl,
                   lifecycleGeneration: lease.generation,
                   ...(effectiveProviderOptions !== undefined
                     ? { providerOptions: effectiveProviderOptions }
@@ -1707,6 +1743,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 upsertSessionBinding(session, threadId, {
                   modelSelection: input.modelSelection,
                   providerOptions: effectiveProviderOptions,
+                  enableComputerControl: effectiveComputerControl,
                   lifecycleGeneration: lease.generation,
                 }).pipe(
                   Effect.andThen(
@@ -1715,6 +1752,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                       provider: session.provider,
                       runtimePayload: {
                         [AGENT_GATEWAY_CREDENTIAL_ROTATION_REQUIRED]: false,
+                        ...(effectiveComputerControl ? { enableComputerControl: true } : {}),
                       },
                     }),
                   ),
@@ -1747,6 +1785,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             const previousProviderOptions = readPersistedProviderOptions(
               persistedBinding.runtimePayload,
             );
+            const previousComputerControl = readPersistedComputerControl(
+              persistedBinding.runtimePayload,
+            );
             const previousCwd = readPersistedCwd(persistedBinding.runtimePayload);
             yield* previousAdapter.stopSession(threadId);
 
@@ -1773,6 +1814,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                         ...(previousProviderOptions !== undefined
                           ? { providerOptions: previousProviderOptions }
                           : {}),
+                        ...(previousComputerControl ? { enableComputerControl: true } : {}),
                         ...(persistedBinding.resumeCursor !== undefined
                           ? { resumeCursor: persistedBinding.resumeCursor }
                           : {}),
@@ -1789,6 +1831,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                           lifecycleGeneration: previousGeneration,
                           modelSelection: previousModelSelection,
                           providerOptions: previousProviderOptions,
+                          enableComputerControl: previousComputerControl,
                         }),
                       );
                       // The restored runtime stamps its events with the exact

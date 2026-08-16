@@ -53,6 +53,7 @@ import {
 import {
   acquireAgentGatewaySessionLease,
   cancelAgentGatewayTurn,
+  computerControlSessionLeaseOptions,
   releaseAgentGatewaySessionLeaseOnInterrupt,
   type AgentGatewaySessionLease,
   withAgentGatewayTurnCancellation,
@@ -327,6 +328,7 @@ const loadPiCodingAgentModule: () => Promise<PiCodingAgentModule> = lazyModule(
 interface PiSessionContext {
   harnessPolicyDelivered?: boolean;
   readonly gatewayControlAvailable: boolean;
+  readonly enableComputerControl: boolean;
   gatewaySessionLease?: AgentGatewaySessionLease;
   gatewayConnection?: AgentGatewayMcpConnection;
   readonly lifecycleGeneration?: string;
@@ -2024,6 +2026,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
               agentGatewayCredentials,
               context.session.threadId,
               PROVIDER,
+              computerControlSessionLeaseOptions(context.enableComputerControl),
             );
             if (replacementLease) {
               context.gatewaySessionLease = replacementLease;
@@ -2172,6 +2175,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
           agentGatewayCredentials,
           input.threadId,
           PROVIDER,
+          computerControlSessionLeaseOptions(input.enableComputerControl),
         );
         const agentGatewayConnection = agentGatewaySessionLease?.connection;
         const gatewayTools = agentGatewayConnection
@@ -2252,6 +2256,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
           ...(resumeCursor ? { resumeCursor } : {}),
         };
         const context: PiSessionContext = {
+          enableComputerControl: input.enableComputerControl === true,
           ...(input.lifecycleGeneration !== undefined
             ? { lifecycleGeneration: input.lifecycleGeneration }
             : {}),

@@ -46,6 +46,7 @@ import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewa
 import {
   acquireAgentGatewaySessionLease,
   cancelAgentGatewayTurn,
+  computerControlSessionLeaseOptions,
   type AgentGatewaySessionLease,
   withAgentGatewayTurnCancellation,
 } from "../../agentGateway/sessionLease.ts";
@@ -3561,7 +3562,12 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           // this exact Synara thread.
           const agentGatewaySessionLease = serverUrl
             ? undefined
-            : acquireAgentGatewaySessionLease(agentGatewayCredentials, input.threadId, provider);
+            : acquireAgentGatewaySessionLease(
+                agentGatewayCredentials,
+                input.threadId,
+                provider,
+                computerControlSessionLeaseOptions(input.enableComputerControl),
+              );
           const agentGatewayConnection = agentGatewaySessionLease?.connection;
           const poolIsolationKey = agentGatewayConnection ? randomUUID() : undefined;
 

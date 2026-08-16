@@ -60,6 +60,8 @@ export const ProviderSessionStartInput = Schema.Struct({
   approvalPolicy: Schema.optional(ProviderApprovalPolicy),
   sandboxMode: Schema.optional(ProviderSandboxMode),
   providerOptions: Schema.optional(ProviderStartOptions),
+  /** Explicit per-thread provisioning for the Linux computer MCP tools. */
+  enableComputerControl: Schema.optional(Schema.Boolean),
   runtimeMode: RuntimeMode,
 });
 export type ProviderSessionStartInput = typeof ProviderSessionStartInput.Type;

@@ -54,7 +54,10 @@ import {
   resolveAcpTurnIdleTimeoutMs,
 } from "../acp/AcpTurnIdleWatchdog.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
-import { acquireAgentGatewaySessionLease } from "../../agentGateway/sessionLease.ts";
+import {
+  acquireAgentGatewaySessionLease,
+  computerControlSessionLeaseOptions,
+} from "../../agentGateway/sessionLease.ts";
 import { filterProviderPromptImageAttachments } from "../promptAttachments.ts";
 import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import {
@@ -1746,8 +1749,13 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
               ? {
                   agentGatewayMcp: {
                     endpointUrl: () => agentGatewayCredentials.mcpEndpointUrl,
-                    acquireSessionLease: (threadId) =>
-                      acquireAgentGatewaySessionLease(agentGatewayCredentials, threadId, PROVIDER)!,
+                    acquireSessionLease: (threadId, options) =>
+                      acquireAgentGatewaySessionLease(
+                        agentGatewayCredentials,
+                        threadId,
+                        PROVIDER,
+                        options,
+                      )!,
                   },
                 }
               : {}),
@@ -1892,6 +1900,9 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
         );
       }
 
+      const agentGatewaySessionLeaseOptions = computerControlSessionLeaseOptions(
+        input.enableComputerControl,
+      );
       const managerInput: CodexAppServerStartSessionInput = {
         threadId: input.threadId,
         provider: "codex",
@@ -1904,6 +1915,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           ? { forkSourceResumeCursor: input.forkSourceResumeCursor }
           : {}),
         ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
+        ...(agentGatewaySessionLeaseOptions ? { agentGatewaySessionLeaseOptions } : {}),
         runtimeMode: input.runtimeMode,
         ...codexModelSelectionOverrides(input.modelSelection),
       };

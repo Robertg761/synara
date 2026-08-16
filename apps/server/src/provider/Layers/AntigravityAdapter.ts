@@ -34,6 +34,7 @@ import {
 import {
   acquireAgentGatewaySessionLease,
   cancelAgentGatewayTurn,
+  computerControlSessionLeaseOptions,
   type AgentGatewaySessionLease,
   withAgentGatewayTurnCancellation,
 } from "../../agentGateway/sessionLease.ts";
@@ -99,6 +100,7 @@ type StoredTurn = {
 
 type AntigravitySessionContext = {
   session: ProviderSession;
+  readonly enableComputerControl: boolean;
   gatewaySessionLease?: AgentGatewaySessionLease;
   harnessPolicyDelivered?: boolean;
   readonly lifecycleGeneration?: string;
@@ -1023,6 +1025,7 @@ const makeAntigravityAdapter = (dependencies: AntigravityAdapterDependencies = {
         };
         const context: AntigravitySessionContext = {
           session,
+          enableComputerControl: input.enableComputerControl === true,
           ...(input.lifecycleGeneration !== undefined
             ? { lifecycleGeneration: input.lifecycleGeneration }
             : {}),
@@ -1133,6 +1136,7 @@ const makeAntigravityAdapter = (dependencies: AntigravityAdapterDependencies = {
           agentGatewayCredentials,
           input.threadId,
           PROVIDER,
+          computerControlSessionLeaseOptions(context.enableComputerControl),
         );
         const gatewayBootstrapToken = gatewaySessionLease?.issueStdioBootstrapToken?.();
         if (gatewaySessionLease && !gatewayBootstrapToken) {

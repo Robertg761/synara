@@ -5,6 +5,17 @@ import type {
   AgentGatewayCredentialsShape,
   AgentGatewayMcpConnection,
 } from "./Services/AgentGatewayCredentials.ts";
+import type { AgentGatewayCapability } from "./Services/AgentGatewaySessionRegistry.ts";
+
+export interface AgentGatewaySessionLeaseOptions {
+  readonly additionalCapabilities?: readonly AgentGatewayCapability[];
+}
+
+export function computerControlSessionLeaseOptions(
+  enabled: boolean | undefined,
+): AgentGatewaySessionLeaseOptions | undefined {
+  return enabled ? { additionalCapabilities: ["computer:control"] } : undefined;
+}
 
 type AgentGatewaySessionLeaseCredentials = Pick<
   AgentGatewayCredentialsShape,
@@ -146,10 +157,14 @@ export function acquireAgentGatewaySessionLease(
   credentials: AgentGatewaySessionLeaseCredentials | undefined,
   threadId: ThreadId,
   provider: ProviderKind,
+  options?: AgentGatewaySessionLeaseOptions,
 ): AgentGatewaySessionLease | undefined {
   if (credentials === undefined) return undefined;
 
-  const connection = credentials.connectionForThread(threadId, provider);
+  const connection =
+    options === undefined
+      ? credentials.connectionForThread(threadId, provider)
+      : credentials.connectionForThread(threadId, provider, options);
   let released = false;
 
   return {
