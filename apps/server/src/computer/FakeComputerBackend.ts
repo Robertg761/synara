@@ -1,0 +1,434 @@
+import type {
+  ComputerAvailability,
+  ComputerId,
+  ComputerLaunchAppResult,
+  ComputerPoint,
+  ComputerScreenSize,
+  ComputerState,
+  ComputerUiNode,
+  ComputerWindow,
+} from "@synara/contracts";
+
+import {
+  ComputerBackendError,
+  type ComputerBackend,
+  type ComputerBackendActionResult,
+  type ComputerBackendEvent,
+  type ComputerBackendEventListener,
+  type ComputerFrameListener,
+  type ComputerResolvedTarget,
+  type ComputerStreamFrame,
+} from "./ComputerBackend.ts";
+
+const FAKE_SCREENSHOT_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+export interface FakeComputerCall {
+  readonly method: string;
+  readonly args: readonly unknown[];
+}
+
+export interface FakeComputerBackendOptions {
+  readonly computerId?: string;
+  readonly availability?: ComputerAvailability;
+  readonly screenSize?: ComputerScreenSize;
+  readonly windows?: readonly ComputerWindow[];
+  readonly root?: ComputerUiNode;
+  readonly now?: () => string;
+}
+
+export class FakeComputerBackend implements ComputerBackend {
+  readonly computerId: ComputerId;
+  readonly calls: FakeComputerCall[] = [];
+
+  private currentAvailability: ComputerAvailability;
+  private currentScreenSize: ComputerScreenSize;
+  private currentWindows: ComputerWindow[];
+  private currentRoot: ComputerUiNode;
+  private readonly now: () => string;
+  private readonly eventListeners = new Set<ComputerBackendEventListener>();
+  private frameListener: ComputerFrameListener | null = null;
+  private nextSequence = 1;
+  private failures = new Map<string, Error>();
+  private disposed = false;
+
+  constructor(options: FakeComputerBackendOptions = {}) {
+    this.computerId = (options.computerId ?? "desktop") as ComputerId;
+    this.currentAvailability = options.availability ?? {
+      kind: "available",
+      backend: "fake",
+    };
+    this.currentScreenSize = options.screenSize ?? { width: 1_920, height: 1_080, scale: 1 };
+    this.currentWindows = [...(options.windows ?? defaultWindows())];
+    this.currentRoot = options.root ?? defaultRoot(this.currentScreenSize, this.currentWindows);
+    this.now = options.now ?? (() => new Date().toISOString());
+  }
+
+  async availability(): Promise<ComputerAvailability> {
+    this.record("availability");
+    this.throwIfFailed("availability");
+    return this.currentAvailability;
+  }
+
+  async listWindows(): Promise<readonly ComputerWindow[]> {
+    this.record("listWindows");
+    this.throwIfFailed("listWindows");
+    return this.currentWindows.map((window) => ({ ...window, bounds: { ...window.bounds } }));
+  }
+
+  async getScreenSize(): Promise<ComputerScreenSize> {
+    this.record("getScreenSize");
+    this.throwIfFailed("getScreenSize");
+    return { ...this.currentScreenSize };
+  }
+
+  async getState(options: {
+    readonly includeScreenshot?: boolean;
+    readonly includeText?: boolean;
+  }): Promise<ComputerState> {
+    this.record("getState", options);
+    this.throwIfFailed("getState");
+    const screenshot = options.includeScreenshot
+      ? {
+          mimeType: "image/png" as const,
+          width: this.currentScreenSize.width,
+          height: this.currentScreenSize.height,
+          sizeBytes: Buffer.from(FAKE_SCREENSHOT_BASE64, "base64").byteLength,
+          bytesBase64: FAKE_SCREENSHOT_BASE64,
+          capturedAt: this.now(),
+        }
+      : undefined;
+    return {
+      computerId: this.computerId,
+      windows: await this.listWindows(),
+      screenSize: { ...this.currentScreenSize },
+      root: this.currentRoot,
+      ...(options.includeText ? { text: describeTree(this.currentRoot) } : {}),
+      ...(screenshot ? { screenshot } : {}),
+      capturedAt: this.now(),
+    } as ComputerState;
+  }
+
+  async launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult> {
+    this.record("launchApp", app, args);
+    this.throwIfFailed("launchApp");
+    const id = `fake-window-${this.currentWindows.length + 1}`;
+    const window: ComputerWindow = {
+      id,
+      title: app,
+      appName: app,
+      bounds: { x: 120, y: 80, width: 900, height: 700 },
+      focused: true,
+      minimized: false,
+      visible: true,
+    };
+    this.currentWindows = [
+      ...this.currentWindows.map((item) => ({ ...item, focused: false })),
+      window,
+    ];
+    this.currentRoot = defaultRoot(this.currentScreenSize, this.currentWindows);
+    this.emit({ type: "windows-changed", windows: this.currentWindows });
+    return { computerId: this.computerId, app, window } as ComputerLaunchAppResult;
+  }
+
+  async click(point: ComputerPoint): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction("click", point);
+  }
+
+  async doubleClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction("doubleClick", point);
+  }
+
+  async rightClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction("rightClick", point);
+  }
+
+  async moveCursor(point: ComputerPoint): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction("moveCursor", point);
+  }
+
+  async drag(
+    from: ComputerPoint,
+    to: ComputerPoint,
+    durationMs: number,
+  ): Promise<ComputerBackendActionResult> {
+    this.record("drag", from, to, durationMs);
+    this.throwIfFailed("drag");
+    this.validatePoint(from);
+    this.validatePoint(to);
+    return { point: to };
+  }
+
+  async scroll(
+    point: ComputerPoint | null,
+    deltaX: number,
+    deltaY: number,
+  ): Promise<ComputerBackendActionResult> {
+    this.record("scroll", point, deltaX, deltaY);
+    this.throwIfFailed("scroll");
+    if (point) this.validatePoint(point);
+    return point ? { point } : {};
+  }
+
+  async typeText(text: string): Promise<ComputerBackendActionResult> {
+    this.record("typeText", text);
+    this.throwIfFailed("typeText");
+    return { value: text };
+  }
+
+  async pressKey(key: string): Promise<ComputerBackendActionResult> {
+    this.record("pressKey", key);
+    this.throwIfFailed("pressKey");
+    return {};
+  }
+
+  async hotkey(keys: readonly string[]): Promise<ComputerBackendActionResult> {
+    this.record("hotkey", keys);
+    this.throwIfFailed("hotkey");
+    return {};
+  }
+
+  async setValue(
+    target: ComputerResolvedTarget,
+    value: string,
+  ): Promise<ComputerBackendActionResult> {
+    this.record("setValue", target, value);
+    this.throwIfFailed("setValue");
+    this.currentRoot = replaceNodeValue(this.currentRoot, target.node, value);
+    return { point: target.point, value };
+  }
+
+  async performAction(
+    target: ComputerResolvedTarget,
+    action: string,
+  ): Promise<ComputerBackendActionResult> {
+    this.record("performAction", target, action);
+    this.throwIfFailed("performAction");
+    return { point: target.point, value: action };
+  }
+
+  onEvent(listener: ComputerBackendEventListener): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
+  async attachStream(listener: ComputerFrameListener): Promise<void> {
+    this.record("attachStream");
+    this.throwIfFailed("attachStream");
+    this.frameListener = listener;
+    this.emitFrame(true, true);
+    this.emitFrame(true, false);
+  }
+
+  async detachStream(): Promise<void> {
+    this.record("detachStream");
+    this.throwIfFailed("detachStream");
+    this.frameListener = null;
+  }
+
+  async requestKeyframe(): Promise<void> {
+    this.record("requestKeyframe");
+    this.throwIfFailed("requestKeyframe");
+    if (this.frameListener) {
+      this.emitFrame(true, true);
+      this.emitFrame(true, false);
+    }
+  }
+
+  async dispose(): Promise<void> {
+    this.record("dispose");
+    this.disposed = true;
+    this.frameListener = null;
+    this.eventListeners.clear();
+  }
+
+  emitFrame(keyframe = false, codecConfig = false, data = Uint8Array.of(0x01)): void {
+    if (!this.frameListener || this.disposed) return;
+    const frame: ComputerStreamFrame = {
+      sequence: this.nextSequence++,
+      timestampMs: Date.now(),
+      keyframe,
+      codecConfig,
+      data,
+    };
+    this.frameListener(frame);
+  }
+
+  emitWindowsChanged(windows: readonly ComputerWindow[]): void {
+    this.currentWindows = [...windows];
+    this.emit({ type: "windows-changed", windows: this.currentWindows });
+  }
+
+  setAvailability(availability: ComputerAvailability): void {
+    this.currentAvailability = availability;
+  }
+
+  setScreenSize(screenSize: ComputerScreenSize): void {
+    this.currentScreenSize = screenSize;
+  }
+
+  failNext(method: string, error: Error = new ComputerBackendError(`${method} failed`)): void {
+    this.failures.set(method, error);
+  }
+
+  callsFor(method: string): readonly FakeComputerCall[] {
+    return this.calls.filter((call) => call.method === method);
+  }
+
+  private async pointerAction(
+    method: "click" | "doubleClick" | "rightClick" | "moveCursor",
+    point: ComputerPoint,
+  ): Promise<ComputerBackendActionResult> {
+    this.record(method, point);
+    this.throwIfFailed(method);
+    this.validatePoint(point);
+    return { point };
+  }
+
+  private validatePoint(point: ComputerPoint): void {
+    if (
+      point.x < 0 ||
+      point.y < 0 ||
+      point.x >= this.currentScreenSize.width ||
+      point.y >= this.currentScreenSize.height
+    ) {
+      throw new ComputerBackendError(`Point (${point.x}, ${point.y}) is outside the fake screen`);
+    }
+  }
+
+  private record(method: string, ...args: readonly unknown[]): void {
+    this.calls.push({ method, args });
+  }
+
+  private throwIfFailed(method: string): void {
+    const error = this.failures.get(method);
+    if (!error) return;
+    this.failures.delete(method);
+    throw error;
+  }
+
+  private emit(event: ComputerBackendEvent): void {
+    for (const listener of this.eventListeners) {
+      try {
+        listener(event);
+      } catch {
+        // One observer cannot prevent the backend's remaining observers.
+      }
+    }
+  }
+}
+
+function defaultWindows(): ComputerWindow[] {
+  return [
+    {
+      id: "fake-terminal",
+      title: "Terminal",
+      appName: "org.kde.konsole",
+      bounds: { x: 40, y: 40, width: 960, height: 720 },
+      focused: true,
+      minimized: false,
+      visible: true,
+    },
+    {
+      id: "fake-calculator",
+      title: "Calculator",
+      appName: "org.kde.kcalc",
+      bounds: { x: 1_050, y: 120, width: 420, height: 620 },
+      focused: false,
+      minimized: false,
+      visible: true,
+    },
+  ];
+}
+
+function defaultRoot(
+  screenSize: ComputerScreenSize,
+  windows: readonly ComputerWindow[],
+): ComputerUiNode {
+  const calculator = windows.find((window) => window.id === "fake-calculator") ?? windows[0];
+  const windowId = calculator?.id ?? null;
+  return {
+    role: "desktop",
+    label: null,
+    value: null,
+    description: "Fake desktop",
+    frame: { x: 0, y: 0, width: screenSize.width, height: screenSize.height },
+    activationPoint: null,
+    onScreen: true,
+    windowId: null,
+    children: [
+      {
+        role: "window",
+        label: calculator?.title ?? "Calculator",
+        value: null,
+        description: null,
+        frame: calculator?.bounds ?? { x: 20, y: 20, width: 400, height: 400 },
+        activationPoint: null,
+        onScreen: true,
+        windowId,
+        children: [
+          {
+            role: "button",
+            label: "Calculate",
+            value: null,
+            description: "Calculate",
+            frame: {
+              x: (calculator?.bounds.x ?? 20) + 40,
+              y: (calculator?.bounds.y ?? 20) + 80,
+              width: 180,
+              height: 56,
+            },
+            activationPoint: null,
+            onScreen: true,
+            windowId,
+            children: [],
+          },
+          {
+            role: "text-field",
+            label: "Display",
+            value: "0",
+            description: "Calculator display",
+            frame: {
+              x: (calculator?.bounds.x ?? 20) + 40,
+              y: (calculator?.bounds.y ?? 20) + 20,
+              width: 280,
+              height: 48,
+            },
+            activationPoint: {
+              x: (calculator?.bounds.x ?? 20) + 180,
+              y: (calculator?.bounds.y ?? 20) + 44,
+            },
+            onScreen: true,
+            windowId,
+            children: [],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function describeTree(root: ComputerUiNode): string {
+  const lines: string[] = [];
+  const visit = (node: ComputerUiNode, depth: number) => {
+    const label = node.label ?? node.description ?? "(unlabelled)";
+    lines.push(
+      `${"  ".repeat(depth)}${node.role}: ${label}${node.value ? ` = ${node.value}` : ""}`,
+    );
+    for (const child of node.children) visit(child, depth + 1);
+  };
+  visit(root, 0);
+  return lines.join("\n");
+}
+
+function replaceNodeValue(
+  root: ComputerUiNode,
+  target: ComputerUiNode,
+  value: string,
+): ComputerUiNode {
+  return {
+    ...root,
+    value: root === target ? value : root.value,
+    children: root.children.map((child) => replaceNodeValue(child, target, value)),
+  };
+}

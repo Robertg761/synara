@@ -1,0 +1,160 @@
+import type {
+  ComputerPoint,
+  ComputerRect,
+  ComputerScreenSize,
+  ComputerUiNode,
+  ComputerWindow,
+  ComputerWindowId,
+} from "@synara/contracts";
+
+/** The small, serializable subset returned by the AT-SPI helper. */
+export interface AtspiRawNode {
+  readonly role: string;
+  readonly label: string | null;
+  readonly value: string | null;
+  readonly description: string | null;
+  /** AT-SPI reports these extents in the client coordinate space on Wayland. */
+  readonly frame: ComputerRect;
+  readonly activationPoint?: ComputerPoint | null;
+  readonly children: readonly AtspiRawNode[];
+}
+
+export interface AtspiClientSize {
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface AtspiWindowTree {
+  readonly windowId: ComputerWindowId;
+  readonly clientSize: AtspiClientSize;
+  readonly root: AtspiRawNode;
+}
+
+export interface DecorationOffset {
+  readonly x: number;
+  readonly y: number;
+}
+
+/**
+ * Derive the frame-to-client decoration offset used by the Phase 0 probe.
+ *
+ * Plasma's Wayland AT-SPI implementation reports widget extents relative to
+ * the client surface. The observed frame has equal four-pixel side/bottom
+ * borders and a 34-pixel title bar, so the horizontal difference is split
+ * across both sides and the remaining vertical difference is the title bar.
+ */
+export function decorationOffsetForClientSize(
+  frame: Pick<ComputerRect, "width" | "height">,
+  client: AtspiClientSize,
+): DecorationOffset {
+  const horizontalDifference = Math.max(0, frame.width - client.width);
+  const verticalDifference = Math.max(0, frame.height - client.height);
+  const sideBorder = horizontalDifference / 2;
+  return {
+    x: sideBorder,
+    y: Math.max(0, verticalDifference - sideBorder),
+  };
+}
+
+/**
+ * Fuse one helper tree with the frame bounds supplied by the KWin plugin.
+ * Every descendant receives the owning window id so semantic targeting can
+ * constrain matches without guessing which application owns a control.
+ */
+export function fuseAtspiWindowTree(input: {
+  readonly window: Pick<ComputerWindow, "id" | "bounds">;
+  readonly tree: AtspiWindowTree;
+  readonly screenSize?: ComputerScreenSize;
+}): ComputerUiNode {
+  const offset = decorationOffsetForClientSize(input.window.bounds, input.tree.clientSize);
+  return fuseNode(input.tree.root, {
+    windowId: input.window.id,
+    origin: {
+      x: input.window.bounds.x + offset.x,
+      y: input.window.bounds.y + offset.y,
+    },
+    ...(input.screenSize ? { screenSize: input.screenSize } : {}),
+  });
+}
+
+/** Combine multiple fused window trees into the root consumed by uiTreeTargeting. */
+export function fuseAtspiTrees(input: {
+  readonly windows: readonly ComputerWindow[];
+  readonly trees: readonly AtspiWindowTree[];
+  readonly screenSize: ComputerScreenSize;
+}): ComputerUiNode {
+  const windowsById = new Map(input.windows.map((window) => [window.id, window]));
+  const children: ComputerUiNode[] = [];
+  for (const tree of input.trees) {
+    const window = windowsById.get(tree.windowId);
+    if (!window || !window.visible || window.minimized) continue;
+    children.push(fuseAtspiWindowTree({ window, tree, screenSize: input.screenSize }));
+  }
+  return {
+    role: "desktop",
+    label: null,
+    value: null,
+    description: "AT-SPI desktop",
+    frame: { x: 0, y: 0, width: input.screenSize.width, height: input.screenSize.height },
+    activationPoint: null,
+    onScreen: true,
+    windowId: null,
+    children,
+  };
+}
+
+export function describeComputerUiTree(root: ComputerUiNode): string {
+  const lines: string[] = [];
+  const visit = (node: ComputerUiNode, depth: number): void => {
+    const label = node.label ?? node.description ?? "(unlabelled)";
+    lines.push(
+      `${"  ".repeat(depth)}${node.role}: ${label}${node.value ? ` = ${node.value}` : ""}`,
+    );
+    for (const child of node.children) visit(child, depth + 1);
+  };
+  visit(root, 0);
+  return lines.join("\n");
+}
+
+function fuseNode(
+  node: AtspiRawNode,
+  input: {
+    readonly windowId: ComputerWindowId;
+    readonly origin: ComputerPoint;
+    readonly screenSize?: ComputerScreenSize;
+  },
+): ComputerUiNode {
+  const frame = {
+    x: input.origin.x + node.frame.x,
+    y: input.origin.y + node.frame.y,
+    width: node.frame.width,
+    height: node.frame.height,
+  } satisfies ComputerRect;
+  const activationPoint = node.activationPoint
+    ? {
+        x: input.origin.x + node.activationPoint.x,
+        y: input.origin.y + node.activationPoint.y,
+      }
+    : null;
+  return {
+    role: node.role,
+    label: node.label,
+    value: node.value,
+    description: node.description,
+    frame,
+    activationPoint,
+    onScreen: isOnScreen(frame, input.screenSize),
+    windowId: input.windowId,
+    children: node.children.map((child) => fuseNode(child, input)),
+  };
+}
+
+function isOnScreen(frame: ComputerRect, screenSize: ComputerScreenSize | undefined): boolean {
+  if (!screenSize) return true;
+  return (
+    frame.x < screenSize.width &&
+    frame.y < screenSize.height &&
+    frame.x + frame.width > 0 &&
+    frame.y + frame.height > 0
+  );
+}
