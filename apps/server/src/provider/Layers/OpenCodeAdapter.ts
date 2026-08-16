@@ -365,7 +365,7 @@ function toToolLifecycleItemType(toolName: string): ToolLifecycleItemType {
 
 function mapPermissionToRequestType(
   permission: string,
-): "command_execution_approval" | "file_read_approval" | "file_change_approval" | "unknown" {
+): "command_execution_approval" | "file_read_approval" | "file_change_approval" | "tool_approval" {
   switch (permission) {
     case "bash":
       return "command_execution_approval";
@@ -374,7 +374,10 @@ function mapPermissionToRequestType(
     case "edit":
       return "file_change_approval";
     default:
-      return "unknown";
+      // Every other permission (MCP servers, provider-specific tools) is still an
+      // approval the user must answer. "unknown" has no request kind, so the card
+      // never renders and the turn hangs — classify it as a generic tool approval.
+      return "tool_approval";
   }
 }
 
