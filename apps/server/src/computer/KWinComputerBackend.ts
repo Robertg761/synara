@@ -40,8 +40,8 @@ import {
 import {
   EVDEV_BUTTON_CODES,
   EVDEV_KEY_CODES,
-  easedPoints,
   keyStrokeForKey,
+  pointerGlideSteps,
   qwertyTextKeyStrokes,
   type QwertyKeyStroke,
 } from "./kwinInput.ts";
@@ -325,12 +325,7 @@ export class KWinComputerBackend implements ComputerBackend {
   async moveCursor(point: ComputerPoint): Promise<ComputerBackendActionResult> {
     const plugin = await this.ensurePlugin();
     const from = this.currentPoint ?? (await this.readPluginState(plugin)).position ?? point;
-    for (const next of easedPoints(from, point, this.glideDurationMs)) {
-      this.throwIfDisposed();
-      await this.pluginSuccess("movePointer", () => plugin.movePointer(next.x, next.y));
-      this.currentPoint = next;
-      if (next.x !== point.x || next.y !== point.y) await this.sleep(8);
-    }
+    await this.glidePointer(plugin, from, point, this.glideDurationMs);
     this.currentPoint = point;
     return await this.pointerResult(plugin, point);
   }
@@ -345,13 +340,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.throwIfDisposed();
     await this.pluginSuccess("button", () => plugin.button(EVDEV_BUTTON_CODES.left, true));
     try {
-      const points = easedPoints(from, to, Math.max(0, durationMs), 2);
-      for (const point of points) {
-        this.throwIfDisposed();
-        await this.pluginSuccess("movePointer", () => plugin.movePointer(point.x, point.y));
-        this.currentPoint = point;
-        if (point.x !== to.x || point.y !== to.y) await this.sleep(8);
-      }
+      await this.glidePointer(plugin, from, to, durationMs);
     } finally {
       if (!this.disposed) {
         await this.pluginSuccess("button release", () =>
@@ -751,6 +740,29 @@ export class KWinComputerBackend implements ComputerBackend {
       asString(parsed.targetWindowId) ?? asString(parsed.focusedWindowId) ?? null;
     if (position) this.currentPoint = position;
     return { position, targetWindowId };
+  }
+
+  /**
+   * Walks an eased path against a wall-clock deadline instead of a fixed sleep
+   * per step, so a glide or drag lands at roughly the duration the caller asked
+   * for. Each step sleeps only the remainder up to its deadline, which means a
+   * slow D-Bus round trip eats into that step's sleep budget rather than adding
+   * to the total, and a duration of `0` sleeps not at all.
+   */
+  private async glidePointer(
+    plugin: KWinComputerPluginApi,
+    from: ComputerPoint,
+    to: ComputerPoint,
+    durationMs: number,
+  ): Promise<void> {
+    const startedAt = this.now();
+    for (const step of pointerGlideSteps(from, to, durationMs)) {
+      this.throwIfDisposed();
+      await this.pluginSuccess("movePointer", () => plugin.movePointer(step.point.x, step.point.y));
+      this.currentPoint = step.point;
+      const remainingMs = startedAt + step.offsetMs - this.now();
+      if (remainingMs > 0) await this.sleep(remainingMs);
+    }
   }
 
   /**

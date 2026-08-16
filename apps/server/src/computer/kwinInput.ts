@@ -266,22 +266,53 @@ export function keyStrokeForKey(key: string): QwertyKeyStroke {
   throw new UnsupportedQwertyKeyError(key);
 }
 
-export function easedPoints(
+/** One sample of an eased pointer path: where to move, and when it is due. */
+export interface PointerGlideStep {
+  readonly point: ComputerPoint;
+  /** Wall-clock offset from the start of the glide at which this sample is due. */
+  readonly offsetMs: number;
+}
+
+/** Longest gap between pointer samples. ~62 Hz reads as continuous motion. */
+export const GLIDE_FRAME_INTERVAL_MS = 16;
+/** Longest jump between samples, so a fast glide over a long path stays smooth. */
+const GLIDE_MAX_STEP_PX = 80;
+
+/**
+ * Samples a smoothstep-eased path from `from` to `to` with a wall-clock
+ * schedule attached.
+ *
+ * `offsetMs` is a deadline measured from the start of the glide, not a sleep
+ * length. A caller sleeps only the remainder up to the deadline, so transport
+ * latency is absorbed by the sleep budget instead of being added on top of it
+ * and the glide lands at roughly `durationMs`. The final sample is due at
+ * exactly `durationMs`; `durationMs === 0` makes every sample due immediately,
+ * which degenerates to moving as fast as the transport allows.
+ */
+export function pointerGlideSteps(
   from: ComputerPoint,
   to: ComputerPoint,
   durationMs: number,
   minimumSteps = 2,
-): readonly ComputerPoint[] {
+): readonly PointerGlideStep[] {
+  const duration = Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0;
   const distance = Math.hypot(to.x - from.x, to.y - from.y);
-  const steps = Math.max(minimumSteps, Math.ceil(distance / 80), Math.ceil(durationMs / 40));
-  const points: ComputerPoint[] = [];
+  const steps = Math.max(
+    minimumSteps,
+    Math.ceil(distance / GLIDE_MAX_STEP_PX),
+    Math.ceil(duration / GLIDE_FRAME_INTERVAL_MS),
+  );
+  const path: PointerGlideStep[] = [];
   for (let index = 1; index <= steps; index += 1) {
     const linear = index / steps;
     const eased = linear * linear * (3 - 2 * linear);
-    points.push({
-      x: from.x + (to.x - from.x) * eased,
-      y: from.y + (to.y - from.y) * eased,
+    path.push({
+      point: {
+        x: from.x + (to.x - from.x) * eased,
+        y: from.y + (to.y - from.y) * eased,
+      },
+      offsetMs: (duration * index) / steps,
     });
   }
-  return points;
+  return path;
 }

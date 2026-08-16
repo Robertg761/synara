@@ -12,6 +12,7 @@ import {
 } from "./KWinComputerBackend.ts";
 import type { AtspiTreeReader } from "./atspiClient.ts";
 import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
+import { GLIDE_FRAME_INTERVAL_MS } from "./kwinInput.ts";
 
 const PNG_1X1 = Uint8Array.from(
   Buffer.from(
@@ -196,6 +197,64 @@ function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value
     resolve = complete;
   });
   return { promise, resolve };
+}
+
+interface FakeClock {
+  readonly now: () => number;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly advance: (milliseconds: number) => void;
+  readonly sleeps: number[];
+}
+
+/** Virtual clock: an injected sleep is the only thing that passes time for free. */
+function fakeClock(): FakeClock {
+  let nowMs = 0;
+  const sleeps: number[] = [];
+  return {
+    now: () => nowMs,
+    sleep: async (milliseconds) => {
+      sleeps.push(milliseconds);
+      nowMs += milliseconds;
+    },
+    advance: (milliseconds) => {
+      nowMs += milliseconds;
+    },
+    sleeps,
+  };
+}
+
+interface PointerTimelineEntry {
+  readonly method: "movePointer" | "press" | "release";
+  readonly at: number;
+}
+
+/**
+ * Makes every pointer D-Bus call cost `callMs` of virtual time so a test can
+ * tell duration-derived pacing (latency comes out of the sleep budget) from the
+ * old fixed per-step sleep (latency was added on top).
+ */
+function instrumentPointer(
+  plugin: FakePlugin,
+  clock: FakeClock,
+  callMs: number,
+): PointerTimelineEntry[] {
+  const timeline: PointerTimelineEntry[] = [];
+  const movePointer = plugin.movePointer;
+  plugin.movePointer = async (x, y) => {
+    timeline.push({ method: "movePointer", at: clock.now() });
+    clock.advance(callMs);
+    return movePointer(x, y);
+  };
+  const button = plugin.button;
+  plugin.button = async (code, pressed) => {
+    timeline.push({ method: pressed ? "press" : "release", at: clock.now() });
+    return button(code, pressed);
+  };
+  return timeline;
+}
+
+function total(values: readonly number[]): number {
+  return values.reduce((sum, value) => sum + value, 0);
 }
 
 function dbusError(type: string, message: string): Error {
@@ -590,6 +649,83 @@ describe("KWinComputerBackend", () => {
     await expect(backend.scroll({ x: 30, y: 30 }, 1, 1)).resolves.toEqual({
       point: { x: 30, y: 30 },
     });
+    await backend.dispose();
+  });
+
+  it("spends the requested duration on a drag instead of a fixed sleep per step", async () => {
+    const dbus = new FakeDbus();
+    const clock = fakeClock();
+    const callMs = 5;
+    const timeline = instrumentPointer(dbus.plugin, clock, callMs);
+    const backend = makeBackend(dbus, {
+      now: clock.now,
+      sleep: clock.sleep,
+      // The lead-in move to the drag origin must not contribute any sleeps.
+      glideDurationMs: 0,
+    });
+    await backend.availability();
+
+    await backend.drag({ x: 0, y: 0 }, { x: 200, y: 0 }, 480);
+
+    const pressedAt = timeline.find((entry) => entry.method === "press")?.at;
+    const releasedAt = timeline.find((entry) => entry.method === "release")?.at;
+    expect(pressedAt).toBeDefined();
+    expect(releasedAt! - pressedAt!).toBeCloseTo(480, 6);
+
+    const dragMoves = timeline.filter(
+      (entry) => entry.method === "movePointer" && entry.at >= pressedAt!,
+    );
+    // D-Bus latency comes out of the sleep budget rather than adding to it.
+    expect(total(clock.sleeps)).toBeCloseTo(480 - dragMoves.length * callMs, 6);
+    expect(Math.max(...clock.sleeps)).toBeLessThanOrEqual(GLIDE_FRAME_INTERVAL_MS);
+    await backend.dispose();
+  });
+
+  it("issues no sleeps for a zero-duration drag", async () => {
+    const dbus = new FakeDbus();
+    const clock = fakeClock();
+    instrumentPointer(dbus.plugin, clock, 5);
+    const backend = makeBackend(dbus, {
+      now: clock.now,
+      sleep: clock.sleep,
+      glideDurationMs: 0,
+    });
+    await backend.availability();
+
+    await backend.drag({ x: 0, y: 0 }, { x: 200, y: 0 }, 0);
+
+    expect(clock.sleeps).toEqual([]);
+    await backend.dispose();
+  });
+
+  it("spends the glide duration on a cursor move", async () => {
+    const dbus = new FakeDbus();
+    const clock = fakeClock();
+    const callMs = 4;
+    const timeline = instrumentPointer(dbus.plugin, clock, callMs);
+    const backend = makeBackend(dbus, { now: clock.now, sleep: clock.sleep, glideDurationMs: 240 });
+    await backend.availability();
+
+    const startedAt = clock.now();
+    await backend.moveCursor({ x: 400, y: 0 });
+
+    expect(clock.now() - startedAt).toBeCloseTo(240, 6);
+    expect(total(clock.sleeps)).toBeCloseTo(240 - timeline.length * callMs, 6);
+    await backend.dispose();
+  });
+
+  it("stops sleeping when pointer calls are slower than the frame budget", async () => {
+    const dbus = new FakeDbus();
+    const clock = fakeClock();
+    instrumentPointer(dbus.plugin, clock, 40);
+    const backend = makeBackend(dbus, { now: clock.now, sleep: clock.sleep, glideDurationMs: 240 });
+    await backend.availability();
+
+    await backend.moveCursor({ x: 400, y: 0 });
+
+    // Every deadline is already in the past, so pacing must not pile extra
+    // waiting on top of a glide that is already over budget.
+    expect(clock.sleeps).toEqual([]);
     await backend.dispose();
   });
 
