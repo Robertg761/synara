@@ -293,6 +293,7 @@ import {
   type WorktreeSetupResolutionAction,
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
+import { useThreadComputerStateSeed } from "../hooks/useThreadComputerStateSeed";
 import { useThreadWorkspaceHandoff } from "../hooks/useThreadWorkspaceHandoff";
 import {
   buildSearchableModelOptions,
@@ -377,6 +378,7 @@ import {
   useComposerThreadDraft,
   useEffectiveComposerModelState,
 } from "../composerDraftStore";
+import { selectThreadComputerState, useComputerStateStore } from "../computerStateStore";
 import { useTemporaryThreadStore } from "../temporaryThreadStore";
 import { useComposerFocusRequestStore } from "../composerFocusRequestStore";
 import { useWorkflowRunUiStore, useWorkflowRunUiThreadState } from "../workflowRunUiStore";
@@ -1256,6 +1258,19 @@ export default function ChatView({
   const composerPastedTexts = composerDraft.pastedTexts;
   const composerSkills = composerDraft.skills;
   const composerMentions = composerDraft.mentions;
+  const enableComputerControl = composerDraft.enableComputerControl === true;
+  // The computer-control toggle needs availability before the Computer pane has
+  // ever been opened, so the composer seeds the snapshot itself.
+  useThreadComputerStateSeed(threadId);
+  const computerThreadState = useComputerStateStore(selectThreadComputerState(threadId));
+  const computerControlAvailable = computerThreadState?.availability.kind === "available";
+  const computerControlDisabledReason = computerThreadState
+    ? computerThreadState.availability.kind === "unsupported-platform"
+      ? `Computer control needs Wayland, KWin, and the Synara plugin on Linux. This server is ${computerThreadState.availability.platform}.`
+      : computerThreadState.availability.kind === "backend-unavailable"
+        ? computerThreadState.availability.message
+        : undefined
+    : "Checking computer availability.";
   const queuedComposerTurns = composerDraft.queuedTurns;
   const restoredSourceProposedPlan = composerDraft.restoredSourceProposedPlan;
   const composerSendState = useMemo(
@@ -1295,6 +1310,9 @@ export default function ChatView({
     (store) => store.setProviderModelOptions,
   );
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
+  const setComposerDraftComputerControl = useComposerDraftStore(
+    (store) => store.setEnableComputerControl,
+  );
   const setComposerDraftInteractionMode = useComposerDraftStore(
     (store) => store.setInteractionMode,
   );
@@ -5024,6 +5042,13 @@ export default function ChatView({
     },
     [persistRuntimeModeChange],
   );
+  const handleComputerControlChange = useCallback(
+    (enabled: boolean) => {
+      setComposerDraftComputerControl(threadId, enabled);
+      scheduleComposerFocus();
+    },
+    [scheduleComposerFocus, setComposerDraftComputerControl, threadId],
+  );
 
   useEffect(() => {
     if (
@@ -7231,6 +7256,7 @@ export default function ChatView({
       setComposerDraftModelSelection(activeThread.id, queuedTurn.modelSelection);
       setComposerDraftRuntimeMode(activeThread.id, queuedTurn.runtimeMode);
       setComposerDraftInteractionMode(activeThread.id, queuedTurn.interactionMode);
+      setComposerDraftComputerControl(activeThread.id, queuedTurn.enableComputerControl === true);
       setComposerCursor(collapseExpandedComposerCursor(nextPrompt, nextPrompt.length));
       setComposerTrigger(detectComposerTrigger(nextPrompt, nextPrompt.length));
       scheduleComposerFocus();
@@ -7248,6 +7274,7 @@ export default function ChatView({
       scheduleComposerFocus,
       setDraftThreadContext,
       setRestoredQueuedSourceProposedPlan,
+      setComposerDraftComputerControl,
       setComposerDraftInteractionMode,
       setComposerDraftModelSelection,
       setComposerDraftPrompt,
@@ -7383,6 +7410,8 @@ export default function ChatView({
     const selectedModelSelectionForSend = queuedChatTurn?.modelSelection ?? selectedModelSelection;
     const providerOptionsForDispatchForSend =
       queuedChatTurn?.providerOptionsForDispatch ?? providerOptionsForDispatch;
+    const enableComputerControlForSend =
+      queuedChatTurn?.enableComputerControl ?? enableComputerControl;
     const runtimeModeForSend = queuedChatTurn?.runtimeMode ?? runtimeMode;
     let interactionModeForSend = queuedChatTurn?.interactionMode ?? interactionMode;
     const envModeForSend = queuedChatTurn?.envMode ?? envMode;
@@ -7452,6 +7481,7 @@ export default function ChatView({
             selectedPromptEffort,
             modelSelection: selectedModelSelection,
             ...(providerOptionsForDispatch ? { providerOptionsForDispatch } : {}),
+            enableComputerControl,
             runtimeMode,
           });
           return true;
@@ -7788,6 +7818,7 @@ export default function ChatView({
         ...(providerOptionsForDispatchForSend
           ? { providerOptionsForDispatch: providerOptionsForDispatchForSend }
           : {}),
+        enableComputerControl: enableComputerControlForSend,
         ...(sourceProposedPlanForSend ? { sourceProposedPlan: sourceProposedPlanForSend } : {}),
         runtimeMode: runtimeModeForSend,
         interactionMode: interactionModeForSend,
@@ -8528,6 +8559,7 @@ export default function ChatView({
           ...(providerOptionsForDispatchForSend
             ? { providerOptions: providerOptionsForDispatchForSend }
             : {}),
+          enableComputerControl: enableComputerControlForSend,
           assistantDeliveryMode,
           dispatchMode,
           runtimeMode: nextRuntimeModeForSend,
@@ -9049,6 +9081,8 @@ export default function ChatView({
 
       const providerOptionsForPlanDispatch =
         queuedTurn?.providerOptionsForDispatch ?? providerOptionsForDispatch;
+      const enableComputerControlForPlanDispatch =
+        queuedTurn?.enableComputerControl ?? enableComputerControl;
       const modelSelectionForPlanDispatch = queuedTurn?.modelSelection ?? selectedModelSelection;
       const sourceProposedPlan =
         nextInteractionMode === "default"
@@ -9078,6 +9112,7 @@ export default function ChatView({
               providerOptions: providerOptionsForPlanDispatch,
             }
           : {}),
+        enableComputerControl: enableComputerControlForPlanDispatch,
         assistantDeliveryMode,
         dispatchMode,
         runtimeMode: queuedTurn?.runtimeMode ?? runtimeMode,
@@ -9191,6 +9226,7 @@ export default function ChatView({
           text: outgoingMessageText,
           modelSelection: selectedModelSelection,
           ...(providerOptionsForDispatch ? { providerOptions: providerOptionsForDispatch } : {}),
+          enableComputerControl,
           assistantDeliveryMode,
           runtimeMode,
           interactionMode,
@@ -9277,6 +9313,7 @@ export default function ChatView({
       selectedPromptEffort,
       modelSelection: selectedModelSelection,
       ...(providerOptionsForDispatch ? { providerOptionsForDispatch } : {}),
+      enableComputerControl,
       runtimeMode,
       interactionMode,
       envMode,
@@ -9492,6 +9529,7 @@ export default function ChatView({
           },
           modelSelection: selectedModelSelection,
           ...(providerOptionsForDispatch ? { providerOptions: providerOptionsForDispatch } : {}),
+          enableComputerControl,
           assistantDeliveryMode,
           dispatchMode: "queue",
           runtimeMode,
@@ -11063,6 +11101,10 @@ export default function ChatView({
     providerStatus: activeProviderStatus,
     runtimeMode,
     onRuntimeModeChange: handleRuntimeModeChange,
+    computerControlEnabled: enableComputerControl,
+    computerControlAvailable,
+    computerControlDisabledReason,
+    onComputerControlChange: handleComputerControlChange,
     contextWindow: runtimeUsageContextWindow,
     cumulativeCostUsd: activeCumulativeCostUsd,
     activeContextWindowLabel: contextWindowSelectionStatus.activeLabel,
