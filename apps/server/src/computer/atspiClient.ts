@@ -11,14 +11,32 @@ import {
 import type { ComputerWindow } from "@synara/contracts";
 import type { AtspiWindowTree } from "./atspiTreeTargeting.ts";
 
-const HELPER_METHOD = "read-tree";
+const HELPER_READ_TREE_METHOD = "read-tree";
+const HELPER_SET_TEXT_METHOD = "set-text";
 const HELPER_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const HELPER_REQUEST_TIMEOUT_MS = 10_000;
 const HELPER_RECONNECT_BASE_DELAY_MS = 250;
 const HELPER_RECONNECT_MAX_DELAY_MS = 5_000;
 
+/**
+ * A semantic text write addressed the same way the tree was read: the window
+ * descriptor the helper matched, plus the child-index path it emitted. The
+ * helper re-resolves both on every call, so nothing depends on the process that
+ * produced the tree still being alive.
+ */
+export interface AtspiTextWrite {
+  readonly window: ComputerWindow;
+  readonly path: readonly number[];
+  readonly text: string;
+  /** Checked against the live node so tree drift cannot redirect the write. */
+  readonly role?: string;
+  readonly label?: string | null;
+}
+
 export interface AtspiTreeReader {
   readonly readTrees: (windows: readonly ComputerWindow[]) => Promise<readonly AtspiWindowTree[]>;
+  /** Resolves `false` when the helper refused the write; rejects when it failed. */
+  readonly setText: (write: AtspiTextWrite) => Promise<boolean>;
   readonly dispose: () => Promise<void>;
 }
 
@@ -53,19 +71,24 @@ export class AtspiHelperClient implements AtspiTreeReader {
 
   async readTrees(windows: readonly ComputerWindow[]): Promise<readonly AtspiWindowTree[]> {
     if (windows.length === 0) return [];
-    const result = await this.request(HELPER_METHOD, {
-      windows: windows.map((window) => ({
-        id: window.id,
-        title: window.title,
-        appName: window.appName ?? null,
-        pid: window.pid ?? null,
-        bounds: window.bounds,
-      })),
+    const result = await this.request(HELPER_READ_TREE_METHOD, {
+      windows: windows.map(helperWindow),
     });
     if (!isRecord(result) || !Array.isArray(result.trees)) {
       throw new Error("AT-SPI helper returned no tree list.");
     }
     return result.trees.filter(isAtspiWindowTree);
+  }
+
+  async setText(write: AtspiTextWrite): Promise<boolean> {
+    const result = await this.request(HELPER_SET_TEXT_METHOD, {
+      window: helperWindow(write.window),
+      path: [...write.path],
+      text: write.text,
+      ...(write.role ? { role: write.role } : {}),
+      ...(write.label ? { label: write.label } : {}),
+    });
+    return isRecord(result) && result.ok === true;
   }
 
   async dispose(): Promise<void> {
@@ -212,6 +235,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** The window descriptor the helper matches against the live AT-SPI desktop. */
+function helperWindow(window: ComputerWindow): Record<string, unknown> {
+  return {
+    id: window.id,
+    title: window.title,
+    appName: window.appName ?? null,
+    pid: window.pid ?? null,
+    bounds: window.bounds,
+  };
+}
+
 function parseJson(line: string): unknown {
   try {
     return JSON.parse(line);
@@ -247,8 +281,19 @@ function isAtspiNode(value: unknown): boolean {
     (value.value === null || typeof value.value === "string") &&
     (value.description === null || typeof value.description === "string") &&
     isRect(value.frame) &&
+    isNodePath(value.path) &&
+    (value.editable === undefined || typeof value.editable === "boolean") &&
     Array.isArray(value.children) &&
     value.children.every(isAtspiNode)
+  );
+}
+
+/** A helper build without semantic addressing simply omits the path. */
+function isNodePath(value: unknown): boolean {
+  if (value === undefined) return true;
+  return (
+    Array.isArray(value) &&
+    value.every((index) => typeof index === "number" && Number.isInteger(index) && index >= 0)
   );
 }
 

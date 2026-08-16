@@ -54,4 +54,96 @@ describe("AtspiHelperClient", () => {
       vi.useRealTimers();
     }
   });
+
+  it("addresses a semantic write by window descriptor and child-index path", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const child = scriptedHelper(requests, () => ({ ok: true }));
+    const client = new AtspiHelperClient({
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+
+    await expect(
+      client.setText({
+        window: WINDOW,
+        path: [2, 0],
+        text: "héllo",
+        role: "entry",
+        label: "Name",
+      }),
+    ).resolves.toBe(true);
+    expect(requests).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "set-text",
+        params: {
+          window: {
+            id: "window-1",
+            title: "Terminal",
+            appName: null,
+            pid: null,
+            bounds: { x: 0, y: 0, width: 640, height: 480 },
+          },
+          path: [2, 0],
+          text: "héllo",
+          role: "entry",
+          label: "Name",
+        },
+      },
+    ]);
+
+    await client.dispose();
+  });
+
+  it("reports a refused write as false rather than a failure", async () => {
+    const child = scriptedHelper([], () => ({ ok: false, reason: "not-editable" }));
+    const client = new AtspiHelperClient({
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+
+    await expect(client.setText({ window: WINDOW, path: [], text: "x" })).resolves.toBe(false);
+
+    await client.dispose();
+  });
+
+  it("propagates a helper error so the caller can fall back", async () => {
+    const child = new FakeHelperProcess();
+    child.stdin.on("data", (chunk) => {
+      const message = JSON.parse(chunk.toString()) as { id: number | string };
+      child.stdout.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: { code: -32000, message: "no editable text interface" },
+        }) + "\n",
+      );
+    });
+    const client = new AtspiHelperClient({
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+
+    await expect(client.setText({ window: WINDOW, path: [0], text: "x" })).rejects.toThrow(
+      "no editable text interface",
+    );
+
+    await client.dispose();
+  });
 });
+
+/** A helper process that records every request and answers with one result. */
+function scriptedHelper(
+  requests: Array<Record<string, unknown>>,
+  result: (request: Record<string, unknown>) => unknown,
+): FakeHelperProcess {
+  const child = new FakeHelperProcess();
+  child.stdin.on("data", (chunk) => {
+    for (const line of chunk.toString().split("\n").filter(Boolean)) {
+      const message = JSON.parse(line) as Record<string, unknown>;
+      requests.push(message);
+      child.stdout.write(
+        JSON.stringify({ jsonrpc: "2.0", id: message.id, result: result(message) }) + "\n",
+      );
+    }
+  });
+  return child;
+}

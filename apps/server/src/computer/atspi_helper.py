@@ -19,6 +19,7 @@ else:
 MAX_NODES = 2048
 MAX_DEPTH = 64
 WINDOW_ROLE_NAMES = {"frame", "window", "dialog"}
+EDITABLE_TEXT_INTERFACE = "editabletext"
 
 
 def emit(message):
@@ -44,7 +45,31 @@ def text_or_none(value):
     return value if isinstance(value, str) and value else None
 
 
-def node_for(accessible, depth, budget):
+def supports_editable_text(accessible):
+    """Whether a node accepts EditableText.set_text_contents.
+
+    The interface list is the cheap answer and is what most toolkits expose;
+    probing the interface itself is the fallback for bindings that do not
+    report the list.
+    """
+    try:
+        interfaces = accessible.get_interfaces()
+    except Exception:
+        interfaces = None
+    if isinstance(interfaces, (list, tuple)):
+        for name in interfaces:
+            if isinstance(name, str) and name.rsplit(".", 1)[-1].casefold() == (
+                EDITABLE_TEXT_INTERFACE
+            ):
+                return True
+        return False
+    try:
+        return accessible.get_editable_text_iface() is not None
+    except Exception:
+        return False
+
+
+def node_for(accessible, depth, budget, path=()):
     if depth > MAX_DEPTH or budget[0] >= MAX_NODES:
         return None
     budget[0] += 1
@@ -74,7 +99,7 @@ def node_for(accessible, depth, budget):
             child = accessible.get_child_at_index(index)
             if child is None:
                 continue
-            child_node = node_for(child, depth + 1, budget)
+            child_node = node_for(child, depth + 1, budget, tuple(path) + (index,))
             if child_node is not None:
                 children.append(child_node)
     except Exception:
@@ -87,6 +112,10 @@ def node_for(accessible, depth, budget):
         "description": description,
         "frame": rect_for(accessible),
         "activationPoint": None,
+        # The real child indices, not the emitted ones: a skipped or budgeted-out
+        # child would otherwise shift every later sibling's address.
+        "path": [int(index) for index in path],
+        "editable": supports_editable_text(accessible),
         "children": children,
     }
 
@@ -229,6 +258,74 @@ def read_tree(params):
     return {"trees": trees}
 
 
+def node_at_path(window, path):
+    """Re-resolve a node from a child-index path, or None when it moved."""
+    node = window
+    for index in path:
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            return None
+        try:
+            if index >= node.get_child_count():
+                return None
+            child = node.get_child_at_index(index)
+        except Exception:
+            return None
+        if child is None:
+            return None
+        node = child
+    return node
+
+
+def matches_expected_node(accessible, expected_role, expected_label):
+    """Guard against tree drift writing text into an unrelated widget."""
+    if isinstance(expected_role, str) and expected_role:
+        if role_name(accessible) != expected_role.strip().casefold():
+            return False
+    if isinstance(expected_label, str) and expected_label:
+        try:
+            name = accessible.get_name() or ""
+        except Exception:
+            name = ""
+        if name.strip() != expected_label.strip():
+            return False
+    return True
+
+
+def set_text(params):
+    if Atspi is None:
+        raise RuntimeError("PyGObject Atspi is unavailable: " + ATSPI_IMPORT_ERROR)
+    text = params.get("text")
+    if not isinstance(text, str):
+        raise ValueError("set-text requires a text string")
+    requested = params.get("window")
+    if not isinstance(requested, dict):
+        raise ValueError("set-text requires a window descriptor")
+    path = params.get("path")
+    if not isinstance(path, list):
+        raise ValueError("set-text requires a node path")
+
+    window = find_window(Atspi.get_desktop(0), requested)
+    if window is None:
+        return {"ok": False, "reason": "window-not-found"}
+    node = node_at_path(window, path)
+    if node is None:
+        return {"ok": False, "reason": "node-not-found"}
+    if not matches_expected_node(node, params.get("role"), params.get("label")):
+        return {"ok": False, "reason": "node-changed"}
+    if not supports_editable_text(node):
+        return {"ok": False, "reason": "not-editable"}
+    try:
+        iface = node.get_editable_text_iface()
+        if iface is None:
+            return {"ok": False, "reason": "not-editable"}
+        result = iface.set_text_contents(text)
+    except Exception as error:
+        return {"ok": False, "reason": str(error)}
+    # Bindings that return nothing have already applied the write; only an
+    # explicit false is a refusal the caller must fall back from.
+    return {"ok": result is None or bool(result)}
+
+
 def main():
     for line in sys.stdin:
         try:
@@ -236,9 +333,13 @@ def main():
             request_id = message.get("id")
             method = message.get("method")
             params = message.get("params") or {}
-            if method != "read-tree":
+            if method == "read-tree":
+                result = read_tree(params)
+            elif method == "set-text":
+                result = set_text(params)
+            else:
                 raise ValueError("Unknown AT-SPI helper method")
-            emit({"jsonrpc": "2.0", "id": request_id, "result": read_tree(params)})
+            emit({"jsonrpc": "2.0", "id": request_id, "result": result})
         except Exception as error:
             emit(
                 {

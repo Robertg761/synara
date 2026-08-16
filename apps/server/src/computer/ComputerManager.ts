@@ -140,9 +140,13 @@ export class ComputerManager {
     return { computerId: this.computerId, screenSize, availability };
   }
 
-  async launchApp(app: string, args: readonly string[] = []): Promise<ComputerLaunchAppResult> {
+  async launchApp(
+    threadId: string | undefined,
+    app: string,
+    args: readonly string[] = [],
+  ): Promise<ComputerLaunchAppResult> {
     const result = await this.backend.launchApp(app, args);
-    this.emit({ type: "computer.action", action: "computer_launch_app", ok: true });
+    this.emitAction(threadId, "computer_launch_app");
     return result;
   }
 
@@ -155,7 +159,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.click(resolved.point);
-    return this.actionResult("computer_click", resolved.point, result);
+    return this.actionResult(threadId, "computer_click", resolved.point, result);
   }
 
   async doubleClick(
@@ -165,7 +169,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.doubleClick(resolved.point);
-    return this.actionResult("computer_double_click", resolved.point, result);
+    return this.actionResult(threadId, "computer_double_click", resolved.point, result);
   }
 
   async rightClick(
@@ -175,7 +179,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.rightClick(resolved.point);
-    return this.actionResult("computer_right_click", resolved.point, result);
+    return this.actionResult(threadId, "computer_right_click", resolved.point, result);
   }
 
   async moveCursor(
@@ -185,7 +189,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.moveCursor(resolved.point);
-    return this.actionResult("computer_move_cursor", resolved.point, result);
+    return this.actionResult(threadId, "computer_move_cursor", resolved.point, result);
   }
 
   async drag(
@@ -200,7 +204,7 @@ export class ComputerManager {
     ]);
     await this.prepareResolvedTarget(resolvedFrom.windowId ?? resolvedTo.windowId);
     const result = await this.backend.drag(resolvedFrom.point, resolvedTo.point, durationMs);
-    return this.actionResult("computer_drag", resolvedTo.point, result);
+    return this.actionResult(threadId, "computer_drag", resolvedTo.point, result);
   }
 
   async scroll(
@@ -212,17 +216,17 @@ export class ComputerManager {
     const resolved = target ? await this.resolvePointTarget(target) : null;
     await this.prepareResolvedTarget(resolved?.windowId);
     const result = await this.backend.scroll(resolved?.point ?? null, deltaX, deltaY);
-    return this.actionResult("computer_scroll", resolved?.point, result);
+    return this.actionResult(threadId, "computer_scroll", resolved?.point, result);
   }
 
   async typeText(threadId: string | undefined, text: string): Promise<ComputerActionResult> {
     const result = await this.backend.typeText(text);
-    return this.actionResult("computer_type_text", undefined, result);
+    return this.actionResult(threadId, "computer_type_text", undefined, result);
   }
 
   async pressKey(threadId: string | undefined, key: string): Promise<ComputerActionResult> {
     const result = await this.backend.pressKey(key);
-    return this.actionResult("computer_press_key", undefined, result);
+    return this.actionResult(threadId, "computer_press_key", undefined, result);
   }
 
   async hotkey(
@@ -230,7 +234,7 @@ export class ComputerManager {
     keys: readonly string[],
   ): Promise<ComputerActionResult> {
     const result = await this.backend.hotkey(keys);
-    return this.actionResult("computer_hotkey", undefined, result);
+    return this.actionResult(threadId, "computer_hotkey", undefined, result);
   }
 
   async setValue(
@@ -241,7 +245,7 @@ export class ComputerManager {
     const resolved = await this.resolveSemanticTarget(target);
     await this.prepareResolvedTarget(resolved.node.windowId ?? undefined);
     const result = await this.backend.setValue(resolved, value);
-    return this.actionResult("computer_set_value", resolved.point, result);
+    return this.actionResult(threadId, "computer_set_value", resolved.point, result);
   }
 
   async performAction(
@@ -252,7 +256,7 @@ export class ComputerManager {
     const resolved = await this.resolveSemanticTarget(target);
     await this.prepareResolvedTarget(resolved.node.windowId ?? undefined);
     const result = await this.backend.performAction(resolved, action);
-    return this.actionResult("computer_perform_action", resolved.point, result);
+    return this.actionResult(threadId, "computer_perform_action", resolved.point, result);
   }
 
   async withAgentActivity<A>(threadId: string, action: () => Promise<A>): Promise<A> {
@@ -440,14 +444,30 @@ export class ComputerManager {
   }
 
   private actionResult(
+    threadId: string | undefined,
     action: string,
     point: ComputerPoint | undefined,
     result: ComputerBackendActionResult | void,
   ): ComputerActionResult {
-    this.emit({ type: "computer.action", action, ok: true });
+    this.emitAction(threadId, action);
     return computerBackendActionResult(this.computerId, action, {
       ...(point ? { point } : {}),
       ...(result ?? {}),
+    });
+  }
+
+  /**
+   * Desktop activity is attributed to the thread that drove it so an observer
+   * can tell one agent's work from another's. Pane input carries no thread and
+   * stays unattributed rather than borrowing an unrelated thread id.
+   */
+  private emitAction(threadId: string | undefined, action: string): void {
+    const attributed = threadId?.trim();
+    this.emit({
+      type: "computer.action",
+      action,
+      ok: true,
+      ...(attributed ? { threadId: ThreadId.makeUnsafe(attributed) } : {}),
     });
   }
 

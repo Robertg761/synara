@@ -16,7 +16,17 @@ export interface AtspiRawNode {
   /** AT-SPI reports these extents in the client coordinate space on Wayland. */
   readonly frame: ComputerRect;
   readonly activationPoint?: ComputerPoint | null;
+  /** Child-index path from the window root, as the helper walked the tree. */
+  readonly path?: readonly number[];
+  /** The accessible exposes the `EditableText` interface. */
+  readonly editable?: boolean;
   readonly children: readonly AtspiRawNode[];
+}
+
+/** Everything the helper needs to re-resolve one node for a semantic write. */
+export interface AtspiNodeAddress {
+  readonly windowId: ComputerWindowId;
+  readonly path: readonly number[];
 }
 
 export interface AtspiClientSize {
@@ -103,6 +113,20 @@ export function fuseAtspiTrees(input: {
   };
 }
 
+/**
+ * The address of a node a semantic text write may target, or `undefined` when
+ * the perception source cannot address it: a node with no editable-text
+ * interface, no child-index path, or no owning window has to be typed into.
+ */
+export function atspiTextWriteAddress(node: ComputerUiNode): AtspiNodeAddress | undefined {
+  if (node.editable !== true || node.windowId === null || node.windowId === undefined) {
+    return undefined;
+  }
+  const path = node.nodePath;
+  if (!path || !path.every((index) => Number.isInteger(index) && index >= 0)) return undefined;
+  return { windowId: node.windowId, path: [...path] };
+}
+
 export function describeComputerUiTree(root: ComputerUiNode): string {
   const lines: string[] = [];
   const visit = (node: ComputerUiNode, depth: number): void => {
@@ -145,6 +169,8 @@ function fuseNode(
     activationPoint,
     onScreen: isOnScreen(frame, input.screenSize),
     windowId: input.windowId,
+    ...(node.path ? { nodePath: [...node.path] } : {}),
+    ...(node.editable === true ? { editable: true } : {}),
     children: node.children.map((child) => fuseNode(child, input)),
   };
 }

@@ -10,7 +10,8 @@ import {
   newestPluginId,
   type KWinComputerBackendOptions,
 } from "./KWinComputerBackend.ts";
-import type { AtspiTreeReader } from "./atspiClient.ts";
+import type { ComputerResolvedTarget } from "./ComputerBackend.ts";
+import type { AtspiTextWrite, AtspiTreeReader } from "./atspiClient.ts";
 import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
 import { GLIDE_FRAME_INTERVAL_MS } from "./kwinInput.ts";
 
@@ -171,17 +172,18 @@ class FakeDbus implements KWinComputerDbus {
 
 const atspi: AtspiTreeReader = {
   readTrees: async () => [],
+  setText: async () => false,
   dispose: async () => undefined,
 };
 
 function makeBackend(
   dbus: FakeDbus,
-  options: Omit<KWinComputerBackendOptions, "dbus" | "atspi"> = {},
+  options: Omit<KWinComputerBackendOptions, "dbus"> = {},
 ): KWinComputerBackend {
   return new KWinComputerBackend({
     ...options,
     dbus,
-    atspi,
+    atspi: options.atspi ?? atspi,
     platform: "linux",
     sessionType: "wayland",
     installedPluginIds:
@@ -189,6 +191,27 @@ function makeBackend(
       (async () => ["SynaraComputerUsePluginV2", "SynaraComputerUsePluginV10"]),
     sleep: options.sleep ?? (async () => undefined),
   });
+}
+
+/** A semantic target resolved against the fake plugin's only window. */
+function resolvedTarget(options: { readonly editable: boolean }): ComputerResolvedTarget {
+  return {
+    target: { label: "Name", role: "entry" },
+    point: { x: 1_000, y: 1_600 },
+    node: {
+      role: "entry",
+      label: "Name",
+      value: null,
+      description: null,
+      frame: { x: 980, y: 1_580, width: 200, height: 40 },
+      activationPoint: null,
+      onScreen: true,
+      windowId: "window-1" as ComputerWindow["id"],
+      nodePath: [1, 2],
+      editable: options.editable,
+      children: [],
+    },
+  };
 }
 
 function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
@@ -616,6 +639,100 @@ describe("KWinComputerBackend", () => {
       args: [0, 0, 5_120, 2_520, 2_048],
     });
     expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
+    await backend.dispose();
+  });
+
+  it("writes an editable control through AT-SPI instead of typing it", async () => {
+    const dbus = new FakeDbus();
+    const writes: AtspiTextWrite[] = [];
+    const backend = makeBackend(dbus, {
+      glideDurationMs: 0,
+      atspi: {
+        readTrees: async () => [],
+        setText: async (write) => {
+          writes.push(write);
+          return true;
+        },
+        dispose: async () => undefined,
+      },
+    });
+    await backend.availability();
+
+    await expect(backend.setValue(resolvedTarget({ editable: true }), "naïve")).resolves.toEqual({
+      point: { x: 1_000, y: 1_600 },
+      windowId: "window-1",
+      value: "naïve",
+    });
+
+    // The write travels with the window KWin reports now, not the one the tree
+    // was read from, so the helper re-resolves against live geometry.
+    expect(writes).toEqual([
+      {
+        window: {
+          id: "window-1",
+          title: "Terminal",
+          pid: 123,
+          bounds: { x: 956, y: 1_519, width: 648, height: 518 },
+          focused: true,
+          minimized: false,
+          visible: true,
+        },
+        path: [1, 2],
+        text: "naïve",
+        role: "entry",
+        label: "Name",
+      },
+    ]);
+    // The click still focuses the control, and nothing is typed into it.
+    expect(dbus.plugin.calls.some((call) => call.method === "button")).toBe(true);
+    expect(dbus.plugin.calls.some((call) => call.method === "key")).toBe(false);
+    await backend.dispose();
+  });
+
+  it("falls back to typing when the AT-SPI helper fails", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, {
+      glideDurationMs: 0,
+      atspi: {
+        readTrees: async () => [],
+        setText: async () => {
+          throw new Error("AT-SPI helper exited (code=1, signal=null).");
+        },
+        dispose: async () => undefined,
+      },
+    });
+    await backend.availability();
+
+    await expect(backend.setValue(resolvedTarget({ editable: true }), "ab")).resolves.toEqual({
+      point: { x: 1_000, y: 1_600 },
+      windowId: "window-1",
+      value: "ab",
+    });
+
+    expect(dbus.plugin.calls.filter((call) => call.method === "key")).toHaveLength(4);
+    await backend.dispose();
+  });
+
+  it("types into a control that exposes no editable-text interface", async () => {
+    const dbus = new FakeDbus();
+    let writes = 0;
+    const backend = makeBackend(dbus, {
+      glideDurationMs: 0,
+      atspi: {
+        readTrees: async () => [],
+        setText: async () => {
+          writes += 1;
+          return true;
+        },
+        dispose: async () => undefined,
+      },
+    });
+    await backend.availability();
+
+    await backend.setValue(resolvedTarget({ editable: false }), "ab");
+
+    expect(writes).toBe(0);
+    expect(dbus.plugin.calls.filter((call) => call.method === "key")).toHaveLength(4);
     await backend.dispose();
   });
 

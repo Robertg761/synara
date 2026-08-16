@@ -95,6 +95,68 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("attributes every action event to the thread that drove it", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    const actions: Array<{ action: string; threadId?: string }> = [];
+    manager.onEvent((event) => {
+      if (event.type !== "computer.action") return;
+      actions.push({
+        action: event.action,
+        ...(event.threadId === undefined ? {} : { threadId: event.threadId }),
+      });
+    });
+
+    await manager.launchApp("thread-1", "kcalc");
+    await manager.click("thread-1", { x: 10, y: 10 });
+    await manager.doubleClick("thread-1", { x: 10, y: 10 });
+    await manager.rightClick("thread-1", { x: 10, y: 10 });
+    await manager.moveCursor("thread-1", { x: 10, y: 10 });
+    await manager.drag("thread-1", { x: 10, y: 10 }, { x: 20, y: 20 });
+    await manager.scroll("thread-1", null, 0, 12);
+    await manager.typeText("thread-1", "hi");
+    await manager.pressKey("thread-1", "enter");
+    await manager.hotkey("thread-1", ["ctrl", "s"]);
+    await manager.setValue("thread-1", { label: "Display" }, "12");
+    await manager.performAction("thread-1", { label: "Calculate", role: "button" }, "activate");
+
+    expect(actions).toEqual([
+      { action: "computer_launch_app", threadId: "thread-1" },
+      { action: "computer_click", threadId: "thread-1" },
+      { action: "computer_double_click", threadId: "thread-1" },
+      { action: "computer_right_click", threadId: "thread-1" },
+      { action: "computer_move_cursor", threadId: "thread-1" },
+      { action: "computer_drag", threadId: "thread-1" },
+      { action: "computer_scroll", threadId: "thread-1" },
+      { action: "computer_type_text", threadId: "thread-1" },
+      { action: "computer_press_key", threadId: "thread-1" },
+      { action: "computer_hotkey", threadId: "thread-1" },
+      { action: "computer_set_value", threadId: "thread-1" },
+      { action: "computer_perform_action", threadId: "thread-1" },
+    ]);
+
+    await manager.dispose();
+  });
+
+  it("leaves pane input unattributed instead of borrowing a thread", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    const actions: Array<Record<string, unknown>> = [];
+    manager.onEvent((event) => {
+      if (event.type === "computer.action") actions.push({ ...event });
+    });
+
+    await manager.click(undefined, { x: 10, y: 10 });
+    await manager.launchApp(undefined, "kcalc");
+    // A whitespace-only caller is not a thread either.
+    await manager.pressKey("  ", "enter");
+
+    expect(actions.every((action) => !("threadId" in action))).toBe(true);
+    expect(actions).toHaveLength(3);
+
+    await manager.dispose();
+  });
+
   it("runs the synthetic frame attach, publish, and detach loop", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });

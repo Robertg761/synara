@@ -27,6 +27,7 @@ import {
 } from "./ComputerBackend.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
 import {
+  atspiTextWriteAddress,
   describeComputerUiTree,
   fuseAtspiTrees,
   type AtspiWindowTree,
@@ -398,18 +399,56 @@ export class KWinComputerBackend implements ComputerBackend {
     return {};
   }
 
+  /**
+   * Writes through AT-SPI when the resolved control exposes `EditableText`, and
+   * types the value otherwise.
+   *
+   * The semantic write is atomic, replaces the whole contents rather than
+   * appending to them, and carries text no QWERTY key map can express. The
+   * click still runs first in both paths: it raises and focuses the control,
+   * which the toolkit needs for anything the user or the agent does next, and a
+   * semantic write on its own leaves keyboard focus wherever it was.
+   */
   async setValue(
     target: ComputerResolvedTarget,
     value: string,
   ): Promise<ComputerBackendActionResult> {
     const clicked = await this.click(target.point);
-    await this.typeText(value);
+    if (!(await this.writeValueThroughAtspi(target, value))) await this.typeText(value);
     return {
       ...clicked,
       point: target.point,
       ...(target.node.windowId ? { windowId: target.node.windowId } : {}),
       value,
     };
+  }
+
+  /**
+   * Never throws: AT-SPI is an optional actuation path, so a stopped helper, a
+   * moved node, or a toolkit that refuses the write all fall back to typing,
+   * which is the only path older sessions ever had.
+   */
+  private async writeValueThroughAtspi(
+    target: ComputerResolvedTarget,
+    value: string,
+  ): Promise<boolean> {
+    const address = atspiTextWriteAddress(target.node);
+    if (!address) return false;
+    try {
+      const window = (await this.listWindows()).find(
+        (candidate) => candidate.id === address.windowId,
+      );
+      if (!window) return false;
+      return await this.atspi.setText({
+        window,
+        path: address.path,
+        text: value,
+        role: target.node.role,
+        label: target.node.label,
+      });
+    } catch {
+      return false;
+    }
   }
 
   async performAction(

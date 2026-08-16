@@ -107,6 +107,9 @@ export type ComputerUiFrame = typeof ComputerUiFrame.Type;
 export const ComputerUiPoint = ComputerPoint;
 export type ComputerUiPoint = typeof ComputerUiPoint.Type;
 
+/** Deepest accessibility path a backend may address, matching the helper's cap. */
+const COMPUTER_NODE_PATH_MAX_DEPTH = 64;
+
 export interface ComputerUiNode {
   readonly role: string;
   readonly label: string | null;
@@ -116,6 +119,15 @@ export interface ComputerUiNode {
   readonly activationPoint: ComputerUiPoint | null;
   readonly onScreen: boolean;
   readonly windowId: ComputerWindowId | null;
+  /**
+   * Child-index path from the owning window's accessibility root, present when
+   * the perception source can re-resolve a node without holding a live handle.
+   * A semantic write addresses `windowId` + `nodePath` on a fresh read, so the
+   * pair stays valid across helper restarts while the tree is unchanged.
+   */
+  readonly nodePath?: readonly number[] | undefined;
+  /** The node accepts a semantic text write (AT-SPI `EditableText`). */
+  readonly editable?: boolean | undefined;
   readonly children: readonly ComputerUiNode[];
 }
 
@@ -128,6 +140,10 @@ export const ComputerUiNode: Schema.Schema<ComputerUiNode> = Schema.Struct({
   activationPoint: Schema.NullOr(ComputerUiPoint),
   onScreen: Schema.Boolean,
   windowId: Schema.NullOr(ComputerWindowId),
+  nodePath: Schema.optional(
+    Schema.Array(NonNegativeInt).check(Schema.isMaxLength(COMPUTER_NODE_PATH_MAX_DEPTH)),
+  ),
+  editable: Schema.optional(Schema.Boolean),
   children: Schema.Array(Schema.suspend((): Schema.Schema<ComputerUiNode> => ComputerUiNode)).check(
     Schema.isMaxLength(2_048),
   ),
@@ -377,6 +393,11 @@ export const ComputerActionEvent = Schema.Struct({
   action: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
   ok: Schema.Boolean,
   message: Schema.optional(Schema.String.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH))),
+  /**
+   * The thread whose agent turn drove the action. Absent for desktop input the
+   * user sent from a computer pane, which belongs to no thread.
+   */
+  threadId: Schema.optional(ThreadId),
 });
 export type ComputerActionEvent = typeof ComputerActionEvent.Type;
 

@@ -399,8 +399,9 @@ export function makeAgentGatewayComputerTools(
         required: ["app"],
         additionalProperties: false,
       },
-      async (args) =>
+      async (args, context) =>
         manager.launchApp(
+          context.callerThreadId,
           readStringArg(args, "app", { required: true })!,
           readStringArrayArg(args, "arguments") ?? [],
         ),

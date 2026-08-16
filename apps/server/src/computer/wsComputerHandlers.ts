@@ -175,7 +175,7 @@ export function makeWsComputerHandlers(
       attempt(() => manager.getScreenSize(), "Failed to read computer screen size"),
     [COMPUTER_WS_METHODS.launchApp]: (input) =>
       attempt(
-        () => manager.launchApp(input.app, input.arguments ?? []),
+        () => manager.launchApp(undefined, input.app, input.arguments ?? []),
         "Failed to launch computer application",
       ),
     [COMPUTER_WS_METHODS.click]: (input) =>
