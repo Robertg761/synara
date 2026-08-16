@@ -22,7 +22,6 @@ import { Cache, Cause, Deferred, Duration, Effect, Layer, Option, Ref, Stream } 
 import * as Semaphore from "effect/Semaphore";
 import { makeDrainableWorker, startDrainableWorkerProducers } from "@synara/shared/DrainableWorker";
 import { providerSupportsNativeTurnSteering } from "@synara/shared/providerMetadata";
-import { buildStalePendingRequestFailureDetail } from "@synara/shared/threadSummary";
 import {
   buildSubagentIdentityDirectory,
   collectSubagentProviderThreadIds,
@@ -65,6 +64,11 @@ import {
   OrchestrationCommandPreviouslyRejectedError,
 } from "../Errors.ts";
 import { makeRuntimeJournalPoisonGate } from "../runtimeJournalPoisonGate.ts";
+import {
+  buildStalePendingRequestSettlementCommand,
+  isUnsettledPendingInteraction,
+  pendingInteractionRequestKind,
+} from "../stalePendingInteractions.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   ProjectionSnapshotQuery,
@@ -1850,8 +1854,10 @@ const make = Effect.gen(function* () {
    * generation, because it kills every turn in that generation.
    *
    * A graceful teardown emits the runtime's own resolution event first, so the
-   * row is already `confirmed` by the time this runs; the stale settlement is
-   * the fallback for ungraceful deaths (kill -9 and friends).
+   * row is already `confirmed` by the time this runs. An ungraceful death
+   * (kill -9 and friends) emits no event at all, so rows that outlive the
+   * process are settled at boot instead — same rows, same command shape, via
+   * the shared builder in `../stalePendingInteractions.ts`.
    */
   const settleUnanswerablePendingInteractions = (
     threadId: ThreadId,
@@ -1862,36 +1868,19 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const rows = yield* pendingInteractions.listByThreadId({ threadId });
       for (const row of rows) {
-        // `uncertain` rows were already reported as unanswerable; re-reporting
-        // on every session start would duplicate the failure activity.
-        if (row.status === "confirmed" || row.status === "uncertain") continue;
+        if (!isUnsettledPendingInteraction(row)) continue;
         if (scopeFilter && !scopeFilter(row)) continue;
-        const isApproval = row.interactionKind === "approval";
-        const requestKind = isApproval ? ("approval" as const) : ("user-input" as const);
-        const commandId = providerCommandId(event, `stale-pending-${requestKind}`, row.requestId);
-        yield* orchestrationEngine.dispatch({
-          type: "thread.activity.append",
-          commandId,
-          threadId,
-          activity: {
-            id: EventId.makeUnsafe(commandId),
-            tone: "error",
-            kind: isApproval
-              ? "provider.approval.respond.failed"
-              : "provider.user-input.respond.failed",
-            summary: isApproval
-              ? "Provider approval response failed"
-              : "Provider user input response failed",
-            payload: {
-              detail: buildStalePendingRequestFailureDetail(requestKind, row.requestId),
-              requestId: row.requestId,
-              ...(row.lifecycleGeneration ? { lifecycleGeneration: row.lifecycleGeneration } : {}),
-            },
-            turnId: null,
-            createdAt: now,
-          },
-          createdAt: now,
-        });
+        const requestKind = pendingInteractionRequestKind(row.interactionKind);
+        yield* orchestrationEngine.dispatch(
+          buildStalePendingRequestSettlementCommand({
+            threadId,
+            commandId: providerCommandId(event, `stale-pending-${requestKind}`, row.requestId),
+            requestKind,
+            requestId: row.requestId,
+            lifecycleGeneration: row.lifecycleGeneration,
+            now,
+          }),
+        );
       }
     });
 
