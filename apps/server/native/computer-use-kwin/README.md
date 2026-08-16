@@ -33,9 +33,16 @@ the macOS comparison.
 
 Service `org.synara.ComputerUse`, path `/org/synara/ComputerUse`, interface
 `org.synara.ComputerUse1`. Methods: `healthJson`, `stateJson`, `windowsJson`,
-`start`, `stop`, `focusWindow`, `clearFocusWindow`, `movePointer`, `button`,
-`axis`, `key`, `captureWindow(s windowId, u maxDimension) -> ay`, and
-`captureRegion(i x, i y, u width, u height, u maxDimension) -> ay`.
+`start`, `stop`, `setIdleTimeout(u milliseconds) -> b`, `focusWindow`,
+`clearFocusWindow`, `movePointer`, `button`, `axis`, `key`,
+`captureWindow(s windowId, u maxDimension) -> ay`, and
+`captureRegion(i x, i y, u width, u height, u maxDimension) -> ay`. One signal:
+`sessionStopped(s reason)`, emitted whenever a running session ends, with the
+reason `request`, `idle-timeout`, or `user-release`.
+
+Every input method (`movePointer`, `button`, `axis`, `key`, `focusWindow`,
+`clearFocusWindow`) returns `false` while the session is stopped, so a stop can
+never be followed by invisible input. Captures work in both states.
 
 Capture requests are rendered at the next safe compositor render opportunity.
 `maxDimension = 0` keeps native pixels; otherwise the PNG is downscaled so its
@@ -58,6 +65,56 @@ Capture failures are returned as the D-Bus error
 `org.synara.ComputerUse.Error.CaptureFailed` with a one-line reason. The methods
 never use an empty `ay` as a failure response.
 
+## Idle timeout
+
+A running session stops itself after 5 minutes without agent activity. The
+timeout lives in the plugin on purpose: if the Synara server crashes or is
+killed, its finalizers never run, and nothing else would take the agent seat
+and the ghost cursor down.
+
+- Any method that expresses agent intent resets the deadline: `movePointer`,
+  `button`, `axis`, `key`, `focusWindow`, `clearFocusWindow`, `captureWindow`,
+  `captureRegion`.
+- `healthJson`, `stateJson`, and `windowsJson` deliberately do not. The server
+  polls health, so counting introspection would keep every session alive
+  forever.
+- `setIdleTimeout(u milliseconds)` reconfigures it; `0` disables it entirely.
+  Anything else outside 1 s – 1 h is rejected with `false`. The server sends its
+  configured value right after `start()`. The deadline is re-armed from the last
+  activity, so lowering it can fire immediately.
+- An idle stop takes the same path as `stop()`: pressed buttons and keys are
+  released, pointer and keyboard focus are dropped, the ghost cursor is hidden,
+  and an in-flight capture is canceled. It does not block the next `start()`.
+- `stateJson` reports `idleTimeoutMs`, `idleMs`, `idleRemainingMs` (only while
+  running with a timeout set), and `stopReason` for the last lifetime change
+  (`request`, `idle-timeout`, `user-release`, `user-resume`).
+
+A long model turn can outlive the deadline — a model that thinks for six minutes
+between clicks will find the session stopped. That is expected: the server
+restarts it on the next action (see below), and the ghost cursor disappears
+while nothing is happening, which is exactly the point.
+
+## Release-control hotkey
+
+**Meta+Shift+Esc** stops the session immediately, from any window, and latches
+the plugin so `start()` fails with
+`org.synara.ComputerUse.Error.ControlReleased` until control is handed back.
+The shortcut is registered through KGlobalAccel (`SynaraReleaseComputerControl`,
+listed under KWin in System Settings, remappable there) and is free on stock
+Plasma — kill-window is Ctrl+Alt+Esc.
+
+The user's real seat drives KWin's shortcut handling, and agent input is
+delivered straight to client surfaces on the `synara-agent` seat without
+entering that pipeline, so the agent can neither trigger the shortcut nor
+swallow it.
+
+Pressing Meta+Shift+Esc again hands control back. An explicit D-Bus `stop()`
+also clears the latch, but Synara only calls `stop()` at server shutdown, so on
+a running server the hotkey is the user's toggle.
+
+Unlike the idle timeout, this is a human takeover, so the server does not
+restart the session behind the user's back.
+
 ## Build (Fedora KDE)
 
 Dependencies:
@@ -65,7 +122,7 @@ Dependencies:
 ```sh
 sudo dnf -y --setopt=install_weak_deps=False install \
   cmake ninja-build extra-cmake-modules kwin-devel kf6-kcoreaddons-devel \
-  qt6-qtbase-devel libepoxy-devel libdrm-devel
+  kf6-kglobalaccel-devel qt6-qtbase-devel libepoxy-devel libdrm-devel
 ```
 
 Build, install, unload older Synara plugin ids, load the new versioned id, and
@@ -133,6 +190,9 @@ depend on whether `start()` has been called.
 When KWin's workspace is available, `healthJson` also includes
 `workspaceGeometry` with `x`, `y`, `width`, and `height` fields. Consumers can
 use that geometry when no client windows are currently enumerable.
+
+`healthJson` also carries the session-lifetime fields the server needs on its
+existing poll: `idleTimeoutMs`, `releasedByUser`, and `releaseShortcut`.
 
 The build identifier is diagnostic data. The plugin filename carries the reload
 identity because KWin can keep a shared library mapped after `UnloadPlugin`.

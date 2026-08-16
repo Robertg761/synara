@@ -28,6 +28,9 @@ class FakePlugin implements KWinComputerPluginApi {
     | { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
     | undefined;
   captureFailure: Error | undefined;
+  releasedByUser = false;
+  idleTimeoutMs: number | undefined;
+  idleTimeoutFailure: Error | undefined;
   position: { readonly x: number; readonly y: number } = { x: 0, y: 0 };
   /** Mirrors KWin clamping a pointer move to the nearest output. */
   clampPointer: ((x: number, y: number) => { readonly x: number; readonly y: number }) | undefined;
@@ -49,29 +52,45 @@ class FakePlugin implements KWinComputerPluginApi {
       ok: true,
       running: this.running,
       capture: this.capture,
+      releasedByUser: this.releasedByUser,
+      idleTimeoutMs: this.idleTimeoutMs ?? 300_000,
       kwinVersion: "6.7.3",
       ...(this.workspace ? { workspaceGeometry: this.workspace } : {}),
     });
   stateJson = async () => JSON.stringify({ position: this.position, targetWindowId: "window-1" });
   windowsJson = async () => JSON.stringify(this.windows);
   start = async () => {
+    this.calls.push({ method: "start", args: [] });
+    if (this.releasedByUser) {
+      throw dbusError(
+        "org.synara.ComputerUse.Error.ControlReleased",
+        "computer control was released with Meta+Shift+Esc",
+      );
+    }
     this.running = true;
-    return this.recordResult("start");
+    return true;
   };
   stop = async () => {
     this.running = false;
+    this.releasedByUser = false;
     return this.recordResult("stop");
   };
-  focusWindow = async (windowId: string) => this.recordResult("focusWindow", windowId);
-  clearFocusWindow = async () => this.recordResult("clearFocusWindow");
-  movePointer = async (x: number, y: number) => {
-    this.position = this.clampPointer?.(x, y) ?? { x, y };
-    return this.recordResult("movePointer", x, y);
+  setIdleTimeout = async (milliseconds: number) => {
+    this.calls.push({ method: "setIdleTimeout", args: [milliseconds] });
+    if (this.idleTimeoutFailure) throw this.idleTimeoutFailure;
+    this.idleTimeoutMs = milliseconds;
+    return true;
   };
-  button = async (code: number, pressed: boolean) => this.recordResult("button", code, pressed);
+  focusWindow = async (windowId: string) => this.recordInput("focusWindow", windowId);
+  clearFocusWindow = async () => this.recordInput("clearFocusWindow");
+  movePointer = async (x: number, y: number) => {
+    if (this.running) this.position = this.clampPointer?.(x, y) ?? { x, y };
+    return this.recordInput("movePointer", x, y);
+  };
+  button = async (code: number, pressed: boolean) => this.recordInput("button", code, pressed);
   axis = async (horizontal: number, vertical: number) =>
-    this.recordResult("axis", horizontal, vertical);
-  key = async (code: number, pressed: boolean) => this.recordResult("key", code, pressed);
+    this.recordInput("axis", horizontal, vertical);
+  key = async (code: number, pressed: boolean) => this.recordInput("key", code, pressed);
   captureWindow = async (windowId: string, maxDimension: number) => {
     this.calls.push({ method: "captureWindow", args: [windowId, maxDimension] });
     if (this.captureFailure) throw this.captureFailure;
@@ -92,6 +111,12 @@ class FakePlugin implements KWinComputerPluginApi {
   private recordResult(method: string, ...args: readonly unknown[]): true {
     this.calls.push({ method, args });
     return true;
+  }
+
+  /** Mirrors the plugin refusing every input while the session is stopped. */
+  private recordInput(method: string, ...args: readonly unknown[]): boolean {
+    this.calls.push({ method, args });
+    return this.running;
   }
 }
 
@@ -209,6 +234,72 @@ describe("KWinComputerBackend", () => {
 
     await backend.availability();
     expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(1);
+    await backend.dispose();
+  });
+
+  it("configures the plugin idle timeout on every session start", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { idleTimeoutMs: 90_000 });
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.calls).toContainEqual({ method: "setIdleTimeout", args: [90_000] });
+    expect(dbus.plugin.idleTimeoutMs).toBe(90_000);
+
+    await backend.dispose();
+  });
+
+  it("keeps the session usable when the plugin has no setIdleTimeout", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.idleTimeoutFailure = dbusError(
+      "org.freedesktop.DBus.Error.UnknownMethod",
+      "No such method 'setIdleTimeout'",
+    );
+    const backend = makeBackend(dbus);
+
+    await expect(backend.focusWindow("window-1")).resolves.toBeUndefined();
+
+    await backend.dispose();
+  });
+
+  it("restarts the session when the plugin idle timeout stopped it mid-turn", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(1);
+
+    // The plugin auto-stopped while the model was thinking; the server still
+    // believes the session is running.
+    dbus.plugin.running = false;
+
+    await expect(backend.click({ x: 44, y: 44 })).resolves.toEqual({ point: { x: 44, y: 44 } });
+    expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(2);
+    expect(dbus.plugin.running).toBe(true);
+
+    await backend.dispose();
+  });
+
+  it("refuses to take control back after the release hotkey", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.focusWindow("window-1");
+
+    dbus.plugin.running = false;
+    dbus.plugin.releasedByUser = true;
+
+    await expect(backend.click({ x: 44, y: 44 })).rejects.toThrow(/Meta\+Shift\+Esc/);
+    expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(1);
+    expect(dbus.plugin.running).toBe(false);
+
+    await backend.dispose();
+  });
+
+  it("explains a released-control error raised by start itself", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.releasedByUser = true;
+    const backend = makeBackend(dbus);
+
+    await expect(backend.focusWindow("window-1")).rejects.toThrow(/hand control back/);
+
     await backend.dispose();
   });
 
@@ -374,7 +465,7 @@ describe("KWinComputerBackend", () => {
     dbus.plugin.captureRegion = async () => capture("region");
 
     const first = backend.captureWindow("window-1");
-    for (let attempt = 0; attempt < 10 && calls.length === 0; attempt += 1) {
+    for (let attempt = 0; attempt < 50 && calls.length === 0; attempt += 1) {
       await Promise.resolve();
     }
     const second = backend.captureRegion(0, 0, 10, 10);

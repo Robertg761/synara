@@ -13,6 +13,7 @@ include(KDECompilerSettings NO_POLICY_SCOPE)
 
 find_package(Qt6 REQUIRED COMPONENTS Core DBus Gui Quick Widgets)
 find_package(KF6CoreAddons REQUIRED)
+find_package(KF6GlobalAccel REQUIRED)
 find_package(KWin REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
@@ -64,6 +65,7 @@ target_include_directories(SynaraComputerUsePlugin PRIVATE
 target_link_libraries(SynaraComputerUsePlugin PRIVATE
     KWin::kwin
     KF6::CoreAddons
+    KF6::GlobalAccel
     Qt6::Core
     Qt6::DBus
     Qt6::Gui

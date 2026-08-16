@@ -32,6 +32,7 @@ export interface KWinComputerPluginApi {
   readonly windowsJson: () => Promise<unknown>;
   readonly start: () => Promise<unknown>;
   readonly stop: () => Promise<unknown>;
+  readonly setIdleTimeout: (milliseconds: number) => Promise<unknown>;
   readonly focusWindow: (windowId: string) => Promise<unknown>;
   readonly clearFocusWindow: () => Promise<unknown>;
   readonly movePointer: (x: number, y: number) => Promise<unknown>;
@@ -142,6 +143,7 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
     windowsJson: () => invoke(iface, "windowsJson"),
     start: () => invoke(iface, "start"),
     stop: () => invoke(iface, "stop"),
+    setIdleTimeout: (milliseconds) => invoke(iface, "setIdleTimeout", milliseconds),
     focusWindow: (windowId) => invoke(iface, "focusWindow", windowId),
     clearFocusWindow: () => invoke(iface, "clearFocusWindow"),
     movePointer: (x, y) => invoke(iface, "movePointer", x, y),

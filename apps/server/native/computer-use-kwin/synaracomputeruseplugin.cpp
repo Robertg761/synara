@@ -35,6 +35,9 @@
 #include "workspace.h"
 #include "xkb.h"
 
+#include <KGlobalAccel>
+
+#include <QAction>
 #include <QBuffer>
 #include <QDBusConnection>
 #include <QDBusMessage>
@@ -42,6 +45,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeySequence>
 #include <QPainter>
 #include <QThreadPool>
 
@@ -67,6 +71,13 @@ static const QString s_buildTimestamp = QStringLiteral(SYNARA_COMPUTER_USE_BUILD
 static const QString s_kwinVersion = QStringLiteral(SYNARA_COMPUTER_USE_KWIN_VERSION);
 static const QString s_agentCursorName = QStringLiteral("synara-agent");
 static const QString s_captureErrorName = QStringLiteral("org.synara.ComputerUse.Error.CaptureFailed");
+static const QString s_releasedErrorName = QStringLiteral("org.synara.ComputerUse.Error.ControlReleased");
+// A dead server must never leave the agent seat alive, so the session's
+// deadline lives here rather than in the server that may have crashed.
+static constexpr uint s_defaultIdleTimeoutMs = 5 * 60 * 1000;
+static constexpr uint s_minIdleTimeoutMs = 1000;
+static constexpr uint s_maxIdleTimeoutMs = 60 * 60 * 1000;
+static const QString s_releaseActionName = QStringLiteral("SynaraReleaseComputerControl");
 static constexpr int s_captureRenderDeadlineMilliseconds = 2000;
 static constexpr int s_captureEncodeDeadlineMilliseconds = 5000;
 static constexpr int s_captureMaxNativeSide = 16384;
@@ -77,6 +88,15 @@ static const QString s_captureSizeLimitReason = QStringLiteral("capture exceeds 
 // time-share the real seat's focus, and concurrent user input would cross
 // over (agent keys landing in the user's window and vice versa).
 static const QString s_agentSeatName = QStringLiteral("synara-agent");
+
+// Meta+Shift+Esc is unused by stock Plasma (kill-window is Ctrl+Alt+Esc) and
+// mirrors the muscle memory of Ctrl+Shift+Esc elsewhere. The user's real seat
+// feeds KWin's shortcut handling, and agent input never enters that pipeline,
+// so the agent can neither trigger nor swallow this combination.
+static QKeySequence releaseShortcut()
+{
+    return QKeySequence(QKeyCombination(Qt::MetaModifier | Qt::ShiftModifier, Qt::Key_Escape));
+}
 
 static QJsonObject pointToJson(const QPointF &point)
 {
@@ -419,9 +439,18 @@ void SynaraAgentCursorItem::refresh()
 
 SynaraComputerUsePlugin::SynaraComputerUsePlugin()
     : Plugin()
+    , m_idleTimeoutMs(s_defaultIdleTimeoutMs)
     , m_pos(Cursors::self()->mouse()->pos())
 {
     m_encodePool.setMaxThreadCount(1);
+
+    m_lastActivity.start();
+    m_idleTimer.setSingleShot(true);
+    m_idleTimer.setTimerType(Qt::CoarseTimer);
+    connect(&m_idleTimer, &QTimer::timeout, this, [this]() {
+        stopSession(StopReason::IdleTimeout);
+    });
+    registerReleaseShortcut();
 
     m_captureRenderWatchdog.setSingleShot(true);
     connect(&m_captureRenderWatchdog, &QTimer::timeout, this, [this]() {
@@ -450,11 +479,15 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
     }
 
     QDBusConnection::sessionBus().registerService(s_service);
-    QDBusConnection::sessionBus().registerObject(s_path, s_interface, this, QDBusConnection::ExportAllInvokables);
+    QDBusConnection::sessionBus().registerObject(s_path,
+                                                 s_interface,
+                                                 this,
+                                                 QDBusConnection::ExportAllInvokables | QDBusConnection::ExportScriptableSignals);
 }
 
 SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
 {
+    m_idleTimer.stop();
     m_encodePool.waitForDone();
     if (m_captureRequest) {
         failCapture(m_captureRequest, QStringLiteral("capture canceled: plugin destroyed"));
@@ -500,6 +533,9 @@ QString SynaraComputerUsePlugin::healthJson() const
         {QStringLiteral("workspace"), Workspace::self() != nullptr},
         {QStringLiteral("effects"), effects != nullptr},
         {QStringLiteral("capture"), effects && effects->isOpenGLCompositing() && effects->openglContext()},
+        {QStringLiteral("idleTimeoutMs"), double(m_idleTimeoutMs)},
+        {QStringLiteral("releasedByUser"), m_releasedByUser},
+        {QStringLiteral("releaseShortcut"), releaseShortcut().toString(QKeySequence::NativeText)},
     };
     if (Workspace::self()) {
         health.insert(QStringLiteral("workspaceGeometry"),
@@ -517,7 +553,18 @@ QString SynaraComputerUsePlugin::stateJson() const
         {QStringLiteral("position"), pointToJson(m_pos)},
         {QStringLiteral("pressedButtonCount"), m_pressedButtons.size()},
         {QStringLiteral("pressedKeyCount"), m_pressedKeys.size()},
+        {QStringLiteral("idleTimeoutMs"), double(m_idleTimeoutMs)},
+        {QStringLiteral("idleMs"), double(idleMilliseconds())},
+        {QStringLiteral("releasedByUser"), m_releasedByUser},
+        {QStringLiteral("releaseShortcut"), releaseShortcut().toString(QKeySequence::NativeText)},
     };
+    if (m_running && m_idleTimeoutMs > 0) {
+        state.insert(QStringLiteral("idleRemainingMs"),
+                     double(std::max<qint64>(0, qint64(m_idleTimeoutMs) - idleMilliseconds())));
+    }
+    if (!m_stopReason.isEmpty()) {
+        state.insert(QStringLiteral("stopReason"), m_stopReason);
+    }
     if (m_pointerWindow) {
         state.insert(QStringLiteral("pointerWindowId"), m_pointerWindow->internalId().toString(QUuid::WithoutBraces));
         state.insert(QStringLiteral("pointerWindowTitle"), m_pointerWindow->caption());
@@ -568,18 +615,45 @@ QString SynaraComputerUsePlugin::windowsJson() const
 
 bool SynaraComputerUsePlugin::start()
 {
+    if (m_releasedByUser) {
+        if (calledFromDBus()) {
+            sendErrorReply(s_releasedErrorName,
+                           QStringLiteral("computer control was released with %1")
+                               .arg(releaseShortcut().toString(QKeySequence::NativeText)));
+        }
+        return false;
+    }
     ensureSeat();
     if (!m_seat) {
         return false;
     }
     m_running = true;
+    m_stopReason.clear();
     setCursorVisible(true);
     movePointer(m_pos.x(), m_pos.y());
+    noteActivity();
     return true;
 }
 
 bool SynaraComputerUsePlugin::stop()
 {
+    stopSession(StopReason::Request);
+    return true;
+}
+
+bool SynaraComputerUsePlugin::setIdleTimeout(uint milliseconds)
+{
+    if (milliseconds != 0 && (milliseconds < s_minIdleTimeoutMs || milliseconds > s_maxIdleTimeoutMs)) {
+        return false;
+    }
+    m_idleTimeoutMs = milliseconds;
+    armIdleTimer();
+    return true;
+}
+
+void SynaraComputerUsePlugin::stopSession(StopReason reason)
+{
+    m_idleTimer.stop();
     if (m_captureRequest) {
         failCapture(m_captureRequest, QStringLiteral("capture canceled by stop"));
     }
@@ -590,13 +664,91 @@ bool SynaraComputerUsePlugin::stop()
     }
     m_pointerWindow.clear();
     m_keyboardWindow.clear();
+
+    const bool wasRunning = m_running;
+    const bool latching = reason == StopReason::UserRelease;
+    const bool changed = wasRunning || (latching && !m_releasedByUser);
     m_running = false;
     setCursorVisible(false);
+    m_stopReason = stopReasonName(reason);
+    // Only the human's panic switch latches. An idle timeout is routine, and an
+    // explicit server stop ends the session the server itself owns, so both
+    // leave the next start() free to run.
+    m_releasedByUser = latching;
+
+    if (changed) {
+        Q_EMIT sessionStopped(m_stopReason);
+    }
+}
+
+QString SynaraComputerUsePlugin::stopReasonName(StopReason reason)
+{
+    switch (reason) {
+    case StopReason::IdleTimeout:
+        return QStringLiteral("idle-timeout");
+    case StopReason::UserRelease:
+        return QStringLiteral("user-release");
+    case StopReason::Request:
+        break;
+    }
+    return QStringLiteral("request");
+}
+
+void SynaraComputerUsePlugin::registerReleaseShortcut()
+{
+    m_releaseAction = new QAction(this);
+    m_releaseAction->setObjectName(s_releaseActionName);
+    m_releaseAction->setText(QStringLiteral("Release Synara computer control"));
+    connect(m_releaseAction, &QAction::triggered, this, &SynaraComputerUsePlugin::handleReleaseShortcut);
+    KGlobalAccel::setGlobalShortcut(m_releaseAction, releaseShortcut());
+}
+
+void SynaraComputerUsePlugin::handleReleaseShortcut()
+{
+    // Pressing it again hands control back without a trip through Synara, so a
+    // panic stop can never strand the feature.
+    if (!m_running && m_releasedByUser) {
+        m_releasedByUser = false;
+        m_stopReason = QStringLiteral("user-resume");
+        return;
+    }
+    stopSession(StopReason::UserRelease);
+}
+
+bool SynaraComputerUsePlugin::requireRunning()
+{
+    if (!m_running) {
+        return false;
+    }
+    noteActivity();
     return true;
+}
+
+void SynaraComputerUsePlugin::noteActivity()
+{
+    m_lastActivity.restart();
+    armIdleTimer();
+}
+
+void SynaraComputerUsePlugin::armIdleTimer()
+{
+    if (!m_running || m_idleTimeoutMs == 0) {
+        m_idleTimer.stop();
+        return;
+    }
+    m_idleTimer.start(int(std::max<qint64>(0, qint64(m_idleTimeoutMs) - idleMilliseconds())));
+}
+
+qint64 SynaraComputerUsePlugin::idleMilliseconds() const
+{
+    return m_lastActivity.isValid() ? m_lastActivity.elapsed() : 0;
 }
 
 bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
 {
+    if (!requireRunning()) {
+        return false;
+    }
     Window *window = findWindowById(windowId);
     if (!usableWindow(window)) {
         return false;
@@ -609,6 +761,9 @@ bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
 
 bool SynaraComputerUsePlugin::clearFocusWindow()
 {
+    if (!requireRunning()) {
+        return false;
+    }
     m_targetWindow.clear();
     updatePointerFocus();
     updateKeyboardFocus();
@@ -617,6 +772,9 @@ bool SynaraComputerUsePlugin::clearFocusWindow()
 
 bool SynaraComputerUsePlugin::movePointer(double x, double y)
 {
+    if (!requireRunning()) {
+        return false;
+    }
     ensureSeat();
     if (!m_seat) {
         return false;
@@ -636,6 +794,9 @@ bool SynaraComputerUsePlugin::movePointer(double x, double y)
 
 bool SynaraComputerUsePlugin::button(uint button, bool pressed)
 {
+    if (!requireRunning()) {
+        return false;
+    }
     ensureSeat();
     if (!m_seat) {
         return false;
@@ -645,21 +806,15 @@ bool SynaraComputerUsePlugin::button(uint button, bool pressed)
     }
     updateKeyboardFocus();
 
-    const auto state = pressed ? PointerButtonState::Pressed : PointerButtonState::Released;
-    if (pressed) {
-        m_pressedButtons.insert(button);
-    } else {
-        m_pressedButtons.remove(button);
-    }
-
-    setTimestampNow();
-    m_seat->notifyPointerButton(button, state);
-    m_seat->notifyPointerFrame();
+    sendButton(button, pressed);
     return true;
 }
 
 bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 {
+    if (!requireRunning()) {
+        return false;
+    }
     ensureSeat();
     if (!m_seat) {
         return false;
@@ -681,6 +836,9 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 
 bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
 {
+    if (!requireRunning()) {
+        return false;
+    }
     ensureSeat();
     if (!m_seat) {
         return false;
@@ -689,7 +847,31 @@ bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
         return false;
     }
 
-    const auto state = pressed ? KeyboardKeyState::Pressed : KeyboardKeyState::Released;
+    sendKey(keyCode, pressed);
+    return true;
+}
+
+void SynaraComputerUsePlugin::sendButton(quint32 code, bool pressed)
+{
+    if (!m_seat) {
+        return;
+    }
+    if (pressed) {
+        m_pressedButtons.insert(code);
+    } else {
+        m_pressedButtons.remove(code);
+    }
+
+    setTimestampNow();
+    m_seat->notifyPointerButton(code, pressed ? PointerButtonState::Pressed : PointerButtonState::Released);
+    m_seat->notifyPointerFrame();
+}
+
+void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
+{
+    if (!m_seat) {
+        return;
+    }
     if (pressed) {
         if (!m_pressedKeys.contains(keyCode)) {
             m_pressedKeys.append(keyCode);
@@ -701,13 +883,14 @@ bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
     setTimestampNow();
     // Delivered on the agent's own seat, never through KWin's real keyboard
     // pipeline, so the user's focus and typing are untouched.
-    m_seat->notifyKeyboardKey(keyCode, state, waylandServer()->display()->nextSerial());
+    m_seat->notifyKeyboardKey(keyCode,
+                              pressed ? KeyboardKeyState::Pressed : KeyboardKeyState::Released,
+                              waylandServer()->display()->nextSerial());
     if (m_xkbState) {
         // evdev keycode -> xkb keycode offset is 8.
         xkb_state_update_key(m_xkbState, keyCode + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
         syncModifiers();
     }
-    return true;
 }
 
 QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint maxDimension)
@@ -716,6 +899,9 @@ QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint 
         return {};
     }
     setDelayedReply(true);
+    if (m_running) {
+        noteActivity();
+    }
 
     auto request = std::make_shared<CaptureRequest>(connection(), message());
     request->window = findWindowById(windowId);
@@ -731,6 +917,9 @@ QByteArray SynaraComputerUsePlugin::captureRegion(int x, int y, uint width, uint
         return {};
     }
     setDelayedReply(true);
+    if (m_running) {
+        noteActivity();
+    }
 
     auto request = std::make_shared<CaptureRequest>(connection(), message());
     request->region = RectF(qreal(x), qreal(y), qreal(width), qreal(height));
@@ -1221,13 +1410,15 @@ void SynaraComputerUsePlugin::releasePressedState()
         return;
     }
 
+    // Bypasses the public entry points: a release must land even when the
+    // session is already stopping, and it must never re-target focus.
     const auto buttons = m_pressedButtons.values();
     for (quint32 button : buttons) {
-        this->button(button, false);
+        sendButton(button, false);
     }
     const auto keys = m_pressedKeys;
     for (auto it = keys.crbegin(); it != keys.crend(); ++it) {
-        this->key(*it, false);
+        sendKey(*it, false);
     }
 }
 

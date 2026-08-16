@@ -11,6 +11,7 @@
 
 #include <QDBusContext>
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
@@ -23,6 +24,7 @@
 
 #include <memory>
 
+class QAction;
 struct xkb_state;
 
 namespace KWin
@@ -62,6 +64,7 @@ public:
     Q_INVOKABLE QString windowsJson() const;
     Q_INVOKABLE bool start();
     Q_INVOKABLE bool stop();
+    Q_INVOKABLE bool setIdleTimeout(uint milliseconds);
     Q_INVOKABLE bool focusWindow(const QString &windowId);
     Q_INVOKABLE bool clearFocusWindow();
     Q_INVOKABLE bool movePointer(double x, double y);
@@ -71,12 +74,36 @@ public:
     Q_INVOKABLE QByteArray captureWindow(const QString &windowId, uint maxDimension);
     Q_INVOKABLE QByteArray captureRegion(int x, int y, uint width, uint height, uint maxDimension);
 
+Q_SIGNALS:
+    /**
+     * Emitted whenever the session ends without the server asking for it, so a
+     * live compositor can be diagnosed with `busctl --user monitor`. Reasons:
+     * `request`, `idle-timeout`, `user-release`.
+     */
+    Q_SCRIPTABLE void sessionStopped(const QString &reason);
+
 private:
     struct CaptureRequest;
 
+    enum class StopReason {
+        Request,
+        IdleTimeout,
+        UserRelease,
+    };
+
     static QString toJson(const QJsonObject &object);
     static QString toJson(const QJsonArray &array);
+    static QString stopReasonName(StopReason reason);
 
+    void stopSession(StopReason reason);
+    void registerReleaseShortcut();
+    void handleReleaseShortcut();
+    bool requireRunning();
+    void noteActivity();
+    void armIdleTimer();
+    qint64 idleMilliseconds() const;
+    void sendButton(quint32 code, bool pressed);
+    void sendKey(quint32 keyCode, bool pressed);
     void ensureSeat();
     void ensureCursorItem();
     void setCursorVisible(bool visible);
@@ -98,6 +125,12 @@ private:
     void failCapture(std::shared_ptr<CaptureRequest> request, const QString &reason);
 
     bool m_running = false;
+    bool m_releasedByUser = false;
+    uint m_idleTimeoutMs;
+    QString m_stopReason;
+    QTimer m_idleTimer;
+    QElapsedTimer m_lastActivity;
+    QAction *m_releaseAction = nullptr;
     QPointF m_pos;
     QPointer<Window> m_pointerWindow;
     QPointer<Window> m_keyboardWindow;

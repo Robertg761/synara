@@ -51,6 +51,15 @@ const POINTER_CLAMP_TOLERANCE_PX = 2;
 const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 const KWIN_RECONNECT_BASE_DELAY_MS = 250;
 const KWIN_RECONNECT_MAX_DELAY_MS = 5_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
+const MIN_IDLE_TIMEOUT_MS = 1_000;
+const MAX_IDLE_TIMEOUT_MS = 60 * 60 * 1_000;
+/** Must match `releaseShortcut()` in the KWin plugin. */
+const RELEASE_CONTROL_HOTKEY = "Meta+Shift+Esc";
+const CONTROL_RELEASED_ERROR_TYPE = "org.synara.ComputerUse.Error.ControlReleased";
+const CONTROL_RELEASED_MESSAGE =
+  `Computer control was released with the ${RELEASE_CONTROL_HOTKEY} hotkey. ` +
+  `Press ${RELEASE_CONTROL_HOTKEY} again to hand control back.`;
 const MAX_PLUGIN_ID = /^SynaraComputerUsePlugin(?:V(\d+))?$/;
 const INSTALLED_PLUGIN_FILE = /^(SynaraComputerUsePluginV(\d+))\.so$/;
 const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
@@ -60,6 +69,7 @@ interface KWinHealth {
   readonly ok: boolean;
   readonly running: boolean;
   readonly capture: boolean;
+  readonly releasedByUser: boolean;
   readonly workspace: ComputerRect | null;
 }
 
@@ -83,6 +93,8 @@ export interface KWinComputerBackendOptions {
   readonly glideDurationMs?: number;
   readonly stillIntervalMs?: number;
   readonly captureMaxDimension?: number;
+  /** Plugin-side session deadline. `0` disables it; see the Phase 3b notes. */
+  readonly idleTimeoutMs?: number;
 }
 
 /**
@@ -103,6 +115,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly glideDurationMs: number;
   private readonly stillIntervalMs: number;
   private readonly captureMaxDimension: number;
+  private readonly idleTimeoutMs: number;
   private readonly atspi: AtspiTreeReader;
   private readonly dbusFactory: () => Promise<KWinComputerDbus>;
   private readonly installedPluginIds: () => Promise<readonly string[]>;
@@ -146,6 +159,7 @@ export class KWinComputerBackend implements ComputerBackend {
       1,
       Math.min(32_768, Math.floor(options.captureMaxDimension ?? DEFAULT_CAPTURE_MAX_DIMENSION)),
     );
+    this.idleTimeoutMs = normalizeIdleTimeout(options.idleTimeoutMs);
     this.atspi = options.atspi ?? new AtspiHelperClient();
     this.dbus = options.dbus;
     this.dbusFactory =
@@ -540,6 +554,9 @@ export class KWinComputerBackend implements ComputerBackend {
         if (!started) {
           throw new ComputerBackendError("Synara KWin computer-use plugin failed to start.");
         }
+        // A plugin build without setIdleTimeout keeps its own default deadline,
+        // so an older loaded plugin must not fail the session.
+        await plugin.setIdleTimeout(this.idleTimeoutMs).catch(() => undefined);
         const runningHealth = parseHealth(await plugin.healthJson());
         if (!runningHealth.ok || !runningHealth.running) {
           throw new ComputerBackendError("Synara KWin computer-use plugin is not running.");
@@ -770,18 +787,33 @@ export class KWinComputerBackend implements ComputerBackend {
     }
   }
 
+  /**
+   * The plugin refuses input while its session is stopped, which is how the
+   * server learns about a stop it never asked for: the idle deadline expiring
+   * during a long model turn, or the user's release hotkey. An idle stop is
+   * routine, so the session is restarted and the call retried once. A hotkey
+   * release is a deliberate human takeover, so it surfaces as a clear error
+   * instead of the agent silently grabbing the desktop back.
+   */
   private async pluginSuccess(operation: string, invoke: () => Promise<unknown>): Promise<void> {
-    let result: unknown;
-    try {
-      result = await invoke();
-    } catch (error) {
-      throw this.reportPluginFailure(error);
+    if (readBoolean(await this.pluginValue(invoke))) return;
+    if (await this.restartAfterExternalStop()) {
+      if (readBoolean(await this.pluginValue(invoke))) return;
     }
-    if (!readBoolean(result)) {
-      throw new ComputerBackendError(`Synara KWin plugin rejected ${operation}.`, {
-        retryable: true,
-      });
-    }
+    throw new ComputerBackendError(`Synara KWin plugin rejected ${operation}.`, {
+      retryable: true,
+    });
+  }
+
+  private async restartAfterExternalStop(): Promise<boolean> {
+    const plugin = this.plugin;
+    if (!plugin || this.disposed) return false;
+    const health = parseHealth(await this.pluginValue(() => plugin.healthJson()));
+    if (!health.ok || health.running) return false;
+    this.health = health;
+    if (health.releasedByUser) throw new ComputerBackendError(CONTROL_RELEASED_MESSAGE);
+    await this.startPlugin(plugin);
+    return true;
   }
 
   private async pluginValue<T>(invoke: () => Promise<T>): Promise<T> {
@@ -823,6 +855,9 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   private reportPluginFailure(error: unknown): ComputerBackendError {
+    if (dbusErrorType(error) === CONTROL_RELEASED_ERROR_TYPE) {
+      return new ComputerBackendError(CONTROL_RELEASED_MESSAGE, { cause: error });
+    }
     if (isConnectionLevelFailure(error)) {
       this.invalidateConnection();
       this.scheduleReconnect();
@@ -947,6 +982,7 @@ function parseHealth(value: unknown): KWinHealth {
     ok: record.ok === true,
     running: record.running === true,
     capture: record.capture === true,
+    releasedByUser: record.releasedByUser === true,
     workspace: parseWorkspaceGeometry(record),
   };
 }
@@ -1098,6 +1134,13 @@ export function readPngDimensions(bytes: Uint8Array): {
   if (width < 1 || height < 1)
     throw new ComputerBackendError("Synara KWin capture has invalid dimensions.");
   return { width, height };
+}
+
+function normalizeIdleTimeout(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_IDLE_TIMEOUT_MS;
+  const milliseconds = Math.floor(value);
+  if (milliseconds <= 0) return 0;
+  return Math.max(MIN_IDLE_TIMEOUT_MS, Math.min(MAX_IDLE_TIMEOUT_MS, milliseconds));
 }
 
 function normalizeDimension(value: number): number {
