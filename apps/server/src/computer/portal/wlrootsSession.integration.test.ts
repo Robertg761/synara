@@ -28,7 +28,14 @@ import type { ComputerRect } from "@synara/contracts";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  createDesktopHelperIdleSource,
+  DEFAULT_IDLE_ARM_MS,
+  HUMAN_ACTIVE_REFUSAL,
+  SharedSeatArbiter,
+} from "../sharedSeatArbiter.ts";
 import { startSupervisedProcess, type SupervisedProcess } from "../supervisedProcess.ts";
+import { DesktopHelperClient } from "./desktopHelperClient.ts";
 import {
   createPortalComputerBackend,
   type PortalComputerBackend,
@@ -122,6 +129,9 @@ describe.skipIf(!process.env.SYNARA_NESTED_WLROOTS_TEST)("wlroots desktop", () =
           "zwp_virtual_keyboard_manager_v1",
           "zwlr_screencopy_manager_v1",
           "zwlr_foreign_toplevel_management_v1",
+          // Tier 2 shares the human's seat, so being able to tell whether they
+          // are using it is part of what makes this desktop supportable.
+          "ext_idle_notifier_v1",
         ]),
       );
       const plan = backend.providerPlan();
@@ -266,6 +276,64 @@ describe.skipIf(!process.env.SYNARA_NESTED_WLROOTS_TEST)("wlroots desktop", () =
       WINDOW_TIMEOUT_MS,
     );
 
+    it(
+      "gives the shared seat back to input the agent did not send",
+      async () => {
+        // The arbiter's own logic is unit-tested; what only sway can show is that
+        // `ext_idle_notify_v1` behaves the way the source reads it — that the
+        // notification fires at all, that injected input resets the seat's idle
+        // clock, and that the two transitions arrive in time to decide an action.
+        //
+        // A second helper stands in for the human: its input reaches the same
+        // `wl_seat` the backend's does, and the arbiter is never told about it,
+        // which is exactly the situation it exists for.
+        const human = new DesktopHelperClient({
+          command: HELPER_PATH,
+          env: session.env,
+        });
+        const arbiter = new SharedSeatArbiter({
+          source: createDesktopHelperIdleSource(human),
+        });
+        const allowed = () =>
+          arbiter.guardMutation().then(
+            () => true,
+            () => false,
+          );
+        try {
+          await expect(human.idleState(DEFAULT_IDLE_ARM_MS)).resolves.toMatchObject({
+            timeoutMs: DEFAULT_IDLE_ARM_MS,
+          });
+          // Waits rather than asserts: the notification is blind for its whole
+          // window after arming, and the earlier tests left the seat busy.
+          await expect(waitFor(allowed)).resolves.toBe(true);
+
+          await human.pointerMotion(...pointOn(outputs[0]!.rect, 0.25));
+          await human.pointerMotion(...pointOn(outputs[0]!.rect, 0.75));
+
+          await expect(
+            waitFor(async () => !(await allowed())),
+            "the seat saw input from outside the agent and the agent kept going",
+          ).resolves.toBe(true);
+          await expect(arbiter.guardMutation()).rejects.toThrow(HUMAN_ACTIVE_REFUSAL);
+          expect(arbiter.status()).toMatchObject({ observing: true });
+
+          // And takes it back on its own once the seat goes quiet, with no reset
+          // and nothing to clear: a yield that needed acknowledging would strand
+          // the turn on a human who walked away.
+          await expect(waitFor(allowed)).resolves.toBe(true);
+
+          // Its own input is not a human's, even though the compositor cannot
+          // tell them apart — `guarded` notes the action after the motion lands,
+          // so the burst it just started is accounted for.
+          await arbiter.guarded(() => human.pointerMotion(...pointOn(outputs[0]!.rect, 0.5)));
+          await expect(arbiter.guardMutation()).resolves.toBeUndefined();
+        } finally {
+          await human.dispose();
+        }
+      },
+      BOOT_TIMEOUT_MS,
+    );
+
     it("refuses rather than reporting an empty desktop once the compositor is gone", async () => {
       // Runs last, and deliberately: the failure mode this whole tier exists to
       // avoid is a dead desktop that answers "no windows".
@@ -371,6 +439,11 @@ function unionRect(rects: readonly ComputerRect[]): ComputerRect {
 
 function centerOf(rect: ComputerRect): { readonly x: number; readonly y: number } {
   return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+}
+
+/** A point at `fraction` across a rect, as the helper's absolute motion wants it. */
+function pointOn(rect: ComputerRect, fraction: number): [number, number] {
+  return [Math.round(rect.x + rect.width * fraction), Math.round(rect.y + rect.height * fraction)];
 }
 
 async function waitFor(

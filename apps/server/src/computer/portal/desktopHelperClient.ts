@@ -103,6 +103,7 @@ export const DESKTOP_HELPER_METHODS = {
   listWindows: "listWindows",
   activateWindow: "activateWindow",
   closeWindow: "closeWindow",
+  idleState: "idleState",
 } as const;
 
 /** One output in desktop logical coordinates, the space pointer events use. */
@@ -140,6 +141,44 @@ export interface DesktopHelperCapture {
   readonly region: ComputerRect;
 }
 
+/**
+ * Whether the human has touched the shared seat lately, as `ext_idle_notify_v1`
+ * reports it.
+ *
+ * The protocol pushes two transitions and answers no questions, so this is a
+ * report of the last thing the compositor said and when it said it — never a
+ * direct reading of how long the human has been away.
+ */
+export interface DesktopHelperIdleState {
+  /** True when the compositor has seen no input for `timeoutMs`. */
+  readonly idle: boolean;
+  /** How long ago the seat last changed between idle and active. */
+  readonly sinceMs: number;
+  /**
+   * The timeout the helper's notification is armed at, which a re-arm changes.
+   * `idle` alone is not a duration; combined with this it is one, because the
+   * seat had been quiet exactly this long when `idle` became true.
+   */
+  readonly timeoutMs: number;
+  /**
+   * Whether the compositor has reported a transition yet. False for the first
+   * `timeoutMs` after the notification is armed — the protocol measures its
+   * timeout from the notification's creation, not from the seat's last input —
+   * and false indefinitely if the seat never goes quiet for that long. A reader
+   * that treats it as "active" refuses in the human's name on an empty desk; a
+   * reader that treats it as "quiet" drives over a human who never stopped.
+   */
+  readonly observed: boolean;
+}
+
+/**
+ * The window `idleState` accepts, enforced in `wayland.h` as
+ * `HELPER_IDLE_TIMEOUT_MIN_MS`/`_MAX_MS`. Restated here because a caller that
+ * passes something outside it gets an invalid-params refusal, and a clamp is
+ * cheaper than a round trip that was never going to work.
+ */
+export const DESKTOP_HELPER_IDLE_TIMEOUT_MS = { min: 100, max: 600_000 } as const;
+
 export interface DesktopHelperCaptureRequest {
   readonly region: ComputerRect;
   readonly maxDimension: number;
@@ -165,6 +204,19 @@ export interface DesktopHelperTransport {
   listWindows(): Promise<readonly DesktopHelperWindow[]>;
   activateWindow(id: string): Promise<void>;
   closeWindow(id: string): Promise<void>;
+  /**
+   * Whether the seat has been idle for `timeoutMs`, arming the compositor's
+   * notification at that window on the first call.
+   *
+   * `idle: false` with `observed: true` is the answer the arbiter acts on: it
+   * means the human touched a key or moved the pointer inside that window, and
+   * the agent gives the seat back. Every other answer is deliberately not its
+   * mirror image — a compositor with no `ext_idle_notifier_v1` refuses rather
+   * than answering `true`, and one that has not spoken yet says so through
+   * `observed` — because "we cannot tell" must never reach the arbiter as
+   * "nobody is there".
+   */
+  idleState(timeoutMs: number): Promise<DesktopHelperIdleState>;
   dispose(): Promise<void>;
 }
 
@@ -332,6 +384,35 @@ export class DesktopHelperClient implements DesktopHelperTransport {
 
   async closeWindow(id: string): Promise<void> {
     await this.request(DESKTOP_HELPER_METHODS.closeWindow, { id });
+  }
+
+  async idleState(timeoutMs: number): Promise<DesktopHelperIdleState> {
+    const result = asRecord(
+      await this.request(DESKTOP_HELPER_METHODS.idleState, {
+        timeoutMs: Math.round(timeoutMs),
+      }),
+    );
+    const sinceMs = asFiniteNumber(result.sinceMs);
+    const armedTimeoutMs = asFiniteNumber(result.timeoutMs);
+    // Read strictly rather than defaulted: every field here is a fact about the
+    // human, and a missing one filled in with a plausible number would be the
+    // arbiter deciding on this module's guess instead of the compositor's answer.
+    if (
+      typeof result.idle !== "boolean" ||
+      typeof result.observed !== "boolean" ||
+      sinceMs === undefined ||
+      armedTimeoutMs === undefined
+    ) {
+      throw new ComputerBackendError(
+        "The desktop helper answered the seat's idle state without an idle flag, an elapsed time, the timeout it was armed at, and whether the compositor has said anything yet, so whether the human is at the keyboard cannot be read from it.",
+      );
+    }
+    return {
+      idle: result.idle,
+      sinceMs,
+      timeoutMs: armedTimeoutMs,
+      observed: result.observed,
+    };
   }
 
   async dispose(): Promise<void> {

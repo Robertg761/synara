@@ -16,6 +16,7 @@
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "ext-idle-notify-v1-client-protocol.h"
 #include "virtual-keyboard-unstable-v1-client-protocol.h"
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
@@ -124,6 +125,18 @@ struct helper_wayland {
 	uint32_t toplevel_manager_name;
 	struct helper_toplevel *toplevels;
 	uint32_t next_toplevel_id;
+
+	struct ext_idle_notifier_v1 *idle_notifier;
+	uint32_t idle_notifier_name;
+	uint32_t idle_notifier_version;
+	/* Held open between requests because the protocol only pushes transitions:
+	 * a notification created per query would report the seat as active for its
+	 * whole timeout, whatever the human was doing. */
+	struct ext_idle_notification_v1 *idle_notification;
+	uint32_t idle_timeout_ms;
+	bool idle;
+	bool idle_observed;
+	int64_t idle_since_ms;
 
 	struct helper_held *held_buttons;
 	struct helper_held *held_keys;
@@ -497,6 +510,53 @@ static void drop_all_toplevels(helper_wayland *state) {
 	}
 }
 
+// ── Idle notification ────────────────────────────────────────────────
+
+/*
+ * The two transitions the compositor pushes are the whole protocol: there is no
+ * request that asks how long the seat has been quiet, so the state one of these
+ * last established, and the moment it did, is all this helper can ever know.
+ */
+static void idle_notification_idled(void *data, struct ext_idle_notification_v1 *notification) {
+	(void)notification;
+	helper_wayland *state = data;
+	state->idle = true;
+	state->idle_observed = true;
+	state->idle_since_ms = monotonic_ms();
+}
+
+static void idle_notification_resumed(void *data, struct ext_idle_notification_v1 *notification) {
+	(void)notification;
+	helper_wayland *state = data;
+	state->idle = false;
+	state->idle_observed = true;
+	state->idle_since_ms = monotonic_ms();
+}
+
+static const struct ext_idle_notification_v1_listener idle_notification_listener = {
+	.idled = idle_notification_idled,
+	.resumed = idle_notification_resumed,
+};
+
+/*
+ * Drops the notification and everything it established.
+ *
+ * Both callers have lost the thing it was watching — the seat, the notifier, or
+ * the connection — so the remembered transition no longer describes anything.
+ * Keeping it would let a stale `idled` answer a later query as though the human
+ * were still away.
+ */
+static void drop_idle_notification(helper_wayland *state) {
+	if (state->idle_notification != NULL) {
+		ext_idle_notification_v1_destroy(state->idle_notification);
+		state->idle_notification = NULL;
+	}
+	state->idle_timeout_ms = 0;
+	state->idle = false;
+	state->idle_observed = false;
+	state->idle_since_ms = 0;
+}
+
 // ── Registry ─────────────────────────────────────────────────────────
 
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
@@ -574,6 +634,12 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
 		if (state->toplevel_manager == NULL) return;
 		zwlr_foreign_toplevel_manager_v1_add_listener(state->toplevel_manager,
 		                                              &toplevel_manager_listener, state);
+	} else if (strcmp(interface, ext_idle_notifier_v1_interface.name) == 0) {
+		if (state->idle_notifier != NULL) return;
+		state->idle_notifier_version = version < 2 ? version : 2;
+		state->idle_notifier = wl_registry_bind(registry, name, &ext_idle_notifier_v1_interface,
+		                                        state->idle_notifier_version);
+		state->idle_notifier_name = name;
 	}
 }
 
@@ -600,6 +666,9 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
 		/* The virtual devices go first: they were created on this seat, and the
 		 * compositor has already dropped whatever they were holding down. */
 		forget_virtual_devices(state);
+		/* The idle notification was created on this seat too, so it is watching
+		 * an object the compositor has forgotten. */
+		drop_idle_notification(state);
 		/* `release` only exists from wl_seat version 5, and sending it to an
 		 * older global is a protocol error. */
 		if (state->seat_version >= 5) {
@@ -634,6 +703,14 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
 		 * description of anything. Reporting it as one would be the lie this
 		 * helper is not allowed to tell. */
 		drop_all_toplevels(state);
+	}
+	if (state->idle_notifier != NULL && state->idle_notifier_name == name) {
+		/* The notification outlives its manager by the letter of the protocol,
+		 * but nothing is left to answer for it, so it goes with the manager. */
+		drop_idle_notification(state);
+		ext_idle_notifier_v1_destroy(state->idle_notifier);
+		state->idle_notifier = NULL;
+		state->idle_notifier_version = 0;
 	}
 
 	struct helper_global **global_cursor = &state->globals;
@@ -717,6 +794,8 @@ void helper_wayland_destroy(helper_wayland *state) {
 		free(global);
 	}
 
+	drop_idle_notification(state);
+	if (state->idle_notifier != NULL) ext_idle_notifier_v1_destroy(state->idle_notifier);
 	if (state->pointer != NULL) zwlr_virtual_pointer_v1_destroy(state->pointer);
 	if (state->keyboard != NULL) zwp_virtual_keyboard_v1_destroy(state->keyboard);
 	if (state->xkb_state != NULL) xkb_state_unref(state->xkb_state);
@@ -1680,5 +1759,85 @@ bool helper_wayland_close_window(helper_wayland *state, const char *id, helper_e
 	}
 	zwlr_foreign_toplevel_handle_v1_close(toplevel->handle);
 	wl_display_flush(state->display);
+	return true;
+}
+
+// ── Idle ─────────────────────────────────────────────────────────────
+
+bool helper_wayland_idle_state(helper_wayland *state, uint32_t timeout_ms, helper_idle_state *out,
+                               helper_error *error) {
+	if (state->idle_notifier == NULL) {
+		helper_error_set(error, HELPER_REFUSAL_UNSUPPORTED,
+		                 "this compositor does not advertise ext_idle_notifier_v1, so whether the "
+		                 "human is at the keyboard cannot be observed");
+		return false;
+	}
+	if (state->seat == NULL) {
+		helper_error_set(error, HELPER_REFUSAL_TRANSIENT,
+		                 "this compositor advertises no wl_seat whose idle state could be watched");
+		return false;
+	}
+	/* A caller that changed its mind about the window gets a new notification:
+	 * the timeout is fixed at creation, so re-arming is the only way to ask a
+	 * different question, and the clock starts again with it. */
+	if (state->idle_notification != NULL && state->idle_timeout_ms != timeout_ms) {
+		drop_idle_notification(state);
+	}
+	if (state->idle_notification == NULL) {
+		/*
+		 * Version 2's input-idle notification is the one that answers the
+		 * question actually being asked. A plain idle notification is suppressed
+		 * by any zwp_idle_inhibitor_v1 — a playing video, a presentation — and a
+		 * notification the compositor is forbidden to idle never idles, never
+		 * resumes, and reports a seat that is busy forever. That reads as "the
+		 * human is always here", which retires the yield silently for as long as
+		 * something on the desktop is holding an inhibitor. Input alone is the
+		 * signal; version 1 compositors get the notification that can be
+		 * inhibited, because it is the only one they have.
+		 */
+		state->idle_notification =
+		    state->idle_notifier_version >= 2
+		        ? ext_idle_notifier_v1_get_input_idle_notification(state->idle_notifier, timeout_ms,
+		                                                           state->seat)
+		        : ext_idle_notifier_v1_get_idle_notification(state->idle_notifier, timeout_ms,
+		                                                     state->seat);
+		if (state->idle_notification == NULL) {
+			helper_error_set(error, HELPER_REFUSAL_TRANSIENT,
+			                 "the compositor refused to create an idle notification for this seat");
+			return false;
+		}
+		ext_idle_notification_v1_add_listener(state->idle_notification, &idle_notification_listener,
+		                                      state);
+		state->idle_timeout_ms = timeout_ms;
+		state->idle = false;
+		state->idle_observed = false;
+		state->idle_since_ms = monotonic_ms();
+	}
+	/*
+	 * Settled before answering, not after.
+	 *
+	 * Nothing else in this process drives the event queue between requests, so
+	 * an `idled` or `resumed` the compositor sent while the helper was idle sits
+	 * unread in the socket. Answering from the remembered state without the
+	 * round trip would report a transition that already happened as though it
+	 * had not — a human who came back a second ago still reported as away, which
+	 * is the one wrong answer here the caller acts on.
+	 */
+	if (wl_display_roundtrip(state->display) < 0) {
+		return connection_failed(state, error, "the Wayland connection failed");
+	}
+	/* The round trip may have carried the withdrawal of the seat or the notifier,
+	 * either of which takes the notification with it. */
+	if (state->idle_notification == NULL) {
+		helper_error_set(error, HELPER_REFUSAL_TRANSIENT,
+		                 "the compositor withdrew the seat or ext_idle_notifier_v1 while its idle "
+		                 "state was being read");
+		return false;
+	}
+	int64_t since_ms = monotonic_ms() - state->idle_since_ms;
+	out->idle = state->idle;
+	out->since_ms = since_ms > 0 ? since_ms : 0;
+	out->timeout_ms = state->idle_timeout_ms;
+	out->observed = state->idle_observed;
 	return true;
 }

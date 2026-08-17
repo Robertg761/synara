@@ -12,8 +12,9 @@ libraries with no usable binding, so all of them live here:
 | `zwlr_screencopy_manager_v1`          | per-output framebuffer capture            |
 | `zwlr_foreign_toplevel_management_v1` | the window list, activate, close          |
 | `zxdg_output_manager_v1`              | output placement in desktop coordinates   |
+| `ext_idle_notifier_v1` (v2 preferred) | human idle/active on the shared seat      |
 
-All four are unprivileged: a wlroots compositor hands them to any client on the
+Every one is unprivileged: a wlroots compositor hands them to any client on the
 session with no portal and no consent dialog. That is why this is the preferred
 Tier 2 path — it is the only one that puts nothing on the user's screen.
 
@@ -65,9 +66,28 @@ module that knows any of this.
 
 Methods: `globals`, `outputs`, `pointerMotion`, `pointerButton`, `scroll`,
 `key`, `releaseAll`, `capture`, `listWindows`, `activateWindow`, `closeWindow`,
-`shutdown`. A method the compositor cannot serve returns a JSON-RPC error naming
-the missing protocol — never an empty result. The client treats that as a
-refusal and leaves the process alone; only a transport failure restarts it.
+`idleState`, `shutdown`. A method the compositor cannot serve returns a JSON-RPC
+error naming the missing protocol — never an empty result. The client treats
+that as a refusal and leaves the process alone; only a transport failure
+restarts it.
+
+`idleState` is the one method whose result is not a direct reading, because
+`ext_idle_notifier_v1` has no request that asks how long the seat has been quiet
+— it pushes `idled` and `resumed` and nothing else. So the helper arms one
+notification at the caller's `timeoutMs` (100 ms … 600 s; a different timeout
+re-arms it) and reports the last thing the compositor said: `idle` is which
+transition, `sinceMs` is how long ago it arrived, `timeoutMs` is the window it
+was armed at, and `observed` is whether any transition has arrived at all.
+
+`observed` is load-bearing and false for at least the first `timeoutMs` after
+arming, because the protocol counts its timeout from the notification's
+creation rather than from the seat's last input. Without it a caller cannot tell
+"the compositor has not spoken yet" from "the human has not stopped typing",
+which is the difference between yielding the seat on an empty desk and typing
+into somebody's window. On v2 the helper asks for
+`get_input_idle_notification`, whose timer ignores idle inhibitors — a video
+player holding a `zwp_idle_inhibitor_v1` would otherwise make the seat look
+permanently busy and retire the whole yield.
 
 Two short-lived CLI modes exist for the probe, which runs at server boot on
 desktops that may have none of these protocols: `--print-globals` and
@@ -96,7 +116,8 @@ The TypeScript providers are unit-tested against a fake transport, which cannot
 prove any of the C. The lane that can is
 `src/computer/portal/wlrootsSession.integration.test.ts`, which boots sway on
 the headless wlroots backend and checks the helper's work against sway's own
-account of it — a keybinding firing, sway's output list:
+account of it — a keybinding firing, sway's output list, the seat's idle clock
+resetting under injected input:
 
 ```sh
 SYNARA_NESTED_WLROOTS_TEST=1 bunx vitest run src/computer/portal/wlrootsSession.integration.test.ts

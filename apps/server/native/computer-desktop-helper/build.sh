@@ -68,6 +68,7 @@ PROTOCOLS=(
   wlr-foreign-toplevel-management-unstable-v1
   virtual-keyboard-unstable-v1
   xdg-output-unstable-v1
+  ext-idle-notify-v1
 )
 
 GENERATED_SOURCES=()

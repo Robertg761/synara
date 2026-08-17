@@ -244,6 +244,60 @@ describe("DesktopHelperClient", () => {
     await client.dispose();
   });
 
+  it("reads the seat's idle state, echoing back the timeout it was armed at", async () => {
+    // `idle: false` is the answer that makes the arbiter yield the seat, so the
+    // flag has to survive the round trip exactly as the compositor gave it.
+    const child = new FakeHelperProcess().respond(({ method, params }) => {
+      expect(method).toBe("idleState");
+      expect(params).toEqual({ timeoutMs: 500 });
+      return { idle: false, sinceMs: 340, timeoutMs: 500, observed: true };
+    });
+    const client = clientFor(child);
+
+    await expect(client.idleState(500)).resolves.toEqual({
+      idle: false,
+      sinceMs: 340,
+      timeoutMs: 500,
+      observed: true,
+    });
+
+    await client.dispose();
+  });
+
+  it("keeps 'the compositor has not spoken yet' distinct from 'the seat is busy'", async () => {
+    // The two look identical on the wire — both are `idle: false` — and they
+    // mean opposite things about whether the answer can be trusted at all.
+    const child = new FakeHelperProcess().respond(() => ({
+      idle: false,
+      sinceMs: 12,
+      timeoutMs: 500,
+      observed: false,
+    }));
+    const client = clientFor(child);
+
+    await expect(client.idleState(500)).resolves.toMatchObject({
+      observed: false,
+    });
+
+    await client.dispose();
+  });
+
+  it("refuses an idle answer missing a field rather than guessing at the human", async () => {
+    // Defaulting the elapsed time, the armed timeout, or whether the compositor
+    // has said anything at all would hand the arbiter this module's guess
+    // wearing the compositor's authority.
+    const child = new FakeHelperProcess().respond(() => ({
+      idle: true,
+      sinceMs: 5,
+      timeoutMs: 500,
+    }));
+    const client = clientFor(child);
+
+    await expect(client.idleState(500)).rejects.toThrow(/whether the human is at the keyboard/);
+
+    await client.dispose();
+  });
+
   it("keeps the process when the helper refuses a method", async () => {
     // "This compositor has no foreign-toplevel protocol" is a correct answer
     // that a restart cannot change, so restarting on it would be a spawn loop.

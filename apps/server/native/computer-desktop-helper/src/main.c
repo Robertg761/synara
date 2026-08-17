@@ -497,6 +497,26 @@ static bool dispatch(helper_context *context, const char *method, const json_val
 		return true;
 	}
 
+	if (strcmp(method, "idleState") == 0) {
+		int64_t timeout_ms = 0;
+		if (!require_int(params, "timeoutMs", HELPER_IDLE_TIMEOUT_MIN_MS, HELPER_IDLE_TIMEOUT_MAX_MS,
+		                 &timeout_ms, error)) {
+			return false;
+		}
+		helper_idle_state idle = {0};
+		if (!helper_wayland_idle_state(wayland, (uint32_t)timeout_ms, &idle, error)) return false;
+		jw_raw(writer, "{\"idle\":");
+		jw_raw(writer, idle.idle ? "true" : "false");
+		jw_raw(writer, ",\"sinceMs\":");
+		jw_int(writer, (long long)idle.since_ms);
+		jw_raw(writer, ",\"timeoutMs\":");
+		jw_int(writer, idle.timeout_ms);
+		jw_raw(writer, ",\"observed\":");
+		jw_raw(writer, idle.observed ? "true" : "false");
+		jw_char(writer, '}');
+		return true;
+	}
+
 	if (strcmp(method, "listWindows") == 0) {
 		jw_raw(writer, "{\"windows\":");
 		if (!helper_wayland_write_windows(wayland, writer, error)) return false;

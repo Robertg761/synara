@@ -15,6 +15,7 @@ import { ComputerBackendError } from "../ComputerBackend.ts";
 import type {
   DesktopHelperCapture,
   DesktopHelperCaptureRequest,
+  DesktopHelperIdleState,
   DesktopHelperOutputs,
   DesktopHelperTransport,
   DesktopHelperWindow,
@@ -41,6 +42,7 @@ export interface FakeDesktopHelperOptions {
   readonly outputs?: DesktopHelperOutputs;
   readonly windows?: readonly DesktopHelperWindow[];
   readonly capture?: (request: DesktopHelperCaptureRequest) => DesktopHelperCapture;
+  readonly idleState?: DesktopHelperIdleState;
   readonly dispose?: () => Promise<void>;
   /** Makes every method reject, for the refusal paths. */
   readonly failWith?: string;
@@ -52,6 +54,20 @@ export interface FakeDesktopHelper extends DesktopHelperTransport {
   /** Mutable so a test can change the desktop between two `listWindows` calls. */
   windows: readonly DesktopHelperWindow[];
 }
+
+/**
+ * A desktop nobody is sitting at.
+ *
+ * The default is the quiet seat so that a test with no opinion about the human
+ * is not silently gated behind one: a provider whose arbiter yields the moment
+ * someone touches the keyboard would otherwise never get to act.
+ */
+const DEFAULT_IDLE_STATE: DesktopHelperIdleState = {
+  idle: true,
+  sinceMs: 10_000,
+  timeoutMs: 500,
+  observed: true,
+};
 
 const DEFAULT_OUTPUTS: DesktopHelperOutputs = {
   outputs: [{ name: "HEADLESS-1", rect: { x: 0, y: 0, width: 1920, height: 1080 }, scale: 1 }],
@@ -92,6 +108,8 @@ export function fakeDesktopHelper(options: FakeDesktopHelperOptions = {}): FakeD
     },
     activateWindow: (id) => record(`activateWindow ${id}`, undefined),
     closeWindow: (id) => record(`closeWindow ${id}`, undefined),
+    idleState: (timeoutMs) =>
+      record(`idleState ${timeoutMs}`, options.idleState ?? DEFAULT_IDLE_STATE),
     dispose: () => {
       calls.push("dispose");
       return options.dispose?.() ?? Promise.resolve();
