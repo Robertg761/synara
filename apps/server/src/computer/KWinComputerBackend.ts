@@ -1191,6 +1191,12 @@ const CONNECTION_DBUS_ERROR_TYPES = new Set([
   "org.freedesktop.DBus.Error.Disconnected",
   "org.freedesktop.DBus.Error.IOError",
   "org.freedesktop.DBus.Error.Timeout",
+  // A KWin crash does not drop this backend's session-bus connection — only
+  // KWin's bus names vanish, so calls to the stale proxy fail with these two
+  // instead of a disconnect. The remedy is the connection-level one: drop the
+  // proxy, reconnect, and re-load the plugin into the restarted compositor.
+  "org.freedesktop.DBus.Error.ServiceUnknown",
+  "org.freedesktop.DBus.Error.NameHasNoOwner",
 ]);
 
 function isMethodLevelDbusError(error: unknown): boolean {

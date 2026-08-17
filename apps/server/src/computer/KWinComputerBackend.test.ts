@@ -1409,3 +1409,40 @@ describe("KWinComputerBackend clipboard", () => {
     await backend.dispose();
   });
 });
+
+describe("KWinComputerBackend KWin crash recovery", () => {
+  it("drops the stale proxy and re-loads the plugin when KWin's bus name vanishes", async () => {
+    const dbus = new FakeDbus();
+    dbus.loaded = ["SynaraComputerUsePluginV10"];
+    const backend = makeBackend(dbus);
+
+    await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+
+    // A KWin crash keeps the session-bus connection alive — onDisconnect never
+    // fires — and calls to the now-ownerless service fail with ServiceUnknown.
+    const healthyWindowsJson = dbus.plugin.windowsJson;
+    const serviceUnknown = () =>
+      Object.assign(
+        new Error("The name org.synara.ComputerUse was not provided by any .service files"),
+        { type: "org.freedesktop.DBus.Error.ServiceUnknown" },
+      );
+    dbus.plugin.windowsJson = async () => {
+      throw serviceUnknown();
+    };
+
+    await expect(backend.listWindows()).rejects.toMatchObject({ retryable: true });
+
+    // KWin restarts without the plugin loaded. The next call must not reuse the
+    // stale proxy: it reconnects, re-loads the plugin, and recovers.
+    dbus.plugin.windowsJson = healthyWindowsJson;
+    dbus.loaded = [];
+    const callsBeforeRecovery = dbus.calls.length;
+
+    await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+    const recoveryCalls = dbus.calls.slice(callsBeforeRecovery).map((call) => call.method);
+    expect(recoveryCalls).toContain("LoadPlugin");
+    expect(recoveryCalls).toContain("connectPlugin");
+
+    await backend.dispose();
+  });
+});
