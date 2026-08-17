@@ -1470,6 +1470,17 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
         return false;
     }
     if (m_keyboardWindow == window) {
+        // Re-borrowing is not enough once KWin has revoked the window's active
+        // flag: that revocation means the human's seat focus churned through the
+        // window, and the leave that seat sent reset the client's keyboard-focus
+        // state. Verified live: re-sending xdg `activated` alone leaves Qt's
+        // shortcut matcher dead, while a fresh enter on our seat revives it. So
+        // cycle our keyboard focus too, carrying any held keys, and let
+        // updateWindowActivation re-assert the flag.
+        if (!window->isActive() && m_seat && window->surface()) {
+            m_seat->setFocusedKeyboardSurface(nullptr);
+            m_seat->setFocusedKeyboardSurface(window->surface(), m_pressedKeys);
+        }
         updateWindowActivation(window);
         return true;
     }
