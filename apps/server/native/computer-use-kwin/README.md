@@ -266,6 +266,13 @@ signature reuses the installed id, so the periodic systemd check does not create
 an unbounded stream of identical plugin files. A source change, KWin upgrade,
 or `--force` creates a new versioned id.
 
+The plugin metadata sets `EnabledByDefault: false`, so KWin does not load any
+installed version at compositor startup; only an explicit `LoadPlugin` (from
+the installer or the server backend) loads one. With auto-load, every installed
+version came up at startup and the oldest registrant won the
+`org.synara.ComputerUse` bus name, shadowing the newest build — builds stamped
+before this change still auto-load until they are uninstalled.
+
 ## KWin ABI
 
 A binary KWin plugin must be built against the exact running KWin version. KWin
