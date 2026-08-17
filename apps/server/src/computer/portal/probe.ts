@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { KWIN_SERVICE } from "../kwinDbus.ts";
 import { readSessionBusProperty, sessionBusNameHasOwner } from "../sessionBusNames.ts";
 import { unwrapDbusValue } from "../computerGeometry.ts";
+import { readWaylandGlobals } from "./desktopHelperClient.ts";
 import type { PortalCapabilitySlot, PortalProviderId } from "./providers.ts";
 
 /** Bus name of the portal front-end every portal backend registers behind. */
@@ -55,6 +56,12 @@ export const WLROOTS_GLOBALS = {
   foreignToplevel: "zwlr_foreign_toplevel_management_v1",
   idleNotify: "ext_idle_notifier_v1",
   dataControl: "zwlr_data_control_manager_v1",
+  /**
+   * The upstreamed successor. wlroots 0.18+, KWin, and Mutter 48 advertise this
+   * and are dropping the wlr name, and wl-clipboard 2.2+ speaks either, so a
+   * check for only the older one would call a working clipboard unsupported.
+   */
+  extDataControl: "ext_data_control_manager_v1",
 } as const;
 
 /**
@@ -218,7 +225,7 @@ export async function probeDesktop(
   let waylandGlobals: readonly string[] | undefined;
   if (sessionType === "wayland") {
     try {
-      waylandGlobals = await (dependencies.waylandGlobals ?? defaultWaylandGlobals)();
+      waylandGlobals = await (dependencies.waylandGlobals ?? (() => defaultWaylandGlobals(env)))();
     } catch (error) {
       record(
         "wayland-globals",
@@ -331,7 +338,7 @@ export function planPortalProviders(probe: PortalProbe): PortalProviderPlan {
 function planInput(probe: PortalProbe): PortalProviderChoice {
   if (probe.sessionType !== "wayland") return { blockedBy: sessionGap(probe) };
   if (probe.waylandGlobals?.includes(WLROOTS_GLOBALS.virtualPointer)) {
-    return blockedByPhase("wlroots-virtual-input", "B2");
+    return helperBacked("wlroots-virtual-input", probe);
   }
   if (probe.portal.remoteDesktopVersion !== undefined) {
     const devices = probe.portal.availableDeviceTypes;
@@ -355,7 +362,7 @@ function planInput(probe: PortalProbe): PortalProviderChoice {
 function planCapture(probe: PortalProbe): PortalProviderChoice {
   if (probe.sessionType !== "wayland") return { blockedBy: sessionGap(probe) };
   if (probe.waylandGlobals?.includes(WLROOTS_GLOBALS.screencopy)) {
-    return blockedByPhase("wlr-screencopy", "B2");
+    return helperBacked("wlr-screencopy", probe);
   }
   if (probe.portal.screenCastVersion !== undefined)
     return blockedByPhase("pipewire-screencast", "B3");
@@ -369,7 +376,7 @@ function planCapture(probe: PortalProbe): PortalProviderChoice {
 function planWindows(probe: PortalProbe): PortalProviderChoice {
   if (probe.desktopExtensionPresent) return blockedByPhase("gnome-shell-extension", "B4");
   if (probe.waylandGlobals?.includes(WLROOTS_GLOBALS.foreignToplevel)) {
-    return blockedByPhase("wlr-foreign-toplevel", "B2");
+    return helperBacked("wlr-foreign-toplevel", probe);
   }
   if (probe.desktop === "gnome") {
     return {
@@ -386,9 +393,18 @@ function planWindows(probe: PortalProbe): PortalProviderChoice {
   };
 }
 
+/** Either data-control protocol lets wl-paste read a selection it does not own. */
+function hasDataControl(globals: readonly string[] | undefined): boolean {
+  return (
+    globals?.includes(WLROOTS_GLOBALS.dataControl) === true ||
+    globals?.includes(WLROOTS_GLOBALS.extDataControl) === true
+  );
+}
+
 function planClipboard(probe: PortalProbe): PortalProviderChoice {
-  if (probe.wlClipboard && probe.waylandGlobals?.includes(WLROOTS_GLOBALS.dataControl)) {
-    return blockedByPhase("wl-clipboard", "B2");
+  if (probe.wlClipboard && hasDataControl(probe.waylandGlobals)) {
+    // No helper: wl-copy and wl-paste are their own Wayland clients.
+    return { implementation: "wl-clipboard" };
   }
   if ((probe.portal.remoteDesktopVersion ?? 0) >= 2)
     return blockedByPhase("portal-selection", "B3");
@@ -403,6 +419,27 @@ function planClipboard(probe: PortalProbe): PortalProviderChoice {
     blockedBy:
       "wl-clipboard is installed but this compositor advertises no data-control protocol, and its portal is too old for " +
       "SelectionRead/SelectionWrite. Clipboard access needs wlr-data-control (or ext-data-control on GNOME 48+).",
+  };
+}
+
+/**
+ * A wlroots provider, which is usable exactly when the native helper that
+ * speaks the protocol is built.
+ *
+ * The compositor advertising the global is only half the answer: Node cannot
+ * hold a `wl_display`, so an unbuilt helper means the protocol is there and
+ * unreachable. Saying which of the two is missing is the difference between a
+ * user running one build script and a user concluding their desktop is
+ * unsupported.
+ */
+function helperBacked(implementation: PortalProviderId, probe: PortalProbe): PortalProviderChoice {
+  if (probe.helperBinary !== undefined) return { implementation };
+  return {
+    implementation,
+    blockedBy:
+      `This desktop would use the ${implementation} provider, but the native desktop helper that speaks ` +
+      "the protocol is not built. Build it with apps/server/native/computer-desktop-helper/build.sh, " +
+      "or point SYNARA_COMPUTER_HELPER at an existing build.",
   };
 }
 
@@ -458,14 +495,23 @@ function defaultReadPortalProperty(interfaceName: string, propertyName: string):
 
 /**
  * Enumerating Wayland globals needs a `wl_display` connection, which Node has
- * no binding for; the native desktop helper owns it. Until that helper exists
- * this reports the absence rather than guessing, which is why every wlroots
- * capability is gated behind the helper being built.
+ * no binding for; the native desktop helper owns it.
+ *
+ * A short-lived `--print-globals` invocation rather than a supervised helper:
+ * this runs at server boot on desktops that may have no wlroots protocols at
+ * all, and holding a process on the compositor for the server's lifetime to
+ * answer one question is a cost the probe has not earned. The rejection when
+ * the helper is not built is the honest answer — it is what makes every wlroots
+ * capability report "not built" rather than "your desktop cannot do this".
  */
-function defaultWaylandGlobals(): Promise<readonly string[]> {
-  return Promise.reject(
-    new Error("the native desktop helper, which owns the Wayland connection, is not built"),
-  );
+async function defaultWaylandGlobals(env: NodeJS.ProcessEnv): Promise<readonly string[]> {
+  const command = desktopHelperPath(env);
+  if (!(await defaultExecutableExists(command))) {
+    throw new Error(
+      `the native desktop helper, which owns the Wayland connection, is not built at ${command}`,
+    );
+  }
+  return await readWaylandGlobals({ command, env });
 }
 
 async function defaultExecutableExists(path: string): Promise<boolean> {

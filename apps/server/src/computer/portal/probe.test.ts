@@ -58,6 +58,22 @@ function desktop(
 
 const WL_CLIPBOARD = ["wl-copy", "wl-paste"] as const;
 
+/** A sway-like desktop: every wlroots global, wl-clipboard installed. */
+function wlrootsDesktop(options: { readonly helper: boolean }): PortalProbeDependencies {
+  return desktop({
+    globals: [
+      WLROOTS_GLOBALS.virtualPointer,
+      WLROOTS_GLOBALS.virtualKeyboard,
+      WLROOTS_GLOBALS.screencopy,
+      WLROOTS_GLOBALS.foreignToplevel,
+      WLROOTS_GLOBALS.dataControl,
+    ],
+    commands: WL_CLIPBOARD,
+    helper: options.helper,
+    env: { XDG_SESSION_TYPE: "wayland", SWAYSOCK: "/run/sway.sock" },
+  });
+}
+
 describe("readSessionType", () => {
   it("prefers the declared session type and falls back to the Wayland socket", () => {
     expect(readSessionType({ XDG_SESSION_TYPE: "X11" })).toBe("x11");
@@ -174,19 +190,7 @@ function probeFor(overrides: Partial<PortalProbe> = {}): PortalProbe {
 
 describe("planPortalProviders", () => {
   it("picks the unprivileged wlroots protocols when the compositor advertises them", async () => {
-    const probe = await probeDesktop(
-      desktop({
-        globals: [
-          WLROOTS_GLOBALS.virtualPointer,
-          WLROOTS_GLOBALS.virtualKeyboard,
-          WLROOTS_GLOBALS.screencopy,
-          WLROOTS_GLOBALS.foreignToplevel,
-          WLROOTS_GLOBALS.dataControl,
-        ],
-        commands: WL_CLIPBOARD,
-        env: { XDG_SESSION_TYPE: "wayland", SWAYSOCK: "/run/sway.sock" },
-      }),
-    );
+    const probe = await probeDesktop(wlrootsDesktop({ helper: true }));
     const plan = planPortalProviders(probe);
 
     expect(probe.desktop).toBe("wlroots");
@@ -194,11 +198,27 @@ describe("planPortalProviders", () => {
     expect(plan.capture.implementation).toBe("wlr-screencopy");
     expect(plan.windows.implementation).toBe("wlr-foreign-toplevel");
     expect(plan.clipboard.implementation).toBe("wl-clipboard");
-    // Selected, but not built: the difference between "your desktop cannot do
-    // this" and "Synara has not written this part yet".
+    // Every one of them is usable: the protocols are advertised and the helper
+    // that speaks them is built.
     for (const choice of Object.values(plan)) {
-      expect(choice.blockedBy).toContain("phase B");
+      expect(choice.blockedBy).toBeUndefined();
     }
+  });
+
+  it("blames the unbuilt helper, not the desktop, when the protocols are all there", async () => {
+    const probe = await probeDesktop(wlrootsDesktop({ helper: false }));
+    const plan = planPortalProviders(probe);
+
+    // Still selected — the difference between "your desktop cannot do this" and
+    // "Synara has not been built for it yet" is the difference between
+    // uninstalling and running one script.
+    expect(plan.input.implementation).toBe("wlroots-virtual-input");
+    for (const slot of ["input", "capture", "windows"] as const) {
+      expect(plan[slot].blockedBy).toContain("build.sh");
+      expect(plan[slot].blockedBy).toContain("SYNARA_COMPUTER_HELPER");
+    }
+    // The clipboard is its own pair of processes and needs no helper at all.
+    expect(plan.clipboard.blockedBy).toBeUndefined();
   });
 
   it("prefers wlroots protocols over the portal even when both are present", () => {
@@ -281,5 +301,15 @@ describe("planPortalProviders", () => {
 
     expect(plan.clipboard.blockedBy).toContain("data-control");
     expect(plan.clipboard.blockedBy).not.toContain("Install the wl-clipboard package");
+  });
+
+  it("accepts either data-control protocol, because the wlr one is being retired", () => {
+    // wlroots 0.18+, KWin and Mutter 48 advertise only `ext_data_control_manager_v1`,
+    // and wl-clipboard 2.2+ speaks it; checking for the wlr name alone would
+    // call a working clipboard unsupported on every current compositor.
+    for (const global of ["zwlr_data_control_manager_v1", "ext_data_control_manager_v1"]) {
+      const plan = planPortalProviders(probeFor({ wlClipboard: true, waylandGlobals: [global] }));
+      expect(plan.clipboard).toEqual({ implementation: "wl-clipboard" });
+    }
   });
 });

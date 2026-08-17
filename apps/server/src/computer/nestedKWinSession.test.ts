@@ -270,6 +270,8 @@ interface FakeSpawn {
 class FakeChild extends EventEmitter {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
+  /** As a real child has it: the same streams, indexed by fd, with stdin ignored. */
+  readonly stdio = [null, this.stdout, this.stderr];
   signal: string | undefined;
   killed = false;
 

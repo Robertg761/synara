@@ -4,6 +4,7 @@ import type { ComputerRect, ComputerWindow } from "@synara/contracts";
 
 import { ComputerBackendError } from "../ComputerBackend.ts";
 import { POINTER_SEQUENCE_OPERATIONS } from "../pointerSequencing.ts";
+import { fakeDesktopHelper } from "./fakeDesktopHelper.ts";
 import {
   capabilitiesFromProviders,
   createPortalComputerBackend,
@@ -217,7 +218,7 @@ describe("capabilitiesFromProviders", () => {
 });
 
 describe("resolvePortalProviders", () => {
-  it("carries the plan's sentence into every slot, phase and all", () => {
+  it("carries the plan's sentence into every slot it could not build", () => {
     const providers = resolvePortalProviders(
       probeFor({
         waylandGlobals: [WLROOTS_GLOBALS.virtualPointer, WLROOTS_GLOBALS.screencopy],
@@ -228,7 +229,74 @@ describe("resolvePortalProviders", () => {
     expect(providers.input.available === false && providers.input.reason).toContain(
       "wlroots-virtual-input",
     );
-    expect(providers.capture.available === false && providers.capture.reason).toContain("phase B2");
+    // The protocol is advertised and the helper is not built, so the refusal
+    // has to name the build rather than the desktop.
+    expect(providers.capture.available === false && providers.capture.reason).toContain("build.sh");
+  });
+
+  it("builds the wlroots providers once the helper exists", () => {
+    const providers = resolvePortalProviders(
+      probeFor({
+        helperBinary: "/tmp/synara-computer-desktop-helper",
+        wlClipboard: true,
+        waylandGlobals: [
+          WLROOTS_GLOBALS.virtualPointer,
+          WLROOTS_GLOBALS.screencopy,
+          WLROOTS_GLOBALS.foreignToplevel,
+          WLROOTS_GLOBALS.dataControl,
+        ],
+      }),
+      // The helper is never spawned here: construction must not touch the
+      // compositor, so nothing below awaits a live process.
+      { createHelper: () => fakeDesktopHelper() },
+    );
+
+    expect(providers.input.available && providers.input.provider.id).toBe("wlroots-virtual-input");
+    expect(providers.capture.available && providers.capture.provider.id).toBe("wlr-screencopy");
+    expect(providers.windows.available && providers.windows.provider.id).toBe(
+      "wlr-foreign-toplevel",
+    );
+    expect(providers.clipboard.available && providers.clipboard.provider.id).toBe("wl-clipboard");
+    expect(capabilitiesFromProviders(providers)).toEqual({
+      windows: true,
+      // The protocol reports no geometry and no stacking, and the capability
+      // flags have to say so or window-scoped tools will be offered and refuse.
+      windowBounds: false,
+      stacking: false,
+      capture: true,
+      input: true,
+      clipboard: true,
+      activation: true,
+      ghostCursor: false,
+      sharedSeat: true,
+    });
+  });
+
+  it("disposes the shared helper exactly once, after the last provider releases it", async () => {
+    let disposals = 0;
+    const providers = resolvePortalProviders(
+      probeFor({
+        helperBinary: "/tmp/synara-computer-desktop-helper",
+        waylandGlobals: [
+          WLROOTS_GLOBALS.virtualPointer,
+          WLROOTS_GLOBALS.screencopy,
+          WLROOTS_GLOBALS.foreignToplevel,
+        ],
+      }),
+      {
+        createHelper: () =>
+          fakeDesktopHelper({
+            dispose: () => {
+              disposals += 1;
+              return Promise.resolve();
+            },
+          }),
+      },
+    );
+
+    await backendWith(providers).dispose();
+
+    expect(disposals).toBe(1);
   });
 });
 

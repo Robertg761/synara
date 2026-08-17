@@ -291,6 +291,10 @@
     "./deviceHelperCache": {
       "types": "./src/deviceHelperCache.ts",
       "import": "./src/deviceHelperCache.ts"
+    },
+    "./lengthPrefixedRecords": {
+      "types": "./src/lengthPrefixedRecords.ts",
+      "import": "./src/lengthPrefixedRecords.ts"
     }
   },
   "scripts": {

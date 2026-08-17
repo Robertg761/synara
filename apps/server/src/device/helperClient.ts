@@ -32,6 +32,11 @@ import * as path from "node:path";
 
 import { decodeDeviceFrame } from "@synara/shared/deviceFrame";
 import {
+  encodeLengthPrefixedRecord,
+  LengthPrefixedRecordError,
+  LengthPrefixedRecordParser,
+} from "@synara/shared/lengthPrefixedRecords";
+import {
   JsonRpcStdioFramer,
   JsonRpcStdioRequestRegistry,
   JsonRpcStdioTransportError,
@@ -57,11 +62,6 @@ export const HELPER_METHODS = {
   screenshot: "screenshot",
   describeUi: "describe-ui",
 } as const;
-
-/** `u32 little-endian payload length`, then the contract frame envelope. */
-const FRAME_LENGTH_PREFIX_BYTES = 4;
-/** Refuse absurd length prefixes rather than allocating on a desynced stream. */
-const FRAME_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_CONTROL_LINE_BYTES = 4 * 1024 * 1024;
@@ -138,52 +138,34 @@ function readNumber(record: Record<string, unknown>, key: string, fallback: numb
 }
 
 /**
- * Splits the helper's length-prefixed records out of an arbitrarily chunked
- * byte stream. The payload is passed through as-is: it is already the contract
- * envelope, and re-parsing it here would duplicate `decodeDeviceFrame`.
+ * The helper's length-prefixed frame records, in this module's error type.
+ *
+ * The splitting itself is shared with the Linux desktop helper, which frames its
+ * capture payloads identically; only the failure type differs, because a
+ * desynced stream here is a `DeviceHelperError` the transport already knows how
+ * to drop a socket on.
  */
 export class DeviceFramePrefixParser {
-  private buffer: Buffer = Buffer.alloc(0);
+  private readonly parser = new LengthPrefixedRecordParser();
 
   /** Returns every complete payload now available, in order. */
   push(chunk: Uint8Array): readonly Uint8Array[] {
-    this.buffer =
-      this.buffer.byteLength === 0
-        ? Buffer.from(chunk)
-        : Buffer.concat([this.buffer, Buffer.from(chunk)]);
-
-    const payloads: Uint8Array[] = [];
-    while (this.buffer.byteLength >= FRAME_LENGTH_PREFIX_BYTES) {
-      const length = this.buffer.readUInt32LE(0);
-      if (length > FRAME_MAX_PAYLOAD_BYTES) {
+    try {
+      return this.parser.push(chunk);
+    } catch (error) {
+      if (error instanceof LengthPrefixedRecordError) {
         throw new DeviceHelperError(
           "frame_stream_desync",
-          `Helper frame record claims ${length} bytes`,
+          `Helper frame record claims ${error.declaredBytes} bytes`,
         );
       }
-      const total = FRAME_LENGTH_PREFIX_BYTES + length;
-      if (this.buffer.byteLength < total) break;
-      // Copied: the payload outlives this parse and `this.buffer` is reassigned.
-      payloads.push(
-        Uint8Array.prototype.slice.call(
-          this.buffer,
-          FRAME_LENGTH_PREFIX_BYTES,
-          total,
-        ) as Uint8Array,
-      );
-      this.buffer = this.buffer.subarray(total);
+      throw error;
     }
-    return payloads;
   }
 }
 
 /** Frame the way the helper does. Used by the tests. */
-export function encodeFrameRecord(payload: Uint8Array): Buffer {
-  const record = Buffer.alloc(FRAME_LENGTH_PREFIX_BYTES + payload.byteLength);
-  record.writeUInt32LE(payload.byteLength, 0);
-  record.set(payload, FRAME_LENGTH_PREFIX_BYTES);
-  return record;
-}
+export const encodeFrameRecord = encodeLengthPrefixedRecord;
 
 /**
  * Owns one helper process: spawn, JSON-RPC over stdio, and the unix socket the

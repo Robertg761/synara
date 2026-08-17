@@ -75,6 +75,7 @@ import {
   type PortalProviders,
   type ProviderSlot,
 } from "./providers.ts";
+import { resolveWlrootsProviders, type WlrootsProviderOptions } from "./wlrootsProviders.ts";
 
 const DEFAULT_COMPUTER_ID = "primary" as ComputerId;
 const DEFAULT_GLIDE_DURATION_MS = 180;
@@ -657,22 +658,31 @@ export function capabilitiesFromProviders(providers: PortalProviders): ComputerC
 /**
  * The providers a probe resolves today.
  *
- * The selection itself is real and lives in `planPortalProviders`; what is not
- * real yet is construction, because the libei, PipeWire, and wlroots providers
- * land in later phases. Each slot therefore carries the sentence the plan
- * produced — which names the provider this desktop *would* use and the phase it
- * arrives in, or the package that is actually missing — so a user is never told
- * "unsupported" when the true answer is "not written yet" or "install this".
+ * The wlroots set — virtual input, screencopy, foreign-toplevel — and the
+ * wl-clipboard provider are built here when the compositor advertises their
+ * protocols and the native helper exists. Everything else (libei, PipeWire, the
+ * GNOME Shell extension) lands in later phases, and each unbuilt slot carries
+ * the sentence the plan produced: the provider this desktop *would* use and the
+ * phase it arrives in, or the package that is actually missing. A user is never
+ * told "unsupported" when the true answer is "not written yet" or "install
+ * this".
  */
-export function resolvePortalProviders(probe: PortalProbe): PortalProviders {
+export function resolvePortalProviders(
+  probe: PortalProbe,
+  options: WlrootsProviderOptions = {},
+): PortalProviders {
   const plan = planPortalProviders(probe);
-  const slot = <T>(blockedBy: string | undefined): ProviderSlot<T> =>
-    missingProvider<T>(blockedBy ?? "No provider is wired up for this capability yet.");
+  const built = resolveWlrootsProviders(probe, plan, options);
+  const slot = <T>(
+    resolved: ProviderSlot<T> | undefined,
+    blockedBy: string | undefined,
+  ): ProviderSlot<T> =>
+    resolved ?? missingProvider<T>(blockedBy ?? "No provider is wired up for this capability yet.");
   return {
-    input: slot(plan.input.blockedBy),
-    capture: slot(plan.capture.blockedBy),
-    windows: slot(plan.windows.blockedBy),
-    clipboard: slot(plan.clipboard.blockedBy),
+    input: slot(built.input, plan.input.blockedBy),
+    capture: slot(built.capture, plan.capture.blockedBy),
+    windows: slot(built.windows, plan.windows.blockedBy),
+    clipboard: slot(built.clipboard, plan.clipboard.blockedBy),
   };
 }
 
@@ -681,13 +691,15 @@ export function createPortalComputerBackend(
   probe: PortalProbe,
   options: Omit<PortalComputerBackendOptions, "probe" | "providers"> & {
     readonly providers?: PortalProviders;
+    /** Passed to the wlroots providers; a nested session supplies its display here. */
+    readonly providerOptions?: WlrootsProviderOptions;
   } = {},
 ): PortalComputerBackend {
-  const { providers, ...rest } = options;
+  const { providers, providerOptions, ...rest } = options;
   return new PortalComputerBackend({
     ...rest,
     probe,
-    providers: providers ?? resolvePortalProviders(probe),
+    providers: providers ?? resolvePortalProviders(probe, providerOptions ?? {}),
   });
 }
 

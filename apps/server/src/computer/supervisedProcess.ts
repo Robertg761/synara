@@ -9,7 +9,8 @@
  * a spawn error or an early exit is recorded rather than thrown, every wait
  * watches for it, and the stderr tail rides along on the failure message.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 
@@ -47,6 +48,30 @@ export class SupervisedProcess {
     // pipes stay referenced until terminate destroys them, because the startup
     // handshake reads them and an unreferenced pipe can lose that race.
     child.unref();
+  }
+
+  /**
+   * The child's own pipes, for a helper that is talked to rather than only
+   * watched. `null` whenever the spawn did not ask for a pipe on that fd, which
+   * a caller must handle rather than assume: the default supervised spawn
+   * ignores stdin.
+   */
+  get stdin(): Writable | null {
+    return this.child.stdin;
+  }
+
+  get stdout(): Readable | null {
+    return this.child.stdout;
+  }
+
+  /**
+   * A pipe past stderr — fd 3 is the desktop helper's binary frame channel,
+   * which exists so a full-desktop PNG never has to be base64'd through the
+   * JSON-RPC line protocol.
+   */
+  extraStream(fd: number): Readable | Writable | null {
+    const stream = this.child.stdio[fd];
+    return stream === undefined || stream === null ? null : (stream as Readable | Writable);
   }
 
   /** A daemon that prints its address and then serves; only the first line matters. */
@@ -99,6 +124,18 @@ export class SupervisedProcess {
     return this.exited;
   }
 
+  /**
+   * Resolves with the exit reason when the process ends.
+   *
+   * A supervisor that holds requests for its child needs this: without it, a
+   * helper that dies mid-request leaves every caller waiting out the full
+   * request timeout for an answer that can no longer come, and the next request
+   * is written into a dead pipe.
+   */
+  whenExited(): Promise<string> {
+    return this.finished.then(() => this.exited ?? "unknown reason");
+  }
+
   /** The tail of stderr, formatted for appending to a failure message. */
   diagnostic(): string {
     const text = Buffer.concat(this.stderr).toString("utf8").trim();
@@ -114,8 +151,12 @@ export class SupervisedProcess {
       await this.finished;
       clearTimeout(escalation);
     }
-    this.child.stdout?.destroy();
-    this.child.stderr?.destroy();
+    // Every pipe, not just stdout and stderr: a helper spawned with a stdin or
+    // an extra frame channel would otherwise leave those fds referenced and the
+    // event loop with a reason to stay awake.
+    for (const stream of this.child.stdio) {
+      (stream as { destroy?: () => void } | null)?.destroy?.();
+    }
   }
 
   private pushStderr(chunk: Buffer): void {
@@ -131,15 +172,19 @@ export type SupervisedSpawn = (
   command: string,
   args: readonly string[],
   env: NodeJS.ProcessEnv,
+  stdio?: StdioOptions,
 ) => ChildProcess;
+
+/** stdin ignored, stderr piped: enough for a daemon that is only watched. */
+const DEFAULT_SUPERVISED_STDIO: StdioOptions = ["ignore", "pipe", "pipe"];
 
 /**
  * The default spawn for a supervised child: an ordinary child of this process,
  * so a signal to the server's process group reaches it too, with stderr piped
  * because the diagnostic is the whole point.
  */
-export const spawnSupervisedProcess: SupervisedSpawn = (command, args, env) =>
-  spawn(command, [...args], { stdio: ["ignore", "pipe", "pipe"], env });
+export const spawnSupervisedProcess: SupervisedSpawn = (command, args, env, stdio) =>
+  spawn(command, [...args], { stdio: stdio ?? DEFAULT_SUPERVISED_STDIO, env });
 
 /**
  * Spawns and wraps a child, converting a spawn failure into the same error type
@@ -149,12 +194,14 @@ export function startSupervisedProcess(options: {
   readonly command: string;
   readonly args: readonly string[];
   readonly env: NodeJS.ProcessEnv;
+  /** Non-default pipe layout, e.g. the desktop helper's stdin and fd 3 channel. */
+  readonly stdio?: StdioOptions;
   readonly spawnProcess?: SupervisedSpawn;
 }): SupervisedProcess {
   const spawnProcess = options.spawnProcess ?? spawnSupervisedProcess;
   let child: ChildProcess;
   try {
-    child = spawnProcess(options.command, options.args, options.env);
+    child = spawnProcess(options.command, options.args, options.env, options.stdio);
   } catch (error) {
     throw new ComputerBackendError(
       `${options.command} could not be started: ${describeProcessError(error)}`,
