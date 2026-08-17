@@ -1,4 +1,9 @@
-import type { ComputerFrameHeader, ThreadComputerState, ThreadId } from "@synara/contracts";
+import type {
+  ComputerFrameHeader,
+  ComputerHealth,
+  ThreadComputerState,
+  ThreadId,
+} from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -11,6 +16,7 @@ import {
   computerWheelScrollDelta,
   createComputerFrameGateState,
   resolveComputerAvailabilityView,
+  resolveComputerHealthBadge,
   shouldSubscribeToComputerStream,
   stepComputerFrameGate,
 } from "./ComputerPanel.logic";
@@ -37,9 +43,14 @@ function state(overrides: Partial<ThreadComputerState> = {}): ThreadComputerStat
     agentActive: false,
     controlledByOtherThread: false,
     availability: { kind: "available" },
+    health: connectedHealth(),
     lastError: null,
     ...overrides,
   };
+}
+
+function connectedHealth(): ComputerHealth {
+  return { status: "connected", consecutiveFailures: 0, reconnects: 0, captureAvailable: true };
 }
 
 describe("computer frame gate", () => {
@@ -96,6 +107,46 @@ describe("computer panel state helpers", () => {
     expect(
       resolveComputerAvailabilityView({ kind: "backend-unavailable", message: "KWin is off" }),
     ).toMatchObject({ kind: "blocked", description: "KWin is off" });
+  });
+
+  it("shows a reconnecting backend as checking rather than blocked", () => {
+    expect(
+      resolveComputerAvailabilityView(
+        { kind: "backend-unavailable", message: "Reconnecting to the desktop. Last failure: boom" },
+        {
+          ...connectedHealth(),
+          status: "reconnecting",
+          consecutiveFailures: 2,
+          lastFailure: { message: "boom", at: "2026-08-16T10:00:00.000Z" },
+        },
+      ),
+    ).toMatchObject({ kind: "checking", description: "boom" });
+  });
+
+  it("badges a degraded backend and stays silent while it is connected", () => {
+    expect(resolveComputerHealthBadge(connectedHealth())).toBeNull();
+    expect(resolveComputerHealthBadge(undefined)).toBeNull();
+
+    const reconnecting = resolveComputerHealthBadge({
+      ...connectedHealth(),
+      status: "reconnecting",
+      consecutiveFailures: 3,
+      reconnects: 1,
+      captureAvailable: false,
+      lastFailure: { message: "KWin vanished", at: "2026-08-16T10:00:00.000Z" },
+    });
+    expect(reconnecting).toMatchObject({
+      label: "Reconnecting to desktop",
+      tone: "warning",
+      pulse: true,
+    });
+    expect(reconnecting?.title).toContain("KWin vanished");
+    expect(reconnecting?.title).toContain("3");
+    expect(reconnecting?.title).toContain("Reconnects since startup: 1.");
+
+    expect(
+      resolveComputerHealthBadge({ ...connectedHealth(), status: "unavailable" }),
+    ).toMatchObject({ label: "Desktop unavailable", tone: "danger", pulse: false });
   });
 
   it("subscribes only for a visible live available thread", () => {

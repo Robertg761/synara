@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 import type {
   ComputerAvailability,
+  ComputerHealth,
+  ComputerHealthFailure,
   ComputerId,
   ComputerLaunchAppResult,
   ComputerPoint,
@@ -17,6 +19,7 @@ import type {
 } from "@synara/contracts";
 
 import {
+  clampComputerMessage,
   ComputerBackendError,
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   intersectComputerRects,
@@ -152,11 +155,25 @@ export class KWinComputerBackend implements ComputerBackend {
   private dbus: KWinComputerDbus | undefined;
   private plugin: KWinComputerPluginApi | undefined;
   private pluginId: string | undefined;
-  private health: KWinHealth | undefined;
+  private pluginHealth: KWinHealth | undefined;
   private disconnect: (() => void) | undefined;
   private connectPromise: Promise<KWinComputerPluginApi> | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectFailures = 0;
+  /** A retry is pending or running, which is what `reconnecting` reports. */
+  private reconnecting = false;
+  private hasConnected = false;
+  private consecutiveFailures = 0;
+  private reconnects = 0;
+  private lastFailure: ComputerHealthFailure | undefined;
+  /**
+   * The error the failure counters were last moved for. One connection loss
+   * reaches the counters twice — the connect path rethrows what the caller then
+   * reports — and both hops carry the same object, so identity is what keeps a
+   * single outage from counting as two.
+   */
+  private countedFailure: unknown;
+  private publishedHealth: ComputerHealth | undefined;
   private disposed = false;
   private streamListener: ComputerFrameListener | undefined;
   private streamTimer: ReturnType<typeof setInterval> | undefined;
@@ -223,15 +240,41 @@ export class KWinComputerBackend implements ComputerBackend {
       if (!health.ok) {
         throw new ComputerBackendError("Synara KWin computer-use health check failed.");
       }
-      this.health = health;
+      this.pluginHealth = health;
+      this.publishHealth();
       return { kind: "available", backend: "kwin" };
     } catch (error) {
       const failure = this.reportPluginFailure(error);
+      // A refusal the reconnect path never sees — no installed plugin, a KWin
+      // version mismatch — is still the newest thing that went wrong, so it is
+      // recorded here rather than only where a retry is scheduled.
+      this.recordHealthFailure(error);
+      this.publishHealth();
       return {
         kind: "backend-unavailable",
         message: failure.message,
       };
     }
+  }
+
+  /**
+   * Health as the supervision path already knows it: no D-Bus call, no probe.
+   * `connected` is exactly the condition `ensureConnectedPlugin` reuses a live
+   * plugin under, so what a panel is told and what the next action will find
+   * cannot drift apart.
+   */
+  health(): ComputerHealth {
+    return {
+      status: this.connectedPlugin()
+        ? "connected"
+        : this.reconnecting
+          ? "reconnecting"
+          : "unavailable",
+      consecutiveFailures: this.consecutiveFailures,
+      reconnects: this.reconnects,
+      ...(this.lastFailure ? { lastFailure: this.lastFailure } : {}),
+      captureAvailable: this.pluginHealth?.capture === true,
+    };
   }
 
   async listWindows(): Promise<readonly ComputerWindow[]> {
@@ -253,7 +296,7 @@ export class KWinComputerBackend implements ComputerBackend {
   async getScreenSize(): Promise<ComputerScreenSize> {
     await this.ensurePlugin({ start: false });
     const windows = await this.listWindows();
-    return screenSizeFromWindows(windows, this.health?.workspace);
+    return screenSizeFromWindows(windows, this.pluginHealth?.workspace);
   }
 
   async getState(options: {
@@ -264,7 +307,7 @@ export class KWinComputerBackend implements ComputerBackend {
     // listWindows already reads the plugin state to resolve the focused window,
     // so a second stateJson round trip here would only add latency.
     const windows = await this.listWindows();
-    const screenSize = screenSizeFromWindows(windows, this.health?.workspace);
+    const screenSize = screenSizeFromWindows(windows, this.pluginHealth?.workspace);
     let root: ComputerUiNode | undefined;
     if (options.includeText) {
       try {
@@ -278,7 +321,7 @@ export class KWinComputerBackend implements ComputerBackend {
     }
 
     const screenshot =
-      options.includeScreenshot && this.health?.capture === true
+      options.includeScreenshot && this.pluginHealth?.capture === true
         ? await this.captureWorkspaceScreenshot(windows).catch(() => undefined)
         : undefined;
     return {
@@ -560,7 +603,7 @@ export class KWinComputerBackend implements ComputerBackend {
     maxDimension = this.captureMaxDimension,
   ): Promise<Uint8Array> {
     const plugin = await this.ensurePlugin();
-    if (this.health?.capture !== true) {
+    if (this.pluginHealth?.capture !== true) {
       throw new ComputerBackendError("The loaded Synara KWin plugin has no capture support.");
     }
     return readByteArray(
@@ -578,7 +621,7 @@ export class KWinComputerBackend implements ComputerBackend {
     maxDimension = this.captureMaxDimension,
   ): Promise<Uint8Array> {
     const plugin = await this.ensurePlugin();
-    if (this.health?.capture !== true) {
+    if (this.pluginHealth?.capture !== true) {
       throw new ComputerBackendError("The loaded Synara KWin plugin has no capture support.");
     }
     return readByteArray(
@@ -616,7 +659,7 @@ export class KWinComputerBackend implements ComputerBackend {
       }
       const region = intersectComputerRects(
         window.bounds,
-        workspaceRectFromWindows(windows, this.health?.workspace),
+        workspaceRectFromWindows(windows, this.pluginHealth?.workspace),
       );
       if (!region) {
         throw new ComputerBackendError(
@@ -662,6 +705,7 @@ export class KWinComputerBackend implements ComputerBackend {
     await this.detachStream();
     if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    this.reconnecting = false;
     const plugin = this.plugin;
     if (plugin) await plugin.stop().catch(() => undefined);
     this.disconnect?.();
@@ -669,7 +713,7 @@ export class KWinComputerBackend implements ComputerBackend {
     await this.dbus?.close().catch(() => undefined);
     this.dbus = undefined;
     this.plugin = undefined;
-    this.health = undefined;
+    this.pluginHealth = undefined;
     await this.atspi.dispose().catch(() => undefined);
     this.eventListeners.clear();
   }
@@ -684,11 +728,14 @@ export class KWinComputerBackend implements ComputerBackend {
 
   private async ensureConnectedPlugin(): Promise<KWinComputerPluginApi> {
     if (this.disposed) throw new ComputerBackendError("KWin computer backend is disposed.");
-    if (this.plugin && this.health?.ok === true) return this.plugin;
+    const connected = this.connectedPlugin();
+    if (connected) return connected;
     if (this.connectPromise) return this.connectPromise;
     this.connectPromise = this.connectWithBackoff()
       .catch((error) => {
         if (!isMethodLevelDbusError(error)) this.scheduleReconnect();
+        this.recordHealthFailure(error);
+        this.publishHealth();
         throw error;
       })
       .finally(() => {
@@ -699,7 +746,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   private async startPlugin(plugin: KWinComputerPluginApi): Promise<void> {
     if (this.disposed) throw new ComputerBackendError("KWin computer backend is disposed.");
-    if (this.health?.running === true) return;
+    if (this.pluginHealth?.running === true) return;
     if (this.startPromise) return this.startPromise;
     this.startPromise = (async () => {
       try {
@@ -714,7 +761,8 @@ export class KWinComputerBackend implements ComputerBackend {
         if (!runningHealth.ok || !runningHealth.running) {
           throw new ComputerBackendError("Synara KWin computer-use plugin is not running.");
         }
-        this.health = runningHealth;
+        this.pluginHealth = runningHealth;
+        this.publishHealth();
       } catch (error) {
         throw this.reportPluginFailure(error);
       }
@@ -835,8 +883,17 @@ export class KWinComputerBackend implements ComputerBackend {
     if (!health.ok) throw new ComputerBackendError("Synara KWin computer-use health check failed.");
     this.plugin = plugin;
     this.pluginId = pluginId;
-    this.health = health;
+    this.pluginHealth = health;
     this.reconnectFailures = 0;
+    // A connection re-established after the first one is a recovery, whether a
+    // reconnect timer or the next action drove it. `lastFailure` survives on
+    // purpose: it is how a healed outage can still be explained.
+    if (this.hasConnected) this.reconnects += 1;
+    this.hasConnected = true;
+    this.reconnecting = false;
+    this.consecutiveFailures = 0;
+    this.countedFailure = undefined;
+    this.publishHealth();
     return plugin;
   }
 
@@ -844,7 +901,7 @@ export class KWinComputerBackend implements ComputerBackend {
     const dbus = this.dbus;
     this.dbus = undefined;
     this.plugin = undefined;
-    this.health = undefined;
+    this.pluginHealth = undefined;
     this.pluginId = undefined;
     this.disconnect?.();
     this.disconnect = undefined;
@@ -858,11 +915,17 @@ export class KWinComputerBackend implements ComputerBackend {
       KWIN_RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectFailures,
     );
     this.reconnectFailures = Math.min(this.reconnectFailures + 1, 5);
+    // Set before the timer, and cleared only by a successful connection: the
+    // attempt the timer runs is part of the same reconnecting state, so a
+    // reader between the timer firing and the connection landing must not see
+    // the backend as given up on.
+    this.reconnecting = true;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       void this.ensurePlugin({ start: false }).catch(() => this.scheduleReconnect());
     }, delayMs);
     this.reconnectTimer.unref?.();
+    this.publishHealth();
   }
 
   private async readPluginState(plugin: KWinComputerPluginApi): Promise<KWinPluginState> {
@@ -935,7 +998,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private async captureWorkspaceScreenshot(
     windows: readonly ComputerWindow[],
   ): Promise<ComputerScreenshot> {
-    const region = workspaceRectFromWindows(windows, this.health?.workspace);
+    const region = workspaceRectFromWindows(windows, this.pluginHealth?.workspace);
     const bytes = await this.captureRegion(region.x, region.y, region.width, region.height);
     return this.screenshotFromPng(bytes, region);
   }
@@ -961,7 +1024,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   /** Workspace geometry without a window round trip when KWin reported it. */
   private async workspaceRect(): Promise<ComputerRect> {
-    const workspace = this.health?.workspace;
+    const workspace = this.pluginHealth?.workspace;
     if (workspace && workspace.width > 0 && workspace.height > 0) {
       return workspaceRectFromWindows([], workspace);
     }
@@ -970,7 +1033,12 @@ export class KWinComputerBackend implements ComputerBackend {
 
   private async publishStillFrame(): Promise<void> {
     const listener = this.streamListener;
-    if (!listener || this.health?.capture !== true || this.stillInFlight || this.capturePending > 0)
+    if (
+      !listener ||
+      this.pluginHealth?.capture !== true ||
+      this.stillInFlight ||
+      this.capturePending > 0
+    )
       return;
     this.stillInFlight = true;
     try {
@@ -1045,7 +1113,8 @@ export class KWinComputerBackend implements ComputerBackend {
     if (!plugin || this.disposed) return false;
     const health = parseHealth(await this.pluginValue(() => plugin.healthJson()));
     if (!health.ok || health.running) return false;
-    this.health = health;
+    this.pluginHealth = health;
+    this.publishHealth();
     if (health.releasedByUser) throw new ComputerBackendError(CONTROL_RELEASED_MESSAGE);
     await this.startPlugin(plugin);
     return true;
@@ -1078,6 +1147,38 @@ export class KWinComputerBackend implements ComputerBackend {
     if (this.disposed) throw new ComputerBackendError("KWin computer backend is disposed.");
   }
 
+  /** The live plugin, or undefined while the connection must be re-established. */
+  private connectedPlugin(): KWinComputerPluginApi | undefined {
+    return this.pluginHealth?.ok === true ? this.plugin : undefined;
+  }
+
+  /**
+   * Records one supervision failure. Mutates only: the transition that follows
+   * it — a scheduled reconnect, a refusal with no retry — decides the status,
+   * and publishing here would put an "unavailable" event on the wire that the
+   * next line immediately corrects.
+   */
+  private recordHealthFailure(error: unknown): void {
+    if (error === this.countedFailure) return;
+    this.countedFailure = error;
+    this.consecutiveFailures += 1;
+    this.lastFailure = {
+      message: clampComputerMessage(
+        error instanceof Error ? error.message : String(error),
+        "The Synara KWin backend failed without a message.",
+      ),
+      at: new Date(this.now()).toISOString(),
+    };
+  }
+
+  /** Health rides the window/frame listeners, and only on a real change. */
+  private publishHealth(): void {
+    const health = this.health();
+    if (this.publishedHealth && sameComputerHealth(this.publishedHealth, health)) return;
+    this.publishedHealth = health;
+    this.emit({ type: "health-changed", health });
+  }
+
   private emit(event: Parameters<ComputerBackendEventListener>[0]): void {
     for (const listener of this.eventListeners) {
       try {
@@ -1094,8 +1195,10 @@ export class KWinComputerBackend implements ComputerBackend {
       return new ComputerBackendError(CONTROL_RELEASED_MESSAGE, { cause: error });
     }
     if (isConnectionLevelFailure(error)) {
+      this.recordHealthFailure(error);
       this.invalidateConnection();
       this.scheduleReconnect();
+      this.publishHealth();
     }
     if (error instanceof ComputerBackendError) return error;
     return new ComputerBackendError(error instanceof Error ? error.message : String(error), {
@@ -1103,6 +1206,17 @@ export class KWinComputerBackend implements ComputerBackend {
       cause: error,
     });
   }
+}
+
+function sameComputerHealth(left: ComputerHealth, right: ComputerHealth): boolean {
+  return (
+    left.status === right.status &&
+    left.consecutiveFailures === right.consecutiveFailures &&
+    left.reconnects === right.reconnects &&
+    left.captureAvailable === right.captureAvailable &&
+    left.lastFailure?.at === right.lastFailure?.at &&
+    left.lastFailure?.message === right.lastFailure?.message
+  );
 }
 
 export function newestPluginId(ids: readonly string[]): string | undefined {

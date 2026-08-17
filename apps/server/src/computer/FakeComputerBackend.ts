@@ -1,5 +1,6 @@
 import type {
   ComputerAvailability,
+  ComputerHealth,
   ComputerId,
   ComputerLaunchAppResult,
   ComputerPoint,
@@ -36,6 +37,7 @@ export interface FakeComputerCall {
 export interface FakeComputerBackendOptions {
   readonly computerId?: string;
   readonly availability?: ComputerAvailability;
+  readonly health?: ComputerHealth;
   readonly screenSize?: ComputerScreenSize;
   readonly windows?: readonly ComputerWindow[];
   readonly root?: ComputerUiNode;
@@ -47,6 +49,7 @@ export class FakeComputerBackend implements ComputerBackend {
   readonly calls: FakeComputerCall[] = [];
 
   private currentAvailability: ComputerAvailability;
+  private currentHealth: ComputerHealth;
   private currentScreenSize: ComputerScreenSize;
   private currentWindows: ComputerWindow[];
   private currentRoot: ComputerUiNode;
@@ -64,6 +67,12 @@ export class FakeComputerBackend implements ComputerBackend {
       kind: "available",
       backend: "fake",
     };
+    this.currentHealth = options.health ?? {
+      status: "connected",
+      consecutiveFailures: 0,
+      reconnects: 0,
+      captureAvailable: true,
+    };
     this.currentScreenSize = options.screenSize ?? { width: 1_920, height: 1_080, scale: 1 };
     this.currentWindows = [...(options.windows ?? defaultWindows())];
     this.currentRoot = options.root ?? defaultRoot(this.currentScreenSize, this.currentWindows);
@@ -74,6 +83,11 @@ export class FakeComputerBackend implements ComputerBackend {
     this.record("availability");
     this.throwIfFailed("availability");
     return this.currentAvailability;
+  }
+
+  /** Not recorded as a call: reading health is a getter, not a backend operation. */
+  health(): ComputerHealth {
+    return this.currentHealth;
   }
 
   async listWindows(): Promise<readonly ComputerWindow[]> {
@@ -294,6 +308,12 @@ export class FakeComputerBackend implements ComputerBackend {
   emitWindowsChanged(windows: readonly ComputerWindow[]): void {
     this.currentWindows = [...windows];
     this.emit({ type: "windows-changed", windows: this.currentWindows });
+  }
+
+  /** Drives a supervision transition the way the KWin reconnect path does. */
+  emitHealthChanged(health: ComputerHealth): void {
+    this.currentHealth = health;
+    this.emit({ type: "health-changed", health });
   }
 
   setAvailability(availability: ComputerAvailability): void {

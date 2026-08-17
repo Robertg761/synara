@@ -1,6 +1,7 @@
 import type {
   ComputerAvailability,
   ComputerFrameHeader,
+  ComputerHealth,
   ComputerInputModifier,
   ComputerPoint,
   ComputerRect,
@@ -82,7 +83,19 @@ export type ComputerAvailabilityView =
 
 export function resolveComputerAvailabilityView(
   availability: ComputerAvailability | undefined,
+  health?: ComputerHealth,
 ): ComputerAvailabilityView {
+  // A pending retry is not a dead desktop, and the viewport must not say it is:
+  // the frames stop either way, but one of the two states ends by itself.
+  if (health?.status === "reconnecting") {
+    return {
+      kind: "checking",
+      title: "Reconnecting to the desktop",
+      description: health.lastFailure
+        ? health.lastFailure.message
+        : "The desktop backend dropped out and is being reconnected.",
+    };
+  }
   if (!availability) {
     return {
       kind: "checking",
@@ -109,6 +122,48 @@ export function resolveComputerAvailabilityView(
     title: "Computer control is unavailable",
     description: availability.message,
   };
+}
+
+export interface ComputerHealthBadge {
+  readonly label: string;
+  readonly title: string;
+  readonly tone: "warning" | "danger";
+  /** A retry is in flight, which the dot animates; a dead backend is still. */
+  readonly pulse: boolean;
+}
+
+/**
+ * Header indicator for a backend that is not connected, or null while it is.
+ * This outranks the lease and agent badges: whoever holds the desktop is beside
+ * the point once there is no desktop to hold, and a dead backend explains every
+ * failure the other two cannot.
+ */
+export function resolveComputerHealthBadge(
+  health: ComputerHealth | undefined,
+): ComputerHealthBadge | null {
+  if (!health || health.status === "connected") return null;
+  const reconnecting = health.status === "reconnecting";
+  return {
+    label: reconnecting ? "Reconnecting to desktop" : "Desktop unavailable",
+    title: computerHealthDetail(health),
+    tone: reconnecting ? "warning" : "danger",
+    pulse: reconnecting,
+  };
+}
+
+/** Counters belong in the badge's tooltip, not in chrome of their own. */
+function computerHealthDetail(health: ComputerHealth): string {
+  const parts = [
+    health.status === "reconnecting"
+      ? "The desktop backend dropped out and is being reconnected."
+      : "The desktop backend is not connected.",
+  ];
+  if (health.lastFailure) parts.push(`Last failure: ${health.lastFailure.message}`);
+  if (health.consecutiveFailures > 0) {
+    parts.push(`Failed attempts since the last connection: ${health.consecutiveFailures}.`);
+  }
+  if (health.reconnects > 0) parts.push(`Reconnects since startup: ${health.reconnects}.`);
+  return parts.join(" ");
 }
 
 export function shouldSubscribeToComputerStream(input: {

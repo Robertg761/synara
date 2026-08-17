@@ -131,6 +131,14 @@ export function makeWsComputerHandlers(
             kind: "backend-unavailable" as const,
             message: UNSUPPORTED_MESSAGE,
           },
+          // Nothing supervises a backend that was never started, so the health
+          // of one is permanently the boot-time verdict.
+          health: {
+            status: "unavailable" as const,
+            consecutiveFailures: 0,
+            reconnects: 0,
+            captureAvailable: false,
+          },
           lastError: null,
         } satisfies ThreadComputerState;
       }, "Failed to read computer availability");

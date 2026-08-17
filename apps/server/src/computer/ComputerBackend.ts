@@ -1,16 +1,18 @@
-import type {
-  ComputerActionResult,
-  ComputerAvailability,
-  ComputerId,
-  ComputerLaunchAppResult,
-  ComputerPoint,
-  ComputerRect,
-  ComputerScreenSize,
-  ComputerScreenshot,
-  ComputerState,
-  ComputerTarget,
-  ComputerUiNode,
-  ComputerWindow,
+import {
+  COMPUTER_MESSAGE_MAX_LENGTH,
+  type ComputerActionResult,
+  type ComputerAvailability,
+  type ComputerHealth,
+  type ComputerId,
+  type ComputerLaunchAppResult,
+  type ComputerPoint,
+  type ComputerRect,
+  type ComputerScreenSize,
+  type ComputerScreenshot,
+  type ComputerState,
+  type ComputerTarget,
+  type ComputerUiNode,
+  type ComputerWindow,
 } from "@synara/contracts";
 
 /** Longest screenshot side in pixels before a capture is downscaled. */
@@ -60,6 +62,7 @@ export interface ComputerBackendActionResult {
 
 export type ComputerBackendEvent =
   | { readonly type: "windows-changed"; readonly windows: readonly ComputerWindow[] }
+  | { readonly type: "health-changed"; readonly health: ComputerHealth }
   | { readonly type: "frame"; readonly frame: ComputerStreamFrame };
 
 export type ComputerFrameListener = (frame: ComputerStreamFrame) => void;
@@ -82,6 +85,14 @@ export class ComputerBackendError extends Error {
 export interface ComputerBackend {
   readonly computerId: ComputerId;
   availability(): Promise<ComputerAvailability>;
+  /**
+   * Live supervision health. Synchronous and side-effect free on purpose: it
+   * reports what the connect and reconnect paths already know, so reading it
+   * can never cost the display server a round trip, and it stays safe to call
+   * from the handler of the very event that changed it. Transitions arrive
+   * through `onEvent` as `health-changed`.
+   */
+  health(): ComputerHealth;
   listWindows(): Promise<readonly ComputerWindow[]>;
   getScreenSize(): Promise<ComputerScreenSize>;
   getState(options: {
@@ -163,6 +174,20 @@ export function intersectComputerRects(
   const bottom = Math.min(first.y + first.height, second.y + second.height);
   if (right <= left || bottom <= top) return undefined;
   return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+/**
+ * Message text that satisfies the contract's bound on availability and health
+ * strings. Both are built from error text the backend does not control — a
+ * D-Bus payload, a plugin diagnostic — so an empty or oversized message must
+ * degrade here rather than fail the state payload carrying it.
+ */
+export function clampComputerMessage(text: string, fallback: string): string {
+  const trimmed = text.trim();
+  const message = trimmed.length > 0 ? trimmed : fallback;
+  return message.length > COMPUTER_MESSAGE_MAX_LENGTH
+    ? `${message.slice(0, COMPUTER_MESSAGE_MAX_LENGTH - 1)}…`
+    : message;
 }
 
 export function computerBackendActionResult(

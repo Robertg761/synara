@@ -16,6 +16,7 @@ const baseState: ThreadComputerState = {
   agentActive: false,
   controlledByOtherThread: false,
   availability: { kind: "available" },
+  health: { status: "connected", consecutiveFailures: 0, reconnects: 0, captureAvailable: true },
   lastError: null,
 };
 
@@ -30,6 +31,29 @@ describe("computerStateStore", () => {
     expect(
       selectThreadComputerState("thread-1" as ThreadId)(useComputerStateStore.getState()),
     ).toEqual(baseState);
+  });
+
+  it("takes a newer snapshot's degraded health", () => {
+    useComputerStateStore.getState().clear();
+    useComputerStateStore.getState().upsertThreadState(baseState);
+    const degraded: ThreadComputerState = {
+      ...baseState,
+      version: 3,
+      availability: { kind: "backend-unavailable", message: "Reconnecting to the desktop." },
+      health: {
+        status: "reconnecting",
+        consecutiveFailures: 1,
+        reconnects: 0,
+        lastFailure: { message: "KWin vanished", at: "2026-08-16T10:00:00.000Z" },
+        captureAvailable: false,
+      },
+    };
+
+    useComputerStateStore.getState().upsertThreadState(degraded);
+
+    expect(
+      selectThreadComputerState("thread-1" as ThreadId)(useComputerStateStore.getState())?.health,
+    ).toEqual(degraded.health);
   });
 
   it("applies window changes and records the latest action", () => {

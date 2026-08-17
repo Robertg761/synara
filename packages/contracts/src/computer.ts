@@ -42,7 +42,12 @@ const COMPUTER_ID_MAX_LENGTH = 128;
  */
 export const COMPUTER_TEXT_MAX_LENGTH = 16 * 1024;
 const COMPUTER_LABEL_MAX_LENGTH = 1_024;
-const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
+/**
+ * Exported because the backend composes health and availability messages from
+ * error text it does not control, and must clamp them to this before they reach
+ * a state payload.
+ */
+export const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
 /** Caps both a reported window list and one window's occluder list. */
 const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
 
@@ -71,6 +76,50 @@ export const ComputerAvailability = Schema.Union([
   }),
 ]);
 export type ComputerAvailability = typeof ComputerAvailability.Type;
+
+/**
+ * What the backend's supervision loop is doing right now, as opposed to what a
+ * boot-time availability probe once found. `reconnecting` means the display
+ * server dropped out and a retry is pending, which is the state a panel must be
+ * able to tell apart from both a healthy desktop and a permanently dead one.
+ */
+export const ComputerHealthStatus = Schema.Literals(["connected", "reconnecting", "unavailable"]);
+export type ComputerHealthStatus = typeof ComputerHealthStatus.Type;
+
+export const ComputerHealthFailure = Schema.Struct({
+  message: TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH)),
+  at: IsoDateTime,
+});
+export type ComputerHealthFailure = typeof ComputerHealthFailure.Type;
+
+export const ComputerHealth = Schema.Struct({
+  status: ComputerHealthStatus,
+  /**
+   * Failures since the last successful connect, back to `0` as soon as one
+   * succeeds, so a non-zero count always describes the outage in progress
+   * rather than the session's whole history.
+   */
+  consecutiveFailures: NonNegativeInt,
+  /**
+   * Connections re-established since the process started. Unlike the
+   * consecutive count this is never reset, because a desktop that keeps
+   * recovering is still a desktop that keeps dying.
+   */
+  reconnects: NonNegativeInt,
+  /**
+   * Newest supervision failure, kept after recovery so a reconnect that already
+   * healed can still be explained. Absent until the backend has failed once,
+   * which is what "nothing has gone wrong yet" looks like.
+   */
+  lastFailure: Schema.optional(ComputerHealthFailure),
+  /**
+   * Whether the connected backend can capture pixels. A backend can be
+   * connected and driveable while its capture path is missing, which is the
+   * difference between a blank pane and a broken one.
+   */
+  captureAvailable: Schema.Boolean,
+});
+export type ComputerHealth = typeof ComputerHealth.Type;
 
 // ── Perception ──────────────────────────────────────────────────────
 
@@ -216,6 +265,13 @@ export const ThreadComputerState = Schema.Struct({
    */
   controlledByOtherThread: Schema.Boolean,
   availability: ComputerAvailability,
+  /**
+   * Live backend health, republished whenever the supervision loop changes it.
+   * Required rather than optional: an absent health field would be
+   * indistinguishable from a healthy one, and every producer of this state has
+   * a backend to read it from.
+   */
+  health: ComputerHealth,
   lastError: Schema.NullOr(Schema.String.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH))),
 });
 export type ThreadComputerState = typeof ThreadComputerState.Type;

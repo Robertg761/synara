@@ -74,6 +74,60 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("republishes every thread when backend health changes, without touching the backend", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    const states: ThreadComputerState[] = [];
+    manager.onEvent((event) => {
+      if (event.type === "computer.thread-state") states.push(event.state);
+    });
+    const seeded = await Promise.all([
+      manager.getThreadState("thread-a"),
+      manager.getThreadState("thread-b"),
+    ]);
+    expect(seeded.map((state) => state.health.status)).toEqual(["connected", "connected"]);
+    const callsBeforeHealth = backend.calls.length;
+
+    backend.emitHealthChanged({
+      status: "reconnecting",
+      consecutiveFailures: 1,
+      reconnects: 0,
+      lastFailure: { message: "KWin vanished", at: "2026-08-16T10:00:00.000Z" },
+      captureAvailable: false,
+    });
+
+    // A supervision event is answered from cache: asking the backend anything
+    // here would put a round trip — and a connect attempt — on every failure.
+    expect(backend.calls).toHaveLength(callsBeforeHealth);
+    const degraded = ["thread-a", "thread-b"].map((threadId) =>
+      states.findLast((state) => state.threadId === threadId),
+    );
+    expect(degraded.map((state) => state?.health.status)).toEqual(["reconnecting", "reconnecting"]);
+    expect(degraded.map((state) => state?.availability.kind)).toEqual([
+      "backend-unavailable",
+      "backend-unavailable",
+    ]);
+    expect(degraded[0]?.availability).toMatchObject({
+      message: expect.stringContaining("KWin vanished"),
+    });
+    // Panels drop stale snapshots by version, so a live change must move it.
+    expect(degraded[0]?.version).toBeGreaterThan(seeded[0]!.version);
+
+    backend.emitHealthChanged({
+      status: "connected",
+      consecutiveFailures: 0,
+      reconnects: 1,
+      lastFailure: { message: "KWin vanished", at: "2026-08-16T10:00:00.000Z" },
+      captureAvailable: true,
+    });
+
+    const recovered = await manager.getThreadState("thread-a");
+    expect(recovered.availability).toEqual({ kind: "available", backend: "fake" });
+    expect(recovered.health).toMatchObject({ status: "connected", reconnects: 1 });
+
+    await manager.dispose();
+  });
+
   it("performs semantic writes only against a fresh, unambiguous snapshot", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });

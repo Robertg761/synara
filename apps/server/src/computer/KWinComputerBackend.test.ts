@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ComputerWindow } from "@synara/contracts";
+import type { ComputerHealth, ComputerWindow } from "@synara/contracts";
 
 import {
   KWinComputerBackend,
@@ -1442,6 +1442,68 @@ describe("KWinComputerBackend KWin crash recovery", () => {
     const recoveryCalls = dbus.calls.slice(callsBeforeRecovery).map((call) => call.method);
     expect(recoveryCalls).toContain("LoadPlugin");
     expect(recoveryCalls).toContain("connectPlugin");
+
+    await backend.dispose();
+  });
+
+  it("counts the outage and the recovery, and reports both without a D-Bus call", async () => {
+    const dbus = new FakeDbus();
+    dbus.loaded = ["SynaraComputerUsePluginV10"];
+    const clock = fakeClock();
+    const backend = makeBackend(dbus, { now: clock.now });
+    const published: ComputerHealth[] = [];
+    backend.onEvent((event) => {
+      if (event.type === "health-changed") published.push(event.health);
+    });
+
+    await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+    expect(backend.health()).toEqual({
+      status: "connected",
+      consecutiveFailures: 0,
+      reconnects: 0,
+      captureAvailable: true,
+    });
+
+    clock.advance(5_000);
+    const healthyWindowsJson = dbus.plugin.windowsJson;
+    dbus.plugin.windowsJson = async () => {
+      throw Object.assign(new Error("KWin went away"), {
+        type: "org.freedesktop.DBus.Error.ServiceUnknown",
+      });
+    };
+    await expect(backend.listWindows()).rejects.toMatchObject({ retryable: true });
+
+    // One outage, counted once: the connect path rethrows the error its caller
+    // then reports, and both hops reach the counters.
+    expect(backend.health()).toMatchObject({
+      status: "reconnecting",
+      consecutiveFailures: 1,
+      reconnects: 0,
+      captureAvailable: false,
+      lastFailure: { message: "KWin went away", at: new Date(5_000).toISOString() },
+    });
+    const dbusCallsBeforeRead = dbus.calls.length;
+    backend.health();
+    expect(dbus.calls).toHaveLength(dbusCallsBeforeRead);
+
+    dbus.plugin.windowsJson = healthyWindowsJson;
+    dbus.loaded = [];
+    await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+
+    // The failure survives the recovery: it is how a healed outage stays
+    // explainable in a panel that only ever sees the current health.
+    expect(backend.health()).toMatchObject({
+      status: "connected",
+      consecutiveFailures: 0,
+      reconnects: 1,
+      captureAvailable: true,
+      lastFailure: { message: "KWin went away" },
+    });
+    expect(published.map((health) => health.status)).toEqual([
+      "connected",
+      "reconnecting",
+      "connected",
+    ]);
 
     await backend.dispose();
   });

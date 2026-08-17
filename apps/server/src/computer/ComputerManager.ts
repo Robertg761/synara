@@ -7,6 +7,7 @@ import {
   type ComputerActionResult,
   type ComputerAvailability,
   type ComputerEvent,
+  type ComputerHealth,
   type ComputerScreenshot,
   type ComputerGetScreenSizeResult,
   type ComputerListWindowsResult,
@@ -20,6 +21,7 @@ import { encodeComputerFrame } from "@synara/shared/computerFrame";
 import { FrameTransport, type FrameSink } from "@synara/shared/frameTransport";
 
 import {
+  clampComputerMessage,
   computerBackendActionResult,
   ComputerBackendError,
   type ComputerBackend,
@@ -112,6 +114,7 @@ export class ComputerManager {
   private readonly backendUnsubscribe?: () => void;
   private readonly now: () => number;
   private readonly leaseIdleMs: number;
+  private backendHealth: ComputerHealth;
   private lease: DesktopLease | null = null;
   private streamAttached = false;
   private streamDesired = false;
@@ -124,6 +127,7 @@ export class ComputerManager {
     this.computerId = options.backend.computerId;
     this.now = options.now ?? Date.now;
     this.leaseIdleMs = options.leaseIdleMs ?? COMPUTER_LEASE_IDLE_MS;
+    this.backendHealth = options.backend.health();
     this.transport =
       options.transport ??
       new FrameTransport<string, ComputerStreamFrame>({
@@ -148,6 +152,9 @@ export class ComputerManager {
           for (const state of this.threads.values()) state.windows = event.windows;
           this.emit({ type: "computer.windows-changed", windows: event.windows });
           void this.publishAllThreads();
+        } else if (event.type === "health-changed") {
+          this.backendHealth = event.health;
+          this.republishAllThreads();
         }
       });
     }
@@ -722,6 +729,21 @@ export class ComputerManager {
     for (const threadId of this.threads.keys()) await this.publish(threadId, true);
   }
 
+  /**
+   * Republish every thread from cached state. A backend health transition
+   * changes what a panel must show but nothing the backend could tell us, and
+   * querying it from the handler of the supervision loop's own event would put
+   * a D-Bus round trip — and another connect attempt — on every failure the
+   * loop reports, which is how a reconnect turns into a storm.
+   */
+  private republishAllThreads(): void {
+    if (this.disposed) return;
+    for (const [threadId, state] of this.threads) {
+      state.version += 1;
+      this.emit({ type: "computer.thread-state", state: this.threadSnapshot(threadId, state) });
+    }
+  }
+
   private threadRuntime(threadId: string): ThreadComputerRuntimeState {
     let state = this.threads.get(threadId);
     if (!state) {
@@ -751,9 +773,25 @@ export class ComputerManager {
       ...(state.cursor ? { cursor: state.cursor } : {}),
       agentActive: state.agentActiveCount > 0,
       controlledByOtherThread: this.lease !== null && this.lease.threadId !== threadId,
-      availability: state.availability,
+      availability: this.liveAvailability(state),
+      health: this.backendHealth,
       lastError: state.lastError,
     };
+  }
+
+  /**
+   * The last availability read, corrected by live backend health. The cached
+   * value is whatever the last successful query said, so without this a panel
+   * keeps being told the desktop is available while the supervision loop is
+   * still trying to get it back. Only a claim of `available` is overridden:
+   * anything already blocked carries its own, better explanation — the platform
+   * it is running on, or the plugin it could not load.
+   */
+  private liveAvailability(state: ThreadComputerRuntimeState): ComputerAvailability {
+    if (this.backendHealth.status === "connected" || state.availability.kind !== "available") {
+      return state.availability;
+    }
+    return { kind: "backend-unavailable", message: healthUnavailableMessage(this.backendHealth) };
   }
 
   private isStreamWanted(epoch: number): boolean {
@@ -789,6 +827,22 @@ export class ComputerManager {
 function agentThreadId(threadId: string | undefined): string | undefined {
   const trimmed = threadId?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+/**
+ * Why a healthy-looking availability is being withheld. The failure text comes
+ * from the display server, so the whole message is clamped rather than only the
+ * part this composes.
+ */
+function healthUnavailableMessage(health: ComputerHealth): string {
+  const reason =
+    health.status === "reconnecting"
+      ? "Reconnecting to the desktop."
+      : "The desktop backend is not connected.";
+  return clampComputerMessage(
+    health.lastFailure ? `${reason} Last failure: ${health.lastFailure.message}` : reason,
+    reason,
+  );
 }
 
 function clipboardUnsupportedError(): ComputerBackendError {
