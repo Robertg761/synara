@@ -2,8 +2,17 @@ import { Effect, Layer } from "effect";
 import type { ComputerAvailability } from "@synara/contracts";
 
 import { ComputerManager } from "../ComputerManager.ts";
+import { ComputerBackendError } from "../ComputerBackend.ts";
 import { FakeComputerBackend } from "../FakeComputerBackend.ts";
 import { KWinComputerBackend } from "../KWinComputerBackend.ts";
+import {
+  nestedAtspiMode,
+  nestedKWinBackendOptions,
+  nestedSessionRequested,
+  parseNestedSizeEnv,
+  startNestedKWinSession,
+  type NestedKWinSession,
+} from "../nestedKWinSession.ts";
 import { ComputerService, type ComputerServiceShape } from "../Services/ComputerService.ts";
 import type { ComputerBackend } from "../ComputerBackend.ts";
 
@@ -14,13 +23,27 @@ export interface ComputerServiceLiveOptions {
   readonly supported?: boolean;
 }
 
+interface LinuxBackend {
+  readonly backend: ComputerBackend;
+  readonly dispose?: () => Promise<void>;
+}
+
 export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {}) {
   return Layer.effect(
     ComputerService,
     Effect.gen(function* () {
-      const backend =
-        options.backend ??
-        (process.platform === "linux" ? new KWinComputerBackend() : new FakeComputerBackend());
+      const linux =
+        options.backend === undefined && process.platform === "linux"
+          ? yield* Effect.promise(() => makeLinuxBackend())
+          : undefined;
+      const backend = options.backend ?? linux?.backend ?? new FakeComputerBackend();
+      // Registered before the manager's finalizer because a scope runs
+      // finalizers in reverse: the backend is disposed first, so nothing is
+      // still talking to the nested compositor when it is killed.
+      const nestedDispose = linux?.dispose;
+      if (nestedDispose) {
+        yield* Effect.addFinalizer(() => Effect.promise(() => nestedDispose()));
+      }
       const manager = new ComputerManager({ backend });
       yield* Effect.addFinalizer(() => Effect.promise(() => manager.dispose()));
       let availability: ComputerAvailability;
@@ -43,6 +66,48 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
       } satisfies ComputerServiceShape;
     }),
   );
+}
+
+/**
+ * Tier 1 by default: the KWin backend drives the session the user is sitting
+ * in. `SYNARA_COMPUTER_NESTED=1` opts into Tier 3 instead — a private
+ * compositor this process owns, for CI and headless hosts — with the geometry
+ * from `SYNARA_COMPUTER_NESTED_SIZE=WxH`.
+ *
+ * A nested session that fails to boot stays failed. Falling back to the real
+ * desktop would hand an agent the human's screen right after an operator asked
+ * for an invisible one, and falling the other way would hide a broken desktop
+ * behind a nested session nobody can see.
+ */
+async function makeLinuxBackend(): Promise<LinuxBackend> {
+  if (!nestedSessionRequested()) return { backend: new KWinComputerBackend() };
+  const size = parseNestedSizeEnv(process.env.SYNARA_COMPUTER_NESTED_SIZE);
+  let session: NestedKWinSession;
+  try {
+    session = await startNestedKWinSession(size ? { size } : {});
+  } catch (error) {
+    return { backend: unavailableNestedBackend(error) };
+  }
+  return {
+    backend: new KWinComputerBackend(
+      nestedKWinBackendOptions(session, { atspiMode: nestedAtspiMode() }),
+    ),
+    dispose: () => session.dispose(),
+  };
+}
+
+/**
+ * A backend whose every call fails with the reason the nested session did not
+ * come up, so the availability card and any tool call name the same missing
+ * piece — a missing kwin_wayland, an uninstalled plugin, a bus that never
+ * answered — instead of a generic connection error.
+ */
+function unavailableNestedBackend(error: unknown): ComputerBackend {
+  const message = `The nested KWin session did not start: ${error instanceof Error ? error.message : String(error)}`;
+  return new KWinComputerBackend({
+    sessionType: "wayland",
+    dbusFactory: () => Promise.reject(new ComputerBackendError(message)),
+  });
 }
 
 export const ComputerServiceLive = makeComputerServiceLayer();

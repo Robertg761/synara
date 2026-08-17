@@ -44,6 +44,12 @@ export interface AtspiHelperClientOptions {
   readonly pythonPath?: string;
   readonly scriptPath?: string;
   readonly requestTimeoutMs?: number;
+  /**
+   * Environment overrides for the helper process. The accessibility bus is
+   * reached through the session bus, so a nested session hands its own
+   * `DBUS_SESSION_BUS_ADDRESS` here to keep perception inside that session.
+   */
+  readonly env?: NodeJS.ProcessEnv;
   readonly spawnProcess?: (
     command: string,
     args: readonly string[],
@@ -163,7 +169,7 @@ export class AtspiHelperClient implements AtspiTreeReader {
       ((spawnCommand, args) =>
         spawn(spawnCommand, args, {
           stdio: ["pipe", "pipe", "pipe"],
-          env: { ...process.env, PYTHONUNBUFFERED: "1" },
+          env: { ...process.env, ...this.options.env, PYTHONUNBUFFERED: "1" },
         }));
     const child = spawnProcess(command, ["-u", scriptPath]);
     this.process = child;

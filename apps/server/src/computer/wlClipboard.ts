@@ -157,12 +157,22 @@ function describeFailure(result: ClipboardCommandResult): string {
 /**
  * Spawns one wl-clipboard process. Only spawn failures reject — an ENOENT for a
  * missing binary — so every exit status is mapped in one place above.
+ *
+ * `env` overrides the inherited environment and is how a nested compositor's
+ * clipboard is reached: wl-clipboard talks to whichever `WAYLAND_DISPLAY` it is
+ * handed, so the same code addresses the ambient session and a Tier 3 one.
  */
-export function spawnClipboardCommand(spec: ClipboardCommandSpec): Promise<ClipboardCommandResult> {
+export function spawnClipboardCommand(
+  spec: ClipboardCommandSpec,
+  env?: NodeJS.ProcessEnv,
+): Promise<ClipboardCommandResult> {
   const maxOutputBytes = spec.maxOutputBytes ?? MAX_COMPUTER_CLIPBOARD_BYTES;
   const timeoutMs = spec.timeoutMs ?? CLIPBOARD_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
-    const child = spawn(spec.command, [...spec.args], { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(spec.command, [...spec.args], {
+      stdio: ["pipe", "pipe", "pipe"],
+      ...(env ? { env: { ...process.env, ...env } } : {}),
+    });
     const stdout = new ChunkBuffer(maxOutputBytes);
     const stderr = new ChunkBuffer(MAX_CLIPBOARD_STDERR_BYTES);
     let outcome: ClipboardCommandResult["outcome"] = "exited";

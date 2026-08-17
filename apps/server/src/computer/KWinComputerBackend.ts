@@ -101,6 +101,11 @@ export interface KWinComputerBackendOptions {
   readonly computerId?: string;
   readonly dbus?: KWinComputerDbus;
   readonly dbusFactory?: () => Promise<KWinComputerDbus>;
+  /**
+   * A private session bus carrying the compositor, set only by the nested
+   * Tier 3 session. Absent, KWin is reached on the ambient session bus.
+   */
+  readonly busAddress?: string;
   readonly atspi?: AtspiTreeReader;
   readonly installedPluginIds?: () => Promise<readonly string[]>;
   readonly pluginDirectories?: readonly string[];
@@ -214,7 +219,12 @@ export class KWinComputerBackend implements ComputerBackend {
     this.dbus = options.dbus;
     this.dbusFactory =
       options.dbusFactory ??
-      (options.dbus ? async () => options.dbus! : createSessionKWinComputerDbus);
+      (options.dbus
+        ? async () => options.dbus!
+        : () =>
+            createSessionKWinComputerDbus(
+              options.busAddress ? { busAddress: options.busAddress } : {},
+            ));
     this.installedPluginIds =
       options.installedPluginIds ??
       (() => scanInstalledPluginIds(options.pluginDirectories ?? defaultPluginDirectories()));
@@ -1224,6 +1234,11 @@ export function newestPluginId(ids: readonly string[]): string | undefined {
     .map((id) => id.replace(/\.so$/, ""))
     .filter((id) => MAX_PLUGIN_ID.test(id))
     .sort((left, right) => pluginVersion(right) - pluginVersion(left))[0];
+}
+
+/** Separates Synara plugin ids from the rest of KWin's loaded plugin list. */
+export function isSynaraPluginId(id: string): boolean {
+  return MAX_PLUGIN_ID.test(id);
 }
 
 export async function scanInstalledPluginIds(

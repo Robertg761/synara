@@ -166,6 +166,12 @@ class FakeDbus implements KWinComputerDbus {
     this.loaded = [pluginId];
     return true;
   };
+  unloadPlugin = async (pluginId: string) => {
+    this.calls.push({ method: "UnloadPlugin", args: [pluginId] });
+    const wasLoaded = this.loaded.includes(pluginId);
+    this.loaded = this.loaded.filter((id) => id !== pluginId);
+    return wasLoaded;
+  };
   connectPlugin = async () => {
     this.calls.push({ method: "connectPlugin", args: [] });
     return this.plugin;

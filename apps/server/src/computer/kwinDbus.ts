@@ -7,11 +7,15 @@ export const KWIN_SERVICE = "org.kde.KWin";
 export const KWIN_PLUGINS_PATH = "/Plugins";
 export const KWIN_PLUGINS_INTERFACE = "org.kde.KWin.Plugins";
 export const DBUS_PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties";
+export const DBUS_SERVICE = "org.freedesktop.DBus";
+export const DBUS_OBJECT_PATH = "/org/freedesktop/DBus";
+export const DBUS_INTERFACE = "org.freedesktop.DBus";
 export const COMPUTER_SERVICE = "org.synara.ComputerUse";
 export const COMPUTER_OBJECT_PATH = "/org/synara/ComputerUse";
 export const COMPUTER_INTERFACE = "org.synara.ComputerUse1";
 export const KWIN_DBUS_DEFAULT_TIMEOUT_MS = 5_000;
 export const KWIN_DBUS_CAPTURE_TIMEOUT_MS = 10_000;
+const DBUS_NAME_POLL_MS = 100;
 
 export class KWinDbusTimeoutError extends Error {
   readonly connectionLevel = true;
@@ -53,24 +57,39 @@ export interface KWinComputerPluginApi {
 export interface KWinComputerDbus {
   readonly listLoadedPluginIds: () => Promise<readonly string[]>;
   readonly loadPlugin: (pluginId: string) => Promise<boolean>;
+  /** `false` only when KWin reports the id was not loaded to begin with. */
+  readonly unloadPlugin: (pluginId: string) => Promise<boolean>;
   readonly connectPlugin: () => Promise<KWinComputerPluginApi>;
   readonly onDisconnect: (listener: () => void) => () => void;
   readonly close: () => Promise<void>;
 }
 
+export interface KWinComputerDbusOptions {
+  /**
+   * A private bus to use instead of the ambient session bus, as the nested
+   * Tier 3 compositor runs on one. Absent, this is the user's own session bus,
+   * which is the only bus a real desktop's KWin is reachable on.
+   */
+  readonly busAddress?: string;
+}
+
 /**
- * Connect to the user session bus and KWin's plugin manager.
+ * Connect to a session bus and KWin's plugin manager.
  *
  * The plugin proxy is resolved only after the backend has selected and loaded
  * an installed plugin. This matters because KWin does not own the Synara
  * service until the plugin has been loaded.
  */
-export async function createSessionKWinComputerDbus(): Promise<KWinComputerDbus> {
+export async function createSessionKWinComputerDbus(
+  options: KWinComputerDbusOptions = {},
+): Promise<KWinComputerDbus> {
   // Keep the optional Linux runtime out of test imports. The production path
   // resolves it only when the backend has passed the Linux/Wayland gate.
   const require = createRequire(import.meta.url);
   const dbus = require("dbus-next") as typeof dbusModule;
-  const bus = dbus.sessionBus();
+  const bus = options.busAddress
+    ? dbus.sessionBus({ busAddress: options.busAddress })
+    : dbus.sessionBus();
   let closed = false;
   const disconnectListeners = new Set<() => void>();
   const onDisconnectEvent = () => {
@@ -107,6 +126,13 @@ export async function createSessionKWinComputerDbus(): Promise<KWinComputerDbus>
         const result = await invoke(plugins, "LoadPlugin", pluginId);
         return readBoolean(result);
       },
+      unloadPlugin: async (pluginId) => {
+        // KWin's UnloadPlugin reply differs by version: older builds answer
+        // `b`, newer ones are void. A void reply means the call succeeded, so
+        // only an explicit `false` reports "was not loaded".
+        const result = await invoke(plugins, "UnloadPlugin", pluginId);
+        return readOptionalBoolean(result) ?? true;
+      },
       connectPlugin: async () => {
         const object = await withTimeout(
           Promise.resolve(bus.getProxyObject(COMPUTER_SERVICE, COMPUTER_OBJECT_PATH)),
@@ -134,6 +160,56 @@ export async function createSessionKWinComputerDbus(): Promise<KWinComputerDbus>
     eventBus.off("error", onDisconnectEvent);
     bus.disconnect();
     throw error;
+  }
+}
+
+/**
+ * Waits for `name` to be owned on a bus, and reports whether it appeared.
+ *
+ * One connection polls `NameHasOwner` rather than reconnecting per attempt: a
+ * connect/disconnect cycle per poll would churn the bus, and a failed connect
+ * can emit a late error on a bus nobody is listening to any more.
+ */
+export async function waitForSessionBusName(options: {
+  readonly busAddress: string;
+  readonly name: string;
+  readonly timeoutMs: number;
+  readonly pollMs?: number;
+  /** Ends the wait early, for a caller that knows the name will never appear. */
+  readonly abort?: () => boolean;
+}): Promise<boolean> {
+  const require = createRequire(import.meta.url);
+  const dbus = require("dbus-next") as typeof dbusModule;
+  const bus = dbus.sessionBus({ busAddress: options.busAddress });
+  const eventBus = bus as unknown as EventEmitter;
+  let connectionError: unknown;
+  const onError = (error: unknown) => {
+    connectionError ??= error;
+  };
+  eventBus.on("error", onError);
+  eventBus.on("disconnect", onError);
+  try {
+    const daemon = await withTimeout(
+      Promise.resolve(bus.getProxyObject(DBUS_SERVICE, DBUS_OBJECT_PATH)),
+      KWIN_DBUS_DEFAULT_TIMEOUT_MS,
+      "getProxyObject",
+    );
+    const iface = daemon.getInterface(DBUS_INTERFACE);
+    const deadline = Date.now() + options.timeoutMs;
+    for (;;) {
+      if (options.abort?.() === true) return false;
+      if (connectionError !== undefined) throw connectionError;
+      if ((await invoke(iface, "NameHasOwner", options.name)) === true) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, options.pollMs ?? DBUS_NAME_POLL_MS);
+        timer.unref?.();
+      });
+    }
+  } finally {
+    eventBus.off("error", onError);
+    eventBus.off("disconnect", onError);
+    bus.disconnect();
   }
 }
 
@@ -228,6 +304,12 @@ function readBoolean(value: unknown): boolean {
     throw new Error("KWin returned a non-boolean plugin result.");
   }
   return unwrapped;
+}
+
+/** `undefined` for the void reply a KWin build without a return value sends. */
+export function readOptionalBoolean(value: unknown): boolean | undefined {
+  const unwrapped = unwrapDbusValue(value);
+  return typeof unwrapped === "boolean" ? unwrapped : undefined;
 }
 
 export function readStringArray(value: unknown): readonly string[] {
