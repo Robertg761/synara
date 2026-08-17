@@ -1278,6 +1278,7 @@ function parseWindows(value: unknown, focusedWindowId: string | null): ComputerW
       ...(pid ? { pid } : {}),
       bounds,
       focused: record.focused === true || id === focusedWindowId,
+      ...(typeof record.active === "boolean" ? { active: record.active } : {}),
       minimized: record.minimized === true,
       visible: record.visible !== false,
       ...(stackingIndex !== undefined ? { stackingIndex } : {}),

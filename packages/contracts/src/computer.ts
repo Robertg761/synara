@@ -98,6 +98,14 @@ export const ComputerWindow = Schema.Struct({
   pid: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
   bounds: ComputerRect,
   focused: Schema.Boolean,
+  /**
+   * Whether the compositor reports this window as activated to its client.
+   * Distinct from `focused` (the agent's own input target): toolkits gate
+   * keyboard-shortcut dispatch on activation, so a hotkey sent to a window
+   * that is not active may be silently dropped. Optional because a backend
+   * need not expose activation.
+   */
+  active: Schema.optional(Schema.Boolean),
   minimized: Schema.Boolean,
   visible: Schema.Boolean,
   /**

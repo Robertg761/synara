@@ -1079,6 +1079,7 @@ describe("KWinComputerBackend", () => {
           title: "Browser",
           bounds: { x: 0, y: 0, width: 1_600, height: 900 },
           visible: true,
+          active: true,
           stackingIndex: 0,
           occludedBy: [],
         },
@@ -1087,6 +1088,7 @@ describe("KWinComputerBackend", () => {
           title: "Calculator",
           bounds: { x: 100, y: 100, width: 300, height: 400 },
           visible: true,
+          active: false,
           stackingIndex: 1,
           occludedBy: ["window-top", 7, ""],
         },
@@ -1097,6 +1099,7 @@ describe("KWinComputerBackend", () => {
           title: "Legacy",
           bounds: { x: 1_700, y: 0, width: 200, height: 200 },
           visible: true,
+          active: "yes",
           stackingIndex: -3,
           occludedBy: "not-an-array",
         },
@@ -1105,11 +1108,16 @@ describe("KWinComputerBackend", () => {
 
     const windows = await backend.listWindows();
     expect(windows.map((window) => window.id)).toEqual(["window-top", "window-1", "window-legacy"]);
-    expect(windows[0]).toMatchObject({ stackingIndex: 0 });
+    expect(windows[0]).toMatchObject({ stackingIndex: 0, active: true });
     expect(windows[0]).not.toHaveProperty("occludedBy");
-    expect(windows[1]).toMatchObject({ stackingIndex: 1, occludedBy: ["window-top"] });
+    expect(windows[1]).toMatchObject({
+      stackingIndex: 1,
+      occludedBy: ["window-top"],
+      active: false,
+    });
     expect(windows[2]).not.toHaveProperty("stackingIndex");
     expect(windows[2]).not.toHaveProperty("occludedBy");
+    expect(windows[2]).not.toHaveProperty("active");
 
     await backend.dispose();
   });

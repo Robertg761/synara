@@ -114,6 +114,11 @@ private:
     bool usableWindow(const Window *window) const;
     bool updatePointerFocus();
     bool updateKeyboardFocus();
+    void clearKeyboardFocus();
+    void updateWindowActivation(Window *window);
+    void clearWindowActivation();
+    void releasePressedKeys();
+    void forgetPressedKeys();
     void releasePressedState();
     void setTimestampNow();
     void syncModifiers();
@@ -136,6 +141,11 @@ private:
     QPointer<Window> m_pointerWindow;
     QPointer<Window> m_keyboardWindow;
     QPointer<Window> m_targetWindow;
+    // Distinct from m_targetWindow being non-null: the QPointer clears itself when
+    // the window dies, and the agent still needs to know it asked for that window
+    // so the input path can refuse rather than retarget.
+    bool m_targetRequested = false;
+    QPointer<Window> m_activatedWindow;
     SeatInterface *m_seat = nullptr;
     xkb_state *m_xkbState = nullptr;
     std::unique_ptr<SynaraAgentCursorItem> m_cursorItem;

@@ -53,6 +53,44 @@ human's keyboard focus is never moved, because the agent drives its own seat and
 only needs the window it is clicking to be the one on top at that coordinate. It
 returns `false` when the session is stopped or the id names no usable window.
 
+Each `windowsJson` entry also carries `active`: whether the compositor reports
+the window as activated to its client. This matters because toolkits gate
+keyboard-shortcut dispatch on activation, not on keyboard focus. Qt's shortcut
+matcher requires an active window; a Ctrl-chord delivered to a window the
+toolkit considers inactive is silently dropped, while plain typing and pointer
+clicks still work. (Apps vary: KWrite drops shortcuts when inactive, KCalc and
+Konsole fire them anyway.)
+
+## Keyboard targeting and borrowed activation
+
+`focusWindow(windowId)` names the window that receives all subsequent key
+events, independent of where the pointer is. Three rules keep chords from going
+astray:
+
+- **Borrowed activation.** While the agent's keyboard focus rests on a window
+  the human has not activated, the plugin marks it active via
+  `Window::setActive(true)` — a visual/state change only, the human's real
+  focus never moves — so toolkits dispatch shortcuts sent to it. The borrow is
+  undone when focus moves on, the target is cleared, or the session stops, and
+  it refuses to undo activation KWin has since granted for real (if the human
+  activates the window themselves, the plugin leaves it alone). Cosmetic side
+  effect: while borrowed, two windows may draw active-style decorations.
+- **A dead target is an error, not a fallback.** Once `focusWindow` has named a
+  target, that target closing does not silently retarget key events to whatever
+  window happens to be under the pointer. Key methods return `false` until the
+  server names a new target or calls `clearFocusWindow`. `stateJson` reports
+  this as `targetLost: true`.
+- **Held keys never migrate.** When keyboard focus moves between surfaces, keys
+  still held are released to the old surface first; when the old surface is
+  already gone, they are dropped and the xkb modifier state is rewound. Without
+  this, a dying target could hand the next window a phantom held Ctrl via the
+  Wayland enter-with-pressed-keys array, turning the next chord into a
+  misdirected shortcut in an unrelated app.
+
+`stateJson` reports `keyboardWindowActive` (whether the current keyboard target
+is activated) and `borrowedActivation` (whether that activation is the
+plugin's borrow) alongside `targetLost`.
+
 Every input method (`movePointer`, `button`, `axis`, `key`, `focusWindow`,
 `raiseWindow`, `clearFocusWindow`) returns `false` while the session is stopped,
 so a stop can never be followed by invisible input. Captures work in both

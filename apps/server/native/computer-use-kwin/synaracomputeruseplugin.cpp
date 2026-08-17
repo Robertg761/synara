@@ -497,6 +497,7 @@ SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
         m_seat->notifyPointerLeave();
         m_seat->setFocusedKeyboardSurface(nullptr);
     }
+    clearWindowActivation();
     if (m_xkbState) {
         xkb_state_unref(m_xkbState);
         m_xkbState = nullptr;
@@ -572,6 +573,13 @@ QString SynaraComputerUsePlugin::stateJson() const
     if (m_keyboardWindow) {
         state.insert(QStringLiteral("keyboardWindowId"), m_keyboardWindow->internalId().toString(QUuid::WithoutBraces));
         state.insert(QStringLiteral("keyboardWindowTitle"), m_keyboardWindow->caption());
+        state.insert(QStringLiteral("keyboardWindowActive"), m_keyboardWindow->isActive());
+    }
+    // True while the agent, rather than the compositor, is the reason the focused
+    // window reports itself active to its client.
+    state.insert(QStringLiteral("borrowedActivation"), !m_activatedWindow.isNull());
+    if (m_targetRequested && !usableWindow(m_targetWindow)) {
+        state.insert(QStringLiteral("targetLost"), true);
     }
     if (m_targetWindow) {
         state.insert(QStringLiteral("targetWindowId"), m_targetWindow->internalId().toString(QUuid::WithoutBraces));
@@ -633,6 +641,10 @@ QString SynaraComputerUsePlugin::windowsJson() const
             {QStringLiteral("desktop"), window->isDesktop()},
             {QStringLiteral("dock"), window->isDock()},
             {QStringLiteral("minimized"), window->isMinimized()},
+            // Toolkits gate shortcut dispatch on this, not on keyboard focus, so
+            // the agent has to be able to see it before blaming a lost hotkey on
+            // the input path.
+            {QStringLiteral("active"), window->isActive()},
             {QStringLiteral("stackingIndex"), stackingIndex},
             {QStringLiteral("occludedBy"), occludedBy},
         };
@@ -696,6 +708,9 @@ void SynaraComputerUsePlugin::stopSession(StopReason reason)
     }
     m_pointerWindow.clear();
     m_keyboardWindow.clear();
+    m_targetWindow.clear();
+    m_targetRequested = false;
+    clearWindowActivation();
 
     const bool wasRunning = m_running;
     const bool latching = reason == StopReason::UserRelease;
@@ -786,6 +801,7 @@ bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
         return false;
     }
     m_targetWindow = window;
+    m_targetRequested = true;
     updatePointerFocus();
     updateKeyboardFocus();
     return true;
@@ -813,6 +829,7 @@ bool SynaraComputerUsePlugin::clearFocusWindow()
         return false;
     }
     m_targetWindow.clear();
+    m_targetRequested = false;
     updatePointerFocus();
     updateKeyboardFocus();
     return true;
@@ -1432,7 +1449,16 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
 bool SynaraComputerUsePlugin::updateKeyboardFocus()
 {
     Window *window = nullptr;
-    if (usableWindow(m_targetWindow)) {
+    if (m_targetRequested) {
+        // An explicit target that has gone away has to fail loudly. Silently
+        // falling back to whatever sits under the ghost cursor is how a Ctrl+Q
+        // aimed at a closing window ends up quitting an unrelated one, and it
+        // reads to the caller as input being delivered late.
+        if (!usableWindow(m_targetWindow)) {
+            forgetPressedKeys();
+            clearKeyboardFocus();
+            return false;
+        }
         window = m_targetWindow;
     } else if (usableWindow(m_pointerWindow)) {
         window = m_pointerWindow;
@@ -1444,12 +1470,97 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
         return false;
     }
     if (m_keyboardWindow == window) {
+        updateWindowActivation(window);
         return true;
     }
 
+    // Keys still held while focus migrates must be released on the surface that
+    // saw the press. Handing the pressed-key array to the next surface makes that
+    // client believe the agent is holding Ctrl, and then delivers it the orphaned
+    // release, so a half-finished chord leaks into an unrelated window.
+    releasePressedKeys();
+
     m_keyboardWindow = window;
     m_seat->setFocusedKeyboardSurface(window->surface(), m_pressedKeys);
+    updateWindowActivation(window);
     return true;
+}
+
+void SynaraComputerUsePlugin::clearKeyboardFocus()
+{
+    m_keyboardWindow.clear();
+    clearWindowActivation();
+    if (m_seat) {
+        m_seat->setFocusedKeyboardSurface(nullptr);
+    }
+}
+
+void SynaraComputerUsePlugin::updateWindowActivation(Window *window)
+{
+    if (m_activatedWindow == window) {
+        return;
+    }
+    clearWindowActivation();
+    if (!window || !m_running) {
+        return;
+    }
+    // Toolkits do not derive "this window is active" from wl_keyboard focus: Qt
+    // tracks the xdg_toplevel `activated` state, and its shortcut matcher refuses
+    // to match anything while the application has no active window. Without this,
+    // the agent's keystrokes reach the focus widget (text still types) but every
+    // QAction shortcut is dropped.
+    //
+    // Window::setActive() is the narrow tool for that: it flips the window's
+    // activation state, and therefore the `activated` flag the client sees, while
+    // deliberately leaving the compositor's keyboard focus alone. The human's seat
+    // keeps typing wherever it was.
+    if (Workspace::self() && Workspace::self()->activeWindow() == window) {
+        return;
+    }
+    window->setActive(true);
+    m_activatedWindow = window;
+}
+
+void SynaraComputerUsePlugin::clearWindowActivation()
+{
+    Window *window = m_activatedWindow;
+    m_activatedWindow.clear();
+    if (!window || window->isDeleted()) {
+        return;
+    }
+    // KWin may have handed the window real activation in the meantime; that state
+    // is the compositor's to own, so only undo activation we invented ourselves.
+    if (Workspace::self() && Workspace::self()->activeWindow() == window) {
+        return;
+    }
+    window->setActive(false);
+}
+
+void SynaraComputerUsePlugin::releasePressedKeys()
+{
+    const auto keys = m_pressedKeys;
+    for (auto it = keys.crbegin(); it != keys.crend(); ++it) {
+        sendKey(*it, false);
+    }
+}
+
+void SynaraComputerUsePlugin::forgetPressedKeys()
+{
+    if (m_pressedKeys.isEmpty()) {
+        return;
+    }
+    // The surface that saw the presses is gone, so no release can land there.
+    // Drop the keys locally instead, or the next window the agent focuses inherits
+    // a phantom Ctrl through the enter event's pressed-key array.
+    const auto keys = m_pressedKeys;
+    m_pressedKeys.clear();
+    if (!m_xkbState) {
+        return;
+    }
+    for (auto it = keys.crbegin(); it != keys.crend(); ++it) {
+        xkb_state_update_key(m_xkbState, *it + 8, XKB_KEY_UP);
+    }
+    syncModifiers();
 }
 
 void SynaraComputerUsePlugin::releasePressedState()
@@ -1464,10 +1575,7 @@ void SynaraComputerUsePlugin::releasePressedState()
     for (quint32 button : buttons) {
         sendButton(button, false);
     }
-    const auto keys = m_pressedKeys;
-    for (auto it = keys.crbegin(); it != keys.crend(); ++it) {
-        sendKey(*it, false);
-    }
+    releasePressedKeys();
 }
 
 void SynaraComputerUsePlugin::setTimestampNow()
