@@ -274,9 +274,13 @@ describe("resolveWlrootsProviders", () => {
 
     await slotProvider(resolved.input)?.dispose();
     await slotProvider(resolved.capture)?.dispose();
+    await slotProvider(resolved.windows)?.dispose();
     expect(helper.calls).not.toContain("dispose");
 
-    await slotProvider(resolved.windows)?.dispose();
+    // The idle source is the fourth user, not a free rider: the backend
+    // disposes it with the providers, and forgetting to would leave the process
+    // attached to the compositor for the server's lifetime.
+    await resolved.seatIdle?.dispose();
     expect(helper.calls.filter((call) => call === "dispose")).toEqual(["dispose"]);
   });
 
@@ -326,10 +330,32 @@ describe("resolveWlrootsProviders", () => {
 
     expect(resolved.windows).toBeUndefined();
     await slotProvider(resolved.input)?.dispose();
-    expect(helper.calls).not.toContain("dispose");
-    // Two users, not three: a share count taken from the plan rather than the
-    // slot list would leave the process alive with nobody holding it.
     await slotProvider(resolved.capture)?.dispose();
+    expect(helper.calls).not.toContain("dispose");
+    // Three users, not four: a share count taken from the plan rather than the
+    // slot list would leave the process alive with nobody holding it.
+    await resolved.seatIdle?.dispose();
     expect(helper.calls).toContain("dispose");
+  });
+
+  it("gives the idle source a share of the helper, and never a helper of its own", () => {
+    let helpers = 0;
+    const blocked = { blockedBy: "this compositor advertises no wlroots protocols" };
+    const resolved = resolveWlrootsProviders(
+      probe("/opt/helper"),
+      plan({ input: blocked, capture: blocked, windows: blocked }),
+      {
+        createHelper: () => {
+          helpers += 1;
+          return fakeDesktopHelper();
+        },
+      },
+    );
+
+    // Watching the seat is worth riding a helper that exists, never worth
+    // spawning one: the arbiter stands down where it cannot observe, which
+    // costs the agent nothing but a sentence in health.
+    expect(helpers).toBe(0);
+    expect(resolved.seatIdle).toBeUndefined();
   });
 });

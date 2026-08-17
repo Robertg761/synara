@@ -4,6 +4,7 @@ import type { ComputerRect, ComputerWindow } from "@synara/contracts";
 
 import { ComputerBackendError } from "../ComputerBackend.ts";
 import { POINTER_SEQUENCE_OPERATIONS } from "../pointerSequencing.ts";
+import { HUMAN_ACTIVE_REFUSAL, type SeatActivity } from "../sharedSeatArbiter.ts";
 import { fakeDesktopHelper } from "./fakeDesktopHelper.ts";
 import {
   capabilitiesFromProviders,
@@ -23,6 +24,8 @@ import {
 } from "./providers.ts";
 
 const WORKSPACE: ComputerRect = { x: 0, y: 0, width: 1920, height: 1080 };
+/** A seat nobody has touched for long enough that the arbiter never waits. */
+const SEAT_QUIET: SeatActivity = { state: "quiet", idleMs: 60_000 };
 
 /** A 1x1 PNG whose IHDR is rewritten to the requested size. */
 const PNG_1X1 = Uint8Array.from(
@@ -270,6 +273,41 @@ describe("resolvePortalProviders", () => {
       ghostCursor: false,
       sharedSeat: true,
     });
+  });
+
+  it("builds the GNOME Shell window provider when the extension is on the bus", () => {
+    const providers = resolvePortalProviders(
+      probeFor({ desktop: "gnome", desktopExtensionPresent: true }),
+      {
+        // Never awaited here: the provider connects on its first call, so
+        // resolving must not open a bus.
+        connectGnomeShellExtension: () => Promise.reject(new Error("connected too early")),
+      },
+    );
+
+    expect(providers.windows.available && providers.windows.provider.id).toBe(
+      "gnome-shell-extension",
+    );
+    expect(capabilitiesFromProviders(providers)).toMatchObject({
+      windows: true,
+      windowBounds: true,
+      stacking: true,
+      activation: true,
+    });
+  });
+
+  it("names the extension rather than building one against KWin's bus name", () => {
+    // Both own `org.kde.KWin` and neither can be told from the other by name,
+    // so a KDE host forced into Tier 2 gets the refusal, not a provider that
+    // would speak GNOME's protocol to the KWin plugin.
+    const providers = resolvePortalProviders(
+      probeFor({ desktop: "gnome", desktopExtensionPresent: true, kwinPresent: true }),
+    );
+
+    expect(providers.windows.available).toBe(false);
+    expect(providers.windows.available === false && providers.windows.reason).toContain(
+      "synara-computer-use@synara.dev",
+    );
   });
 
   it("disposes the shared helper exactly once, after the last provider releases it", async () => {
@@ -545,6 +583,163 @@ describe("PortalComputerBackend input", () => {
   });
 });
 
+describe("PortalComputerBackend shared seat", () => {
+  const HUMAN_AT_THE_KEYBOARD: SeatActivity = { state: "active", datedInputMs: 0 };
+
+  function seatProviders(
+    activity: SeatActivity,
+    overrides: Partial<PortalProviders> = {},
+  ): PortalProviders {
+    return providersOf({
+      windows: resolvedProvider(fakeWindows([WINDOW_WITHOUT_BOUNDS], { activate: true })),
+      clipboard: resolvedProvider(fakeClipboard()),
+      seatIdle: { sample: () => Promise.resolve(activity), dispose: () => Promise.resolve() },
+      ...overrides,
+    });
+  }
+
+  it("refuses every mutating action while the human is using the seat", async () => {
+    const input = fakeInput();
+    const backend = backendWith(
+      seatProviders(HUMAN_AT_THE_KEYBOARD, { input: resolvedProvider(input) }),
+    );
+
+    for (const action of [
+      () => backend.click({ x: 1, y: 1 }),
+      () => backend.doubleClick({ x: 1, y: 1 }),
+      () => backend.rightClick({ x: 1, y: 1 }),
+      () => backend.moveCursor({ x: 1, y: 1 }),
+      () => backend.drag({ x: 0, y: 0 }, { x: 10, y: 10 }, 0),
+      () => backend.scroll(null, 0, 10),
+      () => backend.typeText("hi"),
+      () => backend.pressKey("enter"),
+      () => backend.hotkey(["ctrl", "c"]),
+      () => backend.focusWindow("toplevel-1"),
+      () => backend.writeClipboard("copied"),
+    ]) {
+      await expect(action()).rejects.toThrow(HUMAN_ACTIVE_REFUSAL);
+    }
+    // Nothing reached the compositor: the guard runs before the action, not
+    // around a half-delivered one.
+    expect(input.calls).toEqual([]);
+  });
+
+  it("keeps perception running while it is waiting for the human", async () => {
+    const backend = backendWith(seatProviders(HUMAN_AT_THE_KEYBOARD));
+
+    await expect(
+      backend.captureScreenshot({ kind: "region", region: WORKSPACE }),
+    ).resolves.toMatchObject({ region: WORKSPACE });
+    await expect(backend.listWindows()).resolves.toEqual([WINDOW_WITHOUT_BOUNDS]);
+    await expect(backend.getScreenSize()).resolves.toMatchObject({ width: 1920 });
+    await expect(backend.readClipboard()).resolves.toBe("");
+  });
+
+  it("reports the yield in health, where the panel can say who is waiting", async () => {
+    const backend = backendWith(seatProviders(HUMAN_AT_THE_KEYBOARD));
+
+    expect(backend.health().seat).toEqual({ observing: true });
+    await expect(backend.click({ x: 1, y: 1 })).rejects.toThrow(HUMAN_ACTIVE_REFUSAL);
+
+    expect(backend.health().seat).toEqual({
+      observing: true,
+      lastYieldAt: new Date(1_700_000_000_000).toISOString(),
+    });
+  });
+
+  it("acts without waiting once the seat has been quiet for the threshold", async () => {
+    const input = fakeInput();
+    const backend = backendWith(seatProviders(SEAT_QUIET, { input: resolvedProvider(input) }));
+
+    await backend.click({ x: 400, y: 300 });
+
+    expect(input.calls.at(-1)).toBe(`${POINTER_SEQUENCE_OPERATIONS.buttonRelease} 272 false`);
+    expect(backend.health().seat).toEqual({ observing: true });
+  });
+
+  it("arms the idle source on first perception, never at construction", async () => {
+    // Construction happens at server boot, and on a wlroots desktop the first
+    // sample is what spawns the compositor-attached helper — so it must wait
+    // for the feature to actually be used.
+    let samples = 0;
+    const backend = backendWith(
+      seatProviders(SEAT_QUIET, {
+        seatIdle: {
+          sample: () => {
+            samples += 1;
+            return Promise.resolve(SEAT_QUIET);
+          },
+          dispose: () => Promise.resolve(),
+        },
+      }),
+    );
+
+    expect(samples).toBe(0);
+    await backend.getScreenSize();
+    expect(samples).toBe(1);
+    await backend.getScreenSize();
+    expect(samples).toBe(1);
+  });
+
+  it("arbitrates nothing on a seat of the agent's own", async () => {
+    // A nested compositor or a dedicated seat has no human to give way to, and
+    // an arbiter there would refuse on behalf of somebody who is not in the
+    // room — so the idle source is present and deliberately unused.
+    const input = { ...fakeInput(), sharedSeat: false };
+    const backend = backendWith(
+      seatProviders(HUMAN_AT_THE_KEYBOARD, { input: resolvedProvider(input) }),
+    );
+
+    await expect(backend.click({ x: 1, y: 1 })).resolves.toMatchObject({ point: { x: 1, y: 1 } });
+    expect(backend.health().seat).toBeUndefined();
+  });
+
+  it("stands down with the source's own sentence rather than refusing forever", async () => {
+    const input = fakeInput();
+    const backend = backendWith(
+      seatProviders(HUMAN_AT_THE_KEYBOARD, {
+        input: resolvedProvider(input),
+        seatIdle: {
+          sample: () =>
+            Promise.reject(
+              new ComputerBackendError("org.gnome.Mutter.IdleMonitor is not on the session bus.", {
+                retryable: false,
+              }),
+            ),
+          dispose: () => Promise.resolve(),
+        },
+      }),
+    );
+
+    // Fails open: yielding is a courtesy the user already consented past, so a
+    // broken idle clock must not take desktop control down with it.
+    await expect(backend.click({ x: 1, y: 1 })).resolves.toMatchObject({ point: { x: 1, y: 1 } });
+    expect(backend.health().seat).toEqual({
+      observing: false,
+      reason: expect.stringContaining("org.gnome.Mutter.IdleMonitor"),
+    });
+  });
+
+  it("releases the idle source's share of the helper on dispose", async () => {
+    let disposals = 0;
+    const backend = backendWith(
+      seatProviders(HUMAN_AT_THE_KEYBOARD, {
+        seatIdle: {
+          sample: () => Promise.resolve(HUMAN_AT_THE_KEYBOARD),
+          dispose: () => {
+            disposals += 1;
+            return Promise.resolve();
+          },
+        },
+      }),
+    );
+
+    await backend.dispose();
+
+    expect(disposals).toBe(1);
+  });
+});
+
 describe("PortalComputerBackend perception", () => {
   it("clips a capture request to the desktop and reports the region it really got", async () => {
     const capture = fakeCapture();
@@ -620,14 +815,25 @@ describe("createPortalComputerBackend", () => {
           availableDeviceTypes: REMOTE_DESKTOP_DEVICE_POINTER,
         },
       }),
-      { platform: "linux" },
+      {
+        platform: "linux",
+        // Without the seam the arbiter would arm the real
+        // `org.gnome.Mutter.IdleMonitor` on this machine's session bus.
+        providerOptions: {
+          createSeatIdleSource: () => ({ sample: () => Promise.resolve(SEAT_QUIET) }),
+        },
+      },
     );
 
-    expect(backend.providerPlan().input.implementation).toBe("libei");
-    expect(backend.capabilities().input).toBe(false);
+    // The portal session is built lazily, so resolving providers raises no
+    // dialog and touches no bus until something actually asks for input.
+    expect(backend.providerPlan().input.implementation).toBe("portal-remote-desktop");
+    expect(backend.capabilities().input).toBe(true);
+    expect(backend.capabilities().capture).toBe(false);
     const availability = await backend.availability();
     expect(availability.kind === "backend-unavailable" && availability.message).toContain(
-      "not implemented yet",
+      "PipeWire",
     );
+    await backend.dispose();
   });
 });

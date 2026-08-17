@@ -15,13 +15,14 @@
  * Nothing here decides availability. A slot that is not returned is left to the
  * plan's own sentence, which names the missing global or the missing package.
  */
+import { createDesktopHelperIdleSource } from "../sharedSeatArbiter.ts";
 import {
   DesktopHelperClient,
   shareDesktopHelper,
   type DesktopHelperTransport,
 } from "./desktopHelperClient.ts";
 import { ForeignToplevelWindowProvider } from "./foreignToplevelWindowProvider.ts";
-import type { PortalProbe, PortalProviderPlan } from "./probe.ts";
+import { usesProvider, type PortalProbe, type PortalProviderPlan } from "./probe.ts";
 import {
   resolvedProvider,
   type PortalCaptureProvider,
@@ -74,6 +75,7 @@ export function resolveWlrootsProviders(
     capture?: PortalProviders["capture"];
     windows?: PortalProviders["windows"];
     clipboard?: PortalProviders["clipboard"];
+    seatIdle?: NonNullable<PortalProviders["seatIdle"]>;
   } = {};
 
   const command = probe.helperBinary;
@@ -83,7 +85,7 @@ export function resolveWlrootsProviders(
     command === undefined
       ? []
       : (["input", "capture", "windows"] as const).filter((slot) =>
-          usable(plan, slot, HELPER_BACKED[slot]),
+          usesProvider(plan, slot, HELPER_BACKED[slot]),
         );
 
   if (command !== undefined && helperSlots.length > 0) {
@@ -91,7 +93,17 @@ export function resolveWlrootsProviders(
       command,
       ...(options.env ? { env: options.env } : {}),
     });
-    const releases = shareDesktopHelper(helper, helperSlots.length);
+    // One more user than there are capability slots: the idle source is the
+    // extra. It never justifies a helper of its own — `helperSlots.length > 0`
+    // is what got here — but where one exists anyway, `ext_idle_notify_v1`
+    // rides the same connection rather than opening a second one.
+    const releases = shareDesktopHelper(helper, helperSlots.length + 1);
+    const idleRelease = releases[helperSlots.length] ?? (() => helper.dispose());
+    // Built unconditionally rather than gated on the compositor advertising
+    // `ext_idle_notifier_v1`: a compositor without it refuses the first sample
+    // permanently, which stands the arbiter down with the helper's own sentence
+    // in health — more useful than silently never yielding.
+    resolved.seatIdle = { ...createDesktopHelperIdleSource(helper), dispose: idleRelease };
     helperSlots.forEach((slot, index) => {
       // The fallback is unreachable — `shareDesktopHelper` returns exactly one
       // release per user — and disposing directly is a safe reading of it in
@@ -119,23 +131,13 @@ export function resolveWlrootsProviders(
 
   // The clipboard runs separate short-lived processes and needs no helper, so
   // it resolves on desktops where every Wayland-native slot refused.
-  if (usable(plan, "clipboard", "wl-clipboard")) {
+  if (usesProvider(plan, "clipboard", "wl-clipboard")) {
     resolved.clipboard = resolvedProvider<PortalClipboardProvider>(
       (options.createClipboard ?? createWlClipboardProvider)(options.env),
     );
   }
 
   return resolved;
-}
-
-/** A choice is usable when it named this implementation and nothing blocks it. */
-function usable(
-  plan: PortalProviderPlan,
-  slot: keyof PortalProviderPlan,
-  implementation: PortalProviderId,
-): boolean {
-  const choice = plan[slot];
-  return choice.implementation === implementation && choice.blockedBy === undefined;
 }
 
 function defaultCreateHelper(options: {

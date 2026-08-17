@@ -19,6 +19,7 @@ import type { ComputerPoint, ComputerRect, ComputerWindow } from "@synara/contra
 
 import { ComputerBackendError } from "../ComputerBackend.ts";
 import type { ComputerInputSink } from "../pointerSequencing.ts";
+import type { SeatIdleSource } from "../sharedSeatArbiter.ts";
 
 /**
  * Every provider implementation the Tier 2 architecture has a place for, named
@@ -28,6 +29,7 @@ import type { ComputerInputSink } from "../pointerSequencing.ts";
  * of the implementations.
  */
 export const PORTAL_PROVIDER_IDS = [
+  "portal-remote-desktop",
   "libei",
   "pipewire-screencast",
   "wlroots-virtual-input",
@@ -126,11 +128,29 @@ export function missingProvider<T>(reason: string): ProviderSlot<T> {
   return { available: false, reason };
 }
 
+/**
+ * The seat's idle clock, on a desktop that can report one.
+ *
+ * `dispose` is part of it because on wlroots the source rides the same helper
+ * process the three Wayland-native providers share, and so holds a refcount on
+ * it exactly as they do.
+ */
+export interface PortalSeatIdleSource extends SeatIdleSource {
+  dispose(): Promise<void>;
+}
+
 export interface PortalProviders {
   readonly input: ProviderSlot<PortalInputProvider>;
   readonly capture: ProviderSlot<PortalCaptureProvider>;
   readonly windows: ProviderSlot<PortalWindowProvider>;
   readonly clipboard: ProviderSlot<PortalClipboardProvider>;
+  /**
+   * Not a `ProviderSlot`, because its absence is not a refused capability. No
+   * tool asks for the human's idle time; it exists so the agent can give way,
+   * and a desktop that cannot report it is one where the arbiter stands down
+   * and says so in health — never one where an action is refused.
+   */
+  readonly seatIdle?: PortalSeatIdleSource;
 }
 
 /**

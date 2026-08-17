@@ -103,6 +103,35 @@ export const ComputerHealthFailure = Schema.Struct({
 });
 export type ComputerHealthFailure = typeof ComputerHealthFailure.Type;
 
+/**
+ * How the agent is getting on with the human it shares a seat with.
+ *
+ * Present only on a backend that shares the human's seat and can watch it — a
+ * dedicated seat has nobody to yield to, and a shared seat with no idle
+ * protocol has nothing to report. It is not a health *status* because it never
+ * makes the desktop unusable: mutating actions are refused while the human is
+ * touching the seat and perception keeps working, so a panel that showed
+ * `unavailable` would be describing a backend that is fine.
+ */
+export const ComputerSeatHealth = Schema.Struct({
+  /**
+   * Whether the human's activity can be observed at all. `false` means the
+   * agent is driving the shared seat without giving way, which the panel has to
+   * say out loud rather than imply by omission.
+   */
+  observing: Schema.Boolean,
+  /** Why observation stopped, or why the last reading was unusable. */
+  reason: Schema.optional(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH)),
+  ),
+  /**
+   * When the agent last gave the seat back, which is what the "waiting for you"
+   * copy is keyed off. Absent until it has yielded once.
+   */
+  lastYieldAt: Schema.optional(IsoDateTime),
+});
+export type ComputerSeatHealth = typeof ComputerSeatHealth.Type;
+
 export const ComputerHealth = Schema.Struct({
   status: ComputerHealthStatus,
   /**
@@ -129,6 +158,12 @@ export const ComputerHealth = Schema.Struct({
    * difference between a blank pane and a broken one.
    */
   captureAvailable: Schema.Boolean,
+  /**
+   * The shared-seat arbiter's account of the human, on backends that have one.
+   * Absent means nobody is being yielded to — a dedicated seat, or a shared one
+   * this desktop cannot observe.
+   */
+  seat: Schema.optional(ComputerSeatHealth),
 });
 export type ComputerHealth = typeof ComputerHealth.Type;
 
