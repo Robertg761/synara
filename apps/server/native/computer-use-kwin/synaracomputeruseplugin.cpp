@@ -1498,6 +1498,21 @@ void SynaraComputerUsePlugin::clearKeyboardFocus()
 void SynaraComputerUsePlugin::updateWindowActivation(Window *window)
 {
     if (m_activatedWindow == window) {
+        // A borrow is not durable: KWin revokes the window's active flag when the
+        // human moves real activation through it (activate the borrowed window,
+        // then another). The borrow pointer alone therefore proves nothing, and
+        // returning here on a revoked borrow is how chords die: the client keeps
+        // wl_keyboard focus, text still types, but its shortcut matcher sees an
+        // inactive window and drops every QAction. Re-assert lazily, on the next
+        // focus or key call, rather than from a signal handler that would fight
+        // the compositor mid-transition.
+        if (!window || window->isDeleted() || window->isActive() || !m_running) {
+            return;
+        }
+        if (Workspace::self() && Workspace::self()->activeWindow() == window) {
+            return;
+        }
+        window->setActive(true);
         return;
     }
     clearWindowActivation();
