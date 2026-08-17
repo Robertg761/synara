@@ -82,8 +82,19 @@ export type ComputerAvailability = typeof ComputerAvailability.Type;
  * boot-time availability probe once found. `reconnecting` means the display
  * server dropped out and a retry is pending, which is the state a panel must be
  * able to tell apart from both a healthy desktop and a permanently dead one.
+ *
+ * `awaiting-consent` is the fourth state, and it is not a failure: the backend
+ * is installed and reachable but the desktop's own permission dialog has not
+ * been answered yet. Nothing is broken, nothing is retrying, and the user has to
+ * go find a dialog — which is exactly the thing an `unavailable` badge would
+ * hide. Availability stays `available` while health reports it.
  */
-export const ComputerHealthStatus = Schema.Literals(["connected", "reconnecting", "unavailable"]);
+export const ComputerHealthStatus = Schema.Literals([
+  "connected",
+  "reconnecting",
+  "awaiting-consent",
+  "unavailable",
+]);
 export type ComputerHealthStatus = typeof ComputerHealthStatus.Type;
 
 export const ComputerHealthFailure = Schema.Struct({
@@ -121,6 +132,42 @@ export const ComputerHealth = Schema.Struct({
 });
 export type ComputerHealth = typeof ComputerHealth.Type;
 
+/**
+ * What this desktop backend can actually do, as opposed to what the tool
+ * surface describes in general.
+ *
+ * The backends differ in kind, not only in quality: a compositor plugin owning
+ * a dedicated seat can enumerate windows with geometry, stack them, and draw a
+ * ghost cursor, while a display server reached through portals may expose
+ * titles with no geometry at all and shares the human's one pointer. A caller
+ * that cannot tell those apart either lies to the model — "no windows" when the
+ * truth is "no window enumeration exists here" — or hides a shared seat from
+ * the human whose cursor is about to move. Both were observed in the Tier 1
+ * end-to-end runs, so the answer travels with the state instead of being
+ * inferred from the backend's name.
+ */
+export const ComputerCapabilities = Schema.Struct({
+  /** Windows can be enumerated at all. `false` means listing refuses, never `[]`. */
+  windows: Schema.Boolean,
+  /** Enumerated windows carry `bounds`. False on display servers with no client-visible geometry. */
+  windowBounds: Schema.Boolean,
+  /** `stackingIndex` and `occludedBy` are reported, so occlusion is knowable. */
+  stacking: Schema.Boolean,
+  capture: Schema.Boolean,
+  input: Schema.Boolean,
+  clipboard: Schema.Boolean,
+  /** A window can be focused or raised, so window-targeted typing is possible. */
+  activation: Schema.Boolean,
+  /** A second pointer the agent drives, drawn without moving the human's cursor. */
+  ghostCursor: Schema.Boolean,
+  /**
+   * The agent drives the same seat as the human: the real cursor moves, real
+   * focus follows, and the human sees every action. The panel must say so.
+   */
+  sharedSeat: Schema.Boolean,
+});
+export type ComputerCapabilities = typeof ComputerCapabilities.Type;
+
 // ── Perception ──────────────────────────────────────────────────────
 
 export const ComputerRect = Schema.Struct({
@@ -149,7 +196,14 @@ export const ComputerWindow = Schema.Struct({
   title: Schema.String.check(Schema.isMaxLength(COMPUTER_LABEL_MAX_LENGTH)),
   appName: Schema.optional(Schema.String.check(Schema.isMaxLength(COMPUTER_LABEL_MAX_LENGTH))),
   pid: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
-  bounds: ComputerRect,
+  /**
+   * Absent when the display server exposes no window geometry. wlroots'
+   * foreign-toplevel protocol reports a title, an app id, and activation, and
+   * nothing about where the window is; a client under Wayland cannot ask.
+   * Callers must treat an absent rect as unknown rather than as the origin, and
+   * `ComputerCapabilities.windowBounds` says up front which case this is.
+   */
+  bounds: Schema.optional(ComputerRect),
   focused: Schema.Boolean,
   /**
    * Whether the compositor reports this window as activated to its client.
@@ -272,6 +326,12 @@ export const ThreadComputerState = Schema.Struct({
    * a backend to read it from.
    */
   health: ComputerHealth,
+  /**
+   * What this backend can do. Required for the same reason `health` is: an
+   * absent capability set is indistinguishable from a fully capable backend,
+   * and every producer of this state has a backend to ask.
+   */
+  capabilities: ComputerCapabilities,
   lastError: Schema.NullOr(Schema.String.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH))),
 });
 export type ThreadComputerState = typeof ThreadComputerState.Type;

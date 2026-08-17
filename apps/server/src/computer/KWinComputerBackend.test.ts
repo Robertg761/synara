@@ -17,7 +17,7 @@ import { MAX_COMPUTER_CLIPBOARD_BYTES, type ComputerResolvedTarget } from "./Com
 import type { ClipboardCommandResult, ClipboardCommandSpec } from "./wlClipboard.ts";
 import type { AtspiTextWrite, AtspiTreeReader } from "./atspiClient.ts";
 import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
-import { GLIDE_FRAME_INTERVAL_MS } from "./kwinInput.ts";
+import { GLIDE_FRAME_INTERVAL_MS } from "./pointerSequencing.ts";
 
 const PNG_1X1 = Uint8Array.from(
   Buffer.from(
@@ -324,6 +324,24 @@ describe("newestPluginId", () => {
 describe("KWinComputerBackend", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  it("reports Tier 1's whole capability set, without a dedicated seat being shared", () => {
+    // The dedicated agent seat inside the compositor is what makes all of these
+    // true at once, and `sharedSeat: false` is the same fact stated the other
+    // way round. This set is what Tier 2 is measured against, so a silent
+    // change here would move the baseline the portal backend is compared to.
+    expect(makeBackend(new FakeDbus()).capabilities()).toEqual({
+      windows: true,
+      windowBounds: true,
+      stacking: true,
+      capture: true,
+      input: true,
+      clipboard: true,
+      activation: true,
+      ghostCursor: true,
+      sharedSeat: false,
+    });
   });
 
   it("loads the newest installed plugin and passes the health gate", async () => {

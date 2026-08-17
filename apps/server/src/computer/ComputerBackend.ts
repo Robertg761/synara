@@ -2,6 +2,7 @@ import {
   COMPUTER_MESSAGE_MAX_LENGTH,
   type ComputerActionResult,
   type ComputerAvailability,
+  type ComputerCapabilities,
   type ComputerHealth,
   type ComputerId,
   type ComputerLaunchAppResult,
@@ -81,6 +82,26 @@ export class ComputerBackendError extends Error {
   }
 }
 
+/**
+ * What a backend that does not exist can do, which is nothing.
+ *
+ * Used where a state payload has to be produced with no backend behind it — an
+ * unsupported host, a service that never started. The alternative is omitting
+ * the field, and an absent capability set reads as a fully capable one, which
+ * is how a panel ends up offering desktop control on a machine that has none.
+ */
+export const NO_COMPUTER_CAPABILITIES: ComputerCapabilities = {
+  windows: false,
+  windowBounds: false,
+  stacking: false,
+  capture: false,
+  input: false,
+  clipboard: false,
+  activation: false,
+  ghostCursor: false,
+  sharedSeat: false,
+};
+
 /** Provider-side contract shared by real display backends and the CI fake. */
 export interface ComputerBackend {
   readonly computerId: ComputerId;
@@ -93,6 +114,13 @@ export interface ComputerBackend {
    * through `onEvent` as `health-changed`.
    */
   health(): ComputerHealth;
+  /**
+   * What this backend can do, decided by which providers its probe resolved at
+   * construction. Synchronous and constant for the backend's lifetime: a
+   * capability is a property of the display server this process is talking to,
+   * not a live reading, so it is safe to cache and cheap to publish with state.
+   */
+  capabilities(): ComputerCapabilities;
   listWindows(): Promise<readonly ComputerWindow[]>;
   getScreenSize(): Promise<ComputerScreenSize>;
   getState(options: {

@@ -38,6 +38,13 @@ import {
   waitForSessionBusName,
   type KWinComputerDbus,
 } from "./kwinDbus.ts";
+import {
+  describeProcessError,
+  spawnSupervisedProcess,
+  startSupervisedProcess,
+  type SupervisedProcess,
+  type SupervisedSpawn,
+} from "./supervisedProcess.ts";
 import { spawnClipboardCommand, type ClipboardCommandRunner } from "./wlClipboard.ts";
 
 const DBUS_DAEMON_COMMAND = "dbus-daemon";
@@ -48,9 +55,6 @@ const MIN_NESTED_DIMENSION = 64;
 const MAX_NESTED_DIMENSION = 16_384;
 const BUS_ADDRESS_TIMEOUT_MS = 10_000;
 const KWIN_READY_TIMEOUT_MS = 30_000;
-/** Enough compositor stderr to quote a startup failure, never a whole log. */
-const MAX_DIAGNOSTIC_BYTES = 4 * 1024;
-const TERMINATE_GRACE_MS = 2_000;
 const NESTED_SIZE_PATTERN = /^(\d+)x(\d+)$/i;
 const INSTALL_SCRIPT_PATH = "apps/server/native/computer-use-kwin/scripts/install-and-load.sh";
 
@@ -79,11 +83,7 @@ export interface NestedKWinSessionOptions {
   readonly hostEnv?: NodeJS.ProcessEnv;
   readonly installedPluginIds?: () => Promise<readonly string[]>;
   /** Replaced in tests, which must never spawn a compositor. */
-  readonly spawnProcess?: (
-    command: string,
-    args: readonly string[],
-    env: NodeJS.ProcessEnv,
-  ) => ChildProcess;
+  readonly spawnProcess?: SupervisedSpawn;
   readonly connectDbus?: (busAddress: string) => Promise<KWinComputerDbus>;
   readonly waitForBusName?: typeof waitForSessionBusName;
 }
@@ -105,7 +105,7 @@ export interface NestedKWinSession {
 export async function startNestedKWinSession(
   options: NestedKWinSessionOptions = {},
 ): Promise<NestedKWinSession> {
-  const spawnProcess = options.spawnProcess ?? spawnNestedProcess;
+  const spawnProcess = options.spawnProcess ?? spawnSupervisedProcess;
   const connectDbus =
     options.connectDbus ?? ((busAddress: string) => createSessionKWinComputerDbus({ busAddress }));
   const waitForBusName = options.waitForBusName ?? waitForSessionBusName;
@@ -114,7 +114,7 @@ export async function startNestedKWinSession(
   const hostEnv = options.hostEnv ?? process.env;
   const size = normalizeNestedSize(options.size);
   const waylandDisplay = options.socketName ?? generateSocketName();
-  const children: NestedProcess[] = [];
+  const children: SupervisedProcess[] = [];
   const dispose = async () => {
     // Newest first: the compositor is torn down before the bus it announced
     // itself on, which keeps its exit from racing a dead bus.
@@ -173,7 +173,7 @@ export async function startNestedKWinSession(
     await dispose();
     throw error instanceof ComputerBackendError
       ? error
-      : new ComputerBackendError(error instanceof Error ? error.message : String(error), {
+      : new ComputerBackendError(describeProcessError(error), {
           cause: error,
         });
   }
@@ -350,7 +350,7 @@ async function loadNestedPlugin(
 
 /** Names which of the two ways the compositor can fail to appear happened. */
 function kwinNotReadyError(
-  kwin: NestedProcess,
+  kwin: SupervisedProcess,
   mode: NestedSessionMode,
   timeoutMs: number,
 ): ComputerBackendError {
@@ -400,147 +400,22 @@ function compositorEnv(
   return env;
 }
 
+/**
+ * Starts one child and registers it for disposal. Both nested processes are
+ * ordinary children so a signal to the server's process group reaches them too,
+ * and both are unref'd so they never keep the server alive. Dispose is what
+ * reliably ends them.
+ */
 function start(
   spawnProcess: NonNullable<NestedKWinSessionOptions["spawnProcess"]>,
-  children: NestedProcess[],
+  children: SupervisedProcess[],
   command: string,
   args: readonly string[],
   env: NodeJS.ProcessEnv,
-): NestedProcess {
-  let child: ChildProcess;
-  try {
-    child = spawnProcess(command, args, env);
-  } catch (error) {
-    throw new ComputerBackendError(`${command} could not be started: ${describeError(error)}`, {
-      cause: error,
-    });
-  }
-  const supervised = new NestedProcess(command, child);
+): SupervisedProcess {
+  const supervised = startSupervisedProcess({ command, args, env, spawnProcess });
   children.push(supervised);
   return supervised;
-}
-
-/**
- * One supervised child of the nested session. A spawn error or an early exit is
- * recorded instead of thrown, so every wait can fail fast with the process's
- * own diagnostic rather than running to its deadline.
- */
-class NestedProcess {
-  private readonly stderr: Buffer[] = [];
-  private stderrBytes = 0;
-  private exited: string | undefined;
-  private readonly finished: Promise<void>;
-
-  constructor(
-    private readonly command: string,
-    private readonly child: ChildProcess,
-  ) {
-    child.stderr?.on("data", (chunk: Buffer) => this.pushStderr(chunk));
-    child.on("error", (error) => {
-      this.exited ??= describeError(error);
-    });
-    this.finished = new Promise<void>((resolve) => {
-      child.on("exit", (code, signal) => {
-        this.exited ??= `exit code ${code ?? "null"}, signal ${signal ?? "null"}`;
-        resolve();
-      });
-      child.on("error", () => resolve());
-    });
-    // The process handle must not hold the server's event loop open. The stdio
-    // pipes stay referenced until terminate destroys them, because the startup
-    // handshake reads them and an unreferenced pipe can lose that race.
-    child.unref();
-  }
-
-  /** The dbus-daemon prints its address and then serves; only the first line matters. */
-  readFirstStdoutLine(timeoutMs: number): Promise<string> {
-    const stdout = this.child.stdout;
-    if (!stdout) {
-      return Promise.reject(new ComputerBackendError(`${this.command} has no stdout to read.`));
-    }
-    return new Promise<string>((resolve, reject) => {
-      let buffered = "";
-      const settle = (outcome: () => void) => {
-        clearTimeout(timer);
-        stdout.off("data", onData);
-        this.child.off("exit", onExit);
-        this.child.off("error", onExit);
-        outcome();
-      };
-      const onData = (chunk: Buffer) => {
-        buffered += chunk.toString("utf8");
-        const newline = buffered.indexOf("\n");
-        if (newline >= 0) settle(() => resolve(buffered.slice(0, newline).trim()));
-      };
-      const onExit = () => {
-        settle(() =>
-          reject(
-            new ComputerBackendError(
-              `${this.command} exited before it printed anything: ${this.exitDiagnostic() ?? "unknown reason"}.${this.diagnostic()}`,
-            ),
-          ),
-        );
-      };
-      const timer = setTimeout(() => {
-        settle(() =>
-          reject(
-            new ComputerBackendError(
-              `${this.command} printed no output within ${timeoutMs} ms.${this.diagnostic()}`,
-            ),
-          ),
-        );
-      }, timeoutMs);
-      timer.unref?.();
-      stdout.on("data", onData);
-      this.child.once("exit", onExit);
-      this.child.once("error", onExit);
-    });
-  }
-
-  /** How the process ended, or `undefined` while it is still running. */
-  exitDiagnostic(): string | undefined {
-    return this.exited;
-  }
-
-  /** The tail of stderr, formatted for appending to a failure message. */
-  diagnostic(): string {
-    const text = Buffer.concat(this.stderr).toString("utf8").trim();
-    return text.length > 0 ? ` Last ${this.command} output: ${text}` : "";
-  }
-
-  /** Ends the process, escalating to SIGKILL, and releases its pipes. */
-  async terminate(): Promise<void> {
-    if (this.exited === undefined && !this.child.killed) {
-      this.child.kill("SIGTERM");
-      const escalation = setTimeout(() => this.child.kill("SIGKILL"), TERMINATE_GRACE_MS);
-      escalation.unref?.();
-      await this.finished;
-      clearTimeout(escalation);
-    }
-    this.child.stdout?.destroy();
-    this.child.stderr?.destroy();
-  }
-
-  private pushStderr(chunk: Buffer): void {
-    this.stderr.push(chunk);
-    this.stderrBytes += chunk.byteLength;
-    while (this.stderrBytes > MAX_DIAGNOSTIC_BYTES && this.stderr.length > 1) {
-      this.stderrBytes -= this.stderr.shift()?.byteLength ?? 0;
-    }
-  }
-}
-
-/**
- * Both nested processes are ordinary children so a signal to the server's
- * process group reaches them too, and both are unref'd so they never keep the
- * server alive. Dispose is what reliably ends them.
- */
-function spawnNestedProcess(
-  command: string,
-  args: readonly string[],
-  env: NodeJS.ProcessEnv,
-): ChildProcess {
-  return spawn(command, [...args], { stdio: ["ignore", "pipe", "pipe"], env });
 }
 
 function normalizeNestedSize(size: NestedSize | undefined): NestedSize {
@@ -565,8 +440,4 @@ function inNestedDimensionRange(value: number): boolean {
  */
 function generateSocketName(): string {
   return `synara-nested-${process.pid}-${randomBytes(3).toString("hex")}`;
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

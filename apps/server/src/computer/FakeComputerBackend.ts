@@ -1,5 +1,6 @@
 import type {
   ComputerAvailability,
+  ComputerCapabilities,
   ComputerHealth,
   ComputerId,
   ComputerLaunchAppResult,
@@ -25,9 +26,29 @@ import {
   type ComputerResolvedTarget,
   type ComputerStreamFrame,
 } from "./ComputerBackend.ts";
+import { requireWindowBounds } from "./computerGeometry.ts";
 
 const FAKE_SCREENSHOT_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+/**
+ * What the fake actually simulates. It enumerates windows with bounds and a
+ * stacking order, captures, takes input, holds a clipboard, and focuses and
+ * raises — so those are all true. `ghostCursor` is true because the fake moves
+ * a pointer nothing else shares, and `sharedSeat` is false for the same reason:
+ * there is no human at this desktop to take the cursor from.
+ */
+const DEFAULT_FAKE_CAPABILITIES: ComputerCapabilities = {
+  windows: true,
+  windowBounds: true,
+  stacking: true,
+  capture: true,
+  input: true,
+  clipboard: true,
+  activation: true,
+  ghostCursor: true,
+  sharedSeat: false,
+};
 
 export interface FakeComputerCall {
   readonly method: string;
@@ -38,6 +59,12 @@ export interface FakeComputerBackendOptions {
   readonly computerId?: string;
   readonly availability?: ComputerAvailability;
   readonly health?: ComputerHealth;
+  /**
+   * Overrides what the fake claims to be able to do, so a test can drive the
+   * capability-gated refusals a bounds-less or shared-seat backend produces
+   * without standing up a real display server.
+   */
+  readonly capabilities?: ComputerCapabilities;
   readonly screenSize?: ComputerScreenSize;
   readonly windows?: readonly ComputerWindow[];
   readonly root?: ComputerUiNode;
@@ -50,6 +77,7 @@ export class FakeComputerBackend implements ComputerBackend {
 
   private currentAvailability: ComputerAvailability;
   private currentHealth: ComputerHealth;
+  private readonly currentCapabilities: ComputerCapabilities;
   private currentScreenSize: ComputerScreenSize;
   private currentWindows: ComputerWindow[];
   private currentRoot: ComputerUiNode;
@@ -73,6 +101,7 @@ export class FakeComputerBackend implements ComputerBackend {
       reconnects: 0,
       captureAvailable: true,
     };
+    this.currentCapabilities = options.capabilities ?? DEFAULT_FAKE_CAPABILITIES;
     this.currentScreenSize = options.screenSize ?? { width: 1_920, height: 1_080, scale: 1 };
     this.currentWindows = [...(options.windows ?? defaultWindows())];
     this.currentRoot = options.root ?? defaultRoot(this.currentScreenSize, this.currentWindows);
@@ -90,10 +119,18 @@ export class FakeComputerBackend implements ComputerBackend {
     return this.currentHealth;
   }
 
+  /** Not recorded either, and for the same reason. */
+  capabilities(): ComputerCapabilities {
+    return this.currentCapabilities;
+  }
+
   async listWindows(): Promise<readonly ComputerWindow[]> {
     this.record("listWindows");
     this.throwIfFailed("listWindows");
-    return this.currentWindows.map((window) => ({ ...window, bounds: { ...window.bounds } }));
+    return this.currentWindows.map((window) => ({
+      ...window,
+      ...(window.bounds ? { bounds: { ...window.bounds } } : {}),
+    }));
   }
 
   async getScreenSize(): Promise<ComputerScreenSize> {
@@ -340,7 +377,7 @@ export class FakeComputerBackend implements ComputerBackend {
         `No desktop window has id ${JSON.stringify(request.windowId)}.`,
       );
     }
-    return window.bounds;
+    return requireWindowBounds(window, "a window screenshot");
   }
 
   private workspaceRect(): ComputerRect {
@@ -470,8 +507,8 @@ function defaultRoot(
             value: null,
             description: "Calculate",
             frame: {
-              x: (calculator?.bounds.x ?? 20) + 40,
-              y: (calculator?.bounds.y ?? 20) + 80,
+              x: (calculator?.bounds?.x ?? 20) + 40,
+              y: (calculator?.bounds?.y ?? 20) + 80,
               width: 180,
               height: 56,
             },
@@ -486,14 +523,14 @@ function defaultRoot(
             value: "0",
             description: "Calculator display",
             frame: {
-              x: (calculator?.bounds.x ?? 20) + 40,
-              y: (calculator?.bounds.y ?? 20) + 20,
+              x: (calculator?.bounds?.x ?? 20) + 40,
+              y: (calculator?.bounds?.y ?? 20) + 20,
               width: 280,
               height: 48,
             },
             activationPoint: {
-              x: (calculator?.bounds.x ?? 20) + 180,
-              y: (calculator?.bounds.y ?? 20) + 44,
+              x: (calculator?.bounds?.x ?? 20) + 180,
+              y: (calculator?.bounds?.y ?? 20) + 44,
             },
             onScreen: true,
             windowId,

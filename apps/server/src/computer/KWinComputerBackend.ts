@@ -5,8 +5,8 @@ import { join } from "node:path";
 
 import type {
   ComputerAvailability,
+  ComputerCapabilities,
   ComputerHealth,
-  ComputerHealthFailure,
   ComputerId,
   ComputerLaunchAppResult,
   ComputerPoint,
@@ -19,7 +19,6 @@ import type {
 } from "@synara/contracts";
 
 import {
-  clampComputerMessage,
   ComputerBackendError,
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   intersectComputerRects,
@@ -38,19 +37,36 @@ import {
   type AtspiWindowTree,
 } from "./atspiTreeTargeting.ts";
 import {
+  alignRect,
+  asRecord,
+  asString,
+  formatRect,
+  parseComputerPoint,
+  parseComputerRect,
+  parseJsonPayload,
+  parseWindows,
+  requireWindowBounds,
+  screenSizeFromWindows,
+  screenshotFromPng,
+  unwrapDbusValue,
+  workspaceRectFromWindows,
+} from "./computerGeometry.ts";
+import { ComputerHealthState } from "./computerHealthState.ts";
+import {
   createSessionKWinComputerDbus,
   KWinDbusTimeoutError,
   type KWinComputerDbus,
   type KWinComputerPluginApi,
 } from "./kwinDbus.ts";
+import { EVDEV_BUTTON_CODES, keyStrokeForKey, qwertyTextKeyStrokes } from "./evdevInput.ts";
 import {
-  EVDEV_BUTTON_CODES,
-  EVDEV_KEY_CODES,
-  keyStrokeForKey,
-  pointerGlideSteps,
-  qwertyTextKeyStrokes,
-  type QwertyKeyStroke,
-} from "./kwinInput.ts";
+  glidePointerToDeadline,
+  POINTER_SEQUENCE_OPERATIONS,
+  pressButtonOnce,
+  pressHotkeyStrokes,
+  pressKeyStroke,
+  type ComputerInputSink,
+} from "./pointerSequencing.ts";
 import {
   readWlClipboard,
   spawnClipboardCommand,
@@ -81,8 +97,8 @@ const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
 const KWIN_VERSION_PROBE_TIMEOUT_MS = 2_000;
 const MAX_PLUGIN_ID = /^SynaraComputerUsePlugin(?:V(\d+))?$/;
 const INSTALLED_PLUGIN_FILE = /^(SynaraComputerUsePluginV(\d+))\.so$/;
-const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
-const PNG_IHDR = Uint8Array.of(0x49, 0x48, 0x44, 0x52);
+/** Names this backend in a capture failure, which reaches a tool call verbatim. */
+const CAPTURE_SOURCE = "Synara KWin capture";
 
 interface KWinHealth {
   readonly ok: boolean;
@@ -167,18 +183,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private reconnectFailures = 0;
   /** A retry is pending or running, which is what `reconnecting` reports. */
   private reconnecting = false;
-  private hasConnected = false;
-  private consecutiveFailures = 0;
-  private reconnects = 0;
-  private lastFailure: ComputerHealthFailure | undefined;
-  /**
-   * The error the failure counters were last moved for. One connection loss
-   * reaches the counters twice — the connect path rethrows what the caller then
-   * reports — and both hops carry the same object, so identity is what keeps a
-   * single outage from counting as two.
-   */
-  private countedFailure: unknown;
-  private publishedHealth: ComputerHealth | undefined;
+  private readonly healthState: ComputerHealthState;
   private disposed = false;
   private streamListener: ComputerFrameListener | undefined;
   private streamTimer: ReturnType<typeof setInterval> | undefined;
@@ -232,6 +237,41 @@ export class KWinComputerBackend implements ComputerBackend {
       options.readInstallStamp ??
       (() => readInstallStamp(options.installStampPath ?? defaultInstallStampPath()));
     this.runningKwinVersion = options.runningKwinVersion ?? detectRunningKwinVersion;
+    this.healthState = new ComputerHealthState({
+      readStatus: () => ({
+        status: this.connectedPlugin()
+          ? "connected"
+          : this.reconnecting
+            ? "reconnecting"
+            : "unavailable",
+        captureAvailable: this.pluginHealth?.capture === true,
+      }),
+      emit: (health) => this.emit({ type: "health-changed", health }),
+      now: () => this.now(),
+      failureFallbackMessage: "The Synara KWin backend failed without a message.",
+    });
+  }
+
+  /**
+   * Tier 1's whole capability set. The KWin plugin owns a dedicated seat inside
+   * the compositor, which is what makes every one of these true at once:
+   * enumeration with real `frameGeometry`, a stacking order and its occlusion,
+   * focus and raise, and a second pointer drawn without touching the human's.
+   * `sharedSeat` is false for exactly that reason, and the panel's shared-control
+   * warning keys off it.
+   */
+  capabilities(): ComputerCapabilities {
+    return {
+      windows: true,
+      windowBounds: true,
+      stacking: true,
+      capture: true,
+      input: true,
+      clipboard: true,
+      activation: true,
+      ghostCursor: true,
+      sharedSeat: false,
+    };
   }
 
   async availability(): Promise<ComputerAvailability> {
@@ -274,17 +314,7 @@ export class KWinComputerBackend implements ComputerBackend {
    * cannot drift apart.
    */
   health(): ComputerHealth {
-    return {
-      status: this.connectedPlugin()
-        ? "connected"
-        : this.reconnecting
-          ? "reconnecting"
-          : "unavailable",
-      consecutiveFailures: this.consecutiveFailures,
-      reconnects: this.reconnects,
-      ...(this.lastFailure ? { lastFailure: this.lastFailure } : {}),
-      captureAvailable: this.pluginHealth?.capture === true,
-    };
+    return this.healthState.health();
   }
 
   async listWindows(): Promise<readonly ComputerWindow[]> {
@@ -435,15 +465,18 @@ export class KWinComputerBackend implements ComputerBackend {
     durationMs: number,
   ): Promise<ComputerBackendActionResult> {
     const plugin = await this.ensurePlugin();
+    const sink = this.inputSink(plugin);
     await this.moveCursor(from);
     this.throwIfDisposed();
-    await this.pluginSuccess("button", () => plugin.button(EVDEV_BUTTON_CODES.left, true));
+    await sink.button(EVDEV_BUTTON_CODES.left, true, POINTER_SEQUENCE_OPERATIONS.buttonPress);
     try {
       await this.glidePointer(plugin, from, to, durationMs);
     } finally {
       if (!this.disposed) {
-        await this.pluginSuccess("button release", () =>
-          plugin.button(EVDEV_BUTTON_CODES.left, false),
+        await sink.button(
+          EVDEV_BUTTON_CODES.left,
+          false,
+          POINTER_SEQUENCE_OPERATIONS.buttonRelease,
         );
       }
     }
@@ -465,35 +498,22 @@ export class KWinComputerBackend implements ComputerBackend {
   async typeText(text: string): Promise<ComputerBackendActionResult> {
     const strokes = qwertyTextKeyStrokes(text);
     const plugin = await this.ensurePlugin();
-    for (const stroke of strokes) await this.emitStroke(plugin, stroke);
+    const sink = this.inputSink(plugin);
+    for (const stroke of strokes) await pressKeyStroke({ sink, stroke });
     return { value: text };
   }
 
   async pressKey(key: string): Promise<ComputerBackendActionResult> {
     const stroke = keyStrokeForKey(key);
     const plugin = await this.ensurePlugin();
-    await this.emitStroke(plugin, stroke);
+    await pressKeyStroke({ sink: this.inputSink(plugin), stroke });
     return {};
   }
 
   async hotkey(keys: readonly string[]): Promise<ComputerBackendActionResult> {
     const strokes = keys.map(keyStrokeForKey);
     const plugin = await this.ensurePlugin();
-    const releases: number[] = [];
-    try {
-      for (const stroke of strokes) {
-        if (stroke.shift) {
-          await this.pluginSuccess("key", () => plugin.key(EVDEV_KEY_CODES.LeftShift, true));
-          releases.push(EVDEV_KEY_CODES.LeftShift);
-        }
-        await this.pluginSuccess("key", () => plugin.key(stroke.code, true));
-        releases.push(stroke.code);
-      }
-    } finally {
-      for (const code of releases.toReversed()) {
-        await this.pluginSuccess("key release", () => plugin.key(code, false));
-      }
-    }
+    await pressHotkeyStrokes({ sink: this.inputSink(plugin), strokes });
     return {};
   }
 
@@ -668,7 +688,7 @@ export class KWinComputerBackend implements ComputerBackend {
         );
       }
       const region = intersectComputerRects(
-        window.bounds,
+        requireWindowBounds(window, "a window screenshot"),
         workspaceRectFromWindows(windows, this.pluginHealth?.workspace),
       );
       if (!region) {
@@ -676,10 +696,7 @@ export class KWinComputerBackend implements ComputerBackend {
           `Window ${JSON.stringify(request.windowId)} sits outside the desktop workspace and has nothing to capture.`,
         );
       }
-      return this.screenshotFromPng(
-        await this.captureWindow(request.windowId, maxDimension),
-        region,
-      );
+      return this.screenshot(await this.captureWindow(request.windowId, maxDimension), region);
     }
 
     const requested = request.region;
@@ -701,7 +718,7 @@ export class KWinComputerBackend implements ComputerBackend {
           "Regions use global desktop logical pixels, the same space as window bounds.",
       );
     }
-    return this.screenshotFromPng(
+    return this.screenshot(
       await this.captureRegion(region.x, region.y, region.width, region.height, maxDimension),
       region,
     );
@@ -895,14 +912,8 @@ export class KWinComputerBackend implements ComputerBackend {
     this.pluginId = pluginId;
     this.pluginHealth = health;
     this.reconnectFailures = 0;
-    // A connection re-established after the first one is a recovery, whether a
-    // reconnect timer or the next action drove it. `lastFailure` survives on
-    // purpose: it is how a healed outage can still be explained.
-    if (this.hasConnected) this.reconnects += 1;
-    this.hasConnected = true;
     this.reconnecting = false;
-    this.consecutiveFailures = 0;
-    this.countedFailure = undefined;
+    this.healthState.recordConnected();
     this.publishHealth();
     return plugin;
   }
@@ -945,8 +956,8 @@ export class KWinComputerBackend implements ComputerBackend {
     } catch (error) {
       throw this.reportPluginFailure(error);
     }
-    const parsed = asRecord(parseJson(raw));
-    const position = asPoint(parsed.position);
+    const parsed = asRecord(parseJsonPayload(raw));
+    const position = parseComputerPoint(parsed.position);
     const targetWindowId =
       asString(parsed.targetWindowId) ?? asString(parsed.focusedWindowId) ?? null;
     if (position) this.currentPoint = position;
@@ -954,11 +965,9 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   /**
-   * Walks an eased path against a wall-clock deadline instead of a fixed sleep
-   * per step, so a glide or drag lands at roughly the duration the caller asked
-   * for. Each step sleeps only the remainder up to its deadline, which means a
-   * slow D-Bus round trip eats into that step's sleep budget rather than adding
-   * to the total, and a duration of `0` sleeps not at all.
+   * The shared glide, driven through the plugin's D-Bus surface. Every timing
+   * decision lives in pointerSequencing.ts so a second backend's pointer moves
+   * the same way; all this supplies is the transport and the disposal check.
    */
   private async glidePointer(
     plugin: KWinComputerPluginApi,
@@ -966,14 +975,34 @@ export class KWinComputerBackend implements ComputerBackend {
     to: ComputerPoint,
     durationMs: number,
   ): Promise<void> {
-    const startedAt = this.now();
-    for (const step of pointerGlideSteps(from, to, durationMs)) {
-      this.throwIfDisposed();
-      await this.pluginSuccess("movePointer", () => plugin.movePointer(step.point.x, step.point.y));
-      this.currentPoint = step.point;
-      const remainingMs = startedAt + step.offsetMs - this.now();
-      if (remainingMs > 0) await this.sleep(remainingMs);
-    }
+    await glidePointerToDeadline({
+      sink: this.inputSink(plugin),
+      from,
+      to,
+      durationMs,
+      now: () => this.now(),
+      sleep: (milliseconds) => this.sleep(milliseconds),
+      beforeStep: () => this.throwIfDisposed(),
+      onStep: (point) => {
+        this.currentPoint = point;
+      },
+    });
+  }
+
+  /**
+   * The plugin's evdev-shaped D-Bus API as the shared sequencing sink. Each
+   * method carries the operation name through so a refusal still says which half
+   * of a press/release pair KWin rejected.
+   */
+  private inputSink(plugin: KWinComputerPluginApi): ComputerInputSink {
+    return {
+      movePointer: (x, y, operation) =>
+        this.pluginSuccess(operation, () => plugin.movePointer(x, y)),
+      button: (code, pressed, operation) =>
+        this.pluginSuccess(operation, () => plugin.button(code, pressed)),
+      key: (code, pressed, operation) =>
+        this.pluginSuccess(operation, () => plugin.key(code, pressed)),
+    };
   }
 
   /**
@@ -1010,26 +1039,16 @@ export class KWinComputerBackend implements ComputerBackend {
   ): Promise<ComputerScreenshot> {
     const region = workspaceRectFromWindows(windows, this.pluginHealth?.workspace);
     const bytes = await this.captureRegion(region.x, region.y, region.width, region.height);
-    return this.screenshotFromPng(bytes, region);
+    return this.screenshot(bytes, region);
   }
 
-  /**
-   * The screenshot payload is only useful to a model when the desktop rect it
-   * covers travels with it, so every capture path builds it the same way:
-   * `desktop = region.origin + screenshot_pixel / scale`.
-   */
-  private screenshotFromPng(bytes: Uint8Array, region: ComputerRect): ComputerScreenshot {
-    const dimensions = readPngDimensions(bytes);
-    return {
-      mimeType: "image/png",
-      width: dimensions.width,
-      height: dimensions.height,
-      sizeBytes: bytes.byteLength,
-      bytesBase64: Buffer.from(bytes).toString("base64"),
+  private screenshot(bytes: Uint8Array, region: ComputerRect): ComputerScreenshot {
+    return screenshotFromPng({
+      bytes,
       region,
-      scale: dimensions.width / region.width,
       capturedAt: new Date(this.now()).toISOString(),
-    };
+      source: CAPTURE_SOURCE,
+    });
   }
 
   /** Workspace geometry without a window round trip when KWin reported it. */
@@ -1074,30 +1093,13 @@ export class KWinComputerBackend implements ComputerBackend {
     }
   }
 
-  private async emitStroke(plugin: KWinComputerPluginApi, stroke: QwertyKeyStroke): Promise<void> {
-    if (stroke.shift) {
-      await this.pluginSuccess("key", () => plugin.key(EVDEV_KEY_CODES.LeftShift, true));
-    }
-    try {
-      await this.pluginSuccess("key", () => plugin.key(stroke.code, true));
-      await this.pluginSuccess("key release", () => plugin.key(stroke.code, false));
-    } finally {
-      if (stroke.shift) {
-        await this.pluginSuccess("shift release", () =>
-          plugin.key(EVDEV_KEY_CODES.LeftShift, false),
-        );
-      }
-    }
-  }
-
   private async pressButton(code: number): Promise<void> {
     const plugin = await this.ensurePlugin();
-    await this.pluginSuccess("button", () => plugin.button(code, true));
-    try {
-      await this.sleep(20);
-    } finally {
-      await this.pluginSuccess("button release", () => plugin.button(code, false));
-    }
+    await pressButtonOnce({
+      sink: this.inputSink(plugin),
+      code,
+      sleep: (milliseconds) => this.sleep(milliseconds),
+    });
   }
 
   /**
@@ -1162,31 +1164,13 @@ export class KWinComputerBackend implements ComputerBackend {
     return this.pluginHealth?.ok === true ? this.plugin : undefined;
   }
 
-  /**
-   * Records one supervision failure. Mutates only: the transition that follows
-   * it — a scheduled reconnect, a refusal with no retry — decides the status,
-   * and publishing here would put an "unavailable" event on the wire that the
-   * next line immediately corrects.
-   */
   private recordHealthFailure(error: unknown): void {
-    if (error === this.countedFailure) return;
-    this.countedFailure = error;
-    this.consecutiveFailures += 1;
-    this.lastFailure = {
-      message: clampComputerMessage(
-        error instanceof Error ? error.message : String(error),
-        "The Synara KWin backend failed without a message.",
-      ),
-      at: new Date(this.now()).toISOString(),
-    };
+    this.healthState.recordFailure(error);
   }
 
   /** Health rides the window/frame listeners, and only on a real change. */
   private publishHealth(): void {
-    const health = this.health();
-    if (this.publishedHealth && sameComputerHealth(this.publishedHealth, health)) return;
-    this.publishedHealth = health;
-    this.emit({ type: "health-changed", health });
+    this.healthState.publish();
   }
 
   private emit(event: Parameters<ComputerBackendEventListener>[0]): void {
@@ -1216,17 +1200,6 @@ export class KWinComputerBackend implements ComputerBackend {
       cause: error,
     });
   }
-}
-
-function sameComputerHealth(left: ComputerHealth, right: ComputerHealth): boolean {
-  return (
-    left.status === right.status &&
-    left.consecutiveFailures === right.consecutiveFailures &&
-    left.reconnects === right.reconnects &&
-    left.captureAvailable === right.captureAvailable &&
-    left.lastFailure?.at === right.lastFailure?.at &&
-    left.lastFailure?.message === right.lastFailure?.message
-  );
 }
 
 export function newestPluginId(ids: readonly string[]): string | undefined {
@@ -1393,7 +1366,7 @@ function hasConnectionLevelMarker(error: unknown): boolean {
 }
 
 function parseHealth(value: unknown): KWinHealth {
-  const record = asRecord(parseJson(value));
+  const record = asRecord(parseJsonPayload(value));
   return {
     ok: record.ok === true,
     running: record.running === true,
@@ -1406,131 +1379,11 @@ function parseHealth(value: unknown): KWinHealth {
 function parseWorkspaceGeometry(record: Record<string, unknown>): ComputerRect | null {
   const workspace = asRecord(record.workspace);
   return (
-    parseRect(record.workspaceGeometry) ??
-    parseRect(record.workspace) ??
-    parseRect(workspace.geometry) ??
-    parseRect(workspace.bounds) ??
+    parseComputerRect(record.workspaceGeometry) ??
+    parseComputerRect(record.workspace) ??
+    parseComputerRect(workspace.geometry) ??
+    parseComputerRect(workspace.bounds) ??
     null
-  );
-}
-
-function parseWindows(value: unknown, focusedWindowId: string | null): ComputerWindow[] {
-  const parsed = parseJson(value);
-  const items = Array.isArray(parsed) ? parsed : [];
-  const windows: ComputerWindow[] = [];
-  for (const item of items) {
-    const record = asRecord(item);
-    const id = asString(record.id) ?? asString(record.windowId);
-    const bounds = parseRect(record.bounds);
-    if (!id || !bounds) continue;
-    const title = asString(record.title) ?? "";
-    const appName = asString(record.appId) ?? asString(record.resourceClass);
-    const pid =
-      typeof record.pid === "number" && record.pid > 0 ? Math.trunc(record.pid) : undefined;
-    const stackingIndex = asNonNegativeInt(record.stackingIndex);
-    const occludedBy = asWindowIds(record.occludedBy);
-    windows.push({
-      id: id as ComputerWindow["id"],
-      title,
-      ...(appName ? { appName } : {}),
-      ...(pid ? { pid } : {}),
-      bounds,
-      focused: record.focused === true || id === focusedWindowId,
-      ...(typeof record.active === "boolean" ? { active: record.active } : {}),
-      minimized: record.minimized === true,
-      visible: record.visible !== false,
-      ...(stackingIndex !== undefined ? { stackingIndex } : {}),
-      ...(occludedBy ? { occludedBy } : {}),
-    });
-  }
-  return windows;
-}
-
-/**
- * Resolves the global desktop rect. KWin's reported workspace geometry is the
- * source of truth; the window bounding box is the fallback for a plugin build
- * that does not report it yet.
- */
-export function workspaceRectFromWindows(
-  windows: readonly ComputerWindow[],
-  workspace?: ComputerRect | null,
-): ComputerRect {
-  if (workspace && workspace.width > 0 && workspace.height > 0) {
-    return {
-      x: Math.floor(workspace.x),
-      y: Math.floor(workspace.y),
-      width: Math.max(1, Math.ceil(workspace.width)),
-      height: Math.max(1, Math.ceil(workspace.height)),
-    };
-  }
-  const left = Math.min(0, ...windows.map((window) => Math.floor(window.bounds.x)));
-  const top = Math.min(0, ...windows.map((window) => Math.floor(window.bounds.y)));
-  const right = Math.max(
-    left + 1,
-    ...windows.map((window) => Math.ceil(window.bounds.x + window.bounds.width)),
-  );
-  const bottom = Math.max(
-    top + 1,
-    ...windows.map((window) => Math.ceil(window.bounds.y + window.bounds.height)),
-  );
-  return { x: left, y: top, width: right - left, height: bottom - top };
-}
-
-/**
- * Snaps a requested region onto whole logical pixels without losing coverage:
- * the D-Bus capture signature only takes integers, so a fractional rect must
- * grow outward instead of cropping the edge the caller asked for.
- */
-function alignRect(rect: ComputerRect): ComputerRect {
-  const x = Math.floor(rect.x);
-  const y = Math.floor(rect.y);
-  return {
-    x,
-    y,
-    width: Math.max(1, Math.ceil(rect.x + rect.width) - x),
-    height: Math.max(1, Math.ceil(rect.y + rect.height) - y),
-  };
-}
-
-function formatRect(rect: ComputerRect): string {
-  return `${rect.width}x${rect.height} at (${rect.x}, ${rect.y})`;
-}
-
-export function screenSizeFromWindows(
-  windows: readonly ComputerWindow[],
-  workspace?: ComputerRect | null,
-): ComputerScreenSize {
-  const rect = workspaceRectFromWindows(windows, workspace);
-  return { width: rect.width, height: rect.height, scale: 1 };
-}
-
-function parseJson(value: unknown): unknown {
-  const unwrapped = unwrapDbusValue(value);
-  if (typeof unwrapped === "string") {
-    try {
-      return JSON.parse(unwrapped);
-    } catch {
-      return null;
-    }
-  }
-  return unwrapped;
-}
-
-function unwrapDbusValue(value: unknown): unknown {
-  if (isDbusVariant(value)) {
-    return unwrapDbusValue((value as { readonly value: unknown }).value);
-  }
-  return value;
-}
-
-function isDbusVariant(
-  value: unknown,
-): value is { readonly signature: string; readonly value: unknown } {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { readonly signature?: unknown }).signature === "string" &&
-    "value" in value
   );
 }
 
@@ -1558,25 +1411,6 @@ function readByteArray(value: unknown): Uint8Array {
   throw new ComputerBackendError("Synara KWin capture returned invalid PNG bytes.");
 }
 
-export function readPngDimensions(bytes: Uint8Array): {
-  readonly width: number;
-  readonly height: number;
-} {
-  if (
-    bytes.byteLength < 24 ||
-    !PNG_SIGNATURE.every((byte, index) => bytes[index] === byte) ||
-    !PNG_IHDR.every((byte, index) => bytes[12 + index] === byte)
-  ) {
-    throw new ComputerBackendError("Synara KWin capture did not return a PNG image.");
-  }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const width = view.getUint32(16);
-  const height = view.getUint32(20);
-  if (width < 1 || height < 1)
-    throw new ComputerBackendError("Synara KWin capture has invalid dimensions.");
-  return { width, height };
-}
-
 /**
  * `SYNARA_COMPUTER_IDLE_TIMEOUT_MS` is an operator override, so a typo must
  * neither crash the backend nor silently disable the plugin-side deadline:
@@ -1602,55 +1436,6 @@ function normalizeIdleTimeout(value: number | undefined): number {
 function normalizeDimension(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_CAPTURE_MAX_DIMENSION;
   return Math.max(1, Math.min(32_768, Math.floor(value)));
-}
-
-function parseRect(value: unknown): ComputerRect | undefined {
-  const record = asRecord(value);
-  const x = asFiniteNumber(record.x);
-  const y = asFiniteNumber(record.y);
-  const width = asFiniteNumber(record.width);
-  const height = asFiniteNumber(record.height);
-  if (x === undefined || y === undefined || width === undefined || height === undefined)
-    return undefined;
-  if (width < 0 || height < 0) return undefined;
-  return { x, y, width, height };
-}
-
-function asPoint(value: unknown): ComputerPoint | null {
-  const record = asRecord(value);
-  const x = asFiniteNumber(record.x);
-  const y = asFiniteNumber(record.y);
-  return x === undefined || y === undefined ? null : { x, y };
-}
-
-function asFiniteNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function asNonNegativeInt(value: unknown): number | undefined {
-  const numeric = asFiniteNumber(value);
-  return numeric === undefined || numeric < 0 ? undefined : Math.trunc(numeric);
-}
-
-/**
- * Occluder ids from a plugin build that reports them. Both the field and its
- * individual entries degrade to absent rather than failing the whole window
- * list, because stacking metadata is an optional hint and an older loaded
- * plugin omits it entirely. An empty list is dropped: "nothing above this
- * window" is what an absent field already means.
- */
-function asWindowIds(value: unknown): readonly ComputerWindow["id"][] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const ids = value.filter((item): item is string => typeof item === "string" && item.length > 0);
-  return ids.length > 0 ? (ids as ComputerWindow["id"][]) : undefined;
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
 
 function delay(milliseconds: number): Promise<void> {

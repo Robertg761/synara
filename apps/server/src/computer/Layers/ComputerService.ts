@@ -2,19 +2,26 @@ import { Effect, Layer } from "effect";
 import type { ComputerAvailability } from "@synara/contracts";
 
 import { ComputerManager } from "../ComputerManager.ts";
-import { ComputerBackendError } from "../ComputerBackend.ts";
 import { FakeComputerBackend } from "../FakeComputerBackend.ts";
 import { KWinComputerBackend } from "../KWinComputerBackend.ts";
+import { UnavailableComputerBackend } from "../UnavailableComputerBackend.ts";
+import {
+  nestedModeForChoice,
+  selectLinuxBackend,
+  type LinuxBackendSelection,
+} from "../linuxBackendSelection.ts";
+import { sessionBusNameHasOwner } from "../sessionBusNames.ts";
 import {
   nestedAtspiMode,
   nestedKWinBackendOptions,
   nestedModeLabel,
-  nestedSessionMode,
   parseNestedSizeEnv,
   startNestedKWinSession,
   type NestedKWinSession,
   type NestedSessionMode,
 } from "../nestedKWinSession.ts";
+import { createPortalComputerBackend } from "../portal/PortalComputerBackend.ts";
+import { probeDesktop } from "../portal/probe.ts";
 import { ComputerService, type ComputerServiceShape } from "../Services/ComputerService.ts";
 import type { ComputerBackend } from "../ComputerBackend.ts";
 
@@ -71,26 +78,56 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
 }
 
 /**
- * Tier 1 by default: the KWin backend drives the session the user is sitting
- * in. `SYNARA_COMPUTER_NESTED` opts into a private compositor this process owns
- * instead — `1` for the headless Tier 3 session, `window` for the Tier 2 one
- * that nests as a window in the host session — with the geometry from
- * `SYNARA_COMPUTER_NESTED_SIZE=WxH`.
+ * Builds whichever backend `selectLinuxBackend` resolved, with no fallback in
+ * any direction: a tier that fails stays failed and its backend carries the
+ * reason. See `linuxBackendSelection.ts` for the order and why it probes the
+ * session bus rather than reading `XDG_CURRENT_DESKTOP`.
  *
- * A nested session that fails to boot stays failed. Falling back to the real
- * desktop would hand an agent the human's screen right after an operator asked
- * for an isolated one, and falling the other way would hide a broken desktop
- * behind a nested session nobody can see.
+ * On a KDE host with none of these environment variables set, this is still a
+ * bare `new KWinComputerBackend()` — the same object, with the same defaults,
+ * as before Tier 2 existed.
  */
 async function makeLinuxBackend(): Promise<LinuxBackend> {
-  const mode = nestedSessionMode();
-  if (mode === undefined) return { backend: new KWinComputerBackend() };
+  let selection: LinuxBackendSelection;
+  try {
+    selection = await selectLinuxBackend({ busNameHasOwner: sessionBusNameHasOwner });
+  } catch (error) {
+    // Only a malformed SYNARA_COMPUTER_BACKEND reaches here, and it must not
+    // take the server down: an operator typo becomes an availability card that
+    // lists the backends that do exist.
+    return { backend: new UnavailableComputerBackend(describeError(error)) };
+  }
+  switch (selection.choice) {
+    case "kwin":
+      return { backend: new KWinComputerBackend() };
+    case "nested":
+    case "nested-window":
+      return await makeNestedBackend(nestedModeForChoice(selection.choice) ?? "virtual");
+    case "portal":
+      return { backend: createPortalComputerBackend(await probeDesktop()) };
+  }
+}
+
+/**
+ * A private compositor this process owns, with the geometry from
+ * `SYNARA_COMPUTER_NESTED_SIZE=WxH`. One that fails to boot stays failed:
+ * falling back to the real desktop would hand an agent the human's screen right
+ * after an operator asked for an isolated one.
+ */
+async function makeNestedBackend(mode: NestedSessionMode): Promise<LinuxBackend> {
   const size = parseNestedSizeEnv(process.env.SYNARA_COMPUTER_NESTED_SIZE);
   let session: NestedKWinSession;
   try {
     session = await startNestedKWinSession(size ? { mode, size } : { mode });
   } catch (error) {
-    return { backend: unavailableNestedBackend(mode, error) };
+    // The mode is part of the message: the two boot different things and fail
+    // for different reasons — a missing kwin_wayland, an uninstalled plugin, a
+    // bus that never answered, no host display to nest into.
+    return {
+      backend: new UnavailableComputerBackend(
+        `The ${nestedModeLabel(mode)} nested KWin session did not start: ${describeError(error)}`,
+      ),
+    };
   }
   return {
     backend: new KWinComputerBackend(
@@ -100,20 +137,8 @@ async function makeLinuxBackend(): Promise<LinuxBackend> {
   };
 }
 
-/**
- * A backend whose every call fails with the reason the nested session did not
- * come up, so the availability card and any tool call name the same missing
- * piece — a missing kwin_wayland, an uninstalled plugin, a bus that never
- * answered, no host display to nest into — instead of a generic connection
- * error. The mode is part of that: the two boot different things and fail for
- * different reasons.
- */
-function unavailableNestedBackend(mode: NestedSessionMode, error: unknown): ComputerBackend {
-  const message = `The ${nestedModeLabel(mode)} nested KWin session did not start: ${error instanceof Error ? error.message : String(error)}`;
-  return new KWinComputerBackend({
-    sessionType: "wayland",
-    dbusFactory: () => Promise.reject(new ComputerBackendError(message)),
-  });
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export const ComputerServiceLive = makeComputerServiceLayer();

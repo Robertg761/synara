@@ -62,9 +62,13 @@ describe.skipIf(!process.env.SYNARA_NESTED_KWIN_TEST)("nested KWin session", () 
         const windows = await backend!.listWindows();
         return windows.find((candidate) => candidate.appName?.includes(TEST_APP));
       }, WINDOW_TIMEOUT_MS);
-      expect(window?.bounds.width).toBeGreaterThan(0);
+      // KWin is the one compositor that always reports geometry, so a nested
+      // session missing it is a regression in the plugin, not a capability gap.
+      const bounds = window?.bounds;
+      expect(bounds).toBeDefined();
+      expect(bounds!.width).toBeGreaterThan(0);
       // The virtual output is the only screen, so the window is inside it.
-      expect(window!.bounds.x).toBeLessThan(NESTED_SIZE.width);
+      expect(bounds!.x).toBeLessThan(NESTED_SIZE.width);
     },
     WINDOW_TIMEOUT_MS + 10_000,
   );

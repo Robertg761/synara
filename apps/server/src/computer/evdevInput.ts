@@ -1,6 +1,13 @@
-import type { ComputerPoint } from "@synara/contracts";
+/**
+ * The Linux evdev key/button tables and the US-QWERTY mapping onto them.
+ *
+ * Nothing here is compositor-specific: evdev codes are the kernel's, and every
+ * injection path Synara has — the KWin plugin's D-Bus API, libei through the
+ * RemoteDesktop portal, and wlroots' virtual keyboard — takes the same codes.
+ * A second backend reuses these tables verbatim rather than restating them.
+ */
 
-/** Linux input-event codes used by the plugin's evdev-shaped API. */
+/** Linux input-event codes used by every evdev-shaped injection API. */
 export const EVDEV_KEY_CODES = {
   Escape: 1,
   Digit1: 2,
@@ -264,55 +271,4 @@ export function keyStrokeForKey(key: string): QwertyKeyStroke {
   const named = NAMED_KEYS[normalized];
   if (named !== undefined) return { code: named, shift: false };
   throw new UnsupportedQwertyKeyError(key);
-}
-
-/** One sample of an eased pointer path: where to move, and when it is due. */
-export interface PointerGlideStep {
-  readonly point: ComputerPoint;
-  /** Wall-clock offset from the start of the glide at which this sample is due. */
-  readonly offsetMs: number;
-}
-
-/** Longest gap between pointer samples. ~62 Hz reads as continuous motion. */
-export const GLIDE_FRAME_INTERVAL_MS = 16;
-/** Longest jump between samples, so a fast glide over a long path stays smooth. */
-const GLIDE_MAX_STEP_PX = 80;
-
-/**
- * Samples a smoothstep-eased path from `from` to `to` with a wall-clock
- * schedule attached.
- *
- * `offsetMs` is a deadline measured from the start of the glide, not a sleep
- * length. A caller sleeps only the remainder up to the deadline, so transport
- * latency is absorbed by the sleep budget instead of being added on top of it
- * and the glide lands at roughly `durationMs`. The final sample is due at
- * exactly `durationMs`; `durationMs === 0` makes every sample due immediately,
- * which degenerates to moving as fast as the transport allows.
- */
-export function pointerGlideSteps(
-  from: ComputerPoint,
-  to: ComputerPoint,
-  durationMs: number,
-  minimumSteps = 2,
-): readonly PointerGlideStep[] {
-  const duration = Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0;
-  const distance = Math.hypot(to.x - from.x, to.y - from.y);
-  const steps = Math.max(
-    minimumSteps,
-    Math.ceil(distance / GLIDE_MAX_STEP_PX),
-    Math.ceil(duration / GLIDE_FRAME_INTERVAL_MS),
-  );
-  const path: PointerGlideStep[] = [];
-  for (let index = 1; index <= steps; index += 1) {
-    const linear = index / steps;
-    const eased = linear * linear * (3 - 2 * linear);
-    path.push({
-      point: {
-        x: from.x + (to.x - from.x) * eased,
-        y: from.y + (to.y - from.y) * eased,
-      },
-      offsetMs: (duration * index) / steps,
-    });
-  }
-  return path;
 }

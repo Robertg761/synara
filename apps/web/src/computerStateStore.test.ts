@@ -7,10 +7,23 @@ import {
   useComputerStateStore,
 } from "./computerStateStore";
 
+const FULL_CAPABILITIES: ThreadComputerState["capabilities"] = {
+  windows: true,
+  windowBounds: true,
+  stacking: true,
+  capture: true,
+  input: true,
+  clipboard: true,
+  activation: true,
+  ghostCursor: true,
+  sharedSeat: false,
+};
+
 const baseState: ThreadComputerState = {
   threadId: "thread-1" as ThreadId,
   version: 2,
   computerId: "desktop",
+  capabilities: FULL_CAPABILITIES,
   windows: [],
   screenSize: { width: 5120, height: 2520 },
   agentActive: false,

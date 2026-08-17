@@ -7,6 +7,8 @@ import type {
   ComputerWindowId,
 } from "@synara/contracts";
 
+import { requireWindowBounds } from "./computerGeometry.ts";
+
 /** The small, serializable subset returned by the AT-SPI helper. */
 export interface AtspiRawNode {
   readonly role: string;
@@ -76,12 +78,17 @@ export function fuseAtspiWindowTree(input: {
   readonly tree: AtspiWindowTree;
   readonly screenSize?: ComputerScreenSize;
 }): ComputerUiNode {
-  const offset = decorationOffsetForClientSize(input.window.bounds, input.tree.clientSize);
+  // A fused node's frame is desktop-absolute, so the window's own origin is the
+  // one input this cannot do without: without it every AT-SPI coordinate would
+  // be frame-relative while claiming to be a desktop coordinate, which is the
+  // clamp bug the Tier 1 runs already produced once.
+  const bounds = requireWindowBounds(input.window, "accessibility-tree targeting");
+  const offset = decorationOffsetForClientSize(bounds, input.tree.clientSize);
   return fuseNode(input.tree.root, {
     windowId: input.window.id,
     origin: {
-      x: input.window.bounds.x + offset.x,
-      y: input.window.bounds.y + offset.y,
+      x: bounds.x + offset.x,
+      y: bounds.y + offset.y,
     },
     ...(input.screenSize ? { screenSize: input.screenSize } : {}),
   });

@@ -30,11 +30,20 @@ import {
 } from "@synara/contracts";
 import { Effect } from "effect";
 
+import { NO_COMPUTER_CAPABILITIES } from "./ComputerBackend.ts";
 import type { ComputerManager } from "./ComputerManager.ts";
 import type { ComputerServiceShape } from "./Services/ComputerService.ts";
 
+/**
+ * Shown only when no computer service started at all, so it cannot name the
+ * missing piece the way a live backend's `availability()` does — a backend that
+ * exists always reports its own reason, and this is the case where there is no
+ * backend to ask. It therefore names the requirement every tier shares rather
+ * than any one tier's dependencies.
+ */
 const UNSUPPORTED_MESSAGE =
-  "Linux computer control requires a Wayland session, a reachable KWin user bus, and the Synara KWin plugin.";
+  "Linux computer control requires a Wayland session this server can reach: either KDE with the Synara KWin plugin, " +
+  "another Wayland desktop with xdg-desktop-portal, or SYNARA_COMPUTER_NESTED=window for an isolated agent desktop.";
 
 function unsupported<A>(): Effect.Effect<A, WsRpcError> {
   return Effect.fail(new WsRpcError({ message: UNSUPPORTED_MESSAGE }));
@@ -139,6 +148,10 @@ export function makeWsComputerHandlers(
             reconnects: 0,
             captureAvailable: false,
           },
+          // A backend that was never started can do nothing, and saying so is
+          // what keeps the panel's badges and the tool descriptions from
+          // advertising a desktop this host has not got.
+          capabilities: NO_COMPUTER_CAPABILITIES,
           lastError: null,
         } satisfies ThreadComputerState;
       }, "Failed to read computer availability");

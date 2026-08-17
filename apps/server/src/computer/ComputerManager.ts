@@ -6,6 +6,7 @@ import {
   ThreadId,
   type ComputerActionResult,
   type ComputerAvailability,
+  type ComputerCapabilities,
   type ComputerEvent,
   type ComputerHealth,
   type ComputerScreenshot,
@@ -115,6 +116,12 @@ export class ComputerManager {
   private readonly now: () => number;
   private readonly leaseIdleMs: number;
   private backendHealth: ComputerHealth;
+  /**
+   * Read once. A backend's capability set is decided by which providers its
+   * probe resolved at construction, so it cannot change under a live backend,
+   * and re-reading it per snapshot would put a call on every state publish.
+   */
+  private readonly backendCapabilities: ComputerCapabilities;
   private lease: DesktopLease | null = null;
   private streamAttached = false;
   private streamDesired = false;
@@ -128,6 +135,7 @@ export class ComputerManager {
     this.now = options.now ?? Date.now;
     this.leaseIdleMs = options.leaseIdleMs ?? COMPUTER_LEASE_IDLE_MS;
     this.backendHealth = options.backend.health();
+    this.backendCapabilities = options.backend.capabilities();
     this.transport =
       options.transport ??
       new FrameTransport<string, ComputerStreamFrame>({
@@ -626,7 +634,20 @@ export class ComputerManager {
         notFound: true,
       });
     }
-    const { bounds } = window;
+    const bounds = window.bounds;
+    if (!bounds) {
+      // Scoping exists to guarantee the point is inside the named window. A
+      // display server with no geometry cannot answer that, and letting the
+      // click through unchecked would silently drop the guarantee the caller
+      // asked for by passing window_id at all.
+      throw new ComputerTargetError({
+        code: "computer_target_offscreen",
+        message:
+          `This desktop reports no geometry for window ${JSON.stringify(windowId)}, so a coordinate ` +
+          "cannot be checked against it. Drop window_id to click whatever is topmost at that point, " +
+          "or target the control by label instead.",
+      });
+    }
     if (
       point.x < bounds.x ||
       point.y < bounds.y ||
@@ -775,6 +796,7 @@ export class ComputerManager {
       controlledByOtherThread: this.lease !== null && this.lease.threadId !== threadId,
       availability: this.liveAvailability(state),
       health: this.backendHealth,
+      capabilities: this.backendCapabilities,
       lastError: state.lastError,
     };
   }
@@ -786,9 +808,18 @@ export class ComputerManager {
    * still trying to get it back. Only a claim of `available` is overridden:
    * anything already blocked carries its own, better explanation — the platform
    * it is running on, or the plugin it could not load.
+   *
+   * `awaiting-consent` is deliberately not an override either. The backend is
+   * installed and reachable and nothing has failed; the desktop's own permission
+   * dialog is simply unanswered. Reporting that as unavailable would hide the
+   * one thing the user can act on behind a badge that says to give up.
    */
   private liveAvailability(state: ThreadComputerRuntimeState): ComputerAvailability {
-    if (this.backendHealth.status === "connected" || state.availability.kind !== "available") {
+    if (
+      this.backendHealth.status === "connected" ||
+      this.backendHealth.status === "awaiting-consent" ||
+      state.availability.kind !== "available"
+    ) {
       return state.availability;
     }
     return { kind: "backend-unavailable", message: healthUnavailableMessage(this.backendHealth) };

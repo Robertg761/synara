@@ -547,6 +547,57 @@ describe("ComputerManager and FakeComputerBackend", () => {
     unsubscribe();
   });
 
+  it("carries the backend's capabilities onto every thread snapshot", async () => {
+    // The panel decides which controls to offer from this field alone, so a
+    // backend that cannot report geometry has to say so in the snapshot rather
+    // than let the panel offer window-scoped actions that will be refused.
+    const backend = new FakeComputerBackend({
+      capabilities: {
+        windows: true,
+        windowBounds: false,
+        stacking: false,
+        capture: true,
+        input: true,
+        clipboard: false,
+        activation: false,
+        ghostCursor: false,
+        sharedSeat: true,
+      },
+    });
+    const manager = new ComputerManager({ backend });
+
+    const state = await manager.getThreadState("thread-1");
+
+    expect(state.capabilities).toEqual(backend.capabilities());
+    await manager.dispose();
+  });
+
+  it("refuses a window-scoped click when the desktop reports no geometry", async () => {
+    // Passing window_id is a request for a guarantee — that the point lands in
+    // that window. Without bounds nothing can check it, and clicking anyway
+    // would drop the guarantee silently instead of telling the agent to drop
+    // the scope or target by label.
+    const backend = new FakeComputerBackend({
+      windows: [
+        {
+          id: "boundless",
+          title: "Calculator",
+          appName: "org.kde.kcalc",
+          focused: true,
+          minimized: false,
+          visible: true,
+        },
+      ],
+    });
+    const manager = new ComputerManager({ backend });
+
+    await expect(
+      manager.click("thread-1", { x: 100, y: 100, windowId: "boundless" }),
+    ).rejects.toMatchObject({ code: "computer_target_offscreen" });
+    expect(backend.callsFor("click")).toHaveLength(0);
+    await manager.dispose();
+  });
+
   it("returns perception payloads with optional text and screenshot", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });
