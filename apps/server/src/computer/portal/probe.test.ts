@@ -235,7 +235,7 @@ describe("planPortalProviders", () => {
     expect(plan.capture.implementation).toBe("wlr-screencopy");
   });
 
-  it("picks libei and PipeWire on a portal-only desktop", () => {
+  it("drives a portal-only desktop through RemoteDesktop, and blocks only the pixels", () => {
     const plan = planPortalProviders(
       probeFor({
         desktop: "gnome",
@@ -248,9 +248,30 @@ describe("planPortalProviders", () => {
       }),
     );
 
-    expect(plan.input.implementation).toBe("libei");
-    expect(plan.capture.implementation).toBe("pipewire-screencast");
+    // Input ships whole: Start hands back the ScreenCast stream's position and
+    // size, so absolute motion has a coordinate space without opening PipeWire.
+    expect(plan.input.implementation).toBe("portal-remote-desktop");
+    expect(plan.input.blockedBy).toBeUndefined();
     expect(plan.clipboard.implementation).toBe("portal-selection");
+    // Only the frames need the native seam, and the sentence names it.
+    expect(plan.capture.implementation).toBe("pipewire-screencast");
+    expect(plan.capture.blockedBy).toMatch(/pipewire-devel/);
+  });
+
+  it("blocks portal input when the desktop has no ScreenCast to anchor motion to", () => {
+    const plan = planPortalProviders(
+      probeFor({
+        desktop: "gnome",
+        portal: {
+          present: true,
+          remoteDesktopVersion: 2,
+          availableDeviceTypes: REMOTE_DESKTOP_DEVICE_KEYBOARD | REMOTE_DESKTOP_DEVICE_POINTER,
+        },
+      }),
+    );
+
+    expect(plan.input.implementation).toBe("portal-remote-desktop");
+    expect(plan.input.blockedBy).toMatch(/no org\.freedesktop\.portal\.ScreenCast interface/);
   });
 
   it("refuses a portal that advertises no pointer device, naming the flags it saw", () => {

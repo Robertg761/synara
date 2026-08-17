@@ -335,6 +335,22 @@ export function planPortalProviders(probe: PortalProbe): PortalProviderPlan {
   };
 }
 
+/**
+ * Whether a slot's choice is this implementation with nothing blocking it.
+ *
+ * Lives with the plan rather than in each resolver, because it is the one
+ * question every resolver asks and three copies of it is three chances for a
+ * blocked choice to be built anyway.
+ */
+export function usesProvider(
+  plan: PortalProviderPlan,
+  slot: PortalCapabilitySlot,
+  implementation: PortalProviderId,
+): boolean {
+  const choice = plan[slot];
+  return choice.implementation === implementation && choice.blockedBy === undefined;
+}
+
 function planInput(probe: PortalProbe): PortalProviderChoice {
   if (probe.sessionType !== "wayland") return { blockedBy: sessionGap(probe) };
   if (probe.waylandGlobals?.includes(WLROOTS_GLOBALS.virtualPointer)) {
@@ -344,13 +360,26 @@ function planInput(probe: PortalProbe): PortalProviderChoice {
     const devices = probe.portal.availableDeviceTypes;
     if (devices !== undefined && (devices & REMOTE_DESKTOP_DEVICE_POINTER) === 0) {
       return {
-        implementation: "libei",
+        implementation: "portal-remote-desktop",
         blockedBy:
           `${PORTAL_REMOTE_DESKTOP_INTERFACE} reports no pointer device (AvailableDeviceTypes=${devices}), ` +
           "so this portal backend cannot inject pointer input. Update xdg-desktop-portal and its backend for this desktop.",
       };
     }
-    return blockedByPhase("libei", "B3");
+    // Absolute motion addresses a ScreenCast stream, so a portal with no
+    // ScreenCast interface can only offer relative motion — which cannot
+    // implement "click the button at this coordinate" at all. Naming that is
+    // more useful than resolving a provider whose every click lands elsewhere.
+    if (probe.portal.screenCastVersion === undefined) {
+      return {
+        implementation: "portal-remote-desktop",
+        blockedBy:
+          `${PORTAL_REMOTE_DESKTOP_INTERFACE} can inject input, but this desktop exposes no ${PORTAL_SCREENCAST_INTERFACE} ` +
+          "interface to join the session to, and the portal only offers absolute pointer motion relative to a screen stream. " +
+          "Install the xdg-desktop-portal backend for this desktop so it provides ScreenCast.",
+      };
+    }
+    return { implementation: "portal-remote-desktop" };
   }
   return {
     blockedBy:
@@ -364,8 +393,7 @@ function planCapture(probe: PortalProbe): PortalProviderChoice {
   if (probe.waylandGlobals?.includes(WLROOTS_GLOBALS.screencopy)) {
     return helperBacked("wlr-screencopy", probe);
   }
-  if (probe.portal.screenCastVersion !== undefined)
-    return blockedByPhase("pipewire-screencast", "B3");
+  if (probe.portal.screenCastVersion !== undefined) return nativeCaptureGap();
   return {
     blockedBy:
       "This desktop offers neither the wlroots screencopy protocol nor a ScreenCast portal, so the screen cannot be captured. " +
@@ -374,7 +402,14 @@ function planCapture(probe: PortalProbe): PortalProviderChoice {
 }
 
 function planWindows(probe: PortalProbe): PortalProviderChoice {
-  if (probe.desktopExtensionPresent) return blockedByPhase("gnome-shell-extension", "B4");
+  // The extension and the KWin plugin own the same bus name and never coexist:
+  // KWin's presence is what selects Tier 1 in the first place. Requiring its
+  // absence here means a KDE host forced into Tier 2 by an override is not
+  // handed a GNOME provider to talk to the KWin plugin with — that mismatch is
+  // caught lazily by `Version()`, and never reaching it is better.
+  if (probe.desktopExtensionPresent && !probe.kwinPresent) {
+    return { implementation: "gnome-shell-extension" };
+  }
   if (probe.waylandGlobals?.includes(WLROOTS_GLOBALS.foreignToplevel)) {
     return helperBacked("wlr-foreign-toplevel", probe);
   }
@@ -406,8 +441,7 @@ function planClipboard(probe: PortalProbe): PortalProviderChoice {
     // No helper: wl-copy and wl-paste are their own Wayland clients.
     return { implementation: "wl-clipboard" };
   }
-  if ((probe.portal.remoteDesktopVersion ?? 0) >= 2)
-    return blockedByPhase("portal-selection", "B3");
+  if ((probe.portal.remoteDesktopVersion ?? 0) >= 2) return { implementation: "portal-selection" };
   if (!probe.wlClipboard) {
     return {
       blockedBy:
@@ -444,15 +478,24 @@ function helperBacked(implementation: PortalProviderId, probe: PortalProbe): Por
 }
 
 /**
- * A provider this desktop would use, once its phase lands. Named as such rather
- * than reported as an unsupported desktop: the difference between "your desktop
- * cannot do this" and "Synara has not written this part yet" is the difference
- * between uninstalling and waiting, and only one of them is true.
+ * The one Tier 2 gap that is a missing *library*, not missing code.
+ *
+ * The ScreenCast portal is reachable and its session is already brokered — the
+ * granted stream's node id, position, and size come back in the `Start`
+ * response, which is what makes absolute pointing work on this desktop today.
+ * What is missing is the other half: the frames themselves arrive over
+ * PipeWire, and neither Node nor the current native helper can receive them.
+ * Saying that precisely is what stops a user concluding GNOME is unsupported.
  */
-function blockedByPhase(implementation: PortalProviderId, phase: string): PortalProviderChoice {
+function nativeCaptureGap(): PortalProviderChoice {
   return {
-    implementation,
-    blockedBy: `This desktop would use the ${implementation} provider, which is not implemented yet (Tier 2 phase ${phase}).`,
+    implementation: "pipewire-screencast",
+    blockedBy:
+      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara's native " +
+      "desktop helper has no PipeWire support compiled in: it needs the PipeWire development headers present at build " +
+      "time (dnf install pipewire-devel / apt install libpipewire-0.3-dev) and a rebuild with " +
+      "apps/server/native/computer-desktop-helper/build.sh. Until then this desktop's screen cannot be read; " +
+      "SYNARA_COMPUTER_NESTED=window runs an isolated agent desktop that can be captured today.",
   };
 }
 
