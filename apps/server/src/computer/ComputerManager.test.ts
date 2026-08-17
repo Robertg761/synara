@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { ThreadComputerState } from "@synara/contracts";
 import { decodeComputerFrame } from "@synara/shared/computerFrame";
 
 import { ComputerManager } from "./ComputerManager.ts";
@@ -267,6 +268,158 @@ describe("ComputerManager and FakeComputerBackend", () => {
 
     expect(actions.every((action) => !("threadId" in action))).toBe(true);
     expect(actions).toHaveLength(3);
+
+    await manager.dispose();
+  });
+
+  it("gives the desktop to the first thread that drives it and refuses the second", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    const states: ThreadComputerState[] = [];
+    manager.onEvent((event) => {
+      if (event.type === "computer.thread-state") states.push(event.state);
+    });
+    await manager.getThreadState("thread-a");
+    await manager.getThreadState("thread-b");
+
+    await manager.click("thread-a", { x: 10, y: 10 });
+    await expect(manager.click("thread-b", { x: 20, y: 20 })).rejects.toMatchObject({
+      code: "computer_controlled_by_other_thread",
+      retryable: true,
+      message: expect.stringMatching(/another conversation; try again when it is free/),
+    });
+
+    // Watching is safe while someone else drives, so nothing read-only is gated
+    // — including the blocked thread's own state.
+    await expect(manager.listWindows()).resolves.toMatchObject({ computerId: backend.computerId });
+    await expect(manager.getState({})).resolves.toMatchObject({ computerId: backend.computerId });
+    await expect(manager.getScreenSize()).resolves.toMatchObject({
+      computerId: backend.computerId,
+    });
+    await expect(manager.getThreadState("thread-b")).resolves.toMatchObject({
+      controlledByOtherThread: true,
+    });
+    await expect(manager.getThreadState("thread-a")).resolves.toMatchObject({
+      controlledByOtherThread: false,
+    });
+
+    // The human at the pane is not a competing agent: their input carries no
+    // thread, and it neither waits for the lease nor takes it.
+    await expect(manager.click(undefined, { x: 30, y: 30 })).resolves.toMatchObject({
+      action: "computer_click",
+    });
+    await expect(manager.click("thread-b", { x: 20, y: 20 })).rejects.toMatchObject({
+      code: "computer_controlled_by_other_thread",
+    });
+
+    // Both panels learned about the handover without polling.
+    expect(
+      states.some((state) => state.threadId === "thread-b" && state.controlledByOtherThread),
+    ).toBe(true);
+    expect(states.findLast((state) => state.threadId === "thread-a")?.controlledByOtherThread).toBe(
+      false,
+    );
+
+    await manager.dispose();
+  });
+
+  it("hands the desktop to the next thread when the owner's turn ends", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    await manager.getThreadState("thread-a");
+    await manager.getThreadState("thread-b");
+
+    await manager.launchApp("thread-a", "kcalc");
+    await expect(manager.typeText("thread-b", "hi")).rejects.toThrow(/another conversation/);
+
+    // What the lease reactor calls on turn.completed / turn.aborted /
+    // session.exited.
+    await manager.releaseDesktopControl("thread-a");
+    await expect(manager.getThreadState("thread-b")).resolves.toMatchObject({
+      controlledByOtherThread: false,
+    });
+
+    await expect(manager.typeText("thread-b", "hi")).resolves.toMatchObject({
+      action: "computer_type_text",
+    });
+    // A's next turn now waits on B, and a release from a thread that no longer
+    // owns the desktop cannot take it away from B.
+    await expect(manager.click("thread-a", { x: 10, y: 10 })).rejects.toThrow(
+      /another conversation/,
+    );
+    await manager.releaseDesktopControl("thread-a");
+    await expect(manager.click("thread-a", { x: 10, y: 10 })).rejects.toThrow(
+      /another conversation/,
+    );
+    await expect(manager.getThreadState("thread-a")).resolves.toMatchObject({
+      controlledByOtherThread: true,
+    });
+
+    // Removing the owning thread frees the desktop the same way.
+    await manager.handleThreadRemoved("thread-b");
+    await expect(manager.click("thread-a", { x: 10, y: 10 })).resolves.toMatchObject({
+      action: "computer_click",
+    });
+
+    await manager.dispose();
+  });
+
+  it("expires an idle lease as a backstop, but never one whose owner is still acting", async () => {
+    const backend = new FakeComputerBackend();
+    let nowMs = 0;
+    const manager = new ComputerManager({ backend, now: () => nowMs, leaseIdleMs: 1_000 });
+    await manager.getThreadState("thread-a");
+
+    await manager.click("thread-a", { x: 10, y: 10 });
+    nowMs = 999;
+    await expect(manager.click("thread-b", { x: 20, y: 20 })).rejects.toThrow(
+      /another conversation/,
+    );
+
+    // An owner that is mid-call still holds the pointer, however long ago the
+    // call started — the crash this backstop exists for leaves nothing running.
+    nowMs = 10_000;
+    const started = deferred();
+    const finish = deferred();
+    const inFlight = manager.withAgentActivity("thread-a", async () => {
+      started.resolve();
+      await finish.promise;
+    });
+    await started.promise;
+    await expect(manager.click("thread-b", { x: 20, y: 20 })).rejects.toThrow(
+      /another conversation/,
+    );
+    finish.resolve();
+    await inFlight;
+
+    await expect(manager.click("thread-b", { x: 20, y: 20 })).resolves.toMatchObject({
+      action: "computer_click",
+    });
+    await expect(manager.click("thread-a", { x: 10, y: 10 })).rejects.toThrow(
+      /another conversation/,
+    );
+
+    await manager.dispose();
+  });
+
+  it("lets one thread keep driving across a long think, and keeps perception free", async () => {
+    const backend = new FakeComputerBackend();
+    let nowMs = 0;
+    const manager = new ComputerManager({ backend, now: () => nowMs, leaseIdleMs: 1_000 });
+
+    await manager.click("thread-a", { x: 10, y: 10 });
+    // Nobody else asked for the desktop while the model thought, so the owner
+    // simply picks it back up: expiry is a chance for others, not a revocation.
+    nowMs = 60_000;
+    await expect(manager.click("thread-a", { x: 10, y: 10 })).resolves.toMatchObject({
+      action: "computer_click",
+    });
+    // Perception from another thread neither takes the lease nor renews it.
+    await manager.getState({});
+    await manager.listWindows();
+    await expect(manager.click("thread-a", { x: 10, y: 10 })).resolves.toMatchObject({
+      action: "computer_click",
+    });
 
     await manager.dispose();
   });

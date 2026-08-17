@@ -258,7 +258,18 @@ export default function ComputerPanel(props: {
     <div className="flex h-full w-full min-w-0 items-center gap-2">
       <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
       <span className="truncate font-medium text-xs">Computer</span>
-      {threadState?.agentActive ? (
+      {/* The lease takes precedence: this thread may still be reading the
+          desktop while another conversation drives it, and being blocked is the
+          more useful of the two facts. */}
+      {threadState?.controlledByOtherThread ? (
+        <span
+          className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground"
+          title="Only one conversation can drive the desktop at a time. This one can still watch it."
+        >
+          <span className="size-1.5 rounded-full bg-current" />
+          Another conversation is controlling
+        </span>
+      ) : threadState?.agentActive ? (
         <span className="flex shrink-0 items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400">
           <span className="size-1.5 animate-pulse rounded-full bg-current" />
           Agent controlling

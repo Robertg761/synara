@@ -208,6 +208,13 @@ export const ThreadComputerState = Schema.Struct({
   screenSize: ComputerScreenSize,
   cursor: Schema.optional(ComputerPoint),
   agentActive: Schema.Boolean,
+  /**
+   * Another conversation holds the exclusive desktop lease, so this thread's
+   * agent actions are refused until it is released. Perception is unaffected.
+   * The owning thread is deliberately not named: a thread's state is delivered
+   * to that thread's clients, and nothing else here crosses conversations.
+   */
+  controlledByOtherThread: Schema.Boolean,
   availability: ComputerAvailability,
   lastError: Schema.NullOr(Schema.String.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH))),
 });

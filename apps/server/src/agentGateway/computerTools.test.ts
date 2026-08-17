@@ -31,16 +31,16 @@ function withoutClipboard(backend: FakeComputerBackend): FakeComputerBackend {
   });
 }
 
-function makeContext(provider: ProviderKind = "claudeAgent"): ToolContext {
+function makeContext(provider: ProviderKind = "claudeAgent", threadId = THREAD): ToolContext {
   return {
     principal: {
       kind: "provider-session",
       sessionKey: "gateway-session:computer",
-      threadId: THREAD,
+      threadId,
       provider,
       turnId: "turn-computer",
     },
-    callerThreadId: THREAD,
+    callerThreadId: threadId,
     callerSessionKey: "gateway-session:computer",
     callerProvider: provider,
     callerCapabilities: new Set(["computer:control"]),
@@ -58,10 +58,11 @@ async function setup(backend = new FakeComputerBackend()) {
     name: string,
     args: Record<string, unknown>,
     provider?: ProviderKind,
+    threadId?: string,
   ): Promise<McpToolCallResult> => {
     const tool = byName.get(name);
     if (!tool) throw new Error(`no such tool: ${name}`);
-    return await Effect.runPromise(tool.handler(args, makeContext(provider)));
+    return await Effect.runPromise(tool.handler(args, makeContext(provider, threadId)));
   };
   return { backend, manager, tools, byName, call };
 }
@@ -425,5 +426,46 @@ describe("agent gateway computer tools", () => {
     const refused = await call("computer_read_clipboard", {}, "antigravity");
     expect(refused.isError).toBe(true);
     expect(backend.callsFor("readClipboard")).toHaveLength(0);
+  });
+
+  it("refuses a second thread's actions with a retryable error and keeps its perception", async () => {
+    const { backend, call, manager } = await setup();
+
+    // The first action to land owns the desktop; nothing asks for it explicitly.
+    const owned = await call("computer_click", { x: 10, y: 10 }, undefined, "thread-a");
+    expect(owned.isError).not.toBe(true);
+
+    const blocked = await call("computer_type_text", { text: "hello" }, undefined, "thread-b");
+    expect(blocked.isError).toBe(true);
+    expect(resultJson(blocked)).toMatchObject({
+      error: {
+        code: "computer_controlled_by_other_thread",
+        retryable: true,
+        message: expect.stringContaining("another conversation"),
+      },
+    });
+    // The refusal happens before the backend, so the loser never moves anything.
+    expect(backend.callsFor("typeText")).toHaveLength(0);
+
+    // Reading the desktop is never arbitrated: the blocked thread can keep
+    // watching, which is what makes "try again later" actionable advice.
+    for (const [name, args] of [
+      ["computer_list_windows", {}],
+      ["computer_get_state", { include_screenshot: true }],
+      ["computer_get_screen_size", {}],
+      ["computer_screenshot", { x: 0, y: 0, width: 100, height: 100 }],
+    ] as const) {
+      const perception = await call(name, args, undefined, "thread-b");
+      expect(perception.isError).not.toBe(true);
+    }
+
+    // Turn end hands the desktop over; the roles then swap.
+    await manager.releaseDesktopControl("thread-a");
+    const handover = await call("computer_type_text", { text: "hello" }, undefined, "thread-b");
+    expect(handover.isError).not.toBe(true);
+    const nowBlocked = await call("computer_click", { x: 1, y: 1 }, undefined, "thread-a");
+    expect(resultJson(nowBlocked)).toMatchObject({
+      error: { code: "computer_controlled_by_other_thread" },
+    });
   });
 });

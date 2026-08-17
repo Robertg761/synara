@@ -126,6 +126,7 @@ export function makeWsComputerHandlers(
           windows: [],
           screenSize: { width: 1, height: 1 },
           agentActive: false,
+          controlledByOtherThread: false,
           availability: computerService?.availability ?? {
             kind: "backend-unavailable" as const,
             message: UNSUPPORTED_MESSAGE,

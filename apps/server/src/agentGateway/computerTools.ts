@@ -10,7 +10,7 @@ import {
   MAX_COMPUTER_CLIPBOARD_BYTES,
   type ComputerCaptureRequest,
 } from "../computer/ComputerBackend.ts";
-import { ComputerManager } from "../computer/ComputerManager.ts";
+import { ComputerLeaseError, ComputerManager } from "../computer/ComputerManager.ts";
 import { mcpToolResultError, mcpToolResultJson, type McpToolCallResult } from "./protocol.ts";
 import {
   ToolInputError,
@@ -97,6 +97,20 @@ function approvalUnavailableResult(name: string): McpToolCallResult {
         code: "ComputerApprovalRequired",
         message: `${name} requires explicit user approval, and this provider session has no approval gate. The action was refused before it ran.`,
       },
+    }),
+    isError: true,
+  };
+}
+
+/**
+ * The refusal carries a code and `retryable` rather than only prose so a model
+ * can tell "wait and try again" apart from the target and approval failures it
+ * must fix before retrying.
+ */
+function leaseErrorResult(error: ComputerLeaseError): McpToolCallResult {
+  return {
+    ...mcpToolResultJson({
+      error: { code: error.code, message: error.message, retryable: error.retryable },
     }),
     isError: true,
   };
@@ -297,7 +311,9 @@ export function makeAgentGatewayComputerTools(
           Effect.succeed(
             error instanceof ComputerTargetError
               ? targetErrorResult(error)
-              : mcpToolResultError(errorText(error)),
+              : error instanceof ComputerLeaseError
+                ? leaseErrorResult(error)
+                : mcpToolResultError(errorText(error)),
           ),
         ),
       );

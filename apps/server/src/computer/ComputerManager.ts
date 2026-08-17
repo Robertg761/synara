@@ -38,6 +38,23 @@ import {
 export const COMPUTER_FRAME_QUEUE_LIMIT = 8;
 export const COMPUTER_FRAME_SOCKET_BUDGET_BYTES = 2 * 1024 * 1024;
 
+/**
+ * Crash backstop for the desktop lease, not the normal release path.
+ *
+ * There is one desktop, one cursor and one keyboard focus, so exactly one
+ * thread may drive it at a time. Ownership is released the moment the owner's
+ * turn ends (`releaseDesktopControl`, driven by the provider runtime's
+ * terminal turn and session events), because a takeover mid-turn corrupts the
+ * owner: its drag is teleported, its typing is retargeted. Idle expiry only
+ * covers the case where that signal never arrives — a provider process that
+ * died without a terminal event — and so is deliberately long: a model can
+ * think for minutes between two tool calls, and expiring under a live turn is
+ * the failure this whole mechanism exists to prevent. Five minutes matches the
+ * KWin plugin's own session idle timeout, the point past which the desktop
+ * session is being torn down anyway.
+ */
+export const COMPUTER_LEASE_IDLE_MS = 300_000;
+
 export type ComputerEventListener = (event: ComputerEvent) => void;
 
 interface ThreadComputerRuntimeState {
@@ -50,9 +67,38 @@ interface ThreadComputerRuntimeState {
   cursor?: ComputerPoint;
 }
 
+/** The single desktop's exclusive owner, and when it last drove it. */
+interface DesktopLease {
+  readonly threadId: string;
+  lastActivityMs: number;
+}
+
 export interface ComputerManagerOptions {
   readonly backend: ComputerBackend;
   readonly transport?: FrameTransport<string, ComputerStreamFrame>;
+  /** Injected for tests; the lease is the only clock-dependent state here. */
+  readonly now?: () => number;
+  readonly leaseIdleMs?: number;
+}
+
+/**
+ * Refusal raised when another thread owns the desktop. It extends
+ * `ComputerBackendError` so every existing catch site keeps classifying it,
+ * and carries `retryable` because the desktop does come free again — the
+ * message tells the model to come back rather than to give up or find another
+ * way in.
+ */
+export class ComputerLeaseError extends ComputerBackendError {
+  readonly code = "computer_controlled_by_other_thread";
+
+  constructor() {
+    super(
+      "The computer is currently controlled by another conversation; try again when it is free. " +
+        "Reading the desktop (windows, state, screenshots) still works while it is held.",
+      { retryable: true },
+    );
+    this.name = "ComputerLeaseError";
+  }
 }
 
 /** Thread state, targeting, action dispatch, and stream ownership for a computer. */
@@ -64,6 +110,9 @@ export class ComputerManager {
   private readonly listeners = new Set<ComputerEventListener>();
   private readonly threads = new Map<string, ThreadComputerRuntimeState>();
   private readonly backendUnsubscribe?: () => void;
+  private readonly now: () => number;
+  private readonly leaseIdleMs: number;
+  private lease: DesktopLease | null = null;
   private streamAttached = false;
   private streamDesired = false;
   private streamEpoch = 0;
@@ -73,6 +122,8 @@ export class ComputerManager {
   constructor(options: ComputerManagerOptions) {
     this.backend = options.backend;
     this.computerId = options.backend.computerId;
+    this.now = options.now ?? Date.now;
+    this.leaseIdleMs = options.leaseIdleMs ?? COMPUTER_LEASE_IDLE_MS;
     this.transport =
       options.transport ??
       new FrameTransport<string, ComputerStreamFrame>({
@@ -141,11 +192,13 @@ export class ComputerManager {
     return { computerId: this.computerId, screenSize, availability };
   }
 
+  /** Launching spawns windows on the shared desktop, so it takes the lease too. */
   async launchApp(
     threadId: string | undefined,
     app: string,
     args: readonly string[] = [],
   ): Promise<ComputerLaunchAppResult> {
+    await this.claimDesktopControl(threadId);
     const result = await this.backend.launchApp(app, args);
     this.emitAction(threadId, "computer_launch_app");
     return result;
@@ -157,6 +210,7 @@ export class ComputerManager {
   }
 
   async click(threadId: string | undefined, target: ComputerTarget): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.click(resolved.point);
@@ -167,6 +221,7 @@ export class ComputerManager {
     threadId: string | undefined,
     target: ComputerTarget,
   ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.doubleClick(resolved.point);
@@ -177,6 +232,7 @@ export class ComputerManager {
     threadId: string | undefined,
     target: ComputerTarget,
   ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.rightClick(resolved.point);
@@ -187,6 +243,7 @@ export class ComputerManager {
     threadId: string | undefined,
     target: ComputerTarget,
   ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.moveCursor(resolved.point);
@@ -199,6 +256,7 @@ export class ComputerManager {
     to: ComputerTarget,
     durationMs = 250,
   ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const [resolvedFrom, resolvedTo] = await Promise.all([
       this.resolvePointTarget(from),
       this.resolvePointTarget(to),
@@ -214,6 +272,7 @@ export class ComputerManager {
     deltaX: number,
     deltaY: number,
   ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const resolved = target ? await this.resolvePointTarget(target) : null;
     await this.prepareResolvedTarget(resolved?.windowId);
     const result = await this.backend.scroll(resolved?.point ?? null, deltaX, deltaY);
@@ -221,11 +280,13 @@ export class ComputerManager {
   }
 
   async typeText(threadId: string | undefined, text: string): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const result = await this.backend.typeText(text);
     return this.actionResult(threadId, "computer_type_text", undefined, result);
   }
 
   async pressKey(threadId: string | undefined, key: string): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const result = await this.backend.pressKey(key);
     return this.actionResult(threadId, "computer_press_key", undefined, result);
   }
@@ -234,6 +295,7 @@ export class ComputerManager {
     threadId: string | undefined,
     keys: readonly string[],
   ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const result = await this.backend.hotkey(keys);
     return this.actionResult(threadId, "computer_hotkey", undefined, result);
   }
@@ -242,8 +304,15 @@ export class ComputerManager {
    * The clipboard is the system one the human shares, and it is optional on the
    * backend, so a backend without it refuses the call instead of the tool
    * layer discovering a missing method at dispatch time.
+   *
+   * Reading it takes the lease even though it mutates nothing: the clipboard is
+   * one shared slot that the owning thread is mid-way through using, and a read
+   * from a second thread is either racing that write or reading its private
+   * payload. Uniformity also keeps the rule the model must learn simple —
+   * perception of the screen is free, everything clipboard is not.
    */
   async readClipboard(threadId: string | undefined): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const read = this.backend.readClipboard?.bind(this.backend);
     if (!read) throw clipboardUnsupportedError();
     const value = await read();
@@ -259,6 +328,7 @@ export class ComputerManager {
   }
 
   async writeClipboard(threadId: string | undefined, text: string): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const write = this.backend.writeClipboard?.bind(this.backend);
     if (!write) throw clipboardUnsupportedError();
     await write(text);
@@ -272,6 +342,7 @@ export class ComputerManager {
     target: ComputerTarget,
     value: string,
   ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const resolved = await this.resolveSemanticTarget(target);
     await this.prepareResolvedTarget(resolved.node.windowId ?? undefined);
     const result = await this.backend.setValue(resolved, value);
@@ -283,6 +354,7 @@ export class ComputerManager {
     target: ComputerTarget,
     action: string,
   ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
     const resolved = await this.resolveSemanticTarget(target);
     await this.prepareResolvedTarget(resolved.node.windowId ?? undefined);
     const result = await this.backend.performAction(resolved, action);
@@ -303,6 +375,64 @@ export class ComputerManager {
         if (state.agentActiveCount === 0) await this.publish(threadId, true).catch(() => undefined);
       }
     }
+  }
+
+  /**
+   * Take or renew the exclusive desktop lease for a mutating agent action, or
+   * refuse the action because another conversation holds it.
+   *
+   * Ownership is implicit: the first thread to drive the desktop owns it, and
+   * keeps owning it until its turn ends. There is no explicit acquire tool
+   * because there is nothing sensible for a model to do with one — it would
+   * either forget to release, or treat a refusal to acquire as a different
+   * failure from a refusal to act.
+   *
+   * An undefined (or blank) thread is the human driving through the computer
+   * pane, which the same rule as `emitAction` identifies. The human is not a
+   * competing agent: they are the person the desktop belongs to, so pane input
+   * neither takes the lease nor is ever refused by it.
+   */
+  private async claimDesktopControl(threadId: string | undefined): Promise<void> {
+    const owner = agentThreadId(threadId);
+    if (owner === undefined) return;
+    const now = this.now();
+    const held = this.lease;
+    if (held && held.threadId !== owner && !this.isLeaseStale(held, now)) {
+      throw new ComputerLeaseError();
+    }
+    const changed = held?.threadId !== owner;
+    this.lease = { threadId: owner, lastActivityMs: now };
+    // Both panels change: the new owner stops being blocked, and every other
+    // thread starts being.
+    if (changed) await this.publishAllThreads();
+  }
+
+  /**
+   * Release the desktop the moment the owning thread stops being able to drive
+   * it — its turn reached a terminal state, or its provider session exited.
+   * This is the lease's primary release path; idle expiry only covers a runtime
+   * that died without reporting either.
+   *
+   * Scoped to the thread rather than to one turn: the manager never sees turn
+   * ids, and it does not need them, because the gateway already refuses every
+   * computer tool call outside an active turn. A thread whose turn ended cannot
+   * act again regardless of what the lease says.
+   */
+  async releaseDesktopControl(threadId: string): Promise<void> {
+    const owner = agentThreadId(threadId);
+    if (owner === undefined || this.lease?.threadId !== owner) return;
+    this.lease = null;
+    await this.publishAllThreads();
+  }
+
+  /**
+   * Stale only once nothing is in flight: a call that is still running holds
+   * the pointer or the keyboard right now, and elapsed time since it started
+   * says nothing about whether it has finished.
+   */
+  private isLeaseStale(lease: DesktopLease, now: number): boolean {
+    if (now - lease.lastActivityMs < this.leaseIdleMs) return false;
+    return (this.threads.get(lease.threadId)?.agentActiveCount ?? 0) === 0;
   }
 
   async recordThreadError(threadId: string, message: string): Promise<void> {
@@ -361,6 +491,9 @@ export class ComputerManager {
 
   async handleThreadRemoved(threadId: string): Promise<void> {
     this.threads.delete(threadId);
+    // Deleted after the thread state, so the resulting publish cannot recreate
+    // it: a removed thread must not reappear as a lease holder.
+    await this.releaseDesktopControl(threadId);
   }
 
   async dispose(): Promise<void> {
@@ -549,7 +682,7 @@ export class ComputerManager {
    * stays unattributed rather than borrowing an unrelated thread id.
    */
   private emitAction(threadId: string | undefined, action: string): void {
-    const attributed = threadId?.trim();
+    const attributed = agentThreadId(threadId);
     this.emit({
       type: "computer.action",
       action,
@@ -617,6 +750,7 @@ export class ComputerManager {
       screenSize: state.screenSize,
       ...(state.cursor ? { cursor: state.cursor } : {}),
       agentActive: state.agentActiveCount > 0,
+      controlledByOtherThread: this.lease !== null && this.lease.threadId !== threadId,
       availability: state.availability,
       lastError: state.lastError,
     };
@@ -645,6 +779,16 @@ export class ComputerManager {
       }
     }
   }
+}
+
+/**
+ * The caller as an agent thread, or undefined for desktop input that belongs to
+ * no thread — the human at the computer pane. Attribution and the desktop lease
+ * must agree on who that is, so both read it here.
+ */
+function agentThreadId(threadId: string | undefined): string | undefined {
+  const trimmed = threadId?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 function clipboardUnsupportedError(): ComputerBackendError {

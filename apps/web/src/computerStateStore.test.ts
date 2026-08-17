@@ -14,6 +14,7 @@ const baseState: ThreadComputerState = {
   windows: [],
   screenSize: { width: 5120, height: 2520 },
   agentActive: false,
+  controlledByOtherThread: false,
   availability: { kind: "available" },
   lastError: null,
 };
