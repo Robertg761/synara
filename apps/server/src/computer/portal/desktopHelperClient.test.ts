@@ -305,7 +305,7 @@ describe("DesktopHelperClient", () => {
     const child = new FakeHelperProcess().respond(({ method }) =>
       method === "listWindows"
         ? new HelperRefusal(
-            "this compositor does not implement zwlr_foreign_toplevel_management_v1",
+            "this compositor does not implement zwlr_foreign_toplevel_manager_v1",
             -32001,
           )
         : {},
@@ -315,7 +315,7 @@ describe("DesktopHelperClient", () => {
     // -32001 is permanent: retrying it is a busy loop against a compositor that
     // will keep giving the same answer.
     await expect(client.listWindows()).rejects.toMatchObject({
-      message: expect.stringMatching(/zwlr_foreign_toplevel_management_v1/) as unknown as string,
+      message: expect.stringMatching(/zwlr_foreign_toplevel_manager_v1/) as unknown as string,
       retryable: false,
     });
     await expect(client.pointerMotion(10, 20)).resolves.toBeUndefined();

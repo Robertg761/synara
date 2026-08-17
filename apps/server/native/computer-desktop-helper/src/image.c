@@ -9,9 +9,12 @@
 
 /*
  * wl_shm's two historical formats have small enum values; every other format is
- * its DRM fourcc. Only 32-bit packed formats are handled: they are what every
- * wlroots compositor hands to a shm screencopy client, and a half-decoded
- * 24-bit or planar buffer would be a corrupt screenshot rather than a refusal.
+ * its DRM fourcc. The 32-bit packed formats are what a GPU renderer hands to a
+ * shm screencopy client; the two 24-bit RGB formats are what the pixman
+ * software renderer offers (headless sway, VMs, GPU-less fallback desktops —
+ * proven by the live headless-sway lane, whose only offer is BGR888). Anything
+ * else — 16-bit, 10-bit, planar — stays a refusal, because a half-decoded
+ * buffer would be a corrupt screenshot rather than an honest sentence.
  */
 #define WL_SHM_FORMAT_ARGB8888 0
 #define WL_SHM_FORMAT_XRGB8888 1
@@ -22,6 +25,8 @@
 #define WL_SHM_FORMAT_RGBA8888 FOURCC('R', 'A', '2', '4')
 #define WL_SHM_FORMAT_BGRX8888 FOURCC('B', 'X', '2', '4')
 #define WL_SHM_FORMAT_BGRA8888 FOURCC('B', 'A', '2', '4')
+#define WL_SHM_FORMAT_RGB888 FOURCC('R', 'G', '2', '4')
+#define WL_SHM_FORMAT_BGR888 FOURCC('B', 'G', '2', '4')
 
 bool image_alloc(image_rgba *image, uint32_t width, uint32_t height) {
 	image->pixels = NULL;
@@ -48,32 +53,53 @@ void image_free(image_rgba *image) {
 	image->height = 0;
 }
 
-/* Byte offsets of red, green and blue inside one little-endian 32-bit pixel. */
-static bool format_offsets(uint32_t format, int *red, int *green, int *blue) {
+/*
+ * Bytes per pixel and the byte offsets of red, green and blue inside one
+ * little-endian pixel. DRM fourcc channel order reads high-to-low bit, so the
+ * bytes in memory run in the opposite order to the name: RGB888's memory bytes
+ * are B,G,R and BGR888's are R,G,B.
+ */
+static bool format_layout(uint32_t format, int *bytes_per_pixel, int *red, int *green, int *blue) {
 	switch (format) {
 	case WL_SHM_FORMAT_ARGB8888:
 	case WL_SHM_FORMAT_XRGB8888:
+		*bytes_per_pixel = 4;
 		*red = 2;
 		*green = 1;
 		*blue = 0;
 		return true;
 	case WL_SHM_FORMAT_XBGR8888:
 	case WL_SHM_FORMAT_ABGR8888:
+		*bytes_per_pixel = 4;
 		*red = 0;
 		*green = 1;
 		*blue = 2;
 		return true;
 	case WL_SHM_FORMAT_RGBX8888:
 	case WL_SHM_FORMAT_RGBA8888:
+		*bytes_per_pixel = 4;
 		*red = 3;
 		*green = 2;
 		*blue = 1;
 		return true;
 	case WL_SHM_FORMAT_BGRX8888:
 	case WL_SHM_FORMAT_BGRA8888:
+		*bytes_per_pixel = 4;
 		*red = 1;
 		*green = 2;
 		*blue = 3;
+		return true;
+	case WL_SHM_FORMAT_RGB888:
+		*bytes_per_pixel = 3;
+		*red = 2;
+		*green = 1;
+		*blue = 0;
+		return true;
+	case WL_SHM_FORMAT_BGR888:
+		*bytes_per_pixel = 3;
+		*red = 0;
+		*green = 1;
+		*blue = 2;
 		return true;
 	default:
 		return false;
@@ -81,10 +107,11 @@ static bool format_offsets(uint32_t format, int *red, int *green, int *blue) {
 }
 
 bool image_format_supported(uint32_t wl_shm_format) {
+	int bytes_per_pixel = 0;
 	int red = 0;
 	int green = 0;
 	int blue = 0;
-	return format_offsets(wl_shm_format, &red, &green, &blue);
+	return format_layout(wl_shm_format, &bytes_per_pixel, &red, &green, &blue);
 }
 
 const char *image_format_name(uint32_t wl_shm_format) {
@@ -97,24 +124,27 @@ const char *image_format_name(uint32_t wl_shm_format) {
 	case WL_SHM_FORMAT_RGBA8888: return "RGBA8888";
 	case WL_SHM_FORMAT_BGRX8888: return "BGRX8888";
 	case WL_SHM_FORMAT_BGRA8888: return "BGRA8888";
+	case WL_SHM_FORMAT_RGB888: return "RGB888";
+	case WL_SHM_FORMAT_BGR888: return "BGR888";
 	default: return "an unrecognised wl_shm format";
 	}
 }
 
 bool image_from_shm(image_rgba *out, const uint8_t *source, uint32_t width, uint32_t height,
                     uint32_t stride, uint32_t wl_shm_format, bool y_invert) {
+	int bytes_per_pixel = 0;
 	int red = 0;
 	int green = 0;
 	int blue = 0;
-	if (!format_offsets(wl_shm_format, &red, &green, &blue)) return false;
-	if (stride < width * 4) return false;
+	if (!format_layout(wl_shm_format, &bytes_per_pixel, &red, &green, &blue)) return false;
+	if ((uint64_t)stride < (uint64_t)width * (uint64_t)bytes_per_pixel) return false;
 	if (!image_alloc(out, width, height)) return false;
 	for (uint32_t row = 0; row < height; row++) {
 		uint32_t source_row = y_invert ? height - 1 - row : row;
 		const uint8_t *in = source + (size_t)source_row * stride;
 		uint8_t *dst = out->pixels + (size_t)row * width * 4;
 		for (uint32_t column = 0; column < width; column++) {
-			const uint8_t *pixel = in + (size_t)column * 4;
+			const uint8_t *pixel = in + (size_t)column * (size_t)bytes_per_pixel;
 			dst[0] = pixel[red];
 			dst[1] = pixel[green];
 			dst[2] = pixel[blue];

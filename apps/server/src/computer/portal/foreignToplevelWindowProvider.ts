@@ -1,5 +1,5 @@
 /**
- * Window enumeration through `zwlr_foreign_toplevel_management_v1`.
+ * Window enumeration through `zwlr_foreign_toplevel_manager_v1`.
  *
  * This protocol exists for taskbars, and it reports what a taskbar needs: a
  * title, an app id, and the activated/minimized/maximized/fullscreen state. It

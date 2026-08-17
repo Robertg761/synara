@@ -1446,8 +1446,9 @@ static bool capture_one(helper_wayland *state, struct helper_output *output, hel
 	}
 	if (!image_format_supported(capture.format)) {
 		helper_error_set(error, HELPER_REFUSAL_UNSUPPORTED,
-		                 "the compositor only offered %s, which this helper cannot decode",
-		                 image_format_name(capture.format));
+		                 "the compositor only offered %s (wl_shm format 0x%08x), which this "
+		                 "helper cannot decode",
+		                 image_format_name(capture.format), capture.format);
 		zwlr_screencopy_frame_v1_destroy(frame);
 		return false;
 	}
@@ -1678,7 +1679,7 @@ bool helper_wayland_capture(helper_wayland *state, helper_box region, uint32_t m
 static bool refresh_toplevels(helper_wayland *state, helper_error *error) {
 	if (state->toplevel_manager == NULL) {
 		helper_error_set(error, HELPER_REFUSAL_UNSUPPORTED,
-		                 "this compositor does not advertise zwlr_foreign_toplevel_management_v1, so "
+		                 "this compositor does not advertise zwlr_foreign_toplevel_manager_v1, so "
 		                 "its windows cannot be enumerated");
 		return false;
 	}
@@ -1690,7 +1691,7 @@ static bool refresh_toplevels(helper_wayland *state, helper_error *error) {
 	 * takes the window list with it. */
 	if (state->toplevel_manager == NULL) {
 		helper_error_set(error, HELPER_REFUSAL_TRANSIENT,
-		                 "the compositor withdrew zwlr_foreign_toplevel_management_v1 while its "
+		                 "the compositor withdrew zwlr_foreign_toplevel_manager_v1 while its "
 		                 "windows were being enumerated");
 		return false;
 	}

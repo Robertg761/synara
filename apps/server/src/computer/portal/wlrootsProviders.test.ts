@@ -198,7 +198,7 @@ describe("ForeignToplevelWindowProvider", () => {
   });
 
   it("propagates a refusal instead of reporting an empty desktop", async () => {
-    const helper = fakeDesktopHelper({ failWith: "no zwlr_foreign_toplevel_management_v1 here" });
+    const helper = fakeDesktopHelper({ failWith: "no zwlr_foreign_toplevel_manager_v1 here" });
     const provider = new ForeignToplevelWindowProvider(helper, noRelease);
 
     await expect(provider.listWindows()).rejects.toThrow(/foreign_toplevel/);

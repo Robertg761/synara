@@ -128,7 +128,7 @@ describe.skipIf(!process.env.SYNARA_NESTED_WLROOTS_TEST)("wlroots desktop", () =
           "zwlr_virtual_pointer_manager_v1",
           "zwp_virtual_keyboard_manager_v1",
           "zwlr_screencopy_manager_v1",
-          "zwlr_foreign_toplevel_management_v1",
+          "zwlr_foreign_toplevel_manager_v1",
           // Tier 2 shares the human's seat, so being able to tell whether they
           // are using it is part of what makes this desktop supportable.
           "ext_idle_notifier_v1",
@@ -222,7 +222,7 @@ describe.skipIf(!process.env.SYNARA_NESTED_WLROOTS_TEST)("wlroots desktop", () =
       // witness that absolute motion landed where it was aimed — and the second
       // output is only reachable if the desktop is one coordinate space.
       for (const output of outputs) {
-        await backend.moveCursor(centerOf(output.rect));
+        await onceSeatIsQuiet(() => backend.moveCursor(centerOf(output.rect)));
         await expect(
           waitFor(() => readOutputs(session).find((entry) => entry.focused)?.name === output.name),
         ).resolves.toBe(true);
@@ -233,19 +233,19 @@ describe.skipIf(!process.env.SYNARA_NESTED_WLROOTS_TEST)("wlroots desktop", () =
       // The keymap is the risky part of the helper: a chord fires only if the
       // uploaded xkb map agrees with the evdev codes being sent, so sway's own
       // binding firing is the proof that it does.
-      await backend.hotkey(["ctrl", "alt", "f12"]);
+      await onceSeatIsQuiet(() => backend.hotkey(["ctrl", "alt", "f12"]));
 
       await expect(waitFor(() => fileExists(join(session.dir, "hotkey")))).resolves.toBe(true);
     });
 
     it("types a character that arrives as that character", async () => {
-      await backend.typeText("z");
+      await onceSeatIsQuiet(() => backend.typeText("z"));
 
       await expect(waitFor(() => fileExists(join(session.dir, "typed")))).resolves.toBe(true);
     });
 
     it("round-trips the nested session's own clipboard", async () => {
-      await backend.writeClipboard("tier two clipboard");
+      await onceSeatIsQuiet(() => backend.writeClipboard("tier two clipboard"));
 
       await expect(backend.readClipboard()).resolves.toBe("tier two clipboard");
     });
@@ -257,7 +257,7 @@ describe.skipIf(!process.env.SYNARA_NESTED_WLROOTS_TEST)("wlroots desktop", () =
     it.skipIf(TEST_CLIENT === undefined)(
       "sees a real client's window, without bounds, and refuses what bounds would buy",
       async () => {
-        await backend.launchApp(TEST_CLIENT!, []);
+        await onceSeatIsQuiet(() => backend.launchApp(TEST_CLIENT!, []));
         const window = await waitForValue(async () => (await backend.listWindows())[0]);
 
         expect(window.title.length).toBeGreaterThan(0);
@@ -444,6 +444,26 @@ function centerOf(rect: ComputerRect): { readonly x: number; readonly y: number 
 /** A point at `fraction` across a rect, as the helper's absolute motion wants it. */
 function pointOn(rect: ComputerRect, fraction: number): [number, number] {
   return [Math.round(rect.x + rect.width * fraction), Math.round(rect.y + rect.height * fraction)];
+}
+
+/**
+ * Runs a mutating action the way the tool surface does: `computer_human_active`
+ * is a retryable refusal, not a failure. A fresh seat is refused until
+ * `ext_idle_notify_v1` has proven it quiet for the yield threshold — a couple
+ * of real seconds after the backend first arms its idle source — so the lane
+ * waits that out rather than reporting the arbiter's caution as a bug.
+ */
+async function onceSeatIsQuiet<T>(action: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+  for (;;) {
+    try {
+      return await action();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes(HUMAN_ACTIVE_REFUSAL) || Date.now() >= deadline) throw error;
+      await delay(POLL_MS);
+    }
+  }
 }
 
 async function waitFor(

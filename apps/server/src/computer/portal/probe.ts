@@ -53,7 +53,7 @@ export const WLROOTS_GLOBALS = {
   virtualPointer: "zwlr_virtual_pointer_manager_v1",
   virtualKeyboard: "zwp_virtual_keyboard_manager_v1",
   screencopy: "zwlr_screencopy_manager_v1",
-  foreignToplevel: "zwlr_foreign_toplevel_management_v1",
+  foreignToplevel: "zwlr_foreign_toplevel_manager_v1",
   idleNotify: "ext_idle_notifier_v1",
   dataControl: "zwlr_data_control_manager_v1",
   /**
@@ -275,20 +275,27 @@ export async function probeDesktop(
 }
 
 /**
- * Which desktop, from strongest evidence to weakest: a compositor that owns a
- * bus name, a compositor-specific socket in the environment, an advertised
- * wlroots-only global, and only then `XDG_CURRENT_DESKTOP`.
+ * Which desktop, from strongest evidence to weakest: a compositor-specific
+ * socket in the environment, an advertised wlroots-only global, a compositor
+ * that owns a bus name, and only then `XDG_CURRENT_DESKTOP`.
+ *
+ * The wlroots evidence deliberately outranks `org.kde.KWin` being on the bus.
+ * The bus names say what shares this session bus; the socket and the globals
+ * say which compositor owns the display this probe is actually about — and the
+ * two disagree exactly when a wlroots session is nested inside a KDE desktop,
+ * where wlroots is the true answer. Proven by the live sway lane on a KDE
+ * host, where the nested session inherits the host's session bus.
  */
 export function desktopKind(input: {
   readonly env: NodeJS.ProcessEnv;
   readonly kwinPresent: boolean;
   readonly waylandGlobals?: readonly string[];
 }): DesktopKind {
-  if (input.kwinPresent) return "kde";
   const env = input.env;
   if (env.HYPRLAND_INSTANCE_SIGNATURE || env.SWAYSOCK || env.WAYFIRE_SOCKET) return "wlroots";
   if (input.waylandGlobals?.includes(WLROOTS_GLOBALS.foreignToplevel)) return "wlroots";
   if (input.waylandGlobals?.includes(WLROOTS_GLOBALS.virtualPointer)) return "wlroots";
+  if (input.kwinPresent) return "kde";
   const names = (env.XDG_CURRENT_DESKTOP ?? env.XDG_SESSION_DESKTOP ?? env.DESKTOP_SESSION ?? "")
     .toLowerCase()
     .split(":")
