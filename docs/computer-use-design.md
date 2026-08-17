@@ -277,6 +277,6 @@ Tier 3 nested backend (shipped, `apps/server/src/computer/nestedKWinSession.ts`)
 
 1. Confirm Tier 1 (KWin plugin, real desktop, arbitrary windows) as the headline target. It is the true "just like macOS" answer and this machine can build it today. The cost is per-KWin-version rebuilds.
 2. Plugin language and build: C++ against the installed `kwin-devel` headers is the direct route. Confirm we are comfortable owning a compiled KWin plugin and pinning to KWin 6.7.x.
-3. Do we want Tier 2 (proxy) in the first shippable cut for non-KDE users, or is Tier 1 plus the Tier 3 sandbox enough to start?
+3. ~~Do we want Tier 2 (proxy) in the first shippable cut for non-KDE users, or is Tier 1 plus the Tier 3 sandbox enough to start?~~ Decided 2026-08-17: the feature ships full and complete, so Tier 2 is in scope — but not as the relay proxy sketched above. See `computer-use-tier2-plan.md` for the mechanism correction (portals/libei on GNOME, native wlr protocols on wlroots, a GNOME Shell extension for window listing, and a windowed variant of the Tier 3 nested session as the first slice).
 4. Scope of the Phase 1 tool surface: full surface against the fake backend, or a minimal click, type, screenshot core first?
 5. Which providers may request `computer:control` at all?
