@@ -36,7 +36,11 @@ export const COMPUTER_WS_CHANNELS = {
 } as const;
 
 const COMPUTER_ID_MAX_LENGTH = 128;
-const COMPUTER_TEXT_MAX_LENGTH = 16 * 1024;
+/**
+ * Exported because it bounds `ComputerActionResult.value`, and the clipboard
+ * read path must enforce it before putting clipboard text on that field.
+ */
+export const COMPUTER_TEXT_MAX_LENGTH = 16 * 1024;
 const COMPUTER_LABEL_MAX_LENGTH = 1_024;
 const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
 /** Caps both a reported window list and one window's occluder list. */

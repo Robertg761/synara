@@ -13,7 +13,8 @@ import {
   newestPluginId,
   type KWinComputerBackendOptions,
 } from "./KWinComputerBackend.ts";
-import type { ComputerResolvedTarget } from "./ComputerBackend.ts";
+import { MAX_COMPUTER_CLIPBOARD_BYTES, type ComputerResolvedTarget } from "./ComputerBackend.ts";
+import type { ClipboardCommandResult, ClipboardCommandSpec } from "./wlClipboard.ts";
 import type { AtspiTextWrite, AtspiTreeReader } from "./atspiClient.ts";
 import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
 import { GLIDE_FRAME_INTERVAL_MS } from "./kwinInput.ts";
@@ -1287,6 +1288,124 @@ describe("KWinComputerBackend", () => {
     await backend.availability();
     dbus.disconnect();
     await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    await backend.dispose();
+  });
+});
+
+describe("KWinComputerBackend clipboard", () => {
+  function clipboardBackend(
+    reply: (spec: ClipboardCommandSpec) => ClipboardCommandResult | Promise<never>,
+  ): {
+    readonly backend: KWinComputerBackend;
+    readonly dbus: FakeDbus;
+    readonly specs: ClipboardCommandSpec[];
+  } {
+    const dbus = new FakeDbus();
+    const specs: ClipboardCommandSpec[] = [];
+    const backend = makeBackend(dbus, {
+      runClipboardCommand: async (spec) => {
+        specs.push(spec);
+        return await reply(spec);
+      },
+    });
+    return { backend, dbus, specs };
+  }
+
+  function exited(code: number, output: { stdout?: string; stderr?: string } = {}) {
+    return {
+      outcome: "exited",
+      code,
+      stdout: output.stdout ?? "",
+      stderr: output.stderr ?? "",
+    } as const;
+  }
+
+  it("reads text from the shared seat clipboard without touching the plugin", async () => {
+    const { backend, dbus, specs } = clipboardBackend(() =>
+      exited(0, { stdout: "  copied\ntext  " }),
+    );
+
+    await expect(backend.readClipboard()).resolves.toBe("  copied\ntext  ");
+    expect(specs[0]?.command).toBe("wl-paste");
+    // The generic text type is what makes wl-paste refuse an image instead of
+    // streaming its raw bytes back as "text".
+    expect(specs[0]?.args).toEqual(["--no-newline", "--type", "text"]);
+    // Clipboard access uses neither the agent seat nor the input session.
+    expect(dbus.plugin.calls).toHaveLength(0);
+
+    await backend.dispose();
+  });
+
+  it("reads an empty clipboard as an empty string rather than an error", async () => {
+    const { backend } = clipboardBackend(() => exited(1, { stderr: "Nothing is copied\n" }));
+    await expect(backend.readClipboard()).resolves.toBe("");
+    await backend.dispose();
+  });
+
+  it("explains a clipboard that holds non-text content", async () => {
+    const { backend } = clipboardBackend(() =>
+      exited(1, {
+        stderr:
+          'Clipboard content is not available as requested type "text"\nUse "wl-paste --list-types" to view available types.\n',
+      }),
+    );
+    await expect(backend.readClipboard()).rejects.toThrow(/non-text content/);
+    await backend.dispose();
+  });
+
+  it("refuses an oversized clipboard instead of truncating it", async () => {
+    const { backend } = clipboardBackend(() => ({
+      outcome: "output-limit",
+      code: null,
+      stdout: "",
+      stderr: "",
+    }));
+    await expect(backend.readClipboard()).rejects.toThrow(/past the limit/);
+    await backend.dispose();
+  });
+
+  it("writes clipboard text through stdin so it never reaches the process arguments", async () => {
+    const { backend, specs } = clipboardBackend(() => exited(0));
+    const text = "-secret-\nline two";
+
+    await expect(backend.writeClipboard(text)).resolves.toBeUndefined();
+    expect(specs[0]).toMatchObject({ command: "wl-copy", input: text, forks: true });
+    expect(specs[0]?.args).toEqual(["--type", "text/plain"]);
+    expect(specs[0]?.args).not.toContain(text);
+
+    await backend.dispose();
+  });
+
+  it("rejects clipboard text past the byte cap before spawning anything", async () => {
+    const { backend, specs } = clipboardBackend(() => exited(0));
+    await expect(
+      backend.writeClipboard("x".repeat(MAX_COMPUTER_CLIPBOARD_BYTES + 1)),
+    ).rejects.toThrow(/byte limit/);
+    expect(specs).toHaveLength(0);
+    await backend.dispose();
+  });
+
+  it("quotes the failure when wl-copy refuses the write", async () => {
+    const { backend } = clipboardBackend(() =>
+      exited(1, { stderr: "Failed to connect to a Wayland server\n" }),
+    );
+    await expect(backend.writeClipboard("hello")).rejects.toThrow(
+      /wl-copy failed to write the desktop clipboard: Failed to connect to a Wayland server/,
+    );
+    await backend.dispose();
+  });
+
+  it("names the missing binary and its package when wl-clipboard is absent", async () => {
+    const missing = Object.assign(new Error("spawn wl-paste ENOENT"), { code: "ENOENT" });
+    const { backend } = clipboardBackend(() => Promise.reject(missing));
+
+    await expect(backend.readClipboard()).rejects.toThrow(
+      /wl-paste is not installed.*wl-clipboard package/s,
+    );
+    await expect(backend.writeClipboard("hello")).rejects.toThrow(
+      /wl-copy is not installed.*wl-clipboard package/s,
+    );
+
     await backend.dispose();
   });
 });

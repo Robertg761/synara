@@ -193,6 +193,8 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.typeText("thread-1", "hi");
     await manager.pressKey("thread-1", "enter");
     await manager.hotkey("thread-1", ["ctrl", "s"]);
+    await manager.writeClipboard("thread-1", "clip");
+    await manager.readClipboard("thread-1");
     await manager.setValue("thread-1", { label: "Display" }, "12");
     await manager.performAction("thread-1", { label: "Calculate", role: "button" }, "activate");
 
@@ -207,11 +209,47 @@ describe("ComputerManager and FakeComputerBackend", () => {
       { action: "computer_type_text", threadId: "thread-1" },
       { action: "computer_press_key", threadId: "thread-1" },
       { action: "computer_hotkey", threadId: "thread-1" },
+      { action: "computer_write_clipboard", threadId: "thread-1" },
+      { action: "computer_read_clipboard", threadId: "thread-1" },
       { action: "computer_set_value", threadId: "thread-1" },
       { action: "computer_perform_action", threadId: "thread-1" },
     ]);
 
     await manager.dispose();
+  });
+
+  it("carries clipboard text on the shared action result, and refuses it without backend support", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+
+    await manager.writeClipboard("thread-1", "shared text");
+    await expect(manager.readClipboard("thread-1")).resolves.toMatchObject({
+      action: "computer_read_clipboard",
+      value: "shared text",
+    });
+
+    // Reads are bounded by the contract limit on `value`; writes are not, so a
+    // large paste is fine but cannot come back through the result field.
+    await manager.writeClipboard("thread-1", "x".repeat(16 * 1024 + 1));
+    await expect(manager.readClipboard("thread-1")).rejects.toThrow(/more than the 16384/);
+
+    const withoutClipboard = new ComputerManager({
+      backend: new Proxy(new FakeComputerBackend(), {
+        get: (target, property, receiver) =>
+          property === "readClipboard" || property === "writeClipboard"
+            ? undefined
+            : Reflect.get(target, property, receiver),
+      }),
+    });
+    await expect(withoutClipboard.readClipboard("thread-1")).rejects.toThrow(
+      /does not support clipboard access/,
+    );
+    await expect(withoutClipboard.writeClipboard("thread-1", "nope")).rejects.toThrow(
+      /does not support clipboard access/,
+    );
+
+    await manager.dispose();
+    await withoutClipboard.dispose();
   });
 
   it("leaves pane input unattributed instead of borrowing a thread", async () => {

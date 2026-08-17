@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ProviderKind } from "@synara/contracts";
 
+import { MAX_COMPUTER_CLIPBOARD_BYTES } from "../computer/ComputerBackend.ts";
 import { ComputerManager } from "../computer/ComputerManager.ts";
 import { FakeComputerBackend } from "../computer/FakeComputerBackend.ts";
 import {
@@ -14,6 +15,21 @@ import type { McpToolCallResult } from "./protocol.ts";
 import type { ToolContext } from "./toolRuntime.ts";
 
 const THREAD = "thread-computer";
+
+function resultJson(result: McpToolCallResult): unknown {
+  const text = result.content.find((entry) => entry.type === "text");
+  return text?.type === "text" ? JSON.parse(text.text) : undefined;
+}
+
+/** A backend that never implemented the optional clipboard methods. */
+function withoutClipboard(backend: FakeComputerBackend): FakeComputerBackend {
+  return new Proxy(backend, {
+    get: (target, property, receiver) =>
+      property === "readClipboard" || property === "writeClipboard"
+        ? undefined
+        : Reflect.get(target, property, receiver),
+  });
+}
 
 function makeContext(provider: ProviderKind = "claudeAgent"): ToolContext {
   return {
@@ -58,6 +74,7 @@ describe("agent gateway computer tools", () => {
       "computer_get_state",
       "computer_screenshot",
       "computer_get_screen_size",
+      "computer_read_clipboard",
       "computer_launch_app",
       "computer_click",
       "computer_double_click",
@@ -68,6 +85,7 @@ describe("agent gateway computer tools", () => {
       "computer_type_text",
       "computer_press_key",
       "computer_hotkey",
+      "computer_write_clipboard",
       "computer_set_value",
       "computer_perform_action",
     ]);
@@ -75,6 +93,7 @@ describe("agent gateway computer tools", () => {
     expect(tools.every((tool) => tool.requiresActiveTurn === true)).toBe(true);
     expect(COMPUTER_APPROVAL_REQUIRED_TOOLS).toEqual(
       new Set([
+        "computer_read_clipboard",
         "computer_launch_app",
         "computer_click",
         "computer_double_click",
@@ -85,6 +104,7 @@ describe("agent gateway computer tools", () => {
         "computer_type_text",
         "computer_press_key",
         "computer_hotkey",
+        "computer_write_clipboard",
         "computer_set_value",
         "computer_perform_action",
       ]),
@@ -341,10 +361,69 @@ describe("agent gateway computer tools", () => {
     expect(structured.error.candidates.length).toBeGreaterThan(0);
   });
 
+  it("round-trips the shared clipboard and starts from an empty one", async () => {
+    const { backend, call } = await setup();
+
+    const empty = await call("computer_read_clipboard", {});
+    expect(resultJson(empty)).toMatchObject({ action: "computer_read_clipboard", value: "" });
+
+    const write = await call("computer_write_clipboard", { text: "  copied\ntext  " });
+    expect(write.isError).not.toBe(true);
+    expect(backend.callsFor("writeClipboard").at(-1)?.args).toEqual(["  copied\ntext  "]);
+
+    const read = await call("computer_read_clipboard", {});
+    expect(resultJson(read)).toMatchObject({ value: "  copied\ntext  " });
+  });
+
+  it("tells the model the clipboard belongs to the user too", async () => {
+    const { byName } = await setup();
+    for (const name of ["computer_read_clipboard", "computer_write_clipboard"]) {
+      expect(byName.get(name)?.definition.description).toContain("shared with the human user");
+    }
+  });
+
+  it("refuses clipboard text past the byte limit before it reaches the backend", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_write_clipboard", {
+      text: "x".repeat(MAX_COMPUTER_CLIPBOARD_BYTES + 1),
+    });
+    expect(result.isError).toBe(true);
+    expect(backend.callsFor("writeClipboard")).toHaveLength(0);
+  });
+
+  it("reports clipboard tools as unsupported on a backend without them", async () => {
+    const { call } = await setup(withoutClipboard(new FakeComputerBackend()));
+
+    for (const [name, args] of [
+      ["computer_read_clipboard", {}],
+      ["computer_write_clipboard", { text: "nope" }],
+    ] as const) {
+      const result = await call(name, args);
+      expect(result.isError).toBe(true);
+      const text = result.content.find((entry) => entry.type === "text");
+      expect(text?.type === "text" ? text.text : "").toContain("does not support clipboard access");
+    }
+  });
+
   it("refuses action tools for providers without an approval gate", async () => {
     const { backend, call } = await setup();
     const result = await call("computer_click", { x: 10, y: 10 }, "antigravity");
     expect(result.isError).toBe(true);
     expect(backend.callsFor("click")).toHaveLength(0);
+  });
+
+  it("keeps the clipboard read behind approval instead of the perception set", async () => {
+    const { backend, byName, call } = await setup();
+
+    // Approval-gated on purpose: the clipboard can hold something the human
+    // copied privately, so providers must not auto-approve it as read-only.
+    expect(byName.get("computer_read_clipboard")?.definition.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+    });
+
+    const refused = await call("computer_read_clipboard", {}, "antigravity");
+    expect(refused.isError).toBe(true);
+    expect(backend.callsFor("readClipboard")).toHaveLength(0);
   });
 });

@@ -17,6 +17,12 @@ import type {
 export const DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION = 2_048;
 /** Native per-side image limit enforced by the KWin capture path. */
 export const MAX_COMPUTER_CAPTURE_MAX_DIMENSION = 16_384;
+/**
+ * Largest clipboard payload a backend moves in either direction. Clipboards
+ * hold whole documents, so both directions need a ceiling: without one a read
+ * would stream unbounded data into a turn and a write would pipe it back out.
+ */
+export const MAX_COMPUTER_CLIPBOARD_BYTES = 1024 * 1024;
 
 /**
  * A zoomed capture request: one window, or one rect of the global desktop
@@ -117,6 +123,16 @@ export interface ComputerBackend {
   typeText(text: string): Promise<ComputerBackendActionResult | void>;
   pressKey(key: string): Promise<ComputerBackendActionResult | void>;
   hotkey(keys: readonly string[]): Promise<ComputerBackendActionResult | void>;
+  /**
+   * The system clipboard the human user shares, not an agent-private one.
+   * Toolkits bind their data device to the session's primary seat whichever
+   * seat delivered the input, so a dedicated agent seat cannot own a working
+   * clipboard of its own: reading returns whatever anyone last copied, and
+   * writing replaces it for the human too.
+   */
+  readClipboard?(): Promise<string>;
+  /** Writes the same shared system clipboard `readClipboard` reads. */
+  writeClipboard?(text: string): Promise<void>;
   setValue(
     target: ComputerResolvedTarget,
     value: string,

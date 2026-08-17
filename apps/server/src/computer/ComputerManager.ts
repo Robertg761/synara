@@ -2,6 +2,7 @@ import {
   ComputerId,
   ComputerPoint,
   ComputerScreenSize,
+  COMPUTER_TEXT_MAX_LENGTH,
   ThreadId,
   type ComputerActionResult,
   type ComputerAvailability,
@@ -235,6 +236,35 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     const result = await this.backend.hotkey(keys);
     return this.actionResult(threadId, "computer_hotkey", undefined, result);
+  }
+
+  /**
+   * The clipboard is the system one the human shares, and it is optional on the
+   * backend, so a backend without it refuses the call instead of the tool
+   * layer discovering a missing method at dispatch time.
+   */
+  async readClipboard(threadId: string | undefined): Promise<ComputerActionResult> {
+    const read = this.backend.readClipboard?.bind(this.backend);
+    if (!read) throw clipboardUnsupportedError();
+    const value = await read();
+    // `ComputerActionResult.value` is contract-bounded well below the backend's
+    // byte cap, and an oversized read must not slip out through the unvalidated
+    // MCP result path.
+    if (value.length > COMPUTER_TEXT_MAX_LENGTH) {
+      throw new ComputerBackendError(
+        `The desktop clipboard holds ${value.length} characters of text, more than the ${COMPUTER_TEXT_MAX_LENGTH} this tool returns.`,
+      );
+    }
+    return this.actionResult(threadId, "computer_read_clipboard", undefined, { value });
+  }
+
+  async writeClipboard(threadId: string | undefined, text: string): Promise<ComputerActionResult> {
+    const write = this.backend.writeClipboard?.bind(this.backend);
+    if (!write) throw clipboardUnsupportedError();
+    await write(text);
+    // The text is not echoed back on `value`: the caller already has it, and it
+    // may be far larger than the contract bound on that field.
+    return this.actionResult(threadId, "computer_write_clipboard", undefined, undefined);
   }
 
   async setValue(
@@ -615,6 +645,10 @@ export class ComputerManager {
       }
     }
   }
+}
+
+function clipboardUnsupportedError(): ComputerBackendError {
+  return new ComputerBackendError("This computer backend does not support clipboard access.");
 }
 
 function hasCoordinates(target: ComputerTarget): boolean {

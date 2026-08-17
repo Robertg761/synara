@@ -48,6 +48,12 @@ import {
   qwertyTextKeyStrokes,
   type QwertyKeyStroke,
 } from "./kwinInput.ts";
+import {
+  readWlClipboard,
+  spawnClipboardCommand,
+  writeWlClipboard,
+  type ClipboardCommandRunner,
+} from "./wlClipboard.ts";
 
 const DEFAULT_COMPUTER_ID = "desktop";
 const DEFAULT_GLIDE_DURATION_MS = 180;
@@ -100,6 +106,8 @@ export interface KWinComputerBackendOptions {
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly spawnProcess?: (app: string, args: readonly string[]) => ChildProcess;
+  /** wl-clipboard process runner, replaced in tests. */
+  readonly runClipboardCommand?: ClipboardCommandRunner;
   readonly glideDurationMs?: number;
   readonly stillIntervalMs?: number;
   readonly captureMaxDimension?: number;
@@ -157,6 +165,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private capturePending = 0;
   private startPromise: Promise<void> | undefined;
   private readonly spawnProcess: (app: string, args: readonly string[]) => ChildProcess;
+  private readonly runClipboardCommand: ClipboardCommandRunner;
   private nextSequence = 1;
   private currentPoint: ComputerPoint | null = null;
   private previousWindowsFingerprint: string | undefined;
@@ -174,6 +183,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.spawnProcess =
       options.spawnProcess ??
       ((app, args) => spawn(app, [...args], { detached: true, stdio: "ignore" }));
+    this.runClipboardCommand = options.runClipboardCommand ?? spawnClipboardCommand;
     this.glideDurationMs = Math.max(0, options.glideDurationMs ?? DEFAULT_GLIDE_DURATION_MS);
     this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
     this.captureMaxDimension = Math.max(
@@ -432,6 +442,19 @@ export class KWinComputerBackend implements ComputerBackend {
       }
     }
     return {};
+  }
+
+  /**
+   * The human's clipboard, shared on purpose: see wlClipboard.ts for why the
+   * agent seat cannot own a private one. Neither direction uses the KWin plugin
+   * or the agent seat, so both work without an input session.
+   */
+  async readClipboard(): Promise<string> {
+    return await readWlClipboard(this.runClipboardCommand);
+  }
+
+  async writeClipboard(text: string): Promise<void> {
+    await writeWlClipboard(this.runClipboardCommand, text);
   }
 
   /**

@@ -7,6 +7,7 @@ import { ComputerTargetError } from "../computer/uiTreeTargeting.ts";
 import {
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   MAX_COMPUTER_CAPTURE_MAX_DIMENSION,
+  MAX_COMPUTER_CLIPBOARD_BYTES,
   type ComputerCaptureRequest,
 } from "../computer/ComputerBackend.ts";
 import { ComputerManager } from "../computer/ComputerManager.ts";
@@ -32,6 +33,11 @@ export const COMPUTER_CONTROL_CAPABILITY = "computer:control" as const;
 const PROVIDERS_WITHOUT_APPROVAL_GATE = new Set(["antigravity"]);
 
 export const COMPUTER_APPROVAL_REQUIRED_TOOLS = new Set([
+  // The one read in this set on purpose: the clipboard is the human's, and it
+  // can hold something they copied privately — a password manager entry, a
+  // token — that is not otherwise visible to the agent. Reading it must never
+  // be auto-approved the way perception tools are.
+  "computer_read_clipboard",
   "computer_launch_app",
   "computer_click",
   "computer_double_click",
@@ -42,6 +48,7 @@ export const COMPUTER_APPROVAL_REQUIRED_TOOLS = new Set([
   "computer_type_text",
   "computer_press_key",
   "computer_hotkey",
+  "computer_write_clipboard",
   "computer_set_value",
   "computer_perform_action",
 ]);
@@ -60,6 +67,13 @@ export interface AgentGatewayComputerToolsOptions {
  */
 const SCREENSHOT_MAPPING_NOTE =
   "convert a screenshot pixel to a desktop point with region.x + screenshot_x / scale and region.y + screenshot_y / scale, using the screenshot region and scale returned alongside it";
+
+/**
+ * Both clipboard tools must say the same thing about ownership: the desktop has
+ * one clipboard and the human is the other party using it.
+ */
+const SHARED_CLIPBOARD_NOTE =
+  "The desktop has a single clipboard shared with the human user, not a private one for the agent.";
 
 const POINTER_COORDINATE_NOTE =
   "Coordinates are global desktop coordinates in logical pixels, the same space as window bounds and the screenshot region mapping. On multi-monitor layouts some coordinate ranges fall outside every monitor, and the display server moves the pointer to the nearest monitor edge instead.";
@@ -142,6 +156,17 @@ function readRawRequiredString(args: Record<string, unknown>, name: string): str
 function readRequiredText(args: Record<string, unknown>): string {
   const value = readRawRequiredString(args, "text");
   if (value.length > 16 * 1024) throw new ToolInputError('Argument "text" is too long.');
+  return value;
+}
+
+/** Bounded in bytes rather than characters: the backend pipes it to a process. */
+function readClipboardText(args: Record<string, unknown>): string {
+  const value = readRawRequiredString(args, "text");
+  if (Buffer.byteLength(value, "utf8") > MAX_COMPUTER_CLIPBOARD_BYTES) {
+    throw new ToolInputError(
+      `Argument "text" is longer than the ${MAX_COMPUTER_CLIPBOARD_BYTES} byte clipboard limit.`,
+    );
+  }
   return value;
 }
 
@@ -391,6 +416,29 @@ export function makeAgentGatewayComputerTools(
       },
       handler: handle("computer_get_screen_size", async () => manager.getScreenSize()),
     },
+    {
+      requiredCapability: COMPUTER_CONTROL_CAPABILITY,
+      requiresActiveTurn: true,
+      definition: {
+        name: "computer_read_clipboard",
+        description: `Read the desktop clipboard as text, returned as "value". ${SHARED_CLIPBOARD_NOTE} It returns whatever was copied last by anyone, so it may hold something the user copied for their own purposes. An empty clipboard returns an empty string; a clipboard holding an image, other non-text content, or more than 16384 characters of text is an error.`,
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        // Not READ_ONLY_TOOL_ANNOTATIONS: providers auto-approve on
+        // readOnlyHint, and this read must go through approval — the clipboard
+        // can hold something the human copied privately. It mutates nothing,
+        // hence destructiveHint stays false.
+        annotations: {
+          title: "Read computer clipboard",
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      handler: handle("computer_read_clipboard", async (_args, context) =>
+        manager.readClipboard(context.callerThreadId),
+      ),
+    },
     actionEntry(
       "computer_launch_app",
       "Launch computer app",
@@ -534,6 +582,19 @@ export function makeAgentGatewayComputerTools(
               throw new ToolInputError('Missing required argument "keys".');
             })(),
         ),
+    ),
+    actionEntry(
+      "computer_write_clipboard",
+      "Write computer clipboard",
+      `Replace the desktop clipboard with text, then paste it with the target application's own paste command. ${SHARED_CLIPBOARD_NOTE} Writing discards whatever the user had copied, so prefer computer_type_text for short input and use this for text too long or too awkward to type.`,
+      {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"],
+        additionalProperties: false,
+      },
+      async (args, context) =>
+        manager.writeClipboard(context.callerThreadId, readClipboardText(args)),
     ),
     actionEntry(
       "computer_set_value",

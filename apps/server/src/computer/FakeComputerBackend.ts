@@ -54,6 +54,7 @@ export class FakeComputerBackend implements ComputerBackend {
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
   private frameListener: ComputerFrameListener | null = null;
   private nextSequence = 1;
+  private clipboardText = "";
   private failures = new Map<string, Error>();
   private disposed = false;
 
@@ -209,6 +210,19 @@ export class FakeComputerBackend implements ComputerBackend {
     this.record("hotkey", keys);
     this.throwIfFailed("hotkey");
     return {};
+  }
+
+  /** One in-memory string stands in for the shared system clipboard. */
+  async readClipboard(): Promise<string> {
+    this.record("readClipboard");
+    this.throwIfFailed("readClipboard");
+    return this.clipboardText;
+  }
+
+  async writeClipboard(text: string): Promise<void> {
+    this.record("writeClipboard", text);
+    this.throwIfFailed("writeClipboard");
+    this.clipboardText = text;
   }
 
   async setValue(
