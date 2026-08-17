@@ -9,8 +9,9 @@ import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
 import {
   nestedAtspiMode,
   nestedKWinBackendOptions,
+  nestedModeLabel,
   nestedSessionEnv,
-  nestedSessionRequested,
+  nestedSessionMode,
   parseNestedSizeEnv,
   resolveNestedPluginLoad,
   startNestedKWinSession,
@@ -51,11 +52,16 @@ describe("nested session environment", () => {
     });
   });
 
-  it("is opt-in through the environment", () => {
-    expect(nestedSessionRequested({})).toBe(false);
-    expect(nestedSessionRequested({ SYNARA_COMPUTER_NESTED: "0" })).toBe(false);
-    expect(nestedSessionRequested({ SYNARA_COMPUTER_NESTED: "true" })).toBe(false);
-    expect(nestedSessionRequested({ SYNARA_COMPUTER_NESTED: "1" })).toBe(true);
+  it("is opt-in through the environment, which also names the mode", () => {
+    expect(nestedSessionMode({})).toBeUndefined();
+    expect(nestedSessionMode({ SYNARA_COMPUTER_NESTED: "" })).toBeUndefined();
+    expect(nestedSessionMode({ SYNARA_COMPUTER_NESTED: "0" })).toBeUndefined();
+    expect(nestedSessionMode({ SYNARA_COMPUTER_NESTED: "true" })).toBeUndefined();
+    expect(nestedSessionMode({ SYNARA_COMPUTER_NESTED: "windowed" })).toBeUndefined();
+    expect(nestedSessionMode({ SYNARA_COMPUTER_NESTED: "1" })).toBe("virtual");
+    expect(nestedSessionMode({ SYNARA_COMPUTER_NESTED: "window" })).toBe("window");
+    expect(nestedModeLabel("virtual")).toBe("virtual");
+    expect(nestedModeLabel("window")).toBe("windowed");
     expect(nestedAtspiMode({})).toBe("off");
     expect(nestedAtspiMode({ SYNARA_COMPUTER_NESTED_ATSPI: "1" })).toBe("session");
   });
@@ -140,6 +146,64 @@ describe("startNestedKWinSession", () => {
 
     await session.dispose();
     expect(harness.spawns.map((spawn) => spawn.child.signal)).toEqual(["SIGTERM", "SIGTERM"]);
+  });
+
+  it("keeps a virtual compositor off the host display", async () => {
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(
+      harness.options({ hostEnv: { WAYLAND_DISPLAY: "wayland-0", DISPLAY: ":0" } }),
+    );
+    expect(harness.spawns[1]?.args[0]).toBe("--virtual");
+    expect(harness.spawns[1]?.env.WAYLAND_DISPLAY).toBeUndefined();
+    expect(harness.spawns[1]?.env.DISPLAY).toBeUndefined();
+    await session.dispose();
+  });
+
+  it("nests a windowed compositor into the host display and drops --virtual", async () => {
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(
+      harness.options({
+        mode: "window",
+        socketName: "synara-test-2",
+        hostEnv: { WAYLAND_DISPLAY: "wayland-0", DISPLAY: ":0" },
+      }),
+    );
+
+    expect(harness.spawns[1]?.args).toEqual([
+      "--no-global-shortcuts",
+      "--socket",
+      "synara-test-2",
+      "--width",
+      "1920",
+      "--height",
+      "1080",
+    ]);
+    expect(harness.spawns[1]?.env.WAYLAND_DISPLAY).toBe("wayland-0");
+    expect(harness.spawns[1]?.env.DISPLAY).toBeUndefined();
+    expect(harness.spawns[1]?.env.DBUS_SESSION_BUS_ADDRESS).toBe(BUS_ADDRESS);
+
+    await session.dispose();
+  });
+
+  it("refuses a windowed session with no host display rather than going virtual", async () => {
+    const harness = new NestedHarness();
+    await expect(
+      startNestedKWinSession(harness.options({ mode: "window", hostEnv: {} })),
+    ).rejects.toThrow(/windowed nested session needs a running Wayland session/);
+    expect(harness.spawns).toEqual([]);
+  });
+
+  it("names the mode that was booting when the compositor never appeared", async () => {
+    const harness = new NestedHarness({ nameAppears: false });
+    await expect(
+      startNestedKWinSession(
+        harness.options({
+          mode: "window",
+          hostEnv: { WAYLAND_DISPLAY: "wayland-0" },
+          readyTimeoutMs: 25,
+        }),
+      ),
+    ).rejects.toThrow(/kwin_wayland \(windowed mode\) did not take org\.kde\.KWin/);
   });
 
   it("passes the requested geometry to the compositor", async () => {

@@ -1,12 +1,20 @@
 /**
- * Tier 3: a private KWin this server owns, for CI and headless hosts.
+ * A private KWin this server owns, in one of two modes.
  *
- * A nested session is a dedicated session bus plus `kwin_wayland --virtual` on
- * it. Nothing about the desktop backend changes: the same KWin plugin loads
- * into the private compositor, and `KWinComputerBackend` reaches it through the
- * same D-Bus surface, only pointed at the private bus. It is opt-in and never a
- * fallback — a nested compositor standing in for a broken desktop would hand an
- * agent an invisible screen and report it as healthy.
+ * A nested session is a dedicated session bus plus a `kwin_wayland` on it.
+ * `virtual` is Tier 3: a headless compositor with no display of its own, for CI
+ * and headless hosts. `window` is Tier 2 Phase A: the same compositor running as
+ * an ordinary Wayland client of the host, so the isolated desktop is a window on
+ * a desktop KWin does not otherwise run. Nothing about the desktop backend
+ * changes in either mode: the same KWin plugin loads into the private
+ * compositor, and `KWinComputerBackend` reaches it through the same D-Bus
+ * surface, only pointed at the private bus.
+ *
+ * Both modes are opt-in and neither is ever a fallback, including for each
+ * other — a nested compositor standing in for a broken desktop would hand an
+ * agent an invisible screen and report it as healthy, and a virtual compositor
+ * standing in for a windowed one would hand the operator an isolated desktop
+ * that is nowhere on screen.
  *
  * The compositor is not restarted if it dies. A nested crash takes the whole
  * session with it, so it surfaces the way a real KWin crash does: KWin's bus
@@ -51,11 +59,24 @@ export interface NestedSize {
   readonly height: number;
 }
 
+/**
+ * How the private compositor is displayed.
+ *
+ * `virtual` has no output a human can see, which is the point on a CI runner or
+ * a headless host. `window` nests the compositor inside the host session as an
+ * ordinary Wayland client, which is the only difference between the two — the
+ * bus, the plugin, the seat, and the backend are identical.
+ */
+export type NestedSessionMode = "virtual" | "window";
+
 export interface NestedKWinSessionOptions {
+  readonly mode?: NestedSessionMode;
   readonly size?: NestedSize;
   /** Wayland socket name; generated per session so two servers cannot collide. */
   readonly socketName?: string;
   readonly readyTimeoutMs?: number;
+  /** The server's own environment, injected so tests do not read the host display. */
+  readonly hostEnv?: NodeJS.ProcessEnv;
   readonly installedPluginIds?: () => Promise<readonly string[]>;
   /** Replaced in tests, which must never spawn a compositor. */
   readonly spawnProcess?: (
@@ -89,6 +110,8 @@ export async function startNestedKWinSession(
     options.connectDbus ?? ((busAddress: string) => createSessionKWinComputerDbus({ busAddress }));
   const waitForBusName = options.waitForBusName ?? waitForSessionBusName;
   const installedPluginIds = options.installedPluginIds ?? (() => scanInstalledPluginIds());
+  const mode = options.mode ?? "virtual";
+  const hostEnv = options.hostEnv ?? process.env;
   const size = normalizeNestedSize(options.size);
   const waylandDisplay = options.socketName ?? generateSocketName();
   const children: NestedProcess[] = [];
@@ -99,11 +122,21 @@ export async function startNestedKWinSession(
   };
 
   try {
-    const bus = start(spawnProcess, children, DBUS_DAEMON_COMMAND, [
-      "--session",
-      "--print-address=1",
-      "--nofork",
-    ]);
+    if (mode === "window" && !hostEnv.WAYLAND_DISPLAY) {
+      throw new ComputerBackendError(
+        "A windowed nested session needs a running Wayland session to nest into, and " +
+          `WAYLAND_DISPLAY is not set for this server. Start Synara from the desktop session, or ` +
+          "use SYNARA_COMPUTER_NESTED=1 for a headless virtual session.",
+      );
+    }
+
+    const bus = start(
+      spawnProcess,
+      children,
+      DBUS_DAEMON_COMMAND,
+      ["--session", "--print-address=1", "--nofork"],
+      hostEnv,
+    );
     const busAddress = await bus.readFirstStdoutLine(BUS_ADDRESS_TIMEOUT_MS);
     if (!busAddress.startsWith("unix:")) {
       throw new ComputerBackendError(
@@ -115,17 +148,8 @@ export async function startNestedKWinSession(
       spawnProcess,
       children,
       KWIN_COMMAND,
-      [
-        "--virtual",
-        "--no-global-shortcuts",
-        "--socket",
-        waylandDisplay,
-        "--width",
-        String(size.width),
-        "--height",
-        String(size.height),
-      ],
-      compositorEnv(busAddress),
+      compositorArgs(mode, waylandDisplay, size),
+      compositorEnv(busAddress, mode, hostEnv),
     );
 
     const timeoutMs = options.readyTimeoutMs ?? KWIN_READY_TIMEOUT_MS;
@@ -135,7 +159,7 @@ export async function startNestedKWinSession(
       timeoutMs,
       abort: () => kwin.exitDiagnostic() !== undefined,
     });
-    if (!ready) throw kwinNotReadyError(kwin, timeoutMs);
+    if (!ready) throw kwinNotReadyError(kwin, mode, timeoutMs);
 
     const dbus = await connectDbus(busAddress);
     let pluginId: string;
@@ -238,9 +262,29 @@ export function unavailableAtspiReader(): AtspiTreeReader {
   };
 }
 
-/** `SYNARA_COMPUTER_NESTED=1` is the only way a nested session is ever booted. */
-export function nestedSessionRequested(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.SYNARA_COMPUTER_NESTED === "1";
+/**
+ * `SYNARA_COMPUTER_NESTED` is the only way a nested session is ever booted, and
+ * it names the mode: `1` for virtual, `window` for windowed. Anything else, a
+ * typo included, leaves the real desktop backend in place rather than guessing a
+ * mode — booting the wrong one is either an invisible desktop or a window the
+ * operator never asked for.
+ */
+export function nestedSessionMode(
+  env: NodeJS.ProcessEnv = process.env,
+): NestedSessionMode | undefined {
+  switch (env.SYNARA_COMPUTER_NESTED) {
+    case "1":
+      return "virtual";
+    case "window":
+      return "window";
+    default:
+      return undefined;
+  }
+}
+
+/** The mode as it reads in a failure message an operator has to act on. */
+export function nestedModeLabel(mode: NestedSessionMode): string {
+  return mode === "window" ? "windowed" : "virtual";
 }
 
 export function nestedAtspiMode(env: NodeJS.ProcessEnv = process.env): NestedAtspiMode {
@@ -305,23 +349,53 @@ async function loadNestedPlugin(
 }
 
 /** Names which of the two ways the compositor can fail to appear happened. */
-function kwinNotReadyError(kwin: NestedProcess, timeoutMs: number): ComputerBackendError {
+function kwinNotReadyError(
+  kwin: NestedProcess,
+  mode: NestedSessionMode,
+  timeoutMs: number,
+): ComputerBackendError {
   const exit = kwin.exitDiagnostic();
+  const nested = `The nested ${KWIN_COMMAND} (${nestedModeLabel(mode)} mode)`;
   return new ComputerBackendError(
     exit === undefined
-      ? `The nested ${KWIN_COMMAND} did not take ${KWIN_SERVICE} within ${timeoutMs} ms.${kwin.diagnostic()}`
-      : `The nested ${KWIN_COMMAND} exited before it was ready (${exit}).${kwin.diagnostic()}`,
+      ? `${nested} did not take ${KWIN_SERVICE} within ${timeoutMs} ms.${kwin.diagnostic()}`
+      : `${nested} exited before it was ready (${exit}).${kwin.diagnostic()}`,
   );
 }
 
+/** `--virtual` is the whole difference: without it the compositor nests as a client. */
+function compositorArgs(
+  mode: NestedSessionMode,
+  socketName: string,
+  size: NestedSize,
+): readonly string[] {
+  return [
+    ...(mode === "virtual" ? ["--virtual"] : []),
+    "--no-global-shortcuts",
+    "--socket",
+    socketName,
+    "--width",
+    String(size.width),
+    "--height",
+    String(size.height),
+  ];
+}
+
 /**
- * The compositor must not inherit the ambient display: with WAYLAND_DISPLAY or
- * DISPLAY set, kwin_wayland can attach to the very session a nested one exists
- * to stay independent of.
+ * A virtual compositor must not inherit the ambient display: with
+ * WAYLAND_DISPLAY or DISPLAY set, kwin_wayland can attach to the very session a
+ * nested one exists to stay independent of. A windowed one is the exact
+ * opposite — the host WAYLAND_DISPLAY is the socket it nests through, and
+ * without it there is no window. DISPLAY goes in both modes, because an X11
+ * attach is never what either was asked for.
  */
-function compositorEnv(busAddress: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, DBUS_SESSION_BUS_ADDRESS: busAddress };
-  delete env.WAYLAND_DISPLAY;
+function compositorEnv(
+  busAddress: string,
+  mode: NestedSessionMode,
+  hostEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...hostEnv, DBUS_SESSION_BUS_ADDRESS: busAddress };
+  if (mode === "virtual") delete env.WAYLAND_DISPLAY;
   delete env.DISPLAY;
   return env;
 }
@@ -331,7 +405,7 @@ function start(
   children: NestedProcess[],
   command: string,
   args: readonly string[],
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv,
 ): NestedProcess {
   let child: ChildProcess;
   try {

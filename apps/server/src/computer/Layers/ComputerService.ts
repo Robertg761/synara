@@ -8,10 +8,12 @@ import { KWinComputerBackend } from "../KWinComputerBackend.ts";
 import {
   nestedAtspiMode,
   nestedKWinBackendOptions,
-  nestedSessionRequested,
+  nestedModeLabel,
+  nestedSessionMode,
   parseNestedSizeEnv,
   startNestedKWinSession,
   type NestedKWinSession,
+  type NestedSessionMode,
 } from "../nestedKWinSession.ts";
 import { ComputerService, type ComputerServiceShape } from "../Services/ComputerService.ts";
 import type { ComputerBackend } from "../ComputerBackend.ts";
@@ -70,23 +72,25 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
 
 /**
  * Tier 1 by default: the KWin backend drives the session the user is sitting
- * in. `SYNARA_COMPUTER_NESTED=1` opts into Tier 3 instead — a private
- * compositor this process owns, for CI and headless hosts — with the geometry
- * from `SYNARA_COMPUTER_NESTED_SIZE=WxH`.
+ * in. `SYNARA_COMPUTER_NESTED` opts into a private compositor this process owns
+ * instead — `1` for the headless Tier 3 session, `window` for the Tier 2 one
+ * that nests as a window in the host session — with the geometry from
+ * `SYNARA_COMPUTER_NESTED_SIZE=WxH`.
  *
  * A nested session that fails to boot stays failed. Falling back to the real
  * desktop would hand an agent the human's screen right after an operator asked
- * for an invisible one, and falling the other way would hide a broken desktop
+ * for an isolated one, and falling the other way would hide a broken desktop
  * behind a nested session nobody can see.
  */
 async function makeLinuxBackend(): Promise<LinuxBackend> {
-  if (!nestedSessionRequested()) return { backend: new KWinComputerBackend() };
+  const mode = nestedSessionMode();
+  if (mode === undefined) return { backend: new KWinComputerBackend() };
   const size = parseNestedSizeEnv(process.env.SYNARA_COMPUTER_NESTED_SIZE);
   let session: NestedKWinSession;
   try {
-    session = await startNestedKWinSession(size ? { size } : {});
+    session = await startNestedKWinSession(size ? { mode, size } : { mode });
   } catch (error) {
-    return { backend: unavailableNestedBackend(error) };
+    return { backend: unavailableNestedBackend(mode, error) };
   }
   return {
     backend: new KWinComputerBackend(
@@ -100,10 +104,12 @@ async function makeLinuxBackend(): Promise<LinuxBackend> {
  * A backend whose every call fails with the reason the nested session did not
  * come up, so the availability card and any tool call name the same missing
  * piece — a missing kwin_wayland, an uninstalled plugin, a bus that never
- * answered — instead of a generic connection error.
+ * answered, no host display to nest into — instead of a generic connection
+ * error. The mode is part of that: the two boot different things and fail for
+ * different reasons.
  */
-function unavailableNestedBackend(error: unknown): ComputerBackend {
-  const message = `The nested KWin session did not start: ${error instanceof Error ? error.message : String(error)}`;
+function unavailableNestedBackend(mode: NestedSessionMode, error: unknown): ComputerBackend {
+  const message = `The ${nestedModeLabel(mode)} nested KWin session did not start: ${error instanceof Error ? error.message : String(error)}`;
   return new KWinComputerBackend({
     sessionType: "wayland",
     dbusFactory: () => Promise.reject(new ComputerBackendError(message)),
