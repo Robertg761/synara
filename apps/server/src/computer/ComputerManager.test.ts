@@ -95,6 +95,82 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("raises a target window before focusing it and scopes a coordinate click to it", async () => {
+    // The browser covers the calculator, which is the live failure this
+    // targeting exists for: a bare coordinate click lands on the browser.
+    const backend = new FakeComputerBackend({
+      windows: [
+        {
+          id: "fake-browser",
+          title: "Browser",
+          bounds: { x: 0, y: 0, width: 1_920, height: 1_080 },
+          focused: true,
+          minimized: false,
+          visible: true,
+          stackingIndex: 0,
+          occludedBy: [],
+        },
+        {
+          id: "fake-calculator",
+          title: "Calculator",
+          bounds: { x: 1_050, y: 120, width: 420, height: 620 },
+          focused: false,
+          minimized: false,
+          visible: true,
+          stackingIndex: 1,
+          occludedBy: ["fake-browser"],
+        },
+      ],
+    });
+    const manager = new ComputerManager({ backend });
+
+    await manager.click("thread-1", { label: "Calculate", role: "button" });
+    expect(
+      backend.calls
+        .map((call) => call.method)
+        .filter((method) => ["raiseWindow", "focusWindow", "click"].includes(method)),
+    ).toEqual(["raiseWindow", "focusWindow", "click"]);
+    expect(backend.callsFor("raiseWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+
+    const perceptionCalls = backend.callsFor("getState").length;
+    const scoped = await manager.click("thread-1", {
+      x: 1_100,
+      y: 200,
+      windowId: "fake-calculator",
+    });
+    expect(scoped.point).toEqual({ x: 1_100, y: 200 });
+    expect(backend.callsFor("raiseWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+    expect(backend.callsFor("focusWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+    expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 1_100, y: 200 });
+    // The coordinate is authoritative, so no accessibility tree is read for it.
+    expect(backend.callsFor("getState")).toHaveLength(perceptionCalls);
+
+    // A coordinate that misses the window is refused rather than clicked
+    // wherever it happens to land.
+    await expect(
+      manager.click("thread-1", { x: 40, y: 40, windowId: "fake-calculator" }),
+    ).rejects.toMatchObject({ code: "computer_target_offscreen" });
+    await expect(
+      manager.click("thread-1", { x: 40, y: 40, windowId: "gone" }),
+    ).rejects.toMatchObject({ code: "computer_target_not_found", notFound: true });
+
+    await manager.dispose();
+  });
+
+  it("keeps window targeting working on a backend that cannot raise windows", async () => {
+    const backend = new FakeComputerBackend();
+    (backend as unknown as { raiseWindow?: undefined }).raiseWindow = undefined;
+    const manager = new ComputerManager({ backend });
+
+    await expect(
+      manager.click("thread-1", { label: "Calculate", role: "button" }),
+    ).resolves.toMatchObject({ point: { x: 1_180, y: 228 } });
+    expect(backend.callsFor("raiseWindow")).toHaveLength(0);
+    expect(backend.callsFor("focusWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+
+    await manager.dispose();
+  });
+
   it("attributes every action event to the thread that drove it", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });

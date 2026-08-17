@@ -69,7 +69,11 @@ const TARGET_PROPERTIES = {
   y: { type: "number", description: "Global desktop y coordinate in logical pixels." },
   label: { type: "string", description: "Accessible label to resolve from a fresh UI snapshot." },
   role: { type: "string", description: "Optional accessible role used to disambiguate a label." },
-  window_id: { type: "string", description: "Optional window id used to disambiguate a label." },
+  window_id: {
+    type: "string",
+    description:
+      "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the coordinate is outside the window.",
+  },
 } as const;
 
 function approvalUnavailableResult(name: string): McpToolCallResult {
@@ -303,7 +307,8 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_list_windows",
-        description: "List visible desktop windows and their bounds without touching the pointer.",
+        description:
+          "List visible desktop windows and their bounds without touching the pointer. Windows come back topmost-first: stackingIndex is 0 for the topmost window and grows downward, and occludedBy names the overlapping windows stacked above each one. A plain x/y click lands on whatever is topmost at that point, so when the window you want is occluded, pass its id as window_id alongside x/y to scope the click to it.",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         annotations: { title: "List computer windows", ...READ_ONLY_TOOL_ANNOTATIONS },
       },

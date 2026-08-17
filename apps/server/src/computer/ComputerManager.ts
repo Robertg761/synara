@@ -392,23 +392,21 @@ export class ComputerManager {
     });
   }
 
+  /**
+   * Coordinates plus a window id are a window-scoped click: the point is
+   * resolved exactly as a bare coordinate, and the window id only decides which
+   * window is raised and receives the input. A label or role instead means the
+   * coordinate is at most a hint, so those keep going through AT-SPI
+   * resolution, which owns the final point.
+   */
   private async resolvePointTarget(
     target: ComputerTarget,
   ): Promise<{ point: ComputerPoint; windowId?: string }> {
-    if (hasCoordinates(target) && !hasSemanticFields(target)) {
-      try {
-        return { point: resolveComputerPoint(target, await this.backend.getScreenSize()) };
-      } catch (error) {
-        if (!(error instanceof ComputerTargetError) || error.code !== "computer_target_offscreen") {
-          throw error;
-        }
-        const state = await this.backend.getState({ includeText: true }).catch(() => undefined);
-        throw new ComputerTargetError({
-          code: error.code,
-          message: error.message,
-          candidates: state?.root ? computerTargetCandidates(state.root) : [],
-        });
-      }
+    if (hasCoordinates(target) && !hasLabelFields(target)) {
+      const point = await this.resolveCoordinatePoint(target);
+      if (target.windowId === undefined) return { point };
+      await this.assertPointInsideWindow(point, target.windowId);
+      return { point, windowId: target.windowId };
     }
     if (hasSemanticFields(target)) {
       const resolved = await this.resolveSemanticTarget(target);
@@ -423,8 +421,67 @@ export class ComputerManager {
     });
   }
 
+  private async resolveCoordinatePoint(target: ComputerTarget): Promise<ComputerPoint> {
+    try {
+      return resolveComputerPoint(target, await this.backend.getScreenSize());
+    } catch (error) {
+      if (!(error instanceof ComputerTargetError) || error.code !== "computer_target_offscreen") {
+        throw error;
+      }
+      const state = await this.backend.getState({ includeText: true }).catch(() => undefined);
+      throw new ComputerTargetError({
+        code: error.code,
+        message: error.message,
+        candidates: state?.root ? computerTargetCandidates(state.root) : [],
+      });
+    }
+  }
+
+  /**
+   * A scoped click is refused rather than redirected. Input is routed to the
+   * named window regardless of what covers that coordinate, so a point outside
+   * its bounds would deliver a click to a part of the window that does not
+   * exist — the one failure mode scoping is meant to remove.
+   */
+  private async assertPointInsideWindow(point: ComputerPoint, windowId: string): Promise<void> {
+    const window = (await this.backend.listWindows()).find(
+      (candidate) => candidate.id === windowId,
+    );
+    if (!window) {
+      throw new ComputerTargetError({
+        code: "computer_target_not_found",
+        message:
+          `No desktop window has id ${JSON.stringify(windowId)}. ` +
+          "Call computer_list_windows for the current window ids.",
+        notFound: true,
+      });
+    }
+    const { bounds } = window;
+    if (
+      point.x < bounds.x ||
+      point.y < bounds.y ||
+      point.x >= bounds.x + bounds.width ||
+      point.y >= bounds.y + bounds.height
+    ) {
+      throw new ComputerTargetError({
+        code: "computer_target_offscreen",
+        message:
+          `Computer target (${point.x}, ${point.y}) is outside window ${JSON.stringify(windowId)}, ` +
+          `which covers ${bounds.width}x${bounds.height} at (${bounds.x}, ${bounds.y}). ` +
+          "Pass a coordinate inside those bounds, or drop window_id to click whatever is topmost.",
+      });
+    }
+  }
+
+  /**
+   * Raise before focus: focus alone routes the agent's input to a window that
+   * may still be buried, which leaves the human watching clicks land on pixels
+   * they cannot see. Both calls are optional so a backend that supports neither
+   * keeps working.
+   */
   private async prepareResolvedTarget(windowId: string | undefined): Promise<void> {
     if (windowId !== undefined) {
+      await this.backend.raiseWindow?.(windowId);
       await this.backend.focusWindow?.(windowId);
       return;
     }
@@ -564,8 +621,13 @@ function hasCoordinates(target: ComputerTarget): boolean {
   return typeof target.x === "number" && typeof target.y === "number";
 }
 
+/** Fields that only the accessibility tree can resolve. */
+function hasLabelFields(target: ComputerTarget): boolean {
+  return target.label !== undefined || target.role !== undefined;
+}
+
 function hasSemanticFields(target: ComputerTarget): boolean {
-  return target.label !== undefined || target.role !== undefined || target.windowId !== undefined;
+  return hasLabelFields(target) || target.windowId !== undefined;
 }
 
 export function errorMessage(error: unknown): string {

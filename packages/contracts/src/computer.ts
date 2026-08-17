@@ -39,6 +39,8 @@ const COMPUTER_ID_MAX_LENGTH = 128;
 const COMPUTER_TEXT_MAX_LENGTH = 16 * 1024;
 const COMPUTER_LABEL_MAX_LENGTH = 1_024;
 const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
+/** Caps both a reported window list and one window's occluder list. */
+const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
 
 export const ComputerId = TrimmedNonEmptyString.check(
   Schema.isMaxLength(COMPUTER_ID_MAX_LENGTH),
@@ -98,6 +100,18 @@ export const ComputerWindow = Schema.Struct({
   focused: Schema.Boolean,
   minimized: Schema.Boolean,
   visible: Schema.Boolean,
+  /**
+   * Depth in the compositor stacking order, `0` being the topmost reported
+   * window. Optional because a backend need not expose a stacking order.
+   */
+  stackingIndex: Schema.optional(NonNegativeInt),
+  /**
+   * Ids of the windows above this one that overlap its bounds, so a caller can
+   * tell that a coordinate click would land on a different window.
+   */
+  occludedBy: Schema.optional(
+    Schema.Array(ComputerWindowId).check(Schema.isMaxLength(COMPUTER_WINDOW_LIST_MAX_LENGTH)),
+  ),
 });
 export type ComputerWindow = typeof ComputerWindow.Type;
 
@@ -165,7 +179,7 @@ export type ComputerScreenshot = typeof ComputerScreenshot.Type;
 
 export const ComputerState = Schema.Struct({
   computerId: ComputerId,
-  windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(512)),
+  windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(COMPUTER_WINDOW_LIST_MAX_LENGTH)),
   screenSize: ComputerScreenSize,
   root: Schema.optional(ComputerUiNode),
   text: Schema.optional(Schema.String.check(Schema.isMaxLength(4 * 1024 * 1024))),
@@ -178,7 +192,7 @@ export const ThreadComputerState = Schema.Struct({
   threadId: ThreadId,
   version: NonNegativeInt,
   computerId: ComputerId,
-  windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(512)),
+  windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(COMPUTER_WINDOW_LIST_MAX_LENGTH)),
   screenSize: ComputerScreenSize,
   cursor: Schema.optional(ComputerPoint),
   agentActive: Schema.Boolean,
@@ -192,7 +206,7 @@ export type ComputerListWindowsInput = typeof ComputerListWindowsInput.Type;
 
 export const ComputerListWindowsResult = Schema.Struct({
   computerId: ComputerId,
-  windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(512)),
+  windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(COMPUTER_WINDOW_LIST_MAX_LENGTH)),
   availability: ComputerAvailability,
 });
 export type ComputerListWindowsResult = typeof ComputerListWindowsResult.Type;
@@ -384,7 +398,7 @@ export type ComputerThreadStateEvent = typeof ComputerThreadStateEvent.Type;
 
 export const ComputerWindowsChangedEvent = Schema.Struct({
   type: Schema.Literal("computer.windows-changed"),
-  windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(512)),
+  windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(COMPUTER_WINDOW_LIST_MAX_LENGTH)),
 });
 export type ComputerWindowsChangedEvent = typeof ComputerWindowsChangedEvent.Type;
 

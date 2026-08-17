@@ -264,6 +264,18 @@ export class KWinComputerBackend implements ComputerBackend {
     await this.pluginSuccess("focusWindow", () => plugin.focusWindow(windowId));
   }
 
+  async raiseWindow(windowId: string): Promise<void> {
+    const plugin = await this.ensurePlugin();
+    try {
+      await this.pluginSuccess("raiseWindow", () => plugin.raiseWindow(windowId));
+    } catch (error) {
+      // An older loaded plugin predates raiseWindow. Focus alone still routes
+      // input to the target window, so a missing method skips the restack
+      // rather than failing the action.
+      if (!isUnknownMethodDbusError(error)) throw error;
+    }
+  }
+
   async clearFocusWindow(): Promise<void> {
     const plugin = await this.ensurePlugin();
     await this.pluginSuccess("clearFocusWindow", () => plugin.clearFocusWindow());
@@ -1064,6 +1076,12 @@ function isMethodLevelDbusError(error: unknown): boolean {
   return cause !== undefined && cause !== error ? isMethodLevelDbusError(cause) : false;
 }
 
+function isUnknownMethodDbusError(error: unknown): boolean {
+  if (dbusErrorType(error) === "org.freedesktop.DBus.Error.UnknownMethod") return true;
+  const cause = errorCause(error);
+  return cause !== undefined && cause !== error ? isUnknownMethodDbusError(cause) : false;
+}
+
 function isConnectionLevelFailure(error: unknown): boolean {
   if (error instanceof KWinDbusTimeoutError || hasConnectionLevelMarker(error)) return true;
   if (isMethodLevelDbusError(error)) return false;
@@ -1147,6 +1165,8 @@ function parseWindows(value: unknown, focusedWindowId: string | null): ComputerW
     const appName = asString(record.appId) ?? asString(record.resourceClass);
     const pid =
       typeof record.pid === "number" && record.pid > 0 ? Math.trunc(record.pid) : undefined;
+    const stackingIndex = asNonNegativeInt(record.stackingIndex);
+    const occludedBy = asWindowIds(record.occludedBy);
     windows.push({
       id: id as ComputerWindow["id"],
       title,
@@ -1156,6 +1176,8 @@ function parseWindows(value: unknown, focusedWindowId: string | null): ComputerW
       focused: record.focused === true || id === focusedWindowId,
       minimized: record.minimized === true,
       visible: record.visible !== false,
+      ...(stackingIndex !== undefined ? { stackingIndex } : {}),
+      ...(occludedBy ? { occludedBy } : {}),
     });
   }
   return windows;
@@ -1325,6 +1347,24 @@ function asPoint(value: unknown): ComputerPoint | null {
 
 function asFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asNonNegativeInt(value: unknown): number | undefined {
+  const numeric = asFiniteNumber(value);
+  return numeric === undefined || numeric < 0 ? undefined : Math.trunc(numeric);
+}
+
+/**
+ * Occluder ids from a plugin build that reports them. Both the field and its
+ * individual entries degrade to absent rather than failing the whole window
+ * list, because stacking metadata is an optional hint and an older loaded
+ * plugin omits it entirely. An empty list is dropped: "nothing above this
+ * window" is what an absent field already means.
+ */
+function asWindowIds(value: unknown): readonly ComputerWindow["id"][] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ids = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+  return ids.length > 0 ? (ids as ComputerWindow["id"][]) : undefined;
 }
 
 function asString(value: unknown): string | undefined {

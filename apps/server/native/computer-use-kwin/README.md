@@ -34,15 +34,29 @@ the macOS comparison.
 Service `org.synara.ComputerUse`, path `/org/synara/ComputerUse`, interface
 `org.synara.ComputerUse1`. Methods: `healthJson`, `stateJson`, `windowsJson`,
 `start`, `stop`, `setIdleTimeout(u milliseconds) -> b`, `focusWindow`,
-`clearFocusWindow`, `movePointer`, `button`, `axis`, `key`,
-`captureWindow(s windowId, u maxDimension) -> ay`, and
+`raiseWindow(s windowId) -> b`, `clearFocusWindow`, `movePointer`, `button`,
+`axis`, `key`, `captureWindow(s windowId, u maxDimension) -> ay`, and
 `captureRegion(i x, i y, u width, u height, u maxDimension) -> ay`. One signal:
 `sessionStopped(s reason)`, emitted whenever a running session ends, with the
 reason `request`, `idle-timeout`, or `user-release`.
 
+`windowsJson` reports windows topmost-first. Each entry carries `stackingIndex`
+(`0` is the topmost reported window, increasing downward) and `occludedBy`, the
+ids of usable windows above it whose frame rects overlap it. The overlap is a
+rect intersection rather than true pixel occlusion, so a translucent or shaped
+window above still counts; overstating it is the safe direction, because the
+remedy — scoping the click to a window — is the same either way.
+
+`raiseWindow(windowId)` restacks a window above the ones covering it and
+returns `true` when it did. It deliberately does not call `activateWindow`: the
+human's keyboard focus is never moved, because the agent drives its own seat and
+only needs the window it is clicking to be the one on top at that coordinate. It
+returns `false` when the session is stopped or the id names no usable window.
+
 Every input method (`movePointer`, `button`, `axis`, `key`, `focusWindow`,
-`clearFocusWindow`) returns `false` while the session is stopped, so a stop can
-never be followed by invisible input. Captures work in both states.
+`raiseWindow`, `clearFocusWindow`) returns `false` while the session is stopped,
+so a stop can never be followed by invisible input. Captures work in both
+states.
 
 Capture requests are rendered at the next safe compositor render opportunity.
 `maxDimension = 0` keeps native pixels; otherwise the PNG is downscaled so its
@@ -73,8 +87,8 @@ killed, its finalizers never run, and nothing else would take the agent seat
 and the ghost cursor down.
 
 - Any method that expresses agent intent resets the deadline: `movePointer`,
-  `button`, `axis`, `key`, `focusWindow`, `clearFocusWindow`, `captureWindow`,
-  `captureRegion`.
+  `button`, `axis`, `key`, `focusWindow`, `raiseWindow`, `clearFocusWindow`,
+  `captureWindow`, `captureRegion`.
 - `healthJson`, `stateJson`, and `windowsJson` deliberately do not. The server
   polls health, so counting introspection would keep every session alive
   forever.

@@ -66,6 +66,7 @@ public:
     Q_INVOKABLE bool stop();
     Q_INVOKABLE bool setIdleTimeout(uint milliseconds);
     Q_INVOKABLE bool focusWindow(const QString &windowId);
+    Q_INVOKABLE bool raiseWindow(const QString &windowId);
     Q_INVOKABLE bool clearFocusWindow();
     Q_INVOKABLE bool movePointer(double x, double y);
     Q_INVOKABLE bool button(uint button, bool pressed);

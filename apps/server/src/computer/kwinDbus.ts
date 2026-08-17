@@ -34,6 +34,7 @@ export interface KWinComputerPluginApi {
   readonly stop: () => Promise<unknown>;
   readonly setIdleTimeout: (milliseconds: number) => Promise<unknown>;
   readonly focusWindow: (windowId: string) => Promise<unknown>;
+  readonly raiseWindow: (windowId: string) => Promise<unknown>;
   readonly clearFocusWindow: () => Promise<unknown>;
   readonly movePointer: (x: number, y: number) => Promise<unknown>;
   readonly button: (code: number, pressed: boolean) => Promise<unknown>;
@@ -145,6 +146,7 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
     stop: () => invoke(iface, "stop"),
     setIdleTimeout: (milliseconds) => invoke(iface, "setIdleTimeout", milliseconds),
     focusWindow: (windowId) => invoke(iface, "focusWindow", windowId),
+    raiseWindow: (windowId) => invoke(iface, "raiseWindow", windowId),
     clearFocusWindow: () => invoke(iface, "clearFocusWindow"),
     movePointer: (x, y) => invoke(iface, "movePointer", x, y),
     button: (code, pressed) => invoke(iface, "button", code, pressed),

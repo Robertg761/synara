@@ -587,28 +587,60 @@ QString SynaraComputerUsePlugin::windowsJson() const
         return toJson(windows);
     }
 
+    // Emitted topmost-first so `stackingIndex` reads as depth, and so each
+    // window's occluders are exactly the windows already emitted. A coordinate
+    // click lands on whatever is topmost at that point, so the agent cannot
+    // choose a target safely without knowing what covers it.
+    struct StackedWindow
+    {
+        QString id;
+        RectF bounds;
+    };
+    QList<StackedWindow> covering;
+
     const QList<Window *> stacking = Workspace::self()->stackingOrder();
-    for (Window *window : stacking) {
+    int stackingIndex = 0;
+    for (auto it = stacking.crbegin(); it != stacking.crend(); ++it) {
+        Window *window = *it;
         if (!window || window->isDeleted() || !window->isClient()) {
             continue;
         }
 
+        const QString id = window->internalId().toString(QUuid::WithoutBraces);
+        const RectF bounds = window->frameGeometry();
         const bool visible = usableWindow(window);
+
+        // Frame-rect overlap, not true pixel occlusion: a window above may be
+        // translucent or shaped. Overstating the risk is the safe direction,
+        // because the remedy is scoping the click to a window either way.
+        QJsonArray occludedBy;
+        for (const StackedWindow &above : std::as_const(covering)) {
+            if (above.bounds.intersects(bounds)) {
+                occludedBy.append(above.id);
+            }
+        }
+
         QJsonObject object{
-            {QStringLiteral("id"), window->internalId().toString(QUuid::WithoutBraces)},
+            {QStringLiteral("id"), id},
             {QStringLiteral("title"), window->caption()},
             {QStringLiteral("appId"), window->desktopFileName().isEmpty() ? window->resourceClass() : window->desktopFileName()},
             {QStringLiteral("resourceClass"), window->resourceClass()},
             {QStringLiteral("pid"), int(window->pid())},
-            {QStringLiteral("bounds"), rectToJson(window->frameGeometry())},
+            {QStringLiteral("bounds"), rectToJson(bounds)},
             {QStringLiteral("visible"), visible},
             {QStringLiteral("focusable"), window->wantsInput()},
             {QStringLiteral("normal"), window->isNormalWindow()},
             {QStringLiteral("desktop"), window->isDesktop()},
             {QStringLiteral("dock"), window->isDock()},
             {QStringLiteral("minimized"), window->isMinimized()},
+            {QStringLiteral("stackingIndex"), stackingIndex},
+            {QStringLiteral("occludedBy"), occludedBy},
         };
         windows.append(object);
+        stackingIndex += 1;
+        if (visible) {
+            covering.append({id, bounds});
+        }
     }
     return toJson(windows);
 }
@@ -756,6 +788,22 @@ bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
     m_targetWindow = window;
     updatePointerFocus();
     updateKeyboardFocus();
+    return true;
+}
+
+bool SynaraComputerUsePlugin::raiseWindow(const QString &windowId)
+{
+    if (!requireRunning()) {
+        return false;
+    }
+    Window *window = findWindowById(windowId);
+    if (!usableWindow(window)) {
+        return false;
+    }
+    // Restack only. `activateWindow` would move the human's keyboard focus,
+    // and the agent already has its own seat, so raising is the whole point:
+    // it makes the window the agent is driving the one the user can see.
+    Workspace::self()->raiseWindow(window);
     return true;
 }
 

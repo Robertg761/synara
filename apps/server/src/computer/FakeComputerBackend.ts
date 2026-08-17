@@ -139,6 +139,21 @@ export class FakeComputerBackend implements ComputerBackend {
     return { computerId: this.computerId, app, window } as ComputerLaunchAppResult;
   }
 
+  async raiseWindow(windowId: string): Promise<void> {
+    this.record("raiseWindow", windowId);
+    this.throwIfFailed("raiseWindow");
+  }
+
+  async focusWindow(windowId: string): Promise<void> {
+    this.record("focusWindow", windowId);
+    this.throwIfFailed("focusWindow");
+  }
+
+  async clearFocusWindow(): Promise<void> {
+    this.record("clearFocusWindow");
+    this.throwIfFailed("clearFocusWindow");
+  }
+
   async click(point: ComputerPoint): Promise<ComputerBackendActionResult> {
     return await this.pointerAction("click", point);
   }

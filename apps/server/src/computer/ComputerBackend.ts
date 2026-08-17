@@ -91,6 +91,13 @@ export interface ComputerBackend {
   captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot>;
   /** Pin or release the plugin's per-seat target window when supported. */
   focusWindow?(windowId: string): Promise<void>;
+  /**
+   * Restack a window above the ones covering it, without moving the user's
+   * keyboard focus. Focus alone routes the agent's input to the window even
+   * while it is buried, which leaves the human watching a click land on pixels
+   * they cannot see.
+   */
+  raiseWindow?(windowId: string): Promise<void>;
   clearFocusWindow?(): Promise<void>;
   launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult>;
   click(point: ComputerPoint): Promise<ComputerBackendActionResult | void>;

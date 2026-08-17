@@ -97,6 +97,14 @@ class FakePlugin implements KWinComputerPluginApi {
     return true;
   };
   focusWindow = async (windowId: string) => this.recordInput("focusWindow", windowId);
+  raiseWindowFailure: Error | undefined;
+  raiseWindow = async (windowId: string) => {
+    if (this.raiseWindowFailure) {
+      this.calls.push({ method: "raiseWindow", args: [windowId] });
+      throw this.raiseWindowFailure;
+    }
+    return this.recordInput("raiseWindow", windowId);
+  };
   clearFocusWindow = async () => this.recordInput("clearFocusWindow");
   movePointer = async (x: number, y: number) => {
     if (this.running) this.position = this.clampPointer?.(x, y) ?? { x, y };
@@ -930,6 +938,102 @@ describe("KWinComputerBackend", () => {
     await expect(backend.captureWindow("window-1")).rejects.toThrow("window is not visible");
     expect(dbus.calls.some((call) => call.method === "close")).toBe(false);
     await expect(backend.listWindows()).resolves.toHaveLength(1);
+    await backend.dispose();
+  });
+
+  it("surfaces plugin stacking and occlusion metadata without trusting its shape", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.windowsJson = async () =>
+      JSON.stringify([
+        {
+          id: "window-top",
+          title: "Browser",
+          bounds: { x: 0, y: 0, width: 1_600, height: 900 },
+          visible: true,
+          stackingIndex: 0,
+          occludedBy: [],
+        },
+        {
+          id: "window-1",
+          title: "Calculator",
+          bounds: { x: 100, y: 100, width: 300, height: 400 },
+          visible: true,
+          stackingIndex: 1,
+          occludedBy: ["window-top", 7, ""],
+        },
+        // A plugin build predating the stacking fields, plus values a corrupt
+        // one could emit: the window itself must still list.
+        {
+          id: "window-legacy",
+          title: "Legacy",
+          bounds: { x: 1_700, y: 0, width: 200, height: 200 },
+          visible: true,
+          stackingIndex: -3,
+          occludedBy: "not-an-array",
+        },
+      ]);
+    const backend = makeBackend(dbus);
+
+    const windows = await backend.listWindows();
+    expect(windows.map((window) => window.id)).toEqual(["window-top", "window-1", "window-legacy"]);
+    expect(windows[0]).toMatchObject({ stackingIndex: 0 });
+    expect(windows[0]).not.toHaveProperty("occludedBy");
+    expect(windows[1]).toMatchObject({ stackingIndex: 1, occludedBy: ["window-top"] });
+    expect(windows[2]).not.toHaveProperty("stackingIndex");
+    expect(windows[2]).not.toHaveProperty("occludedBy");
+
+    await backend.dispose();
+  });
+
+  it("raises a window through the plugin under the same session rules as focus", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(0);
+
+    await backend.raiseWindow("window-1");
+    expect(dbus.plugin.calls).toContainEqual({ method: "raiseWindow", args: ["window-1"] });
+    expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(1);
+
+    // An idle stop the server never asked for is recovered and the call retried.
+    dbus.plugin.running = false;
+    await backend.raiseWindow("window-1");
+    expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(2);
+
+    // A human takeover is not.
+    dbus.plugin.running = false;
+    dbus.plugin.releasedByUser = true;
+    await expect(backend.raiseWindow("window-1")).rejects.toThrow(/Meta\+Shift\+Esc/);
+    expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(2);
+
+    await backend.dispose();
+  });
+
+  it("skips the restack when the loaded plugin has no raiseWindow", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.raiseWindowFailure = dbusError(
+      "org.freedesktop.DBus.Error.UnknownMethod",
+      "No such method 'raiseWindow'",
+    );
+    const backend = makeBackend(dbus);
+
+    await expect(backend.raiseWindow("window-1")).resolves.toBeUndefined();
+    expect(dbus.plugin.calls).toContainEqual({ method: "raiseWindow", args: ["window-1"] });
+
+    await backend.dispose();
+  });
+
+  it("still surfaces real raiseWindow failures", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.raiseWindowFailure = dbusError(
+      "org.synara.ComputerUse.Error.SomethingBroke",
+      "restack failed",
+    );
+    const backend = makeBackend(dbus);
+
+    await expect(backend.raiseWindow("window-1")).rejects.toThrow(/restack failed/);
+
     await backend.dispose();
   });
 

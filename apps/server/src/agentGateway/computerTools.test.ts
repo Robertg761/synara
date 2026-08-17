@@ -137,6 +137,21 @@ describe("agent gateway computer tools", () => {
     }
   });
 
+  it("tells the model how to click a window another window covers", async () => {
+    const { byName } = await setup();
+    const list = byName.get("computer_list_windows")?.definition.description ?? "";
+    expect(list).toContain("stackingIndex");
+    expect(list).toContain("occludedBy");
+    expect(list).toContain("window_id");
+
+    // Every pointer tool takes the same target shape, so the escape hatch has
+    // to be described on the shared property rather than in one tool.
+    for (const name of ["computer_click", "computer_double_click", "computer_drag"]) {
+      const schema = JSON.stringify(byName.get(name)?.definition.inputSchema ?? {});
+      expect(schema).toContain("raised and input is routed to it");
+    }
+  });
+
   it("zooms into a window and maps the capture back to desktop coordinates", async () => {
     const { backend, call } = await setup();
     const result = await call("computer_screenshot", { window_id: "fake-calculator" });
