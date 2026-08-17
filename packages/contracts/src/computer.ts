@@ -597,11 +597,22 @@ export const ComputerFrameEvent = Schema.Struct({
 });
 export type ComputerFrameEvent = typeof ComputerFrameEvent.Type;
 
+/**
+ * Carries the thread so whichever chat happens to be visible cannot steal the
+ * pane, mirroring DeviceOpenPaneRequestedEvent.
+ */
+export const ComputerOpenPaneRequestedEvent = Schema.Struct({
+  type: Schema.Literal("computer.open-pane-requested"),
+  threadId: ThreadId,
+});
+export type ComputerOpenPaneRequestedEvent = typeof ComputerOpenPaneRequestedEvent.Type;
+
 export const ComputerEvent = Schema.Union([
   ComputerThreadStateEvent,
   ComputerWindowsChangedEvent,
   ComputerActionEvent,
   ComputerFrameEvent,
+  ComputerOpenPaneRequestedEvent,
 ]);
 export type ComputerEvent = typeof ComputerEvent.Type;
 

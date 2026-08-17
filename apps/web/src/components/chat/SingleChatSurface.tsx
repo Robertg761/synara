@@ -98,6 +98,7 @@ import {
   CHAT_MAIN_VIEWPORT_SHELL_CLASS_NAME,
 } from "./composerPickerStyles";
 import { routeSingleBrowserPanelOpenRequest } from "./browserPanelOpenRequest";
+import { routeSingleComputerPaneOpenRequest } from "./computerPaneOpenRequest";
 import { routeSingleDevicePaneOpenRequest } from "./devicePaneOpenRequest";
 import {
   pullRequestDetailInputFromPane,
@@ -631,7 +632,23 @@ export function SingleChatSurface(props: {
         }
       : null,
   });
-  useComputerEventBridge();
+  useComputerEventBridge({
+    onOpenPaneRequested: (event) => {
+      routeSingleComputerPaneOpenRequest({
+        currentThreadId: props.threadId,
+        requestedThreadId: event.threadId,
+        requestImmediateComputerHydration: () => requestImmediateDockHydration("computer"),
+        openComputerPane: (threadId) => openPane(threadId, { kind: "computer" }),
+        navigateToThread: (threadId) => {
+          void navigate({
+            to: "/$threadId",
+            params: { threadId },
+            replace: true,
+          });
+        },
+      });
+    },
+  });
 
   const excludedThreadIds = new Set<ThreadId>([props.threadId]);
 

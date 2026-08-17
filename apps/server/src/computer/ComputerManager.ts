@@ -68,6 +68,13 @@ interface ThreadComputerRuntimeState {
   screenSize: ComputerScreenSize;
   availability: ComputerAvailability;
   cursor?: ComputerPoint;
+  /**
+   * Whether this thread's agent activity has already asked the UI to open the
+   * computer pane. Actions arrive every few seconds, so surfacing is once per
+   * thread: repeating the request would emit an event per click and could yank
+   * a user who deliberately closed the pane back to it.
+   */
+  paneSurfaced: boolean;
 }
 
 /** The single desktop's exclusive owner, and when it last drove it. */
@@ -711,11 +718,29 @@ export class ComputerManager {
    */
   private emitAction(threadId: string | undefined, action: string): void {
     const attributed = agentThreadId(threadId);
+    if (attributed) this.surfacePaneForAgent(attributed);
     this.emit({
       type: "computer.action",
       action,
       ok: true,
       ...(attributed ? { threadId: ThreadId.makeUnsafe(attributed) } : {}),
+    });
+  }
+
+  /**
+   * Put the desktop in front of the user the moment an agent starts driving it.
+   * Emitted before the action event so the pane is already opening when the
+   * first attributed action reaches the store. Mirrors
+   * DeviceManager.requestOpenPane; see paneSurfaced for the once-per-thread
+   * rule.
+   */
+  private surfacePaneForAgent(threadId: string): void {
+    const state = this.threadRuntime(threadId);
+    if (state.paneSurfaced) return;
+    state.paneSurfaced = true;
+    this.emit({
+      type: "computer.open-pane-requested",
+      threadId: ThreadId.makeUnsafe(threadId),
     });
   }
 
@@ -778,6 +803,7 @@ export class ComputerManager {
           kind: "backend-unavailable",
           message: "Computer state has not been queried yet",
         },
+        paneSurfaced: false,
       };
       this.threads.set(threadId, state);
     }

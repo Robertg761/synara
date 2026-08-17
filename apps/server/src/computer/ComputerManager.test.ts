@@ -307,6 +307,37 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await withoutClipboard.dispose();
   });
 
+  it("asks the UI to open the pane once per thread, and only for agent actions", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    const openRequests: string[] = [];
+    manager.onEvent((event) => {
+      if (event.type === "computer.open-pane-requested") openRequests.push(event.threadId);
+    });
+
+    // Pane input carries no thread and must never summon the pane.
+    await manager.click(undefined, { x: 10, y: 10 });
+    expect(openRequests).toEqual([]);
+
+    // The first attributed action surfaces the pane; the rest of the turn is
+    // silent so a user who closed the pane is not yanked back per click.
+    await manager.click("thread-1", { x: 10, y: 10 });
+    await manager.typeText("thread-1", "hi");
+    expect(openRequests).toEqual(["thread-1"]);
+
+    // A second thread surfaces independently of the first.
+    await manager.releaseDesktopControl("thread-1");
+    await manager.pressKey("thread-2", "enter");
+    expect(openRequests).toEqual(["thread-1", "thread-2"]);
+
+    // Removal clears the once-per-thread latch with the rest of thread state.
+    await manager.handleThreadRemoved("thread-2");
+    await manager.pressKey("thread-2", "enter");
+    expect(openRequests).toEqual(["thread-1", "thread-2", "thread-2"]);
+
+    await manager.dispose();
+  });
+
   it("leaves pane input unattributed instead of borrowing a thread", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });
