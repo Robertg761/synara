@@ -1,5 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import type {
   ComputerAvailability,
@@ -64,6 +66,10 @@ const CONTROL_RELEASED_ERROR_TYPE = "org.synara.ComputerUse.Error.ControlRelease
 const CONTROL_RELEASED_MESSAGE =
   `Computer control was released with the ${RELEASE_CONTROL_HOTKEY} hotkey. ` +
   `Press ${RELEASE_CONTROL_HOTKEY} again to hand control back.`;
+const INSTALL_SCRIPT_PATH = "apps/server/native/computer-use-kwin/scripts/install-and-load.sh";
+const ENABLE_REBUILD_SCRIPT_PATH = "apps/server/native/computer-use-kwin/systemd/enable.sh";
+const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
+const KWIN_VERSION_PROBE_TIMEOUT_MS = 2_000;
 const MAX_PLUGIN_ID = /^SynaraComputerUsePlugin(?:V(\d+))?$/;
 const INSTALLED_PLUGIN_FILE = /^(SynaraComputerUsePluginV(\d+))\.so$/;
 const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
@@ -97,8 +103,16 @@ export interface KWinComputerBackendOptions {
   readonly glideDurationMs?: number;
   readonly stillIntervalMs?: number;
   readonly captureMaxDimension?: number;
-  /** Plugin-side session deadline. `0` disables it; see the Phase 3b notes. */
+  /**
+   * Plugin-side session deadline. `0` disables it; see the Phase 3b notes.
+   * Falls back to `SYNARA_COMPUTER_IDLE_TIMEOUT_MS`, then to five minutes.
+   */
   readonly idleTimeoutMs?: number;
+  /** Installer stamp consulted when KWin refuses to load the plugin. */
+  readonly installStampPath?: string;
+  readonly readInstallStamp?: () => Promise<string | undefined>;
+  /** Running KWin version, read only to explain a load refusal. */
+  readonly runningKwinVersion?: () => Promise<string | undefined>;
 }
 
 /**
@@ -123,6 +137,9 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly atspi: AtspiTreeReader;
   private readonly dbusFactory: () => Promise<KWinComputerDbus>;
   private readonly installedPluginIds: () => Promise<readonly string[]>;
+  private readonly readInstallStamp: () => Promise<string | undefined>;
+  private readonly runningKwinVersion: () => Promise<string | undefined>;
+  private runningKwinVersionPromise: Promise<string | undefined> | undefined;
 
   private dbus: KWinComputerDbus | undefined;
   private plugin: KWinComputerPluginApi | undefined;
@@ -163,7 +180,9 @@ export class KWinComputerBackend implements ComputerBackend {
       1,
       Math.min(32_768, Math.floor(options.captureMaxDimension ?? DEFAULT_CAPTURE_MAX_DIMENSION)),
     );
-    this.idleTimeoutMs = normalizeIdleTimeout(options.idleTimeoutMs);
+    this.idleTimeoutMs = normalizeIdleTimeout(
+      options.idleTimeoutMs ?? parseIdleTimeoutEnv(process.env.SYNARA_COMPUTER_IDLE_TIMEOUT_MS),
+    );
     this.atspi = options.atspi ?? new AtspiHelperClient();
     this.dbus = options.dbus;
     this.dbusFactory =
@@ -172,6 +191,10 @@ export class KWinComputerBackend implements ComputerBackend {
     this.installedPluginIds =
       options.installedPluginIds ??
       (() => scanInstalledPluginIds(options.pluginDirectories ?? defaultPluginDirectories()));
+    this.readInstallStamp =
+      options.readInstallStamp ??
+      (() => readInstallStamp(options.installStampPath ?? defaultInstallStampPath()));
+    this.runningKwinVersion = options.runningKwinVersion ?? detectRunningKwinVersion;
   }
 
   async availability(): Promise<ComputerAvailability> {
@@ -725,15 +748,56 @@ export class KWinComputerBackend implements ComputerBackend {
     const selectedPlugin = loadedPlugin ?? newestPluginId(installed);
     if (!selectedPlugin) {
       throw new ComputerBackendError(
-        "No installed SynaraComputerUsePluginVn was found in the KWin plugin directories.",
+        "No installed SynaraComputerUsePluginVn was found in the KWin plugin directories. " +
+          `Build, install, and load it with ${INSTALL_SCRIPT_PATH}.`,
       );
     }
     if (!loadedPlugin) {
-      const loaded = await dbus.loadPlugin(selectedPlugin);
-      if (!loaded) throw new ComputerBackendError(`KWin refused to load ${selectedPlugin}.`);
+      const accepted = await dbus.loadPlugin(selectedPlugin);
+      if (!accepted) throw new ComputerBackendError(await this.describeLoadRefusal(selectedPlugin));
     }
     const plugin = await dbus.connectPlugin();
     return await this.finishPluginConnection(plugin, selectedPlugin);
+  }
+
+  /**
+   * KWin only logs why it refused a plugin ("has mismatching plugin version"),
+   * so the D-Bus `false` reply carries no reason at all. The plugin is a binary
+   * KWin module tied to the KWin version it was compiled against, which makes a
+   * KWin upgrade the overwhelmingly likely cause. Name the version pair when the
+   * installer stamp and the KWin binary can supply it, and always point at the
+   * rebuild, because this message is all the availability card can show.
+   */
+  private async describeLoadRefusal(pluginId: string): Promise<string> {
+    const mismatch = await this.readKwinVersionMismatch();
+    const cause = mismatch
+      ? `it was built for KWin ${mismatch.builtFor}, but KWin ${mismatch.running} is running`
+      : "a KWin plugin only loads into the exact KWin version it was built against";
+    return (
+      `KWin refused to load ${pluginId}: ${cause}. ` +
+      `If KWin was upgraded, rebuild and reload the plugin with ${INSTALL_SCRIPT_PATH}; ` +
+      `automatic rebuilds can be enabled with ${ENABLE_REBUILD_SCRIPT_PATH}.`
+    );
+  }
+
+  private async readKwinVersionMismatch(): Promise<
+    { readonly builtFor: string; readonly running: string } | undefined
+  > {
+    const [builtFor, running] = await Promise.all([
+      this.readInstallStamp().then(stampKwinVersion, () => undefined),
+      this.probeRunningKwinVersion(),
+    ]);
+    // Equal versions mean the refusal has some other cause, and a half-known
+    // pair says nothing, so only a real mismatch is worth naming.
+    if (!builtFor || !running || builtFor === running) return undefined;
+    return { builtFor, running };
+  }
+
+  private probeRunningKwinVersion(): Promise<string | undefined> {
+    // KWin cannot change under a live session, so probing once keeps the
+    // connect retry loop from spawning a process per attempt.
+    this.runningKwinVersionPromise ??= this.runningKwinVersion().catch(() => undefined);
+    return this.runningKwinVersionPromise;
   }
 
   private async finishPluginConnection(
@@ -1049,6 +1113,46 @@ function defaultPluginDirectories(): readonly string[] {
   ];
 }
 
+/** Mirrors `STATE_ROOT`/`STAMP_FILE` in scripts/install-and-load.sh. */
+function defaultInstallStampPath(): string {
+  const stateRoot =
+    process.env.SYNARA_KWIN_STATE_ROOT ??
+    join(
+      process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"),
+      "synara",
+      "kwin-computer-use-plugin",
+    );
+  return join(stateRoot, "install.stamp");
+}
+
+async function readInstallStamp(path: string): Promise<string | undefined> {
+  return await readFile(path, "utf8").catch(() => undefined);
+}
+
+/** Reads the `kwin_version=` line the installer records for the built plugin. */
+function stampKwinVersion(stamp: string | undefined): string | undefined {
+  const line = stamp?.split("\n").find((entry) => entry.startsWith("kwin_version="));
+  return line ? (KWIN_VERSION_PATTERN.exec(line)?.[0] ?? undefined) : undefined;
+}
+
+/**
+ * `kwin_wayland --version` prints `kwin <version>` and exits, and it is only
+ * spawned on the cold load-refusal path, so a missing or exotic binary just
+ * costs the caller the version detail.
+ */
+function detectRunningKwinVersion(): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    execFile(
+      "kwin_wayland",
+      ["--version"],
+      { timeout: KWIN_VERSION_PROBE_TIMEOUT_MS },
+      (error, stdout) => {
+        resolve(error ? undefined : (KWIN_VERSION_PATTERN.exec(stdout)?.[0] ?? undefined));
+      },
+    );
+  });
+}
+
 function pluginVersion(id: string): number {
   const match = id.match(MAX_PLUGIN_ID);
   return match?.[1] ? Number(match[1]) : 0;
@@ -1312,6 +1416,21 @@ export function readPngDimensions(bytes: Uint8Array): {
   if (width < 1 || height < 1)
     throw new ComputerBackendError("Synara KWin capture has invalid dimensions.");
   return { width, height };
+}
+
+/**
+ * `SYNARA_COMPUTER_IDLE_TIMEOUT_MS` is an operator override, so a typo must
+ * neither crash the backend nor silently disable the plugin-side deadline:
+ * anything that is not `0` or a millisecond count up to an hour is dropped and
+ * the default applies. Accepted values still pass through normalizeIdleTimeout.
+ */
+function parseIdleTimeoutEnv(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds) || milliseconds < 0 || milliseconds > MAX_IDLE_TIMEOUT_MS) {
+    return undefined;
+  }
+  return milliseconds;
 }
 
 function normalizeIdleTimeout(value: number | undefined): number {

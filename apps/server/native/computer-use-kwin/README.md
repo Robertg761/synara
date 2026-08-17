@@ -92,6 +92,9 @@ and the ghost cursor down.
 - `healthJson`, `stateJson`, and `windowsJson` deliberately do not. The server
   polls health, so counting introspection would keep every session alive
   forever.
+- `SYNARA_COMPUTER_IDLE_TIMEOUT_MS` overrides the value the server sends: `0`
+  disables the deadline, anything else is clamped to 1 s – 1 h, and a
+  non-numeric or out-of-range value falls back to the 5 minute default.
 - `setIdleTimeout(u milliseconds)` reconfigures it; `0` disables it entirely.
   Anything else outside 1 s – 1 h is rejected with `false`. The server sends its
   configured value right after `start()`. The deadline is re-armed from the last

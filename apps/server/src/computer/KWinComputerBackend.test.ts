@@ -1,7 +1,10 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ComputerWindow } from "@synara/contracts";
 
@@ -198,6 +201,9 @@ function makeBackend(
       options.installedPluginIds ??
       (async () => ["SynaraComputerUsePluginV2", "SynaraComputerUsePluginV10"]),
     sleep: options.sleep ?? (async () => undefined),
+    // Never let a test read the real installer stamp or spawn kwin_wayland.
+    installStampPath: options.installStampPath ?? join(tmpdir(), "synara-absent-install.stamp"),
+    runningKwinVersion: options.runningKwinVersion ?? (async () => undefined),
   });
 }
 
@@ -309,6 +315,10 @@ describe("newestPluginId", () => {
 });
 
 describe("KWinComputerBackend", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("loads the newest installed plugin and passes the health gate", async () => {
     const dbus = new FakeDbus();
     const backend = makeBackend(dbus);
@@ -347,6 +357,53 @@ describe("KWinComputerBackend", () => {
     await backend.focusWindow("window-1");
     expect(dbus.plugin.calls).toContainEqual({ method: "setIdleTimeout", args: [90_000] });
     expect(dbus.plugin.idleTimeoutMs).toBe(90_000);
+
+    await backend.dispose();
+  });
+
+  it("takes the idle timeout from SYNARA_COMPUTER_IDLE_TIMEOUT_MS", async () => {
+    vi.stubEnv("SYNARA_COMPUTER_IDLE_TIMEOUT_MS", "120000");
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.idleTimeoutMs).toBe(120_000);
+
+    await backend.dispose();
+  });
+
+  it("disables the idle timeout when the environment sets it to zero", async () => {
+    vi.stubEnv("SYNARA_COMPUTER_IDLE_TIMEOUT_MS", "0");
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.idleTimeoutMs).toBe(0);
+
+    await backend.dispose();
+  });
+
+  it.each(["not-a-number", "", "-1", "3600001"])(
+    "falls back to the default idle timeout for %j",
+    async (value) => {
+      vi.stubEnv("SYNARA_COMPUTER_IDLE_TIMEOUT_MS", value);
+      const dbus = new FakeDbus();
+      const backend = makeBackend(dbus);
+
+      await backend.focusWindow("window-1");
+      expect(dbus.plugin.idleTimeoutMs).toBe(300_000);
+
+      await backend.dispose();
+    },
+  );
+
+  it("prefers an explicit idle timeout over the environment", async () => {
+    vi.stubEnv("SYNARA_COMPUTER_IDLE_TIMEOUT_MS", "120000");
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { idleTimeoutMs: 45_000 });
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.idleTimeoutMs).toBe(45_000);
 
     await backend.dispose();
   });
@@ -432,10 +489,82 @@ describe("KWinComputerBackend", () => {
     const dbus = new FakeDbus();
     const backend = makeBackend(dbus, { installedPluginIds: async () => [] });
 
-    await expect(backend.availability()).resolves.toMatchObject({
-      kind: "backend-unavailable",
-      message: expect.stringContaining("No installed SynaraComputerUsePluginVn"),
+    const availability = await backend.availability();
+    expect(availability).toMatchObject({ kind: "backend-unavailable" });
+    const message = availability.kind === "backend-unavailable" ? availability.message : "";
+    expect(message).toContain("No installed SynaraComputerUsePluginVn");
+    expect(message).toContain("scripts/install-and-load.sh");
+    await backend.dispose();
+  });
+
+  it("names the KWin version mismatch when LoadPlugin is refused", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "synara-kwin-stamp-"));
+    const installStampPath = join(directory, "install.stamp");
+    await writeFile(
+      installStampPath,
+      "signature=abc\nplugin_id=SynaraComputerUsePluginV10\nkwin_version=kwin 6.7.2\n",
+      "utf8",
+    );
+    const dbus = new FakeDbus();
+    dbus.loadPlugin = async () => false;
+    const backend = makeBackend(dbus, {
+      installStampPath,
+      runningKwinVersion: async () => "6.7.3",
     });
+
+    const availability = await backend.availability();
+    const message = availability.kind === "backend-unavailable" ? availability.message : "";
+    expect(message).toContain("KWin refused to load SynaraComputerUsePluginV10");
+    expect(message).toContain("built for KWin 6.7.2, but KWin 6.7.3 is running");
+    expect(message).toContain("scripts/install-and-load.sh");
+    expect(message).toContain("systemd/enable.sh");
+    await backend.dispose();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it("keeps the load-refusal message generic when no version pair is known", async () => {
+    const dbus = new FakeDbus();
+    dbus.loadPlugin = async () => false;
+    const backend = makeBackend(dbus);
+
+    const availability = await backend.availability();
+    const message = availability.kind === "backend-unavailable" ? availability.message : "";
+    expect(message).toContain("KWin refused to load SynaraComputerUsePluginV10");
+    expect(message).toContain("built against");
+    expect(message).not.toContain("is running.");
+    expect(message).toContain("scripts/install-and-load.sh");
+    expect(message).toContain("systemd/enable.sh");
+    await backend.dispose();
+  });
+
+  it("omits the versions when the stamp matches the running KWin", async () => {
+    const dbus = new FakeDbus();
+    dbus.loadPlugin = async () => false;
+    const backend = makeBackend(dbus, {
+      readInstallStamp: async () => "kwin_version=kwin 6.7.3\n",
+      runningKwinVersion: async () => "6.7.3",
+    });
+
+    const availability = await backend.availability();
+    const message = availability.kind === "backend-unavailable" ? availability.message : "";
+    expect(message).not.toContain("6.7.3");
+    expect(message).toContain("built against");
+    await backend.dispose();
+  });
+
+  it("probes the running KWin version once across connect retries", async () => {
+    const dbus = new FakeDbus();
+    const loadPlugin = vi.fn(async () => false);
+    dbus.loadPlugin = loadPlugin;
+    const runningKwinVersion = vi.fn(async () => "6.7.3");
+    const backend = makeBackend(dbus, {
+      readInstallStamp: async () => "kwin_version=kwin 6.7.2\n",
+      runningKwinVersion,
+    });
+
+    await backend.availability();
+    expect(loadPlugin.mock.calls.length).toBeGreaterThan(1);
+    expect(runningKwinVersion).toHaveBeenCalledTimes(1);
     await backend.dispose();
   });
 

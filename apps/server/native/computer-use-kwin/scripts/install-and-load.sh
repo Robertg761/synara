@@ -287,6 +287,9 @@ if (( needs_install )); then
         printf 'plugin_id=%s\n' "$plugin_id"
         printf 'installed_at=%s\n' "$(date -Is)"
         printf 'plugin_path=%s\n' "$destination"
+        # The server reads this back to explain a later LoadPlugin refusal:
+        # KWin only accepts a plugin built against the running KWin version.
+        printf 'kwin_version=%s\n' "$(kwin_version | head -n 1)"
     } >"$stamp_tmp"
     mv -f "$stamp_tmp" "$STAMP_FILE"
 fi
