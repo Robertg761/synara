@@ -704,4 +704,86 @@ describe("ComputerManager and FakeComputerBackend", () => {
 
     await manager.dispose();
   });
+
+  it("captures the focused window, and the workspace when nothing capturable has focus", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    const focused = await manager.captureFocusedWindow();
+    expect(focused.windowId).toBe("fake-terminal");
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-terminal",
+    });
+
+    // A minimized focus holder and an unfocused rest leave nothing with focus
+    // on screen except the calculator, the topmost visible window.
+    backend.emitWindowsChanged([
+      {
+        id: "fake-terminal",
+        title: "Terminal",
+        bounds: { x: 40, y: 40, width: 960, height: 720 },
+        focused: true,
+        minimized: true,
+        visible: false,
+        stackingIndex: 1,
+      },
+      {
+        id: "fake-calculator",
+        title: "Calculator",
+        bounds: { x: 1_050, y: 120, width: 420, height: 620 },
+        focused: false,
+        minimized: false,
+        visible: true,
+        stackingIndex: 0,
+      },
+    ]);
+    const topmost = await manager.captureFocusedWindow();
+    expect(topmost.windowId).toBe("fake-calculator");
+
+    // With no capturable window at all, the whole workspace is the answer.
+    backend.emitWindowsChanged([]);
+    const workspace = await manager.captureFocusedWindow(1_024);
+    expect(workspace.windowId).toBeUndefined();
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "region",
+      region: { x: 0, y: 0, width: 1_920, height: 1_080 },
+      maxDimension: 1_024,
+    });
+
+    await manager.dispose();
+  });
+
+  it("captures the action's window on a hint, falls back to focus, and never throws", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    const hinted = await manager.captureActionScreenshot("fake-calculator");
+    expect(hinted?.windowId).toBe("fake-calculator");
+
+    // A hint naming a window the action closed degrades to the focused one.
+    const closed = await manager.captureActionScreenshot("gone-window");
+    expect(closed?.windowId).toBe("fake-terminal");
+
+    // A capture failure returns nothing rather than failing the finished action.
+    backend.failNext("captureScreenshot");
+    expect(await manager.captureActionScreenshot()).toBeUndefined();
+
+    await manager.dispose();
+  });
+
+  it("skips the post-action capture entirely on a backend that cannot capture", async () => {
+    const backend = new FakeComputerBackend({
+      capabilities: {
+        ...new FakeComputerBackend().capabilities(),
+        capture: false,
+      },
+    });
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    expect(await manager.captureActionScreenshot("fake-terminal")).toBeUndefined();
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(0);
+
+    await manager.dispose();
+  });
 });

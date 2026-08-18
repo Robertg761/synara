@@ -51,7 +51,9 @@ function makeContext(provider: ProviderKind = "claudeAgent", threadId = THREAD):
 }
 
 async function setup(backend = new FakeComputerBackend()) {
-  const manager = new ComputerManager({ backend });
+  // A zero settle delay: these tests assert on what the post-action capture
+  // does, not on how long the desktop is given to repaint.
+  const manager = new ComputerManager({ backend, actionSettleMs: 0 });
   const tools = makeAgentGatewayComputerTools({ manager });
   const byName = new Map(tools.map((tool) => [tool.definition.name, tool]));
   const call = async (
@@ -241,10 +243,6 @@ describe("agent gateway computer tools", () => {
     expect(both.isError).toBe(true);
     expect(both.content[0]).toMatchObject({ text: expect.stringContaining("never both") });
 
-    const neither = await call("computer_screenshot", {});
-    expect(neither.isError).toBe(true);
-    expect(neither.content[0]).toMatchObject({ text: expect.stringContaining("window_id") });
-
     const partial = await call("computer_screenshot", { x: 10, y: 20, width: 30 });
     expect(partial.isError).toBe(true);
     expect(partial.content[0]).toMatchObject({ text: expect.stringContaining("height") });
@@ -254,6 +252,25 @@ describe("agent gateway computer tools", () => {
     expect(empty.content[0]).toMatchObject({ text: expect.stringContaining("greater than zero") });
 
     expect(backend.callsFor("captureScreenshot")).toHaveLength(0);
+  });
+
+  it("captures the focused window when called without a target", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_screenshot", {});
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content.map((entry) => entry.type)).toEqual(["text", "image"]);
+    // The fake terminal is the focused window, so an untargeted zoom lands on
+    // it and says so, mapping the same way an explicit window capture does.
+    const text = result.content.find((entry) => entry.type === "text");
+    expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
+      windowId: "fake-terminal",
+      screenshot: { region: { x: 40, y: 40, width: 960, height: 720 } },
+    });
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-terminal",
+    });
   });
 
   it("surfaces a compositor capture failure as a readable error result", async () => {
@@ -298,6 +315,93 @@ describe("agent gateway computer tools", () => {
       point: { x: 44, y: 44 },
       clampedTo: { x: 44, y: 1_080 },
     });
+  });
+
+  it("attaches a post-action screenshot of the focused window to action results", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_click", { x: 10, y: 10 });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content.map((entry) => entry.type)).toEqual(["text", "image"]);
+    // A bare coordinate names no window, so the capture falls to the focused
+    // one, and the metadata says which window the pixels cover.
+    const text = result.content.find((entry) => entry.type === "text");
+    expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
+      action: "computer_click",
+      point: { x: 10, y: 10 },
+      screenshot: {
+        windowId: "fake-terminal",
+        region: { x: 40, y: 40, width: 960, height: 720 },
+        scale: 1,
+      },
+    });
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-terminal",
+    });
+  });
+
+  it("captures the window a scoped action named rather than the focused one", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_click", {
+      x: 1_100,
+      y: 200,
+      window_id: "fake-calculator",
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-calculator",
+    });
+  });
+
+  it("skips the post-action screenshot when the model opts out", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_type_text", { text: "hi", include_screenshot: false });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content.map((entry) => entry.type)).toEqual(["text"]);
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(0);
+  });
+
+  it("keeps a successful action result when the post-action capture fails", async () => {
+    const { backend, call } = await setup();
+    backend.failNext("captureScreenshot");
+    const result = await call("computer_press_key", { key: "enter" });
+
+    // The key press happened; losing the screenshot must not report failure.
+    expect(result.isError).not.toBe(true);
+    expect(result.content.map((entry) => entry.type)).toEqual(["text"]);
+    expect(resultJson(result)).toMatchObject({ action: "computer_press_key" });
+  });
+
+  it("tells the model every observed action already carries its screenshot", async () => {
+    const { byName } = await setup();
+    for (const name of [
+      "computer_click",
+      "computer_double_click",
+      "computer_right_click",
+      "computer_move_cursor",
+      "computer_drag",
+      "computer_scroll",
+      "computer_type_text",
+      "computer_press_key",
+      "computer_hotkey",
+      "computer_set_value",
+      "computer_perform_action",
+    ]) {
+      const tool = byName.get(name);
+      expect(tool?.definition.description).toContain("screenshot taken after the action settled");
+      expect(JSON.stringify(tool?.definition.inputSchema)).toContain("include_screenshot");
+    }
+    // Launching resolves seconds later and clipboard writes change no pixels,
+    // so neither pays for a capture that would only show the previous state.
+    for (const name of ["computer_launch_app", "computer_write_clipboard"]) {
+      const tool = byName.get(name);
+      expect(tool?.definition.description).not.toContain("screenshot taken after");
+      expect(JSON.stringify(tool?.definition.inputSchema)).not.toContain("include_screenshot");
+    }
   });
 
   it("resolves semantic actions from a fresh snapshot and reports backend calls", async () => {

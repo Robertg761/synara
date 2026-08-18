@@ -1,7 +1,12 @@
 /** Agent-facing Linux computer perception and control tools. */
 import { Effect } from "effect";
 
-import type { ComputerScreenshot, ComputerTarget, ComputerState } from "@synara/contracts";
+import type {
+  ComputerActionResult,
+  ComputerScreenshot,
+  ComputerTarget,
+  ComputerState,
+} from "@synara/contracts";
 
 import { ComputerTargetError } from "../computer/uiTreeTargeting.ts";
 import {
@@ -77,6 +82,31 @@ const SHARED_CLIPBOARD_NOTE =
 
 const POINTER_COORDINATE_NOTE =
   "Coordinates are global desktop coordinates in logical pixels, the same space as window bounds and the screenshot region mapping. On multi-monitor layouts some coordinate ranges fall outside every monitor, and the display server moves the pointer to the nearest monitor edge instead.";
+
+/**
+ * Every mutating action carries its own after-screenshot so the model can act
+ * on the result directly instead of spending a separate perception round trip
+ * — the see-act loop is one model turn per action, not two.
+ */
+const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected (or the whole workspace when no window has focus); ${SCREENSHOT_MAPPING_NOTE}. Read the next state from that screenshot instead of making a separate screenshot call.`;
+
+const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
+  include_screenshot: {
+    type: "boolean",
+    description:
+      "Attach the post-action screenshot to the result. Defaults to true; pass false to skip the capture when chaining actions whose intermediate state you will not look at.",
+  },
+} as const;
+
+function withActionScreenshotSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...schema,
+    properties: {
+      ...(schema.properties as Record<string, unknown>),
+      ...INCLUDE_ACTION_SCREENSHOT_PROPERTY,
+    },
+  };
+}
 
 const TARGET_PROPERTIES = {
   x: { type: "number", description: "Global desktop x coordinate in logical pixels." },
@@ -224,11 +254,20 @@ function capturedScreenshotResult(
 const CAPTURE_REGION_KEYS = ["x", "y", "width", "height"] as const;
 
 /**
- * The two request forms are mutually exclusive on purpose: a window id and a
- * loose rect disagree about what "the region" is, and silently preferring one
- * would hand the model a screenshot it cannot map.
+ * No target at all is the third, deliberate form: capture whatever window has
+ * focus. It is resolved by the manager rather than here because focus is a
+ * live property of the desktop, not of the request.
  */
-function readCaptureRequest(args: Record<string, unknown>): ComputerCaptureRequest {
+type ScreenshotRequest =
+  | ComputerCaptureRequest
+  | { readonly kind: "focused"; readonly maxDimension?: number };
+
+/**
+ * The window and rect request forms are mutually exclusive on purpose: a
+ * window id and a loose rect disagree about what "the region" is, and silently
+ * preferring one would hand the model a screenshot it cannot map.
+ */
+function readCaptureRequest(args: Record<string, unknown>): ScreenshotRequest {
   const windowId = readStringArg(args, "window_id") ?? readStringArg(args, "windowId");
   const present = CAPTURE_REGION_KEYS.filter(
     (key) => args[key] !== undefined && args[key] !== null,
@@ -245,9 +284,7 @@ function readCaptureRequest(args: Record<string, unknown>): ComputerCaptureReque
     return { kind: "window", windowId, ...limit };
   }
   if (present.length === 0) {
-    throw new ToolInputError(
-      'Pass either "window_id" from computer_list_windows or all of "x", "y", "width" and "height" in global desktop logical pixels.',
-    );
+    return { kind: "focused", ...limit };
   }
   if (present.length < CAPTURE_REGION_KEYS.length) {
     const missing = CAPTURE_REGION_KEYS.filter((key) => !present.includes(key));
@@ -336,6 +373,54 @@ export function makeAgentGatewayComputerTools(
     handler: handle(name, run),
   });
 
+  /**
+   * The action result with its after-screenshot attached. Capture is
+   * best-effort — the action already happened, so a perception failure must
+   * not convert its success into an error result — and the manager returns
+   * undefined in that case, which degrades to the plain JSON result.
+   */
+  const actionResultWithScreenshot = async (
+    args: Record<string, unknown>,
+    result: ComputerActionResult,
+  ): Promise<unknown> => {
+    if (readBooleanArg(args, "include_screenshot") === false) return result;
+    const capture = await manager.captureActionScreenshot(result.windowId);
+    if (!capture) return result;
+    const { bytesBase64, ...metadata } = capture.screenshot;
+    return screenshotResult(
+      {
+        ...result,
+        screenshot: {
+          ...(capture.windowId !== undefined ? { windowId: capture.windowId } : {}),
+          ...metadata,
+        },
+      },
+      bytesBase64,
+    );
+  };
+
+  /**
+   * An action whose visible outcome matters: every pointer, keyboard, and
+   * semantic action goes through here so its result carries the screenshot.
+   * Launching an app does not — its window appears seconds later, so a capture
+   * taken now would only show the desktop from before the launch — and neither
+   * does writing the clipboard, which changes nothing on screen.
+   */
+  const observedActionEntry = (
+    name: string,
+    title: string,
+    description: string,
+    inputSchema: Record<string, unknown>,
+    run: (args: Record<string, unknown>, context: ToolContext) => Promise<ComputerActionResult>,
+  ): ToolEntry =>
+    actionEntry(
+      name,
+      title,
+      `${description} ${ACTION_SCREENSHOT_NOTE}`,
+      withActionScreenshotSchema(inputSchema),
+      async (args, context) => actionResultWithScreenshot(args, await run(args, context)),
+    );
+
   const targetSchema = {
     type: "object",
     properties: TARGET_PROPERTIES,
@@ -385,14 +470,14 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_screenshot",
-        description: `Zoom into one part of the desktop when detail is too small to read in the downscaled computer_get_state screenshot. Capture either a single window by "window_id" from computer_list_windows, or a rectangle given as "x", "y", "width" and "height" in global desktop logical pixels; pass exactly one of the two forms. The same mapping applies as in computer_get_state: ${SCREENSHOT_MAPPING_NOTE}. The capture is clipped to the desktop workspace, so read the returned region rather than assuming it matches the request.`,
+        description: `Zoom into one part of the desktop when detail is too small to read in the downscaled computer_get_state screenshot. With no arguments it captures the window that currently has focus, which is usually the one to look at. Otherwise capture a single window by "window_id" from computer_list_windows, or a rectangle given as "x", "y", "width" and "height" in global desktop logical pixels; never pass both forms. The same mapping applies as in computer_get_state: ${SCREENSHOT_MAPPING_NOTE}. The capture is clipped to the desktop workspace, so read the returned region rather than assuming it matches the request.`,
         inputSchema: {
           type: "object",
           properties: {
             window_id: {
               type: "string",
               description:
-                "Window id from computer_list_windows. Mutually exclusive with x/y/width/height.",
+                "Window id from computer_list_windows. Mutually exclusive with x/y/width/height. Omit both forms to capture the focused window.",
             },
             x: {
               type: "number",
@@ -414,6 +499,18 @@ export function makeAgentGatewayComputerTools(
       },
       handler: handle("computer_screenshot", async (args) => {
         const request = readCaptureRequest(args);
+        if (request.kind === "focused") {
+          const capture = await manager.captureFocusedWindow(request.maxDimension);
+          const { bytesBase64, ...metadata } = capture.screenshot;
+          return screenshotResult(
+            {
+              computerId: manager.computerId,
+              ...(capture.windowId !== undefined ? { windowId: capture.windowId } : {}),
+              screenshot: metadata,
+            },
+            bytesBase64,
+          );
+        }
         return capturedScreenshotResult(
           manager.computerId,
           request,
@@ -475,35 +572,35 @@ export function makeAgentGatewayComputerTools(
           readStringArrayArg(args, "arguments") ?? [],
         ),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_click",
       "Click",
       `Click a coordinate or a uniquely labelled visible control. Ambiguous and off-screen targets are refused. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.click(context.callerThreadId, readTarget(args)),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_double_click",
       "Double click",
       `Double-click a coordinate or a uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.doubleClick(context.callerThreadId, readTarget(args)),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_right_click",
       "Right click",
       `Right-click a coordinate or a uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.rightClick(context.callerThreadId, readTarget(args)),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_move_cursor",
       "Move cursor",
       `Move the dedicated computer-use cursor to a coordinate or uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.moveCursor(context.callerThreadId, readTarget(args)),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_drag",
       "Drag",
       `Drag between two coordinates or uniquely labelled visible controls. ${POINTER_COORDINATE_NOTE}`,
@@ -525,7 +622,7 @@ export function makeAgentGatewayComputerTools(
           readNumberArg(args, "duration_ms") ?? 250,
         ),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_scroll",
       "Scroll",
       `Scroll at an optional target. The target is resolved before the gesture and is never guessed. ${POINTER_COORDINATE_NOTE}`,
@@ -553,7 +650,7 @@ export function makeAgentGatewayComputerTools(
         );
       },
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_type_text",
       "Type text",
       "Type text into the currently focused desktop control.",
@@ -565,7 +662,7 @@ export function makeAgentGatewayComputerTools(
       },
       async (_args, _context) => manager.typeText(_context.callerThreadId, readRequiredText(_args)),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_press_key",
       "Press key",
       "Press one keyboard key on the computer-use seat.",
@@ -578,7 +675,7 @@ export function makeAgentGatewayComputerTools(
       async (args, context) =>
         manager.pressKey(context.callerThreadId, readStringArg(args, "key", { required: true })!),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_hotkey",
       "Press hotkey",
       "Press a keyboard shortcut as an ordered key sequence.",
@@ -612,7 +709,7 @@ export function makeAgentGatewayComputerTools(
       async (args, context) =>
         manager.writeClipboard(context.callerThreadId, readClipboardText(args)),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_set_value",
       "Set computer value",
       "Set the value of a uniquely labelled accessible control after a fresh snapshot.",
@@ -629,7 +726,7 @@ export function makeAgentGatewayComputerTools(
           readRawRequiredString(args, "value"),
         ),
     ),
-    actionEntry(
+    observedActionEntry(
       "computer_perform_action",
       "Perform computer action",
       "Perform a named semantic action on a uniquely labelled accessible control.",

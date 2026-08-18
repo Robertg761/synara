@@ -59,6 +59,14 @@ export const COMPUTER_FRAME_SOCKET_BUDGET_BYTES = 2 * 1024 * 1024;
  */
 export const COMPUTER_LEASE_IDLE_MS = 300_000;
 
+/**
+ * How long the desktop is given to settle before the screenshot that rides on
+ * an action result is captured. Long enough for a menu to open or a keystroke
+ * to paint, short enough not to throttle the action loop the screenshot exists
+ * to speed up.
+ */
+export const COMPUTER_ACTION_SETTLE_MS = 300;
+
 export type ComputerEventListener = (event: ComputerEvent) => void;
 
 interface ThreadComputerRuntimeState {
@@ -90,6 +98,14 @@ export interface ComputerManagerOptions {
   /** Injected for tests; the lease is the only clock-dependent state here. */
   readonly now?: () => number;
   readonly leaseIdleMs?: number;
+  /** Injected for tests, so action-screenshot tests do not sleep for real. */
+  readonly actionSettleMs?: number;
+}
+
+/** A capture plus which window it covers, when it covers one at all. */
+export interface ComputerCapturedWindow {
+  readonly screenshot: ComputerScreenshot;
+  readonly windowId?: string;
 }
 
 /**
@@ -123,6 +139,7 @@ export class ComputerManager {
   private readonly backendUnsubscribe?: () => void;
   private readonly now: () => number;
   private readonly leaseIdleMs: number;
+  private readonly actionSettleMs: number;
   private backendHealth: ComputerHealth;
   /**
    * Read once. A backend's capability set is decided by which providers its
@@ -142,6 +159,7 @@ export class ComputerManager {
     this.computerId = options.backend.computerId;
     this.now = options.now ?? Date.now;
     this.leaseIdleMs = options.leaseIdleMs ?? COMPUTER_LEASE_IDLE_MS;
+    this.actionSettleMs = options.actionSettleMs ?? COMPUTER_ACTION_SETTLE_MS;
     this.backendHealth = options.backend.health();
     this.backendCapabilities = options.backend.capabilities();
     this.transport =
@@ -229,6 +247,93 @@ export class ComputerManager {
     return await this.backend.captureScreenshot(request);
   }
 
+  /**
+   * Zoomed capture of the window that holds input focus, falling back to the
+   * whole workspace when no visible window with known bounds has it. This is
+   * what a perception request with no explicit target means: "show me where
+   * input is going", at window resolution rather than as a workspace-wide
+   * downscale that loses small text.
+   */
+  async captureFocusedWindow(maxDimension?: number): Promise<ComputerCapturedWindow> {
+    const limit = maxDimension === undefined ? {} : { maxDimension };
+    const window = await this.focusedCapturableWindow();
+    if (window) {
+      return {
+        screenshot: await this.backend.captureScreenshot({
+          kind: "window",
+          windowId: window.id,
+          ...limit,
+        }),
+        windowId: window.id,
+      };
+    }
+    const screenSize = await this.backend.getScreenSize();
+    return {
+      screenshot: await this.backend.captureScreenshot({
+        kind: "region",
+        region: { x: 0, y: 0, width: screenSize.width, height: screenSize.height },
+        ...limit,
+      }),
+    };
+  }
+
+  /**
+   * Best-effort perception for an action that already happened: wait for the
+   * UI to settle, then capture the window the action affected — the caller's
+   * hint when it named one, otherwise whatever holds focus. Failures return no
+   * screenshot instead of throwing, because the action itself succeeded and a
+   * capture problem must not turn that success into an error. The hint falls
+   * back to focus rather than failing outright: the action may have closed the
+   * very window it targeted.
+   */
+  async captureActionScreenshot(
+    windowIdHint?: string,
+  ): Promise<ComputerCapturedWindow | undefined> {
+    if (!this.backendCapabilities.capture) return undefined;
+    if (this.actionSettleMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.actionSettleMs));
+    }
+    if (windowIdHint !== undefined) {
+      try {
+        return {
+          screenshot: await this.backend.captureScreenshot({
+            kind: "window",
+            windowId: windowIdHint,
+          }),
+          windowId: windowIdHint,
+        };
+      } catch {
+        // Fall through to the focused window.
+      }
+    }
+    try {
+      return await this.captureFocusedWindow();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The window an untargeted capture should cover: the agent seat's focus
+   * target first, then the window the compositor reports active, then the
+   * topmost visible one. Windows without bounds cannot be captured — wlroots
+   * exposes no geometry — so they are skipped rather than attempted.
+   */
+  private async focusedCapturableWindow(): Promise<ComputerWindow | undefined> {
+    const candidates = (await this.backend.listWindows()).filter(
+      (window) => window.bounds !== undefined && window.visible && !window.minimized,
+    );
+    return (
+      candidates.find((window) => window.focused) ??
+      candidates.find((window) => window.active === true) ??
+      candidates.toSorted(
+        (first, second) =>
+          (first.stackingIndex ?? Number.MAX_SAFE_INTEGER) -
+          (second.stackingIndex ?? Number.MAX_SAFE_INTEGER),
+      )[0]
+    );
+  }
+
   async getScreenSize(): Promise<ComputerGetScreenSizeResult> {
     const [availability, screenSize] = await Promise.all([
       this.backend.availability(),
@@ -259,7 +364,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.click(resolved.point);
-    return this.actionResult(threadId, "computer_click", resolved.point, result);
+    return this.actionResult(threadId, "computer_click", resolved.point, result, resolved.windowId);
   }
 
   async doubleClick(
@@ -270,7 +375,13 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.doubleClick(resolved.point);
-    return this.actionResult(threadId, "computer_double_click", resolved.point, result);
+    return this.actionResult(
+      threadId,
+      "computer_double_click",
+      resolved.point,
+      result,
+      resolved.windowId,
+    );
   }
 
   async rightClick(
@@ -281,7 +392,13 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.rightClick(resolved.point);
-    return this.actionResult(threadId, "computer_right_click", resolved.point, result);
+    return this.actionResult(
+      threadId,
+      "computer_right_click",
+      resolved.point,
+      result,
+      resolved.windowId,
+    );
   }
 
   async moveCursor(
@@ -292,7 +409,13 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved.windowId);
     const result = await this.backend.moveCursor(resolved.point);
-    return this.actionResult(threadId, "computer_move_cursor", resolved.point, result);
+    return this.actionResult(
+      threadId,
+      "computer_move_cursor",
+      resolved.point,
+      result,
+      resolved.windowId,
+    );
   }
 
   async drag(
@@ -308,7 +431,13 @@ export class ComputerManager {
     ]);
     await this.prepareResolvedTarget(resolvedFrom.windowId ?? resolvedTo.windowId);
     const result = await this.backend.drag(resolvedFrom.point, resolvedTo.point, durationMs);
-    return this.actionResult(threadId, "computer_drag", resolvedTo.point, result);
+    return this.actionResult(
+      threadId,
+      "computer_drag",
+      resolvedTo.point,
+      result,
+      resolvedTo.windowId ?? resolvedFrom.windowId,
+    );
   }
 
   async scroll(
@@ -321,7 +450,13 @@ export class ComputerManager {
     const resolved = target ? await this.resolvePointTarget(target) : null;
     await this.prepareResolvedTarget(resolved?.windowId);
     const result = await this.backend.scroll(resolved?.point ?? null, deltaX, deltaY);
-    return this.actionResult(threadId, "computer_scroll", resolved?.point, result);
+    return this.actionResult(
+      threadId,
+      "computer_scroll",
+      resolved?.point,
+      result,
+      resolved?.windowId,
+    );
   }
 
   async typeText(threadId: string | undefined, text: string): Promise<ComputerActionResult> {
@@ -391,7 +526,13 @@ export class ComputerManager {
     const resolved = await this.resolveSemanticTarget(target);
     await this.prepareResolvedTarget(resolved.node.windowId ?? undefined);
     const result = await this.backend.setValue(resolved, value);
-    return this.actionResult(threadId, "computer_set_value", resolved.point, result);
+    return this.actionResult(
+      threadId,
+      "computer_set_value",
+      resolved.point,
+      result,
+      resolved.node.windowId ?? undefined,
+    );
   }
 
   async performAction(
@@ -403,7 +544,13 @@ export class ComputerManager {
     const resolved = await this.resolveSemanticTarget(target);
     await this.prepareResolvedTarget(resolved.node.windowId ?? undefined);
     const result = await this.backend.performAction(resolved, action);
-    return this.actionResult(threadId, "computer_perform_action", resolved.point, result);
+    return this.actionResult(
+      threadId,
+      "computer_perform_action",
+      resolved.point,
+      result,
+      resolved.node.windowId ?? undefined,
+    );
   }
 
   async withAgentActivity<A>(threadId: string, action: () => Promise<A>): Promise<A> {
@@ -721,15 +868,22 @@ export class ComputerManager {
     return { target, ...resolveComputerSemanticTarget(state.root, target) };
   }
 
+  /**
+   * The window id is the one targeting resolved, so the result reports where
+   * input was routed; a backend that reports its own window id wins, being
+   * closer to what actually happened.
+   */
   private actionResult(
     threadId: string | undefined,
     action: string,
     point: ComputerPoint | undefined,
     result: ComputerBackendActionResult | void,
+    windowId?: string,
   ): ComputerActionResult {
     this.emitAction(threadId, action);
     return computerBackendActionResult(this.computerId, action, {
       ...(point ? { point } : {}),
+      ...(windowId !== undefined ? { windowId } : {}),
       ...(result ?? {}),
     });
   }
