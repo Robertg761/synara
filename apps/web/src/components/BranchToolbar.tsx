@@ -8,13 +8,7 @@ import type {
   ThreadId,
   RuntimeMode,
 } from "@synara/contracts";
-import {
-  CheckIcon,
-  ChevronDownIcon,
-  HandoffIcon,
-  MonitorIcon,
-  WorktreeIcon,
-} from "~/lib/icons";
+import { CheckIcon, ChevronDownIcon, HandoffIcon, MonitorIcon, WorktreeIcon } from "~/lib/icons";
 import { HiOutlineHandRaised } from "react-icons/hi2";
 import { CentralIcon } from "~/lib/central-icons";
 import { useCallback, useMemo, useState, type ReactNode } from "react";

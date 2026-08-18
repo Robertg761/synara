@@ -55,6 +55,13 @@ export const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
 /** Caps both a reported window list and one window's occluder list. */
 const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
 
+/**
+ * Thread-activity kind appended by the agent gateway when a computer tool call
+ * is rejected because the chat does not have computer control enabled. The web
+ * app keys its actionable "enable computer control" chat card off this kind.
+ */
+export const COMPUTER_CONTROL_DENIED_ACTIVITY_KIND = "computer.control-denied";
+
 export const ComputerId = TrimmedNonEmptyString.check(
   Schema.isMaxLength(COMPUTER_ID_MAX_LENGTH),
 ).check(Schema.isPattern(/^[A-Za-z0-9._:-]+$/));

@@ -5053,6 +5053,16 @@ export default function ChatView({
     },
     [scheduleComposerFocus, setComposerDraftComputerControl, threadId, updateSettings],
   );
+  // "Enable" on a computer-control denial card: switch control on (which also
+  // updates the new-chat default) and suggest a retry message when the composer
+  // is empty, so the user can just hit send. Deliberately not auto-sent: the
+  // user should see and approve what goes back to the agent.
+  const handleEnableComputerControlFromDenial = useCallback(() => {
+    handleComputerControlChange(true);
+    if (prompt.trim().length === 0) {
+      setPrompt("Computer control is on now — try again.");
+    }
+  }, [handleComputerControlChange, prompt, setPrompt]);
 
   useEffect(() => {
     if (
@@ -12235,6 +12245,8 @@ export default function ChatView({
                     onOpenTurnDiff={onOpenTurnDiff}
                     onOpenThread={onNavigateToThread}
                     onOpenAutomation={onOpenAutomation}
+                    computerControlEnabled={enableComputerControl}
+                    onEnableComputerControl={handleEnableComputerControlFromDenial}
                     revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
                     onRevertUserMessage={onRevertUserMessage}
                     onUndoTurnFiles={onUndoTurnFiles}

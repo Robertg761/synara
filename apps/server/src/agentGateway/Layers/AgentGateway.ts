@@ -16,11 +16,14 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
   CommandId,
+  EventId,
   SYNARA_GATEWAY_MAX_THREADS_PER_OPERATION,
   MessageId,
   THREAD_GOAL_MAX_CHARS,
   ThreadId,
+  TurnId,
   type ProviderKind,
   type RuntimeMode,
   type ServerProviderStatus,
@@ -51,7 +54,7 @@ import {
   type AgentGatewayProviderAvailability,
 } from "../targetResolver.ts";
 import { mcpToolResultError, mcpToolResultJson } from "../protocol.ts";
-import { gatewayIsoNow as isoNow } from "../creationUtils.ts";
+import { gatewayIsoNow as isoNow, stableGatewayDigest } from "../creationUtils.ts";
 import {
   MODEL_SELECTION_INPUT_SCHEMA,
   PROVIDER_KINDS,
@@ -72,7 +75,7 @@ import { makeAgentGatewayAutomationTools } from "../automationTools.ts";
 import { makeAgentGatewayBrowserTools } from "../browserTools.ts";
 import { makeAgentGatewayDeviceTools } from "../deviceTools.ts";
 import { DeviceService } from "../../device/Services/DeviceService.ts";
-import { makeAgentGatewayComputerTools } from "../computerTools.ts";
+import { COMPUTER_CONTROL_CAPABILITY, makeAgentGatewayComputerTools } from "../computerTools.ts";
 import { ComputerService } from "../../computer/Services/ComputerService.ts";
 import { BrowserAutomationHost } from "../../browserAutomation/Services/BrowserAutomationHost.ts";
 import { makeBrowserAutomationHost } from "../../browserAutomation/Layers/BrowserAutomationHost.ts";
@@ -739,6 +742,57 @@ export const makeAgentGateway = Effect.gen(function* () {
       ? makeAgentGatewayComputerTools({ manager: computerService.manager })
       : []),
   ];
+  // One denial activity per (thread, turn): agents typically retry the denied
+  // tool several times in a row, and repeated cards would bury the chat. The
+  // decider appends activities verbatim, so the dedupe lives here.
+  const surfacedComputerControlDenials = new Set<string>();
+  const SURFACED_DENIALS_MAX = 512;
+  const surfaceCapabilityDenial: NonNullable<
+    Parameters<typeof makeAgentGatewayMcpTransport>[0]["onCapabilityDenied"]
+  > = (denial) => {
+    // Only computer control has a user-facing switch to point at; other
+    // capability denials stay plain tool errors.
+    if (denial.requiredCapability !== COMPUTER_CONTROL_CAPABILITY) return Effect.void;
+    const dedupeKey = `${denial.callerThreadId}:${denial.callerTurnId ?? "no-turn"}`;
+    if (surfacedComputerControlDenials.has(dedupeKey)) return Effect.void;
+    if (surfacedComputerControlDenials.size >= SURFACED_DENIALS_MAX) {
+      surfacedComputerControlDenials.clear();
+    }
+    surfacedComputerControlDenials.add(dedupeKey);
+    const marker = stableGatewayDigest({
+      kind: "computer-control-denied",
+      threadId: denial.callerThreadId,
+      turnId: denial.callerTurnId,
+    });
+    const createdAt = isoNow();
+    return orchestrationEngine
+      .dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.makeUnsafe(`agent:${marker}:computer-control-denied`),
+        threadId: ThreadId.makeUnsafe(denial.callerThreadId),
+        activity: {
+          id: EventId.makeUnsafe(`gateway:${marker}:computer-control-denied`),
+          tone: "error",
+          kind: COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
+          summary: "Computer control is off for this chat",
+          payload: { toolName: denial.toolName },
+          turnId: denial.callerTurnId === null ? null : TurnId.makeUnsafe(denial.callerTurnId),
+          createdAt,
+        },
+        createdAt,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("agent gateway could not surface computer-control denial", {
+            callerThreadId: denial.callerThreadId,
+            toolName: denial.toolName,
+            error: errorText(error),
+          }),
+        ),
+        Effect.asVoid,
+      );
+  };
+
   return {
     handleMcpPost: makeAgentGatewayMcpTransport({
       credentials,
@@ -746,6 +800,7 @@ export const makeAgentGateway = Effect.gen(function* () {
       tools,
       instructions: AGENT_GATEWAY_INSTRUCTIONS,
       requireThreadShell,
+      onCapabilityDenied: surfaceCapabilityDenial,
     }),
   } satisfies AgentGatewayShape;
 });

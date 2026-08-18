@@ -66,6 +66,14 @@ export function makeAgentGatewayMcpTransport(input: {
   readonly requireThreadShell: (
     threadId: string,
   ) => Effect.Effect<OrchestrationThreadShell, unknown>;
+  // Lets the gateway surface a capability denial to the user (e.g. as a thread
+  // activity). Must not fail; the denial response is returned regardless.
+  readonly onCapabilityDenied?: (denial: {
+    readonly toolName: string;
+    readonly requiredCapability: string;
+    readonly callerThreadId: string;
+    readonly callerTurnId: string | null;
+  }) => Effect.Effect<void>;
 }): AgentGatewayShape["handleMcpPost"] {
   const toolsByName = new Map(input.tools.map((tool) => [tool.definition.name, tool]));
   const handleRequest = (request: JsonRpcRequest, context: Omit<ToolContext, "jsonRpcRequestId">) =>
@@ -99,6 +107,14 @@ export function makeAgentGatewayMcpTransport(input: {
           const args = asRecord(rawArgs) ?? {};
           const requiredCapability = tool.requiredCapability;
           if (!context.callerCapabilities.has(requiredCapability)) {
+            if (input.onCapabilityDenied) {
+              yield* input.onCapabilityDenied({
+                toolName,
+                requiredCapability,
+                callerThreadId: context.callerThreadId,
+                callerTurnId: context.callerTurnId,
+              });
+            }
             return jsonRpcResult(
               request.id,
               gatewayToolErrorResult(
