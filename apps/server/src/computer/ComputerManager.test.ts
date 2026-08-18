@@ -128,6 +128,49 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("answers getStatus without a thread, corrected by live health", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+
+    const status = await manager.getStatus();
+    expect(status.computerId).toBe("desktop");
+    expect(status.availability).toEqual({ kind: "available", backend: "fake" });
+    expect(status.health.status).toBe("connected");
+    expect(status.capabilities.input).toBe(true);
+    // No thread state was created as a side effect of asking.
+    expect(backend.calls.map((call) => call.method)).not.toContain("getState");
+
+    backend.emitHealthChanged({
+      status: "reconnecting",
+      consecutiveFailures: 2,
+      reconnects: 1,
+      lastFailure: { message: "KWin vanished", at: "2026-08-16T10:00:00.000Z" },
+      captureAvailable: false,
+    });
+    const degraded = await manager.getStatus();
+    expect(degraded.health.status).toBe("reconnecting");
+    expect(degraded.availability).toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("KWin vanished"),
+    });
+
+    await manager.dispose();
+  });
+
+  it("reports a failed availability probe as backend-unavailable instead of throwing", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+
+    backend.failNext("availability", new Error("probe exploded"));
+    const status = await manager.getStatus();
+    expect(status.availability).toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("probe exploded"),
+    });
+
+    await manager.dispose();
+  });
+
   it("performs semantic writes only against a fresh, unambiguous snapshot", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });

@@ -73,6 +73,7 @@ import {
   ComputerGetScreenSizeInput,
   ComputerGetScreenSizeResult,
   ComputerGetStateInput,
+  ComputerGetStatusInput,
   ComputerHotkeyInput,
   ComputerInputClickInput,
   ComputerInputKeyInput,
@@ -89,6 +90,7 @@ import {
   ComputerSetValueInput,
   ComputerTypeTextInput,
   ComputerState,
+  ComputerStatusResult,
   ComputerThreadInput,
   ThreadComputerState,
 } from "./computer";
@@ -669,6 +671,12 @@ export const WsDeviceRpcGroup = RpcGroup.make(
 // The group is kept separate so AgentGateway can admit it only for sessions
 // that explicitly hold `computer:control` and only when a backend is supported.
 
+export const WsComputerGetStatusRpc = Rpc.make(COMPUTER_WS_METHODS.getStatus, {
+  payload: ComputerGetStatusInput,
+  success: ComputerStatusResult,
+  error: WsRpcError,
+});
+
 export const WsComputerListWindowsRpc = Rpc.make(COMPUTER_WS_METHODS.listWindows, {
   payload: ComputerListWindowsInput,
   success: ComputerListWindowsResult,
@@ -792,6 +800,7 @@ export const WsSubscribeComputerEventsRpc = Rpc.make(COMPUTER_WS_METHODS.subscri
 
 /** Linux computer control and perception surface. */
 export const WsComputerRpcGroup = RpcGroup.make(
+  WsComputerGetStatusRpc,
   WsComputerListWindowsRpc,
   WsComputerGetStateRpc,
   WsComputerGetScreenSizeRpc,

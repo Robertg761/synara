@@ -265,6 +265,32 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     target: null,
   },
 
+  // ── Computer use ──────────────────────────────────────────────────────────────
+  {
+    id: "computer:status",
+    section: "computer",
+    title: "Desktop backend",
+    keywords:
+      "Whether agents can see and control this computer's desktop right now. availability health kwin portal wayland linux computer use control status",
+    // The status row's title is dynamic (Ready / Reconnecting / Unavailable), so
+    // link to the section rather than an anchored row.
+    target: null,
+  },
+  {
+    id: "computer:open-automatically",
+    section: "computer",
+    title: "Open automatically",
+    keywords:
+      "Open the Computer pane the first time an agent acts on the desktop in a chat. auto open dock computer use",
+  },
+  {
+    id: "computer:enabling-computer-control",
+    section: "computer",
+    title: "Enabling computer control",
+    keywords:
+      "Computer control is switched on per chat from the composer's mode menu. full access toggle desktop agent computer use",
+  },
+
   // ── Behavior ──────────────────────────────────────────────────────────────────
   {
     id: "behavior:follow-up-behavior",

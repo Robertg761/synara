@@ -8,6 +8,7 @@ import {
   type ComputerGetScreenSizeInput,
   type ComputerGetScreenSizeResult,
   type ComputerGetStateInput,
+  type ComputerGetStatusInput,
   type ComputerHotkeyInput,
   type ComputerInputClickInput,
   type ComputerInputKeyInput,
@@ -23,6 +24,7 @@ import {
   type ComputerScrollInput,
   type ComputerSetValueInput,
   type ComputerState,
+  type ComputerStatusResult,
   type ComputerThreadInput,
   type ComputerTypeTextInput,
   type ThreadComputerState,
@@ -63,6 +65,9 @@ function attempt<A>(
 }
 
 export interface WsComputerHandlers {
+  readonly [COMPUTER_WS_METHODS.getStatus]: (
+    input: ComputerGetStatusInput,
+  ) => Effect.Effect<ComputerStatusResult, WsRpcError>;
   readonly [COMPUTER_WS_METHODS.listWindows]: (
     input: ComputerListWindowsInput,
   ) => Effect.Effect<ComputerListWindowsResult, WsRpcError>;
@@ -126,36 +131,40 @@ export function makeWsComputerHandlers(
   computerService: ComputerServiceShape | undefined,
 ): WsComputerHandlers {
   if (!computerService?.supported) {
+    const unsupportedStatus = {
+      computerId: computerService?.manager.computerId ?? "desktop",
+      availability: computerService?.availability ?? {
+        kind: "backend-unavailable" as const,
+        message: UNSUPPORTED_MESSAGE,
+      },
+      // Nothing supervises a backend that was never started, so the health
+      // of one is permanently the boot-time verdict.
+      health: {
+        status: "unavailable" as const,
+        consecutiveFailures: 0,
+        reconnects: 0,
+        captureAvailable: false,
+      },
+      // A backend that was never started can do nothing, and saying so is
+      // what keeps the panel's badges and the tool descriptions from
+      // advertising a desktop this host has not got.
+      capabilities: NO_COMPUTER_CAPABILITIES,
+    } satisfies ComputerStatusResult;
     const unsupportedState = (input: ComputerThreadInput) =>
       attempt(async () => {
         return {
+          ...unsupportedStatus,
           threadId: input.threadId,
           version: 0,
-          computerId: computerService?.manager.computerId ?? "desktop",
           windows: [],
           screenSize: { width: 1, height: 1 },
           agentActive: false,
           controlledByOtherThread: false,
-          availability: computerService?.availability ?? {
-            kind: "backend-unavailable" as const,
-            message: UNSUPPORTED_MESSAGE,
-          },
-          // Nothing supervises a backend that was never started, so the health
-          // of one is permanently the boot-time verdict.
-          health: {
-            status: "unavailable" as const,
-            consecutiveFailures: 0,
-            reconnects: 0,
-            captureAvailable: false,
-          },
-          // A backend that was never started can do nothing, and saying so is
-          // what keeps the panel's badges and the tool descriptions from
-          // advertising a desktop this host has not got.
-          capabilities: NO_COMPUTER_CAPABILITIES,
           lastError: null,
         } satisfies ThreadComputerState;
       }, "Failed to read computer availability");
     return {
+      [COMPUTER_WS_METHODS.getStatus]: () => Effect.succeed(unsupportedStatus),
       [COMPUTER_WS_METHODS.listWindows]: () => unsupported(),
       [COMPUTER_WS_METHODS.getState]: () => unsupported(),
       [COMPUTER_WS_METHODS.getScreenSize]: () => unsupported(),
@@ -180,6 +189,8 @@ export function makeWsComputerHandlers(
 
   const manager = computerService.manager;
   return {
+    [COMPUTER_WS_METHODS.getStatus]: () =>
+      attempt(() => manager.getStatus(), "Failed to read computer status"),
     [COMPUTER_WS_METHODS.listWindows]: () =>
       attempt(() => manager.listWindows(), "Failed to list computer windows"),
     [COMPUTER_WS_METHODS.getState]: (input) =>

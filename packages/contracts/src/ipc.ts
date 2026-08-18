@@ -168,11 +168,13 @@ import type {
   ComputerEvent,
   ComputerGetScreenSizeInput,
   ComputerGetScreenSizeResult,
+  ComputerGetStatusInput,
   ComputerInputClickInput,
   ComputerInputKeyInput,
   ComputerInputScrollInput,
   ComputerListWindowsInput,
   ComputerListWindowsResult,
+  ComputerStatusResult,
   ComputerThreadInput,
   ThreadComputerState,
 } from "./computer";
@@ -879,6 +881,8 @@ export interface NativeApi {
     onEvent: (callback: (event: DeviceEvent) => void) => () => void;
   };
   computer: {
+    /** Thread-independent backend status for surfaces outside any conversation. */
+    getStatus: (input: ComputerGetStatusInput) => Promise<ComputerStatusResult>;
     getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
     listWindows: (input: ComputerListWindowsInput) => Promise<ComputerListWindowsResult>;
     getScreenSize: (input: ComputerGetScreenSizeInput) => Promise<ComputerGetScreenSizeResult>;

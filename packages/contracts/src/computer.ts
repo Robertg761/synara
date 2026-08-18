@@ -5,6 +5,10 @@ import { IsoDateTime, NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./
 // ── WebSocket surface ────────────────────────────────────────────────
 
 export const COMPUTER_WS_METHODS = {
+  // Thread-independent backend status for surfaces outside any conversation,
+  // such as the settings screen. Everything else on this surface either acts on
+  // the desktop or answers for one thread.
+  getStatus: "computer.getStatus",
   listWindows: "computer.listWindows",
   getState: "computer.getState",
   getScreenSize: "computer.getScreenSize",
@@ -370,6 +374,23 @@ export const ThreadComputerState = Schema.Struct({
   lastError: Schema.NullOr(Schema.String.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH))),
 });
 export type ThreadComputerState = typeof ThreadComputerState.Type;
+
+export const ComputerGetStatusInput = Schema.Struct({});
+export type ComputerGetStatusInput = typeof ComputerGetStatusInput.Type;
+
+/**
+ * `ThreadComputerState` without the thread: the settings screen asks how this
+ * server's desktop backend is doing, and there is no conversation to attribute
+ * the answer to. Availability is corrected by live health the same way a thread
+ * snapshot's is.
+ */
+export const ComputerStatusResult = Schema.Struct({
+  computerId: ComputerId,
+  availability: ComputerAvailability,
+  health: ComputerHealth,
+  capabilities: ComputerCapabilities,
+});
+export type ComputerStatusResult = typeof ComputerStatusResult.Type;
 
 export const ComputerListWindowsInput = Schema.Struct({});
 export type ComputerListWindowsInput = typeof ComputerListWindowsInput.Type;

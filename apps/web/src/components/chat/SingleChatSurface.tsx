@@ -633,21 +633,23 @@ export function SingleChatSurface(props: {
       : null,
   });
   useComputerEventBridge({
-    onOpenPaneRequested: (event) => {
-      routeSingleComputerPaneOpenRequest({
-        currentThreadId: props.threadId,
-        requestedThreadId: event.threadId,
-        requestImmediateComputerHydration: () => requestImmediateDockHydration("computer"),
-        openComputerPane: (threadId) => openPane(threadId, { kind: "computer" }),
-        navigateToThread: (threadId) => {
-          void navigate({
-            to: "/$threadId",
-            params: { threadId },
-            replace: true,
+    onOpenPaneRequested: appSettings.autoOpenComputerPane
+      ? (event) => {
+          routeSingleComputerPaneOpenRequest({
+            currentThreadId: props.threadId,
+            requestedThreadId: event.threadId,
+            requestImmediateComputerHydration: () => requestImmediateDockHydration("computer"),
+            openComputerPane: (threadId) => openPane(threadId, { kind: "computer" }),
+            navigateToThread: (threadId) => {
+              void navigate({
+                to: "/$threadId",
+                params: { threadId },
+                replace: true,
+              });
+            },
           });
-        },
-      });
-    },
+        }
+      : null,
   });
 
   const excludedThreadIds = new Set<ThreadId>([props.threadId]);

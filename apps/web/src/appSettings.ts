@@ -260,6 +260,8 @@ export const AppSettingsSchema = Schema.Struct({
   appSnapPlaySound: Schema.Boolean.pipe(withDefaults(() => true)),
   // Deprecated rename bridge. Normalization migrates this value and then omits the key.
   enableAppshots: Schema.optionalKey(Schema.Boolean),
+  // Open the Computer pane automatically when an agent starts driving the desktop.
+  autoOpenComputerPane: Schema.Boolean.pipe(withDefaults(() => true)),
   sidebarProjectSortOrder: SidebarProjectSortOrder.pipe(
     withDefaults(() => DEFAULT_SIDEBAR_PROJECT_SORT_ORDER),
   ),

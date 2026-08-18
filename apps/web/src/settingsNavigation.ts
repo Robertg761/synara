@@ -10,6 +10,7 @@ export const SETTINGS_SECTION_IDS = [
   "notifications",
   "behavior",
   "appsnap",
+  "computer",
   "shortcuts",
   "worktrees",
   "archived",
@@ -119,6 +120,14 @@ export const SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = [
     description: "Capture another app's frontmost window directly into a task.",
     icon: "screen-capture",
     eyebrow: "Screen capture",
+  },
+  {
+    id: "computer",
+    group: "integrations",
+    label: "Computer use",
+    description: "Let agents see and control this computer's desktop, and check backend status.",
+    icon: "computer-use",
+    eyebrow: "Desktop control",
   },
   {
     id: "integrations",

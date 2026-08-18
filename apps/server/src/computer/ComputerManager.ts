@@ -14,6 +14,7 @@ import {
   type ComputerListWindowsResult,
   type ComputerLaunchAppResult,
   type ComputerState,
+  type ComputerStatusResult,
   type ComputerTarget,
   type ComputerWindow,
   type ThreadComputerState,
@@ -182,6 +183,28 @@ export class ComputerManager {
 
   async availability(): Promise<ComputerAvailability> {
     return await this.backend.availability();
+  }
+
+  /**
+   * Thread-independent status for surfaces outside any conversation, such as
+   * the settings screen. A probe failure becomes `backend-unavailable` rather
+   * than an error: the caller is asking whether the desktop works, and "the
+   * probe itself failed" is an answer to that question, not a failure to
+   * answer it.
+   */
+  async getStatus(): Promise<ComputerStatusResult> {
+    let availability: ComputerAvailability;
+    try {
+      availability = await this.backend.availability();
+    } catch (error) {
+      availability = { kind: "backend-unavailable", message: errorMessage(error) };
+    }
+    return {
+      computerId: this.computerId,
+      availability: this.correctedAvailability(availability),
+      health: this.backendHealth,
+      capabilities: this.backendCapabilities,
+    };
   }
 
   async listWindows(): Promise<ComputerListWindowsResult> {
@@ -820,7 +843,7 @@ export class ComputerManager {
       ...(state.cursor ? { cursor: state.cursor } : {}),
       agentActive: state.agentActiveCount > 0,
       controlledByOtherThread: this.lease !== null && this.lease.threadId !== threadId,
-      availability: this.liveAvailability(state),
+      availability: this.correctedAvailability(state.availability),
       health: this.backendHealth,
       capabilities: this.backendCapabilities,
       lastError: state.lastError,
@@ -840,13 +863,13 @@ export class ComputerManager {
    * dialog is simply unanswered. Reporting that as unavailable would hide the
    * one thing the user can act on behind a badge that says to give up.
    */
-  private liveAvailability(state: ThreadComputerRuntimeState): ComputerAvailability {
+  private correctedAvailability(availability: ComputerAvailability): ComputerAvailability {
     if (
       this.backendHealth.status === "connected" ||
       this.backendHealth.status === "awaiting-consent" ||
-      state.availability.kind !== "available"
+      availability.kind !== "available"
     ) {
-      return state.availability;
+      return availability;
     }
     return { kind: "backend-unavailable", message: healthUnavailableMessage(this.backendHealth) };
   }

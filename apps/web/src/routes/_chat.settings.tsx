@@ -37,6 +37,7 @@ import {
   AppSnapSettingsPanel,
   NotificationsSettingsPanel,
 } from "~/components/settings/DesktopSettingsPanels";
+import { ComputerSettingsPanel } from "~/components/settings/ComputerSettingsPanel";
 import { ModelsSettingsPanel } from "~/components/settings/ModelsSettingsPanel";
 import {
   isProviderInstallSettingsDirty,
@@ -274,6 +275,9 @@ function SettingsRouteView() {
       ? ["AppSnap shortcut"]
       : []),
     ...(settings.appSnapPlaySound !== defaults.appSnapPlaySound ? ["AppSnap capture sound"] : []),
+    ...(settings.autoOpenComputerPane !== defaults.autoOpenComputerPane
+      ? ["Computer pane auto-open"]
+      : []),
     ...(settings.enableProviderUpdateChecks !== defaults.enableProviderUpdateChecks
       ? ["Provider update checks"]
       : []),
@@ -1163,6 +1167,12 @@ function SettingsRouteView() {
                 />
                 <AppSnapSettingsPanel
                   active={activeSection === "appsnap"}
+                  settings={settings}
+                  defaults={defaults}
+                  updateSettings={updateSettings}
+                />
+                <ComputerSettingsPanel
+                  active={activeSection === "computer"}
                   settings={settings}
                   defaults={defaults}
                   updateSettings={updateSettings}
