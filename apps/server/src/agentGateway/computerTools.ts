@@ -16,7 +16,12 @@ import {
   type ComputerCaptureRequest,
 } from "../computer/ComputerBackend.ts";
 import { ComputerLeaseError, ComputerManager } from "../computer/ComputerManager.ts";
-import { mcpToolResultError, mcpToolResultJson, type McpToolCallResult } from "./protocol.ts";
+import {
+  mcpToolResultError,
+  mcpToolResultJson,
+  type McpToolCallResult,
+  type McpToolMeta,
+} from "./protocol.ts";
 import {
   ToolInputError,
   errorText,
@@ -62,6 +67,44 @@ export function computerToolRequiresApproval(name: string): boolean {
   return COMPUTER_APPROVAL_REQUIRED_TOOLS.has(name);
 }
 
+/**
+ * The see-act loop: the tools an agent driving the desktop reaches for on
+ * nearly every step. Perception first, then the pointer and keyboard actions
+ * that make up the overwhelming majority of desktop work.
+ *
+ * Claude's harness defers MCP tool schemas behind a tool-search indirection, so
+ * without this marker the model spends a round trip discovering these before it
+ * can act, and more of them whenever the loop reaches a tool it has not loaded
+ * yet — pure latency in the middle of a control loop that is already round-trip
+ * bound. The long tail below stays deferred so a thread that never touches the
+ * desktop pays no prompt tokens for it.
+ *
+ * Deliberately no `anthropic/searchHint` on the deferred remainder: the
+ * harness's tool search scores a query term matching a name segment far higher
+ * than one matching a hint, and every tool here already shares the `computer`
+ * segment, so one search retrieves the whole set regardless. A hint would also
+ * *replace* the description the harness advertises for a deferred tool, which
+ * for one shared string would make the long tail indistinguishable.
+ */
+const COMPUTER_ACT_LOOP_TOOLS = new Set([
+  "computer_get_state",
+  "computer_screenshot",
+  "computer_list_windows",
+  "computer_click",
+  "computer_type_text",
+  "computer_press_key",
+  "computer_hotkey",
+  "computer_scroll",
+]);
+
+/**
+ * Spread into a definition rather than set on it: `_meta` must be absent, not
+ * present-and-empty, for the deferred tools.
+ */
+function computerToolMeta(name: string): { readonly _meta?: McpToolMeta } {
+  return COMPUTER_ACT_LOOP_TOOLS.has(name) ? { _meta: { "anthropic/alwaysLoad": true } } : {};
+}
+
 export interface AgentGatewayComputerToolsOptions {
   readonly manager: ComputerManager;
 }
@@ -94,7 +137,23 @@ const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
   include_screenshot: {
     type: "boolean",
     description:
-      "Attach the post-action screenshot to the result. Defaults to true; pass false to skip the capture when chaining actions whose intermediate state you will not look at.",
+      "Attach the post-action screenshot to the result. Defaults to true. Pass false only when another action follows in this same response and you will read that action's screenshot instead. Never pass false on the last action before you need to see the result: skipping it and then calling computer_screenshot costs the extra round trip the attached screenshot exists to avoid.",
+  },
+} as const;
+
+/**
+ * Keyboard input carries no coordinate, so the only thing that decides where it
+ * lands is seat focus. Every keyboard tool says so identically, and says what to
+ * pass to make it deterministic.
+ */
+const KEYBOARD_TARGET_NOTE =
+  "Keys go to whichever window holds the agent seat's keyboard focus. Pass window_id to raise and focus a specific window first — recommended whenever more than one window is open, since focus otherwise sits wherever the last action left it.";
+
+const KEYBOARD_TARGET_PROPERTY = {
+  window_id: {
+    type: "string",
+    description:
+      "Optional window id from computer_list_windows. The window is raised and given the agent seat's keyboard focus before the keys are sent, and the result's screenshot is zoomed to it.",
   },
 } as const;
 
@@ -164,12 +223,17 @@ function readTarget(args: Record<string, unknown>): ComputerTarget {
   return readTargetRecord(args);
 }
 
+/** Accepts both spellings, because models emit the camelCase one either way. */
+function readWindowIdArg(args: Record<string, unknown>): string | undefined {
+  return readStringArg(args, "window_id") ?? readStringArg(args, "windowId");
+}
+
 function readTargetRecord(args: Record<string, unknown>): ComputerTarget {
   const x = readNumberArg(args, "x");
   const y = readNumberArg(args, "y");
   const label = readStringArg(args, "label");
   const role = readStringArg(args, "role");
-  const windowId = readStringArg(args, "window_id") ?? readStringArg(args, "windowId");
+  const windowId = readWindowIdArg(args);
   return {
     ...(x !== undefined ? { x } : {}),
     ...(y !== undefined ? { y } : {}),
@@ -268,7 +332,7 @@ type ScreenshotRequest =
  * preferring one would hand the model a screenshot it cannot map.
  */
 function readCaptureRequest(args: Record<string, unknown>): ScreenshotRequest {
-  const windowId = readStringArg(args, "window_id") ?? readStringArg(args, "windowId");
+  const windowId = readWindowIdArg(args);
   const present = CAPTURE_REGION_KEYS.filter(
     (key) => args[key] !== undefined && args[key] !== null,
   );
@@ -369,6 +433,7 @@ export function makeAgentGatewayComputerTools(
       description,
       inputSchema,
       annotations: { title, ...WRITE_TOOL_ANNOTATIONS },
+      ...computerToolMeta(name),
     },
     handler: handle(name, run),
   });
@@ -437,6 +502,7 @@ export function makeAgentGatewayComputerTools(
           "List visible desktop windows and their bounds without touching the pointer. Windows come back topmost-first: stackingIndex is 0 for the topmost window and grows downward, and occludedBy names the overlapping windows stacked above each one. A plain x/y click lands on whatever is topmost at that point, so when the window you want is occluded, pass its id as window_id alongside x/y to scope the click to it. When present, active reports which window the desktop considers activated; apps may silently drop keyboard shortcuts sent to a window that is not active, so if a hotkey had no effect, check this field.",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         annotations: { title: "List computer windows", ...READ_ONLY_TOOL_ANNOTATIONS },
+        ...computerToolMeta("computer_list_windows"),
       },
       handler: handle("computer_list_windows", async () => manager.listWindows()),
     },
@@ -455,6 +521,7 @@ export function makeAgentGatewayComputerTools(
           additionalProperties: false,
         },
         annotations: { title: "Get computer state", ...READ_ONLY_TOOL_ANNOTATIONS },
+        ...computerToolMeta("computer_get_state"),
       },
       handler: handle("computer_get_state", async (args) =>
         imageStateResult(
@@ -496,6 +563,7 @@ export function makeAgentGatewayComputerTools(
           additionalProperties: false,
         },
         annotations: { title: "Capture computer screenshot", ...READ_ONLY_TOOL_ANNOTATIONS },
+        ...computerToolMeta("computer_screenshot"),
       },
       handler: handle("computer_screenshot", async (args) => {
         const request = readCaptureRequest(args);
@@ -526,6 +594,7 @@ export function makeAgentGatewayComputerTools(
         description: "Read the logical screen dimensions used for coordinate targeting.",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         annotations: { title: "Get screen size", ...READ_ONLY_TOOL_ANNOTATIONS },
+        ...computerToolMeta("computer_get_screen_size"),
       },
       handler: handle("computer_get_screen_size", async () => manager.getScreenSize()),
     },
@@ -547,6 +616,7 @@ export function makeAgentGatewayComputerTools(
           idempotentHint: true,
           openWorldHint: false,
         },
+        ...computerToolMeta("computer_read_clipboard"),
       },
       handler: handle("computer_read_clipboard", async (_args, context) =>
         manager.readClipboard(context.callerThreadId),
@@ -653,36 +723,42 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_type_text",
       "Type text",
-      "Type text into the currently focused desktop control.",
+      `Type text into the focused desktop control. ${KEYBOARD_TARGET_NOTE}`,
       {
         type: "object",
-        properties: { text: { type: "string" } },
+        properties: { text: { type: "string" }, ...KEYBOARD_TARGET_PROPERTY },
         required: ["text"],
         additionalProperties: false,
       },
-      async (_args, _context) => manager.typeText(_context.callerThreadId, readRequiredText(_args)),
+      async (args, context) =>
+        manager.typeText(context.callerThreadId, readRequiredText(args), readWindowIdArg(args)),
     ),
     observedActionEntry(
       "computer_press_key",
       "Press key",
-      "Press one keyboard key on the computer-use seat.",
+      `Press one keyboard key on the computer-use seat. ${KEYBOARD_TARGET_NOTE}`,
       {
         type: "object",
-        properties: { key: { type: "string" } },
+        properties: { key: { type: "string" }, ...KEYBOARD_TARGET_PROPERTY },
         required: ["key"],
         additionalProperties: false,
       },
       async (args, context) =>
-        manager.pressKey(context.callerThreadId, readStringArg(args, "key", { required: true })!),
+        manager.pressKey(
+          context.callerThreadId,
+          readStringArg(args, "key", { required: true })!,
+          readWindowIdArg(args),
+        ),
     ),
     observedActionEntry(
       "computer_hotkey",
       "Press hotkey",
-      "Press a keyboard shortcut as an ordered key sequence.",
+      `Press a keyboard shortcut as an ordered key sequence. ${KEYBOARD_TARGET_NOTE}`,
       {
         type: "object",
         properties: {
           keys: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 16 },
+          ...KEYBOARD_TARGET_PROPERTY,
         },
         required: ["keys"],
         additionalProperties: false,
@@ -694,6 +770,7 @@ export function makeAgentGatewayComputerTools(
             (() => {
               throw new ToolInputError('Missing required argument "keys".');
             })(),
+          readWindowIdArg(args),
         ),
     ),
     actionEntry(

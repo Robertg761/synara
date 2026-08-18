@@ -118,6 +118,35 @@ describe("agent gateway computer tools", () => {
     }
   });
 
+  it("preloads only the act-loop schemas into the Claude prompt", async () => {
+    const { tools, byName } = await setup();
+    const preloaded = tools
+      .filter((tool) => tool.definition._meta?.["anthropic/alwaysLoad"] === true)
+      .map((tool) => tool.definition.name);
+    expect(preloaded).toEqual([
+      "computer_list_windows",
+      "computer_get_state",
+      "computer_screenshot",
+      "computer_click",
+      "computer_scroll",
+      "computer_type_text",
+      "computer_press_key",
+      "computer_hotkey",
+    ]);
+    // The long tail stays behind tool search, and carries no search hint: a
+    // hint replaces the description a deferred tool advertises, and the shared
+    // `computer` name segment already retrieves the whole set in one search.
+    for (const tool of tools) {
+      expect(tool.definition._meta?.["anthropic/searchHint"]).toBeUndefined();
+      if (preloaded.includes(tool.definition.name)) continue;
+      expect(tool.definition._meta).toBeUndefined();
+    }
+    // `_meta` is additive: it must not disturb what the tool already declares.
+    expect(byName.get("computer_click")?.definition.annotations).toMatchObject({
+      readOnlyHint: false,
+    });
+  });
+
   it("returns perception payloads and preserves screenshot image content", async () => {
     const { call } = await setup();
     const list = await call("computer_list_windows", {});
@@ -363,6 +392,52 @@ describe("agent gateway computer tools", () => {
     expect(result.isError).not.toBe(true);
     expect(result.content.map((entry) => entry.type)).toEqual(["text"]);
     expect(backend.callsFor("captureScreenshot")).toHaveLength(0);
+  });
+
+  it("focuses a named window before keyboard input and zooms the result to it", async () => {
+    const { backend, call } = await setup();
+
+    const hotkey = await call("computer_hotkey", {
+      keys: ["ctrl", "t"],
+      window_id: "fake-calculator",
+    });
+    expect(hotkey.isError).not.toBe(true);
+    expect(backend.callsFor("raiseWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+    expect(backend.callsFor("focusWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+    expect(resultJson(hotkey)).toMatchObject({ windowId: "fake-calculator" });
+    // The screenshot follows the keys, so the model sees the window it typed
+    // into rather than whatever happened to be focused.
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-calculator",
+    });
+
+    // The camel-case spelling works here for the same reason it does on targets.
+    const typed = await call("computer_type_text", { text: "hi", windowId: "fake-terminal" });
+    expect(typed.isError).not.toBe(true);
+    expect(backend.callsFor("focusWindow").at(-1)?.args).toEqual(["fake-terminal"]);
+    expect(backend.callsFor("typeText").at(-1)?.args).toEqual(["hi"]);
+
+    const pressed = await call("computer_press_key", { key: "enter", window_id: "gone" });
+    expect(pressed.isError).toBe(true);
+    expect(resultJson(pressed)).toMatchObject({
+      error: { code: "computer_target_not_found" },
+    });
+    expect(backend.callsFor("pressKey")).toHaveLength(0);
+  });
+
+  it("tells the model where keyboard input lands and when not to skip a screenshot", async () => {
+    const { byName } = await setup();
+    for (const name of ["computer_type_text", "computer_press_key", "computer_hotkey"]) {
+      const tool = byName.get(name);
+      expect(tool?.definition.description).toContain("agent seat's keyboard focus");
+      expect(tool?.definition.description).toContain("Pass window_id");
+      expect(JSON.stringify(tool?.definition.inputSchema)).toContain("window_id");
+    }
+    // The opt-out has to fence itself off, or it reintroduces the separate
+    // perception call the attached screenshot exists to remove.
+    const schema = JSON.stringify(byName.get("computer_click")?.definition.inputSchema);
+    expect(schema).toContain("Never pass false on the last action");
   });
 
   it("keeps a successful action result when the post-action capture fails", async () => {
