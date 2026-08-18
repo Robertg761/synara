@@ -9261,6 +9261,7 @@ export default function ChatView({
     },
     [
       activeThread,
+      enableComputerControl,
       isConnecting,
       isRevertingCheckpoint,
       isSendBusy,
@@ -9337,6 +9338,7 @@ export default function ChatView({
     }
   }, [
     activeThreadId,
+    enableComputerControl,
     envMode,
     interactionMode,
     markWorkflowRunDismissed,
@@ -9598,6 +9600,7 @@ export default function ChatView({
     activeThread,
     activeThreadAssociatedWorktree,
     beginLocalDispatch,
+    enableComputerControl,
     isConnecting,
     isSendBusy,
     isServerThread,
