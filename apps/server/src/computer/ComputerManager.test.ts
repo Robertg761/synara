@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import type { ThreadComputerState } from "@synara/contracts";
+import type { ComputerWindow, ThreadComputerState } from "@synara/contracts";
 import { decodeComputerFrame } from "@synara/shared/computerFrame";
 
+import { ComputerBackendError } from "./ComputerBackend.ts";
 import { ComputerManager } from "./ComputerManager.ts";
 import { FakeComputerBackend } from "./FakeComputerBackend.ts";
 import type { FrameSink } from "@synara/shared/frameTransport";
@@ -24,6 +25,35 @@ function deferred(): { readonly promise: Promise<void>; readonly resolve: () => 
     resolve = complete;
   });
   return { promise, resolve };
+}
+
+/**
+ * A calculator buried under a full-screen browser: the live failure window
+ * scoping exists for, where a bare coordinate click lands on the browser.
+ */
+function coveredCalculatorWindows(): readonly ComputerWindow[] {
+  return [
+    {
+      id: "fake-browser",
+      title: "Browser",
+      bounds: { x: 0, y: 0, width: 1_920, height: 1_080 },
+      focused: true,
+      minimized: false,
+      visible: true,
+      stackingIndex: 0,
+      occludedBy: [],
+    },
+    {
+      id: "fake-calculator",
+      title: "Calculator",
+      bounds: { x: 1_050, y: 120, width: 420, height: 620 },
+      focused: false,
+      minimized: false,
+      visible: true,
+      stackingIndex: 1,
+      occludedBy: ["fake-browser"],
+    },
+  ];
 }
 
 describe("ComputerManager and FakeComputerBackend", () => {
@@ -194,32 +224,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
   });
 
   it("raises a target window before focusing it and scopes a coordinate click to it", async () => {
-    // The browser covers the calculator, which is the live failure this
-    // targeting exists for: a bare coordinate click lands on the browser.
-    const backend = new FakeComputerBackend({
-      windows: [
-        {
-          id: "fake-browser",
-          title: "Browser",
-          bounds: { x: 0, y: 0, width: 1_920, height: 1_080 },
-          focused: true,
-          minimized: false,
-          visible: true,
-          stackingIndex: 0,
-          occludedBy: [],
-        },
-        {
-          id: "fake-calculator",
-          title: "Calculator",
-          bounds: { x: 1_050, y: 120, width: 420, height: 620 },
-          focused: false,
-          minimized: false,
-          visible: true,
-          stackingIndex: 1,
-          occludedBy: ["fake-browser"],
-        },
-      ],
-    });
+    const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
     const manager = new ComputerManager({ backend });
 
     await manager.click("thread-1", { label: "Calculate", role: "button" });
@@ -265,6 +270,130 @@ describe("ComputerManager and FakeComputerBackend", () => {
     ).resolves.toMatchObject({ point: { x: 1_180, y: 228 } });
     expect(backend.callsFor("raiseWindow")).toHaveLength(0);
     expect(backend.callsFor("focusWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+
+    await manager.dispose();
+  });
+
+  it("refuses a covered target the desktop cannot raise, and clicks it once it can", async () => {
+    const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
+    (backend as unknown as { raiseWindow?: undefined }).raiseWindow = undefined;
+    const manager = new ComputerManager({ backend });
+
+    const covered = manager.click("thread-1", { x: 1_100, y: 200, windowId: "fake-calculator" });
+    await expect(covered).rejects.toMatchObject({ code: "computer_target_occluded" });
+    // The refusal has to name what is in the way, or the model has nothing to
+    // act on but a retry.
+    await expect(covered).rejects.toThrow(/Browser/);
+    // Nothing was injected: the point of refusing is that no click lands in the
+    // covering window.
+    expect(backend.callsFor("click")).toHaveLength(0);
+    expect(backend.callsFor("focusWindow")).toHaveLength(0);
+
+    // A label target resolves to the same buried window and is refused too.
+    await expect(
+      manager.click("thread-1", { label: "Calculate", role: "button" }),
+    ).rejects.toMatchObject({ code: "computer_target_occluded" });
+
+    // A point the covering window does not contain is safe to click without a
+    // raise, so it goes through.
+    await expect(
+      manager.click("thread-1", { x: 1_100, y: 200, windowId: "fake-browser" }),
+    ).resolves.toMatchObject({ point: { x: 1_100, y: 200 }, windowId: "fake-browser" });
+
+    await manager.dispose();
+  });
+
+  it("refuses a covered target when the raise itself fails", async () => {
+    const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
+    const manager = new ComputerManager({ backend });
+    backend.failNext("raiseWindow", new Error("plugin has no raiseWindow"));
+
+    await expect(
+      manager.click("thread-1", { x: 1_100, y: 200, windowId: "fake-calculator" }),
+    ).rejects.toThrow(/plugin has no raiseWindow/);
+    expect(backend.callsFor("click")).toHaveLength(0);
+
+    // The next call raises normally and is not held against the target.
+    await expect(
+      manager.click("thread-1", { x: 1_100, y: 200, windowId: "fake-calculator" }),
+    ).resolves.toMatchObject({ point: { x: 1_100, y: 200 }, windowId: "fake-calculator" });
+
+    await manager.dispose();
+  });
+
+  it("routes keyboard input to a named window and leaves focus alone without one", async () => {
+    const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    await expect(manager.typeText("thread-1", "12", "fake-calculator")).resolves.toMatchObject({
+      action: "computer_type_text",
+      windowId: "fake-calculator",
+    });
+    expect(backend.callsFor("raiseWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+    expect(backend.callsFor("focusWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+
+    await expect(manager.pressKey("thread-1", "enter", "fake-browser")).resolves.toMatchObject({
+      windowId: "fake-browser",
+    });
+    expect(backend.callsFor("focusWindow").at(-1)?.args).toEqual(["fake-browser"]);
+    await expect(manager.hotkey("thread-1", ["ctrl", "t"], "fake-browser")).resolves.toMatchObject({
+      windowId: "fake-browser",
+    });
+
+    // Without a window the keystroke follows whatever focus the last action
+    // left, which is what click-then-type depends on: focus is never cleared.
+    const focusCalls = backend.callsFor("focusWindow").length;
+    await expect(manager.typeText("thread-1", "9")).resolves.not.toHaveProperty("windowId");
+    expect(backend.callsFor("focusWindow")).toHaveLength(focusCalls);
+    expect(backend.callsFor("clearFocusWindow")).toHaveLength(0);
+
+    // A stale id fails before any key is sent rather than typing into whatever
+    // holds focus instead.
+    const typeCalls = backend.callsFor("typeText").length;
+    await expect(manager.typeText("thread-1", "9", "gone")).rejects.toMatchObject({
+      code: "computer_target_not_found",
+      notFound: true,
+    });
+    expect(backend.callsFor("typeText")).toHaveLength(typeCalls);
+
+    await manager.dispose();
+  });
+
+  it("explains a scoped injection the desktop refused, and passes other failures through", async () => {
+    const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    // A refusal means nothing was delivered, so the caller has to be told that
+    // and told what to change; the compositor only names the call it declined.
+    backend.failNext(
+      "click",
+      new ComputerBackendError("Synara KWin plugin rejected pressButton.", {
+        retryable: true,
+        rejectedOperation: "pressButton",
+      }),
+    );
+    const refused = manager.click("thread-1", { x: 1_100, y: 200, windowId: "fake-calculator" });
+    await expect(refused).rejects.toMatchObject({ code: "computer_target_refused" });
+    await expect(refused).rejects.toThrow(/no input was sent/);
+    await expect(refused).rejects.toThrow(/label instead of a coordinate/);
+
+    // An unscoped action has no window to blame, so its error is left alone.
+    backend.failNext(
+      "click",
+      new ComputerBackendError("Synara KWin plugin rejected pressButton.", {
+        rejectedOperation: "pressButton",
+      }),
+    );
+    await expect(manager.click("thread-1", { x: 1_100, y: 200 })).rejects.toThrow(
+      /plugin rejected pressButton/,
+    );
+
+    // A fault is not a refusal: rewriting it would claim an injection never
+    // happened when it may well have.
+    backend.failNext("click", new ComputerBackendError("session bus disconnected"));
+    await expect(
+      manager.click("thread-1", { x: 1_100, y: 200, windowId: "fake-calculator" }),
+    ).rejects.toThrow(/session bus disconnected/);
 
     await manager.dispose();
   });

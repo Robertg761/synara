@@ -1419,7 +1419,21 @@ bool SynaraComputerUsePlugin::usableWindow(const Window *window) const
 bool SynaraComputerUsePlugin::updatePointerFocus()
 {
     Window *window = nullptr;
-    if (usableWindow(m_targetWindow) && m_targetWindow->hitTest(m_pos)) {
+    if (m_targetRequested) {
+        // An explicit target owns the pointer, exactly as it owns the keyboard.
+        // Falling back to whatever the stacking order puts under the cursor is
+        // how a click aimed at a partly covered window is delivered to the
+        // window covering it, which reads to the caller as a button that does
+        // nothing. A target that has gone away, or that does not accept input
+        // at this point, therefore fails the injection instead: the caller can
+        // recover from a refusal and cannot recover from a click it never made.
+        if (!usableWindow(m_targetWindow) || !m_targetWindow->hitTest(m_pos)) {
+            if (m_pointerWindow && m_seat) {
+                m_seat->notifyPointerLeave();
+            }
+            m_pointerWindow.clear();
+            return false;
+        }
         window = m_targetWindow;
     } else {
         window = windowAt(m_pos);

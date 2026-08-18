@@ -208,6 +208,9 @@ function makeBackend(
       options.installedPluginIds ??
       (async () => ["SynaraComputerUsePluginV2", "SynaraComputerUsePluginV10"]),
     sleep: options.sleep ?? (async () => undefined),
+    // Tests must never resolve names against the host's PATH or flatpak dirs.
+    resolveApp:
+      options.resolveApp ?? ((app, args) => ({ command: app, args: [...args], via: "path" })),
     // Never let a test read the real installer stamp or spawn kwin_wayland.
     installStampPath: options.installStampPath ?? join(tmpdir(), "synara-absent-install.stamp"),
     runningKwinVersion: options.runningKwinVersion ?? (async () => undefined),
@@ -1234,7 +1237,7 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
-  it("skips the restack when the loaded plugin has no raiseWindow", async () => {
+  it("reports the stale plugin when the loaded plugin has no raiseWindow", async () => {
     const dbus = new FakeDbus();
     dbus.plugin.raiseWindowFailure = dbusError(
       "org.freedesktop.DBus.Error.UnknownMethod",
@@ -1242,7 +1245,7 @@ describe("KWinComputerBackend", () => {
     );
     const backend = makeBackend(dbus);
 
-    await expect(backend.raiseWindow("window-1")).resolves.toBeUndefined();
+    await expect(backend.raiseWindow("window-1")).rejects.toThrow(/install-and-load\.sh/);
     expect(dbus.plugin.calls).toContainEqual({ method: "raiseWindow", args: ["window-1"] });
 
     await backend.dispose();
@@ -1297,6 +1300,39 @@ describe("KWinComputerBackend", () => {
     expect(child.unref).toHaveBeenCalledTimes(1);
     child.emit("error", new Error("spawn failed: ENOENT"));
     await expect(launch).rejects.toThrow("spawn failed: ENOENT");
+    await backend.dispose();
+  });
+
+  it("spawns the resolved command and reports it back", async () => {
+    const dbus = new FakeDbus();
+    const child = new FakeChild();
+    const spawned: Array<{ app: string; args: readonly string[] }> = [];
+    const backend = makeBackend(dbus, {
+      resolveApp: (app, args) => ({
+        command: `/var/lib/flatpak/exports/bin/${app}`,
+        args: [...args],
+        via: "flatpak-export",
+      }),
+      spawnProcess: (app, args) => {
+        spawned.push({ app, args });
+        queueMicrotask(() => child.emit("spawn"));
+        return child as unknown as ChildProcess;
+      },
+    });
+    await backend.availability();
+
+    await expect(
+      backend.launchApp("app.zen_browser.zen", ["--new-window", "https://example.com"]),
+    ).resolves.toMatchObject({
+      app: "app.zen_browser.zen",
+      resolvedCommand: "/var/lib/flatpak/exports/bin/app.zen_browser.zen",
+    });
+    expect(spawned).toEqual([
+      {
+        app: "/var/lib/flatpak/exports/bin/app.zen_browser.zen",
+        args: ["--new-window", "https://example.com"],
+      },
+    ]);
     await backend.dispose();
   });
 

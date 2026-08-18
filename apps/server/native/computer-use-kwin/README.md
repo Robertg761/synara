@@ -53,6 +53,14 @@ human's keyboard focus is never moved, because the agent drives its own seat and
 only needs the window it is clicking to be the one on top at that coordinate. It
 returns `false` when the session is stopped or the id names no usable window.
 
+`focusWindow(windowId)` also scopes the pointer: while a target is named, every
+`button` and `axis` event goes to that window, not to whatever the stacking
+order puts under the cursor. Without this, a click aimed at a partly covered
+window is delivered to the window covering it, and the caller sees a button that
+does nothing rather than an error. If the target has gone away, or does not
+accept input at the current pointer position, `button` and `axis` return `false`
+instead of retargeting — the same rule the keyboard already follows.
+
 Each `windowsJson` entry also carries `active`: whether the compositor reports
 the window as activated to its client. This matters because toolkits gate
 keyboard-shortcut dispatch on activation, not on keyboard focus. Qt's shortcut

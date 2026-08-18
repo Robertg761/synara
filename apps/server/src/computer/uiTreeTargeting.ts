@@ -23,7 +23,11 @@ export type ComputerTargetErrorCode =
   | "computer_target_invalid"
   | "computer_target_not_found"
   | "computer_target_ambiguous"
-  | "computer_target_offscreen";
+  | "computer_target_offscreen"
+  /** The named window is covered at the point and the desktop could not raise it. */
+  | "computer_target_occluded"
+  /** The desktop declined to deliver input to the named window, and sent none. */
+  | "computer_target_refused";
 
 export class ComputerTargetError extends Error {
   readonly code: ComputerTargetErrorCode;

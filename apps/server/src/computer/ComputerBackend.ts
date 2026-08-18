@@ -71,14 +71,25 @@ export type ComputerBackendEventListener = (event: ComputerBackendEvent) => void
 
 export class ComputerBackendError extends Error {
   readonly retryable: boolean;
+  /**
+   * The call the desktop declined, when the failure was a refusal rather than a
+   * fault. A refusal means nothing was injected, which is what lets a caller
+   * explain the miss instead of reporting a generic failure.
+   */
+  readonly rejectedOperation: string | undefined;
 
   constructor(
     message: string,
-    options: { readonly retryable?: boolean; readonly cause?: unknown } = {},
+    options: {
+      readonly retryable?: boolean;
+      readonly cause?: unknown;
+      readonly rejectedOperation?: string;
+    } = {},
   ) {
     super(message, options);
     this.name = "ComputerBackendError";
     this.retryable = options.retryable ?? false;
+    this.rejectedOperation = options.rejectedOperation;
   }
 }
 

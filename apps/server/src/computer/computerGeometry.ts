@@ -161,6 +161,45 @@ export function parseWindows(value: unknown, focusedWindowId: string | null): Co
   return windows;
 }
 
+/**
+ * Windows stacked above `windowId` whose bounds contain `point` — what a bare
+ * coordinate click at that point would hit instead of the named window.
+ *
+ * Empty when the display server reports no stacking order, or none for the
+ * named window: an unknown order cannot establish that anything is above
+ * anything, and inventing occlusion from bounds alone would refuse clicks that
+ * are perfectly safe. Bounds are frame rects, so an overlap is an upper bound
+ * on real occlusion — the covering window may be translucent or shaped — which
+ * is the safe direction, because the remedy is raising the target either way.
+ */
+export function windowsCoveringPoint(
+  windows: readonly ComputerWindow[],
+  windowId: string,
+  point: ComputerPoint,
+): readonly ComputerWindow[] {
+  const depth = windows.find((window) => window.id === windowId)?.stackingIndex;
+  if (depth === undefined) return [];
+  return windows.filter(
+    (window) =>
+      window.id !== windowId &&
+      window.visible &&
+      !window.minimized &&
+      window.stackingIndex !== undefined &&
+      window.stackingIndex < depth &&
+      rectContainsPoint(window.bounds, point),
+  );
+}
+
+export function rectContainsPoint(rect: ComputerRect | undefined, point: ComputerPoint): boolean {
+  if (!rect) return false;
+  return (
+    point.x >= rect.x &&
+    point.y >= rect.y &&
+    point.x < rect.x + rect.width &&
+    point.y < rect.y + rect.height
+  );
+}
+
 // ── Workspace geometry ───────────────────────────────────────────────
 
 /**

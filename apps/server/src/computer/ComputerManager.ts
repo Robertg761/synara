@@ -32,6 +32,7 @@ import {
   type ComputerStreamFrame,
   type ComputerResolvedTarget,
 } from "./ComputerBackend.ts";
+import { rectContainsPoint, windowsCoveringPoint } from "./computerGeometry.ts";
 import {
   ComputerTargetError,
   computerTargetCandidates,
@@ -101,6 +102,24 @@ export interface ComputerManagerOptions {
   /** Injected for tests, so action-screenshot tests do not sleep for real. */
   readonly actionSettleMs?: number;
 }
+
+/**
+ * A resolved pointer target, plus what the window read taken while resolving it
+ * showed covering the point. The covering list rides along so the raise-failure
+ * path can decide whether to refuse without paying a second window read.
+ */
+interface ResolvedPointTarget {
+  readonly point: ComputerPoint;
+  readonly windowId?: string;
+  readonly covering?: readonly ComputerWindow[];
+}
+
+/**
+ * What the raise/focus step needs. The point is optional because keyboard
+ * actions name a window without one, and with no point there is nothing an
+ * occlusion check could be about.
+ */
+type PreparedTarget = Omit<ResolvedPointTarget, "point"> & { readonly point?: ComputerPoint };
 
 /** A capture plus which window it covers, when it covers one at all. */
 export interface ComputerCapturedWindow {
@@ -362,8 +381,10 @@ export class ComputerManager {
   async click(threadId: string | undefined, target: ComputerTarget): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved.windowId);
-    const result = await this.backend.click(resolved.point);
+    await this.prepareResolvedTarget(resolved);
+    const result = await this.injectScoped("computer_click", resolved, () =>
+      this.backend.click(resolved.point),
+    );
     return this.actionResult(threadId, "computer_click", resolved.point, result, resolved.windowId);
   }
 
@@ -373,8 +394,10 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved.windowId);
-    const result = await this.backend.doubleClick(resolved.point);
+    await this.prepareResolvedTarget(resolved);
+    const result = await this.injectScoped("computer_double_click", resolved, () =>
+      this.backend.doubleClick(resolved.point),
+    );
     return this.actionResult(
       threadId,
       "computer_double_click",
@@ -390,8 +413,10 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved.windowId);
-    const result = await this.backend.rightClick(resolved.point);
+    await this.prepareResolvedTarget(resolved);
+    const result = await this.injectScoped("computer_right_click", resolved, () =>
+      this.backend.rightClick(resolved.point),
+    );
     return this.actionResult(
       threadId,
       "computer_right_click",
@@ -407,8 +432,10 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved.windowId);
-    const result = await this.backend.moveCursor(resolved.point);
+    await this.prepareResolvedTarget(resolved);
+    const result = await this.injectScoped("computer_move_cursor", resolved, () =>
+      this.backend.moveCursor(resolved.point),
+    );
     return this.actionResult(
       threadId,
       "computer_move_cursor",
@@ -429,8 +456,14 @@ export class ComputerManager {
       this.resolvePointTarget(from),
       this.resolvePointTarget(to),
     ]);
-    await this.prepareResolvedTarget(resolvedFrom.windowId ?? resolvedTo.windowId);
-    const result = await this.backend.drag(resolvedFrom.point, resolvedTo.point, durationMs);
+    // The drag is grabbed by the window it starts in, so that window is the one
+    // raised and focused; the destination only scopes it when the origin names
+    // no window at all.
+    const grabbed = resolvedFrom.windowId ? resolvedFrom : resolvedTo;
+    await this.prepareResolvedTarget(grabbed);
+    const result = await this.injectScoped("computer_drag", grabbed, () =>
+      this.backend.drag(resolvedFrom.point, resolvedTo.point, durationMs),
+    );
     return this.actionResult(
       threadId,
       "computer_drag",
@@ -448,8 +481,10 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const resolved = target ? await this.resolvePointTarget(target) : null;
-    await this.prepareResolvedTarget(resolved?.windowId);
-    const result = await this.backend.scroll(resolved?.point ?? null, deltaX, deltaY);
+    await this.prepareResolvedTarget(resolved ?? undefined);
+    const result = await this.injectScoped("computer_scroll", resolved ?? {}, () =>
+      this.backend.scroll(resolved?.point ?? null, deltaX, deltaY),
+    );
     return this.actionResult(
       threadId,
       "computer_scroll",
@@ -459,25 +494,37 @@ export class ComputerManager {
     );
   }
 
-  async typeText(threadId: string | undefined, text: string): Promise<ComputerActionResult> {
+  async typeText(
+    threadId: string | undefined,
+    text: string,
+    windowId?: string,
+  ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
+    await this.prepareKeyboardTarget(windowId);
     const result = await this.backend.typeText(text);
-    return this.actionResult(threadId, "computer_type_text", undefined, result);
+    return this.actionResult(threadId, "computer_type_text", undefined, result, windowId);
   }
 
-  async pressKey(threadId: string | undefined, key: string): Promise<ComputerActionResult> {
+  async pressKey(
+    threadId: string | undefined,
+    key: string,
+    windowId?: string,
+  ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
+    await this.prepareKeyboardTarget(windowId);
     const result = await this.backend.pressKey(key);
-    return this.actionResult(threadId, "computer_press_key", undefined, result);
+    return this.actionResult(threadId, "computer_press_key", undefined, result, windowId);
   }
 
   async hotkey(
     threadId: string | undefined,
     keys: readonly string[],
+    windowId?: string,
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
+    await this.prepareKeyboardTarget(windowId);
     const result = await this.backend.hotkey(keys);
-    return this.actionResult(threadId, "computer_hotkey", undefined, result);
+    return this.actionResult(threadId, "computer_hotkey", undefined, result, windowId);
   }
 
   /**
@@ -524,7 +571,7 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const resolved = await this.resolveSemanticTarget(target);
-    await this.prepareResolvedTarget(resolved.node.windowId ?? undefined);
+    await this.prepareResolvedTarget(semanticPointTarget(resolved));
     const result = await this.backend.setValue(resolved, value);
     return this.actionResult(
       threadId,
@@ -542,7 +589,7 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const resolved = await this.resolveSemanticTarget(target);
-    await this.prepareResolvedTarget(resolved.node.windowId ?? undefined);
+    await this.prepareResolvedTarget(semanticPointTarget(resolved));
     const result = await this.backend.performAction(resolved, action);
     return this.actionResult(
       threadId,
@@ -754,14 +801,12 @@ export class ComputerManager {
    * coordinate is at most a hint, so those keep going through AT-SPI
    * resolution, which owns the final point.
    */
-  private async resolvePointTarget(
-    target: ComputerTarget,
-  ): Promise<{ point: ComputerPoint; windowId?: string }> {
+  private async resolvePointTarget(target: ComputerTarget): Promise<ResolvedPointTarget> {
     if (hasCoordinates(target) && !hasLabelFields(target)) {
       const point = await this.resolveCoordinatePoint(target);
       if (target.windowId === undefined) return { point };
-      await this.assertPointInsideWindow(point, target.windowId);
-      return { point, windowId: target.windowId };
+      const covering = await this.scopedPointOcclusion(point, target.windowId);
+      return { point, windowId: target.windowId, covering };
     }
     if (hasSemanticFields(target)) {
       const resolved = await this.resolveSemanticTarget(target);
@@ -793,24 +838,23 @@ export class ComputerManager {
   }
 
   /**
+   * Checks a scoped coordinate against the window it names, and reports the
+   * windows stacked above it that also contain the point.
+   *
    * A scoped click is refused rather than redirected. Input is routed to the
    * named window regardless of what covers that coordinate, so a point outside
    * its bounds would deliver a click to a part of the window that does not
-   * exist — the one failure mode scoping is meant to remove.
+   * exist — the one failure mode scoping is meant to remove. The covering list
+   * comes from the same window read, so the raise path downstream never has to
+   * repeat it.
    */
-  private async assertPointInsideWindow(point: ComputerPoint, windowId: string): Promise<void> {
-    const window = (await this.backend.listWindows()).find(
-      (candidate) => candidate.id === windowId,
-    );
-    if (!window) {
-      throw new ComputerTargetError({
-        code: "computer_target_not_found",
-        message:
-          `No desktop window has id ${JSON.stringify(windowId)}. ` +
-          "Call computer_list_windows for the current window ids.",
-        notFound: true,
-      });
-    }
+  private async scopedPointOcclusion(
+    point: ComputerPoint,
+    windowId: string,
+  ): Promise<readonly ComputerWindow[]> {
+    const windows = await this.backend.listWindows();
+    const window = windows.find((candidate) => candidate.id === windowId);
+    if (!window) throw windowNotFoundError(windowId);
     const bounds = window.bounds;
     if (!bounds) {
       // Scoping exists to guarantee the point is inside the named window. A
@@ -825,12 +869,7 @@ export class ComputerManager {
           "or target the control by label instead.",
       });
     }
-    if (
-      point.x < bounds.x ||
-      point.y < bounds.y ||
-      point.x >= bounds.x + bounds.width ||
-      point.y >= bounds.y + bounds.height
-    ) {
+    if (!rectContainsPoint(bounds, point)) {
       throw new ComputerTargetError({
         code: "computer_target_offscreen",
         message:
@@ -839,6 +878,7 @@ export class ComputerManager {
           "Pass a coordinate inside those bounds, or drop window_id to click whatever is topmost.",
       });
     }
+    return windowsCoveringPoint(windows, windowId, point);
   }
 
   /**
@@ -846,14 +886,93 @@ export class ComputerManager {
    * may still be buried, which leaves the human watching clicks land on pixels
    * they cannot see. Both calls are optional so a backend that supports neither
    * keeps working.
+   *
+   * A raise this desktop cannot perform is not by itself a failed action — the
+   * compositor still routes the agent's input to the named window — so it only
+   * refuses when a different window really does cover the point, which is the
+   * one case where proceeding would deliver the click somewhere the caller did
+   * not ask for and could not see coming.
    */
-  private async prepareResolvedTarget(windowId: string | undefined): Promise<void> {
-    if (windowId !== undefined) {
-      await this.backend.raiseWindow?.(windowId);
-      await this.backend.focusWindow?.(windowId);
+  private async prepareResolvedTarget(target: PreparedTarget | undefined): Promise<void> {
+    const windowId = target?.windowId;
+    if (windowId === undefined) {
+      await this.backend.clearFocusWindow?.();
       return;
     }
-    await this.backend.clearFocusWindow?.();
+    const raiseFailure = await this.raiseTargetWindow(windowId);
+    if (raiseFailure !== undefined && target?.point) {
+      const covering = target.covering ?? (await this.coveringWindowsAt(target.point, windowId));
+      if (covering.length > 0) {
+        throw occludedTargetError(windowId, target.point, covering, raiseFailure);
+      }
+    }
+    await this.backend.focusWindow?.(windowId);
+  }
+
+  /**
+   * Points the agent seat's keyboard at a window before a keystroke, or leaves
+   * focus alone when the caller named none.
+   *
+   * Keyboard input carries no coordinate to scope it, so without a window it
+   * lands wherever the seat's focus already is — usually where the last click
+   * put it, which is what a click-then-type sequence depends on. Focus is
+   * therefore never cleared here; only an explicit window moves it, and a stale
+   * id fails before any key is sent rather than typing into another application.
+   */
+  private async prepareKeyboardTarget(windowId: string | undefined): Promise<void> {
+    if (windowId === undefined) return;
+    const windows = await this.backend.listWindows();
+    if (!windows.some((candidate) => candidate.id === windowId)) {
+      throw windowNotFoundError(windowId);
+    }
+    await this.prepareResolvedTarget({ windowId });
+  }
+
+  /** The restack, or the reason this desktop did not perform one. */
+  private async raiseTargetWindow(windowId: string): Promise<string | undefined> {
+    const raise = this.backend.raiseWindow?.bind(this.backend);
+    if (!raise) return "this backend exposes no stacking control";
+    try {
+      await raise(windowId);
+      return undefined;
+    } catch (error) {
+      return errorMessage(error);
+    }
+  }
+
+  /**
+   * Runs a pointer injection that named a window, and replaces the desktop's
+   * bare refusal with something the caller can act on.
+   *
+   * The compositor refuses instead of retargeting, so a refusal is the one
+   * failure that guarantees nothing was delivered — worth saying, because the
+   * caller's alternative reading is that the control is broken. It reports only
+   * which call it declined, so the cause has to be supplied here.
+   */
+  private async injectScoped<T>(
+    action: string,
+    target: PreparedTarget,
+    inject: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await inject();
+    } catch (error) {
+      const windowId = target.windowId;
+      const point = target.point;
+      if (windowId === undefined || !point) throw error;
+      if (!(error instanceof ComputerBackendError) || error.rejectedOperation === undefined) {
+        throw error;
+      }
+      throw refusedInjectionError(action, windowId, point);
+    }
+  }
+
+  private async coveringWindowsAt(
+    point: ComputerPoint,
+    windowId: string,
+  ): Promise<readonly ComputerWindow[]> {
+    const windows = await this.backend.listWindows().catch(() => []);
+    return windowsCoveringPoint(windows, windowId, point);
   }
 
   private async resolveSemanticTarget(target: ComputerTarget): Promise<ComputerResolvedTarget> {
@@ -1080,6 +1199,84 @@ function healthUnavailableMessage(health: ComputerHealth): string {
     health.lastFailure ? `${reason} Last failure: ${health.lastFailure.message}` : reason,
     reason,
   );
+}
+
+function windowNotFoundError(windowId: string): ComputerTargetError {
+  return new ComputerTargetError({
+    code: "computer_target_not_found",
+    message:
+      `No desktop window has id ${JSON.stringify(windowId)}. ` +
+      "Call computer_list_windows for the current window ids.",
+    notFound: true,
+  });
+}
+
+/**
+ * The raise/focus target for a control resolved through the accessibility tree.
+ * The point comes along so a failed raise is still checked for occlusion:
+ * nothing consulted the stacking order while matching the label, and the click
+ * that follows is as misroutable as any other.
+ */
+function semanticPointTarget(resolved: ComputerResolvedTarget): PreparedTarget {
+  return {
+    point: resolved.point,
+    ...(resolved.node.windowId ? { windowId: resolved.node.windowId } : {}),
+  };
+}
+
+/**
+ * Refusal for a scoped action whose window is covered at the point and could
+ * not be raised out from under the windows covering it.
+ *
+ * Refusing beats warning. The input would land in another application, and a
+ * warning read after the fact cannot undo a click that already fired — the live
+ * failure this exists for was a model clicking a buried window repeatedly and
+ * concluding the button was broken. The message names what is in the way and
+ * both ways out, so the next call is a correct one rather than a retry.
+ */
+function occludedTargetError(
+  windowId: string,
+  point: ComputerPoint,
+  covering: readonly ComputerWindow[],
+  reason: string,
+): ComputerTargetError {
+  const blockers = covering
+    .slice(0, 4)
+    .map((window) => `${JSON.stringify(window.title || window.id)} (${window.id})`)
+    .join(", ");
+  return new ComputerTargetError({
+    code: "computer_target_occluded",
+    message:
+      `Window ${JSON.stringify(windowId)} is covered at (${point.x}, ${point.y}) by ${blockers}, ` +
+      `and this desktop could not raise it: ${reason}. The input would go to the covering window. ` +
+      "Aim at a part of the target window that nothing covers, or move the covering window out of " +
+      "the way first; or drop window_id to act on whatever is topmost at that point.",
+  });
+}
+
+/**
+ * Refusal for a scoped pointer action the desktop declined to deliver.
+ *
+ * A coordinate is validated against the window's frame, which includes the
+ * invisible resize and shadow margins around it, so a point can sit inside
+ * those bounds and still be outside the region the window accepts input in.
+ * The window may equally have closed since it was listed. Either way the
+ * remedy is the same, and it is not retrying the identical coordinate.
+ */
+function refusedInjectionError(
+  action: string,
+  windowId: string,
+  point: ComputerPoint,
+): ComputerTargetError {
+  return new ComputerTargetError({
+    code: "computer_target_refused",
+    message:
+      `The desktop refused to deliver ${action} to window ${JSON.stringify(windowId)} at ` +
+      `(${point.x}, ${point.y}), so no input was sent. The window is not accepting input at that ` +
+      "point: a window's bounds include invisible resize and shadow margins, and the window may " +
+      "also have closed since it was listed. Aim nearer the middle of the control, target it by " +
+      "label instead of a coordinate, or drop window_id to act on whatever is topmost there.",
+  });
 }
 
 function clipboardUnsupportedError(): ComputerBackendError {

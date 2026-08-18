@@ -29,6 +29,7 @@ import {
   type ComputerFrameListener,
   type ComputerResolvedTarget,
 } from "./ComputerBackend.ts";
+import { resolveAppLaunchOnHost, type AppLaunchResolver } from "./appLaunchResolution.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
 import {
   atspiTextWriteAddress,
@@ -130,6 +131,8 @@ export interface KWinComputerBackendOptions {
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly spawnProcess?: (app: string, args: readonly string[]) => ChildProcess;
+  /** Name-to-executable resolution, replaced in tests to avoid host lookups. */
+  readonly resolveApp?: AppLaunchResolver;
   /** wl-clipboard process runner, replaced in tests. */
   readonly runClipboardCommand?: ClipboardCommandRunner;
   readonly glideDurationMs?: number;
@@ -199,6 +202,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private capturePending = 0;
   private startPromise: Promise<void> | undefined;
   private readonly spawnProcess: (app: string, args: readonly string[]) => ChildProcess;
+  private readonly resolveApp: AppLaunchResolver;
   private readonly runClipboardCommand: ClipboardCommandRunner;
   private nextSequence = 1;
   private currentPoint: ComputerPoint | null = null;
@@ -218,6 +222,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.spawnProcess =
       options.spawnProcess ??
       ((app, args) => spawn(app, [...args], { detached: true, stdio: "ignore" }));
+    this.resolveApp = options.resolveApp ?? resolveAppLaunchOnHost;
     this.runClipboardCommand = options.runClipboardCommand ?? spawnClipboardCommand;
     this.glideDurationMs = Math.max(0, options.glideDurationMs ?? DEFAULT_GLIDE_DURATION_MS);
     this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
@@ -394,10 +399,15 @@ export class KWinComputerBackend implements ComputerBackend {
     try {
       await this.pluginSuccess("raiseWindow", () => plugin.raiseWindow(windowId));
     } catch (error) {
-      // An older loaded plugin predates raiseWindow. Focus alone still routes
-      // input to the target window, so a missing method skips the restack
-      // rather than failing the action.
+      // A loaded plugin that predates raiseWindow cannot restack, and the
+      // caller has to hear that: focus routes keyboard input, not pointer
+      // input, so a click on a covered window lands in whatever is on top of
+      // it. Swallowing this is what made buried clicks look like dead buttons.
       if (!isUnknownMethodDbusError(error)) throw error;
+      throw new ComputerBackendError(
+        "The loaded Synara KWin plugin has no raiseWindow, so windows cannot be raised above " +
+          `what covers them. Build, install, and load the current plugin with ${INSTALL_SCRIPT_PATH}.`,
+      );
     }
   }
 
@@ -408,15 +418,21 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult> {
     await this.ensurePlugin();
+    const launch = this.resolveApp(app, args);
     let child: ChildProcess;
     try {
-      child = this.spawnProcess(app, args);
+      child = this.spawnProcess(launch.command, launch.args);
     } catch (error) {
       throw launchAppError(app, error);
     }
 
     return await new Promise<ComputerLaunchAppResult>((resolve, reject) => {
-      const result = { computerId: this.computerId, app, window: null } as ComputerLaunchAppResult;
+      const result = {
+        computerId: this.computerId,
+        app,
+        resolvedCommand: launch.command,
+        window: null,
+      } as ComputerLaunchAppResult;
       const cleanup = () => {
         child.off("spawn", onSpawn);
         child.off("error", onError);
@@ -1127,6 +1143,7 @@ export class KWinComputerBackend implements ComputerBackend {
     }
     throw new ComputerBackendError(`Synara KWin plugin rejected ${operation}.`, {
       retryable: true,
+      rejectedOperation: operation,
     });
   }
 

@@ -1,3 +1,6 @@
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+
 import { describe, expect, it, vi } from "vitest";
 
 import type { ComputerRect, ComputerWindow } from "@synara/contracts";
@@ -837,6 +840,53 @@ describe("createPortalComputerBackend", () => {
     expect(availability.kind === "backend-unavailable" && availability.message).toContain(
       "PipeWire",
     );
+    await backend.dispose();
+  });
+});
+
+describe("PortalComputerBackend launchApp", () => {
+  it("spawns the resolved command with the caller's arguments and reports it back", async () => {
+    const spawned: Array<{ app: string; args: readonly string[] }> = [];
+    const backend = backendWith(providersOf(), {
+      resolveApp: (app, args) => ({
+        command: `/var/lib/flatpak/exports/bin/${app}`,
+        args: [...args],
+        via: "flatpak-export",
+      }),
+      spawnProcess: (app, args) => {
+        spawned.push({ app, args });
+        const child = new EventEmitter() as unknown as ChildProcess;
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      },
+    });
+
+    await expect(
+      backend.launchApp("app.zen_browser.zen", ["--new-window", "https://example.com"]),
+    ).resolves.toMatchObject({
+      app: "app.zen_browser.zen",
+      resolvedCommand: "/var/lib/flatpak/exports/bin/app.zen_browser.zen",
+    });
+    expect(spawned).toEqual([
+      {
+        app: "/var/lib/flatpak/exports/bin/app.zen_browser.zen",
+        args: ["--new-window", "https://example.com"],
+      },
+    ]);
+    await backend.dispose();
+  });
+
+  it("refuses an unresolvable name without spawning anything", async () => {
+    const spawnProcess = vi.fn();
+    const backend = backendWith(providersOf(), {
+      resolveApp: () => {
+        throw new ComputerBackendError('nothing named "ghost"');
+      },
+      spawnProcess: spawnProcess as never,
+    });
+
+    await expect(backend.launchApp("ghost", [])).rejects.toThrow('nothing named "ghost"');
+    expect(spawnProcess).not.toHaveBeenCalled();
     await backend.dispose();
   });
 });

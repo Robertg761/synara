@@ -448,6 +448,11 @@ export type ComputerLaunchAppInput = typeof ComputerLaunchAppInput.Type;
 export const ComputerLaunchAppResult = Schema.Struct({
   computerId: ComputerId,
   app: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  /**
+   * The executable the requested name resolved to. Reported back so a caller
+   * that passed a flatpak app id or a .desktop id learns what actually ran.
+   */
+  resolvedCommand: Schema.optional(Schema.String.check(Schema.isMaxLength(4_096))),
   window: Schema.NullOr(ComputerWindow),
 });
 export type ComputerLaunchAppResult = typeof ComputerLaunchAppResult.Type;

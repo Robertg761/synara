@@ -55,6 +55,7 @@ import {
   type ComputerFrameListener,
   type ComputerResolvedTarget,
 } from "../ComputerBackend.ts";
+import { resolveAppLaunchOnHost, type AppLaunchResolver } from "../appLaunchResolution.ts";
 import {
   alignRect,
   formatRect,
@@ -124,6 +125,8 @@ export interface PortalComputerBackendOptions {
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly spawnProcess?: (app: string, args: readonly string[]) => ChildProcess;
+  /** Name-to-executable resolution, replaced in tests to avoid host lookups. */
+  readonly resolveApp?: AppLaunchResolver;
   readonly glideDurationMs?: number;
   readonly stillIntervalMs?: number;
   readonly captureMaxDimension?: number;
@@ -145,6 +148,7 @@ export class PortalComputerBackend implements ComputerBackend {
   private readonly now: () => number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private readonly spawnProcess: (app: string, args: readonly string[]) => ChildProcess;
+  private readonly resolveApp: AppLaunchResolver;
   private readonly glideDurationMs: number;
   private readonly stillIntervalMs: number;
   private readonly captureMaxDimension: number;
@@ -180,6 +184,7 @@ export class PortalComputerBackend implements ComputerBackend {
     this.spawnProcess =
       options.spawnProcess ??
       ((app, args) => spawn(app, [...args], { detached: true, stdio: "ignore" }));
+    this.resolveApp = options.resolveApp ?? resolveAppLaunchOnHost;
     this.glideDurationMs = Math.max(0, options.glideDurationMs ?? DEFAULT_GLIDE_DURATION_MS);
     this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
     this.captureMaxDimension = Math.max(
@@ -393,8 +398,9 @@ export class PortalComputerBackend implements ComputerBackend {
    */
   async launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult> {
     this.throwIfDisposed();
+    const launch = this.resolveApp(app, args);
     await this.guarded(async () => {
-      const child = this.spawnProcess(app, args);
+      const child = this.spawnProcess(launch.command, launch.args);
       child.unref?.();
       await new Promise<void>((resolve, reject) => {
         const settle = () => {
@@ -418,7 +424,7 @@ export class PortalComputerBackend implements ComputerBackend {
     // The window is reported only where enumeration exists. `null` here means
     // "not looked up", which `capabilities.windows === false` already says; the
     // alternative — refusing the launch — would remove a capability that works.
-    return { computerId: this.computerId, app, window: null };
+    return { computerId: this.computerId, app, resolvedCommand: launch.command, window: null };
   }
 
   async click(point: ComputerPoint): Promise<ComputerBackendActionResult> {
