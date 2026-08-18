@@ -1258,7 +1258,9 @@ export default function ChatView({
   const composerPastedTexts = composerDraft.pastedTexts;
   const composerSkills = composerDraft.skills;
   const composerMentions = composerDraft.mentions;
-  const enableComputerControl = composerDraft.enableComputerControl === true;
+  // Per-chat choice wins; an untouched chat follows the sticky new-chat default.
+  const enableComputerControl =
+    composerDraft.enableComputerControl ?? settings.enableComputerControlForNewChats;
   // The computer-control toggle needs availability before the Computer pane has
   // ever been opened, so the composer seeds the snapshot itself.
   useThreadComputerStateSeed(threadId);
@@ -5045,9 +5047,11 @@ export default function ChatView({
   const handleComputerControlChange = useCallback(
     (enabled: boolean) => {
       setComposerDraftComputerControl(threadId, enabled);
+      // Last-used stickiness: the flip also becomes the default for new chats.
+      updateSettings({ enableComputerControlForNewChats: enabled });
       scheduleComposerFocus();
     },
-    [scheduleComposerFocus, setComposerDraftComputerControl, threadId],
+    [scheduleComposerFocus, setComposerDraftComputerControl, threadId, updateSettings],
   );
 
   useEffect(() => {

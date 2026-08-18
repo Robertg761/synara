@@ -884,7 +884,12 @@ function normalizePersistedDraftsByThreadId(
     const interactionMode = Schema.is(ProviderInteractionMode)(draftCandidate.interactionMode)
       ? draftCandidate.interactionMode
       : null;
-    const enableComputerControl = draftCandidate.enableComputerControl === true;
+    // Tri-state: only an explicit boolean is a recorded choice; anything else
+    // means the chat follows the new-chat default.
+    const enableComputerControl =
+      typeof draftCandidate.enableComputerControl === "boolean"
+        ? draftCandidate.enableComputerControl
+        : undefined;
     const prompt = ensureInlineTerminalContextPlaceholders(
       promptCandidate,
       terminalContexts.length,
@@ -960,7 +965,7 @@ function normalizePersistedDraftsByThreadId(
       !hasModelData &&
       !runtimeMode &&
       !interactionMode &&
-      !enableComputerControl
+      enableComputerControl === undefined
     ) {
       continue;
     }
@@ -980,7 +985,7 @@ function normalizePersistedDraftsByThreadId(
       ...(hasModelData ? { modelSelectionByProvider, activeProvider } : {}),
       ...(runtimeMode ? { runtimeMode } : {}),
       ...(interactionMode ? { interactionMode } : {}),
-      ...(enableComputerControl ? { enableComputerControl: true } : {}),
+      ...(enableComputerControl !== undefined ? { enableComputerControl } : {}),
     };
   }
 
@@ -1257,7 +1262,9 @@ export function partializeComposerDraftStoreState(
         : {}),
       ...(draft.runtimeMode ? { runtimeMode: draft.runtimeMode } : {}),
       ...(draft.interactionMode ? { interactionMode: draft.interactionMode } : {}),
-      ...(draft.enableComputerControl ? { enableComputerControl: true } : {}),
+      ...(draft.enableComputerControl !== undefined
+        ? { enableComputerControl: draft.enableComputerControl }
+        : {}),
     };
     persistedDraftsByThreadId[threadId as ThreadId] = persistedDraft;
   }
@@ -1433,6 +1440,9 @@ export function toHydratedThreadDraft(
     activeProvider,
     runtimeMode: persistedDraft.runtimeMode ?? null,
     interactionMode: persistedDraft.interactionMode ?? null,
-    enableComputerControl: persistedDraft.enableComputerControl === true,
+    enableComputerControl:
+      typeof persistedDraft.enableComputerControl === "boolean"
+        ? persistedDraft.enableComputerControl
+        : undefined,
   };
 }

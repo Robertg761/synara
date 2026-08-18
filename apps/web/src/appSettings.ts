@@ -262,6 +262,9 @@ export const AppSettingsSchema = Schema.Struct({
   enableAppshots: Schema.optionalKey(Schema.Boolean),
   // Open the Computer pane automatically when an agent starts driving the desktop.
   autoOpenComputerPane: Schema.Boolean.pipe(withDefaults(() => true)),
+  // Whether new chats start with computer control on. Follows the last per-chat
+  // choice: flipping the composer toggle also updates this value.
+  enableComputerControlForNewChats: Schema.Boolean.pipe(withDefaults(() => false)),
   sidebarProjectSortOrder: SidebarProjectSortOrder.pipe(
     withDefaults(() => DEFAULT_SIDEBAR_PROJECT_SORT_ORDER),
   ),

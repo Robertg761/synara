@@ -538,7 +538,9 @@ export function createEmptyThreadDraft(): ComposerThreadDraftState {
     activeProvider: null,
     runtimeMode: null,
     interactionMode: null,
-    enableComputerControl: false,
+    // Tri-state: undefined means "no explicit choice", so the chat follows the
+    // enableComputerControlForNewChats app setting until the user flips the switch.
+    enableComputerControl: undefined,
   };
 }
 
@@ -838,7 +840,9 @@ export function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
     draft.activeProvider === null &&
     draft.runtimeMode === null &&
     draft.interactionMode === null &&
-    !draft.enableComputerControl
+    // An explicit false is still content: it records the user's choice to keep
+    // computer control off in this chat when the new-chat default is on.
+    draft.enableComputerControl === undefined
   );
 }
 
@@ -892,7 +896,7 @@ const EMPTY_THREAD_DRAFT = Object.freeze<ComposerThreadDraftState>({
   activeProvider: null,
   runtimeMode: null,
   interactionMode: null,
-  enableComputerControl: false,
+  enableComputerControl: undefined,
 });
 
 export function selectComposerThreadDraft(

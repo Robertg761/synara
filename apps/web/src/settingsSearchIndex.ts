@@ -284,6 +284,13 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
       "Open the Computer pane the first time an agent acts on the desktop in a chat. auto open dock computer use",
   },
   {
+    id: "computer:start-new-chats-with-computer-control",
+    section: "computer",
+    title: "Start new chats with computer control",
+    keywords:
+      "New chats follow your last computer-control choice; flipping the per-chat switch updates this default. sticky default enable computer use desktop control new chat",
+  },
+  {
     id: "computer:enabling-computer-control",
     section: "computer",
     title: "Enabling computer control",

@@ -8,7 +8,13 @@ import type {
   ThreadId,
   RuntimeMode,
 } from "@synara/contracts";
-import { CheckIcon, ChevronDownIcon, HandoffIcon, WorktreeIcon } from "~/lib/icons";
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  HandoffIcon,
+  MonitorIcon,
+  WorktreeIcon,
+} from "~/lib/icons";
 import { HiOutlineHandRaised } from "react-icons/hi2";
 import { CentralIcon } from "~/lib/central-icons";
 import { useCallback, useMemo, useState, type ReactNode } from "react";
@@ -227,7 +233,7 @@ export function RuntimeUsageControls({
                   runtimeMode === "auto" && RUNTIME_AUTO_ACCENT_CLASS_NAME,
                   runtimeMode === "full-access" && RUNTIME_FULL_ACCESS_ACCENT_CLASS_NAME,
                 )}
-                title={`${runtimePresentation.label}: ${runtimePresentation.description}. Click to change permissions.`}
+                title={`${runtimePresentation.label}: ${runtimePresentation.description}.${computerControlEnabled ? " Computer control is on." : ""} Click to change permissions.`}
               />
             }
           >
@@ -242,6 +248,12 @@ export function RuntimeUsageControls({
               <span className={cn("truncate", hideLabel ? "sr-only" : "@max-[480px]:sr-only")}>
                 {runtimePresentation.label}
               </span>
+              {computerControlEnabled ? (
+                <>
+                  <MonitorIcon className="size-3.5 shrink-0" aria-hidden />
+                  <span className="sr-only">Computer control is on.</span>
+                </>
+              ) : null}
               <ChevronDownIcon
                 className={cn(
                   "size-3 shrink-0 opacity-70",

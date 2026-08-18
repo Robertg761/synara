@@ -1046,11 +1046,9 @@ export const createComposerDraftStoreState =
         return;
       }
       set((state) => {
-        const existing = state.draftsByThreadId[threadId];
-        if (!existing && !enabled) {
-          return state;
-        }
-        const base = existing ?? createEmptyThreadDraft();
+        // Always record the choice, even an explicit false: the flag is tri-state
+        // and an untouched draft follows the new-chat default instead.
+        const base = state.draftsByThreadId[threadId] ?? createEmptyThreadDraft();
         if (base.enableComputerControl === enabled) {
           return state;
         }

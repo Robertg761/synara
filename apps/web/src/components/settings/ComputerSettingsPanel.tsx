@@ -187,8 +187,34 @@ export function ComputerSettingsPanel({
 
       <SettingsSection title="Per-chat control">
         <SettingsRow
+          title="Start new chats with computer control"
+          description="New chats follow your last choice: flipping Computer control in a chat's mode menu also updates this default. Each chat can still be switched individually."
+          resetAction={
+            settings.enableComputerControlForNewChats !==
+            defaults.enableComputerControlForNewChats ? (
+              <SettingResetButton
+                label="start new chats with computer control"
+                onClick={() =>
+                  updateSettings({
+                    enableComputerControlForNewChats: defaults.enableComputerControlForNewChats,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.enableComputerControlForNewChats}
+              onCheckedChange={(checked) =>
+                updateSettings({ enableComputerControlForNewChats: Boolean(checked) })
+              }
+              aria-label="Start new chats with computer control enabled"
+            />
+          }
+        />
+        <SettingsRow
           title="Enabling computer control"
-          description="Computer control stays off until you switch it on for a chat: open the composer's mode menu (the Full access picker) and flip Computer control. Desktop actions then ask for approval as they run, and clipboard reads always ask."
+          description="Switch computer control per chat from the composer's mode menu (the Full access picker); the mode button shows a monitor icon while it is on. Desktop actions then ask for approval as they run, and clipboard reads always ask."
         />
       </SettingsSection>
     </div>
