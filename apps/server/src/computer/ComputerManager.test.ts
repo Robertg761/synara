@@ -381,6 +381,25 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("never asks for the pane when the agent drives the human's visible desktop", async () => {
+    // Every action is already happening on the screen the user is looking at,
+    // so pushing a preview of their own display open would only be noise.
+    const backend = new FakeComputerBackend({
+      capabilities: { ...new FakeComputerBackend().capabilities(), visibleDesktop: true },
+    });
+    const manager = new ComputerManager({ backend });
+    const openRequests: string[] = [];
+    manager.onEvent((event) => {
+      if (event.type === "computer.open-pane-requested") openRequests.push(event.threadId);
+    });
+
+    await manager.click("thread-1", { x: 10, y: 10 });
+    await manager.typeText("thread-1", "hi");
+
+    expect(openRequests).toEqual([]);
+    await manager.dispose();
+  });
+
   it("leaves pane input unattributed instead of borrowing a thread", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });
@@ -636,6 +655,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
         activation: false,
         ghostCursor: false,
         sharedSeat: true,
+        visibleDesktop: false,
       },
     });
     const manager = new ComputerManager({ backend });

@@ -140,6 +140,12 @@ export interface KWinComputerBackendOptions {
    * Falls back to `SYNARA_COMPUTER_IDLE_TIMEOUT_MS`, then to five minutes.
    */
   readonly idleTimeoutMs?: number;
+  /**
+   * Whether the driven compositor renders on the human's own display. True for
+   * the host session (the default), false when the backend is bound to a
+   * nested, offscreen compositor — see `nestedKWinBackendOptions`.
+   */
+  readonly visibleDesktop?: boolean;
   /** Installer stamp consulted when KWin refuses to load the plugin. */
   readonly installStampPath?: string;
   readonly readInstallStamp?: () => Promise<string | undefined>;
@@ -160,6 +166,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   private readonly platform: string;
   private readonly sessionType: string;
+  private readonly visibleDesktop: boolean;
   private readonly now: () => number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private readonly glideDurationMs: number;
@@ -205,6 +212,7 @@ export class KWinComputerBackend implements ComputerBackend {
       options.sessionType ??
       process.env.XDG_SESSION_TYPE ??
       (process.env.WAYLAND_DISPLAY ? "wayland" : "");
+    this.visibleDesktop = options.visibleDesktop ?? true;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? ((milliseconds) => delay(milliseconds));
     this.spawnProcess =
@@ -271,6 +279,7 @@ export class KWinComputerBackend implements ComputerBackend {
       activation: true,
       ghostCursor: true,
       sharedSeat: false,
+      visibleDesktop: this.visibleDesktop,
     };
   }
 
@@ -841,21 +850,22 @@ export class KWinComputerBackend implements ComputerBackend {
         loaded = [];
       }
     }
-    const loadedPlugin = newestPluginId(loaded);
-    const installed = loadedPlugin ? [] : await this.installedPluginIds();
-    const selectedPlugin = loadedPlugin ?? newestPluginId(installed);
-    if (!selectedPlugin) {
+    const plan = resolveSynaraPluginLoad({ loaded, installed: await this.installedPluginIds() });
+    if (!plan) {
       throw new ComputerBackendError(
         "No installed SynaraComputerUsePluginVn was found in the KWin plugin directories. " +
           `Build, install, and load it with ${INSTALL_SCRIPT_PATH}.`,
       );
     }
-    if (!loadedPlugin) {
-      const accepted = await dbus.loadPlugin(selectedPlugin);
-      if (!accepted) throw new ComputerBackendError(await this.describeLoadRefusal(selectedPlugin));
+    if (plan.kind === "replace") {
+      // A false reply means the id was already gone, which is the state the
+      // unload was after, so the replies are deliberately ignored.
+      for (const staleId of plan.unload) await dbus.unloadPlugin(staleId);
+      const accepted = await dbus.loadPlugin(plan.pluginId);
+      if (!accepted) throw new ComputerBackendError(await this.describeLoadRefusal(plan.pluginId));
     }
     const plugin = await dbus.connectPlugin();
-    return await this.finishPluginConnection(plugin, selectedPlugin);
+    return await this.finishPluginConnection(plugin, plan.pluginId);
   }
 
   /**
@@ -1212,6 +1222,40 @@ export function newestPluginId(ids: readonly string[]): string | undefined {
 /** Separates Synara plugin ids from the rest of KWin's loaded plugin list. */
 export function isSynaraPluginId(id: string): boolean {
   return MAX_PLUGIN_ID.test(id);
+}
+
+export type SynaraPluginLoadPlan =
+  | { readonly kind: "keep"; readonly pluginId: string }
+  | {
+      /** Loaded generations to unload, the target included when it is loaded. */
+      readonly kind: "replace";
+      readonly unload: readonly string[];
+      readonly pluginId: string;
+    };
+
+/**
+ * The one healthy compositor state is exactly one loaded Synara plugin: the
+ * newest generation known, loaded or installed. The plugin claims the
+ * `org.synara.ComputerUse` bus name only in its constructor, so when several
+ * generations are loaded the first registrant owns the name and the rest sit
+ * silent — a session that once loaded an old build keeps answering with it (no
+ * capture, missing methods) no matter how many newer builds are loaded after
+ * it, and an explicit LoadPlugin of the newest returns `false` (already
+ * loaded) while the old build keeps serving. Anything other than exactly
+ * [newest] is therefore a "replace": unload every loaded generation so the
+ * name is free, then load the target. Shared by the host backend's connect
+ * path and the nested session's first load. `undefined` when no Synara plugin
+ * exists at all, which is not recoverable here.
+ */
+export function resolveSynaraPluginLoad(options: {
+  readonly loaded: readonly string[];
+  readonly installed: readonly string[];
+}): SynaraPluginLoadPlan | undefined {
+  const loadedSynara = options.loaded.filter(isSynaraPluginId);
+  const pluginId = newestPluginId([...loadedSynara, ...options.installed]);
+  if (!pluginId) return undefined;
+  if (loadedSynara.length === 1 && loadedSynara[0] === pluginId) return { kind: "keep", pluginId };
+  return { kind: "replace", unload: loadedSynara, pluginId };
 }
 
 export async function scanInstalledPluginIds(

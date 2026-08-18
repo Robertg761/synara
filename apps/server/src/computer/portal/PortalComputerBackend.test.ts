@@ -177,6 +177,7 @@ describe("capabilitiesFromProviders", () => {
       activation: false,
       ghostCursor: false,
       sharedSeat: true,
+      visibleDesktop: true,
     });
   });
 
@@ -216,6 +217,7 @@ describe("capabilitiesFromProviders", () => {
       activation: false,
       ghostCursor: false,
       sharedSeat: false,
+      visibleDesktop: true,
     });
   });
 });
@@ -272,6 +274,7 @@ describe("resolvePortalProviders", () => {
       activation: true,
       ghostCursor: false,
       sharedSeat: true,
+      visibleDesktop: true,
     });
   });
 

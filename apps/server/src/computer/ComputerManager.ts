@@ -755,9 +755,12 @@ export class ComputerManager {
    * Emitted before the action event so the pane is already opening when the
    * first attributed action reaches the store. Mirrors
    * DeviceManager.requestOpenPane; see paneSurfaced for the once-per-thread
-   * rule.
+   * rule. On a visible-desktop backend the actions are already happening on the
+   * human's own screen, so no pane is requested at all — mirroring their
+   * display back at them adds nothing.
    */
   private surfacePaneForAgent(threadId: string): void {
+    if (this.backendCapabilities.visibleDesktop) return;
     const state = this.threadRuntime(threadId);
     if (state.paneSurfaced) return;
     state.paneSurfaced = true;

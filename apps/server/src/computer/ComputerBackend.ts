@@ -100,6 +100,7 @@ export const NO_COMPUTER_CAPABILITIES: ComputerCapabilities = {
   activation: false,
   ghostCursor: false,
   sharedSeat: false,
+  visibleDesktop: false,
 };
 
 /** Provider-side contract shared by real display backends and the CI fake. */

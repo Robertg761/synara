@@ -27,8 +27,7 @@ import { randomBytes } from "node:crypto";
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
 import {
-  isSynaraPluginId,
-  newestPluginId,
+  resolveSynaraPluginLoad,
   scanInstalledPluginIds,
   type KWinComputerBackendOptions,
 } from "./KWinComputerBackend.ts";
@@ -216,6 +215,9 @@ export function nestedKWinBackendOptions(
   const env = nestedSessionEnv(session);
   return {
     busAddress: session.busAddress,
+    // The nested compositor is headless: nothing the agent does there reaches
+    // the human's screen, so the Computer pane is the only view onto it.
+    visibleDesktop: false,
     // The nested compositor is a Wayland session even when the server was
     // started from a tty or a CI runner with no session at all, so the platform
     // gate must not read the ambient session type.
@@ -305,47 +307,33 @@ export function parseNestedSizeEnv(value: string | undefined): NestedSize | unde
   return { width, height };
 }
 
-export interface NestedPluginLoad {
-  /**
-   * Every loaded Synara plugin, the newest one included. KWin auto-loads each
-   * installed version at startup and the oldest registrant wins the
-   * `org.synara.ComputerUse` bus name, so an explicit LoadPlugin of the newest
-   * both returns `false` (already loaded) and leaves the old build serving. The
-   * only reliable order is: unload all of them, then load the one wanted.
-   */
-  readonly unload: readonly string[];
-  readonly load: string;
-}
-
-/** `undefined` when no Synara plugin is installed, which is not recoverable. */
-export function resolveNestedPluginLoad(options: {
-  readonly loaded: readonly string[];
-  readonly installed: readonly string[];
-}): NestedPluginLoad | undefined {
-  const load = newestPluginId(options.installed);
-  if (!load) return undefined;
-  return { unload: options.loaded.filter(isSynaraPluginId), load };
-}
-
+/**
+ * KWin auto-loads every installed plugin version at compositor startup, so the
+ * fresh nested session almost always begins with several stale generations
+ * loaded. `resolveSynaraPluginLoad` owns the unload-all-then-load-newest
+ * doctrine; this only adds the nested session's error sentences.
+ */
 async function loadNestedPlugin(
   dbus: KWinComputerDbus,
   installed: readonly string[],
 ): Promise<string> {
-  const plan = resolveNestedPluginLoad({ loaded: await dbus.listLoadedPluginIds(), installed });
+  const plan = resolveSynaraPluginLoad({ loaded: await dbus.listLoadedPluginIds(), installed });
   if (!plan) {
     throw new ComputerBackendError(
       "No installed SynaraComputerUsePluginVn was found for the nested KWin session. " +
         `Build and install it with ${INSTALL_SCRIPT_PATH}.`,
     );
   }
-  for (const pluginId of plan.unload) await dbus.unloadPlugin(pluginId);
-  if (!(await dbus.loadPlugin(plan.load))) {
-    throw new ComputerBackendError(
-      `The nested KWin session refused to load ${plan.load}: a KWin plugin only loads into ` +
-        `the exact KWin version it was built against. Rebuild it with ${INSTALL_SCRIPT_PATH}.`,
-    );
+  if (plan.kind === "replace") {
+    for (const pluginId of plan.unload) await dbus.unloadPlugin(pluginId);
+    if (!(await dbus.loadPlugin(plan.pluginId))) {
+      throw new ComputerBackendError(
+        `The nested KWin session refused to load ${plan.pluginId}: a KWin plugin only loads into ` +
+          `the exact KWin version it was built against. Rebuild it with ${INSTALL_SCRIPT_PATH}.`,
+      );
+    }
   }
-  return plan.load;
+  return plan.pluginId;
 }
 
 /** Names which of the two ways the compositor can fail to appear happened. */

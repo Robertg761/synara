@@ -36,7 +36,9 @@ const FAKE_SCREENSHOT_BASE64 =
  * stacking order, captures, takes input, holds a clipboard, and focuses and
  * raises — so those are all true. `ghostCursor` is true because the fake moves
  * a pointer nothing else shares, and `sharedSeat` is false for the same reason:
- * there is no human at this desktop to take the cursor from.
+ * there is no human at this desktop to take the cursor from. `visibleDesktop`
+ * is false too — a fake desktop renders nowhere, so the pane is its only view,
+ * which also keeps the pane auto-open path exercised under this backend.
  */
 const DEFAULT_FAKE_CAPABILITIES: ComputerCapabilities = {
   windows: true,
@@ -48,6 +50,7 @@ const DEFAULT_FAKE_CAPABILITIES: ComputerCapabilities = {
   activation: true,
   ghostCursor: true,
   sharedSeat: false,
+  visibleDesktop: false,
 };
 
 export interface FakeComputerCall {

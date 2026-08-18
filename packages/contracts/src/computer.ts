@@ -211,6 +211,15 @@ export const ComputerCapabilities = Schema.Struct({
    * focus follows, and the human sees every action. The panel must say so.
    */
   sharedSeat: Schema.Boolean,
+  /**
+   * The driven desktop is the display the human is already looking at, so every
+   * action is visible without a preview. Auto-opening the Computer pane keys
+   * off this being false: on a nested or offscreen desktop the pane is the only
+   * window onto the agent's work, while mirroring the human's own screen back
+   * at them is noise. Distinct from `sharedSeat` — the KWin tier drives the
+   * visible desktop through a dedicated seat.
+   */
+  visibleDesktop: Schema.Boolean,
 });
 export type ComputerCapabilities = typeof ComputerCapabilities.Type;
 

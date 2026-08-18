@@ -17,6 +17,7 @@ const FULL_CAPABILITIES: ThreadComputerState["capabilities"] = {
   activation: true,
   ghostCursor: true,
   sharedSeat: false,
+  visibleDesktop: true,
 };
 
 const baseState: ThreadComputerState = {

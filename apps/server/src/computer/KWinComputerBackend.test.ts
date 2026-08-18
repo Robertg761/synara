@@ -341,6 +341,15 @@ describe("KWinComputerBackend", () => {
       activation: true,
       ghostCursor: true,
       sharedSeat: false,
+      visibleDesktop: true,
+    });
+  });
+
+  it("reports an invisible desktop when bound to a nested compositor", () => {
+    // Same class, different tier: the nested session passes visibleDesktop
+    // false, and the pane auto-open gate keys off exactly this flag.
+    expect(makeBackend(new FakeDbus(), { visibleDesktop: false }).capabilities()).toMatchObject({
+      visibleDesktop: false,
     });
   });
 
@@ -488,13 +497,66 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
-  it("does not load when KWin already reports a Synara plugin", async () => {
+  it("does not reload when exactly the newest installed plugin is loaded", async () => {
+    const dbus = new FakeDbus();
+    dbus.loaded = ["SynaraComputerUsePluginV10"];
+    const backend = makeBackend(dbus);
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(dbus.calls.some((call) => call.method === "LoadPlugin")).toBe(false);
+    expect(dbus.calls.some((call) => call.method === "UnloadPlugin")).toBe(false);
+    await backend.dispose();
+  });
+
+  it("replaces a loaded plugin that is older than the newest installed one", async () => {
+    // The regression this guards: a session whose compositor still carries an
+    // old generation must not be trusted just because something Synara is
+    // loaded — the installed V10 is the build the server's API expects.
     const dbus = new FakeDbus();
     dbus.loaded = ["SynaraComputerUsePluginV4"];
     const backend = makeBackend(dbus);
 
     await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
-    expect(dbus.calls.some((call) => call.method === "LoadPlugin")).toBe(false);
+    expect(dbus.calls).toContainEqual({
+      method: "UnloadPlugin",
+      args: ["SynaraComputerUsePluginV4"],
+    });
+    expect(dbus.calls).toContainEqual({
+      method: "LoadPlugin",
+      args: ["SynaraComputerUsePluginV10"],
+    });
+    expect(dbus.loaded).toEqual(["SynaraComputerUsePluginV10"]);
+    await backend.dispose();
+  });
+
+  it("unloads every stale Synara generation before loading the target", async () => {
+    // The plugin claims its D-Bus name only in its constructor, so with several
+    // generations loaded the oldest owns the name and newer ones sit silent.
+    // Loading the target without clearing them would leave the name owned by
+    // the stale build — every one of them has to go first, and the compositor's
+    // unrelated plugins have to stay untouched.
+    const dbus = new FakeDbus();
+    dbus.loaded = [
+      "kwin-script-fancy",
+      "SynaraComputerUsePlugin",
+      "SynaraComputerUsePluginV2",
+      "SynaraComputerUsePluginV10",
+    ];
+    const backend = makeBackend(dbus);
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    const unloaded = dbus.calls
+      .filter((call) => call.method === "UnloadPlugin")
+      .map((call) => call.args[0]);
+    expect(unloaded).toEqual([
+      "SynaraComputerUsePlugin",
+      "SynaraComputerUsePluginV2",
+      "SynaraComputerUsePluginV10",
+    ]);
+    const loadIndex = dbus.calls.findIndex((call) => call.method === "LoadPlugin");
+    const lastUnloadIndex = dbus.calls.findLastIndex((call) => call.method === "UnloadPlugin");
+    expect(loadIndex).toBeGreaterThan(lastUnloadIndex);
+    expect(dbus.loaded).toEqual(["SynaraComputerUsePluginV10"]);
     await backend.dispose();
   });
 

@@ -5,6 +5,7 @@ import type { ChildProcess } from "node:child_process";
 import { describe, expect, it } from "vitest";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
+import { resolveSynaraPluginLoad } from "./KWinComputerBackend.ts";
 import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
 import {
   nestedAtspiMode,
@@ -13,7 +14,6 @@ import {
   nestedSessionEnv,
   nestedSessionMode,
   parseNestedSizeEnv,
-  resolveNestedPluginLoad,
   startNestedKWinSession,
   unavailableAtspiReader,
   type NestedKWinSession,
@@ -77,6 +77,7 @@ describe("nested session environment", () => {
     const options = nestedKWinBackendOptions(session);
     expect(options.busAddress).toBe(BUS_ADDRESS);
     expect(options.sessionType).toBe("wayland");
+    expect(options.visibleDesktop).toBe(false);
     await expect(options.atspi?.readTrees([])).resolves.toEqual([]);
     await expect(unavailableAtspiReader().setText({} as never)).resolves.toBe(false);
   });
@@ -85,7 +86,7 @@ describe("nested session environment", () => {
 describe("nested plugin shadowing", () => {
   it("unloads every loaded Synara plugin, the newest included, then loads the newest installed", () => {
     expect(
-      resolveNestedPluginLoad({
+      resolveSynaraPluginLoad({
         loaded: [
           "kwin4_effect_something",
           "SynaraComputerUsePlugin",
@@ -95,21 +96,30 @@ describe("nested plugin shadowing", () => {
         installed: ["SynaraComputerUsePluginV2", "SynaraComputerUsePluginV3"],
       }),
     ).toEqual({
+      kind: "replace",
       unload: ["SynaraComputerUsePlugin", "SynaraComputerUsePluginV2", "SynaraComputerUsePluginV3"],
-      load: "SynaraComputerUsePluginV3",
+      pluginId: "SynaraComputerUsePluginV3",
     });
   });
 
   it("unloads nothing when the compositor auto-loaded nothing", () => {
     expect(
-      resolveNestedPluginLoad({ loaded: [], installed: ["SynaraComputerUsePluginV10"] }),
-    ).toEqual({ unload: [], load: "SynaraComputerUsePluginV10" });
+      resolveSynaraPluginLoad({ loaded: [], installed: ["SynaraComputerUsePluginV10"] }),
+    ).toEqual({ kind: "replace", unload: [], pluginId: "SynaraComputerUsePluginV10" });
   });
 
-  it("has no plan when no plugin is installed", () => {
+  it("keeps a sole loaded plugin even when the disk scan finds nothing", () => {
+    // A long-lived compositor can outlive the .so files it loaded from; the
+    // loaded plugin is still serving and is strictly better than erroring.
     expect(
-      resolveNestedPluginLoad({ loaded: ["SynaraComputerUsePluginV3"], installed: [] }),
-    ).toBeUndefined();
+      resolveSynaraPluginLoad({ loaded: ["SynaraComputerUsePluginV3"], installed: [] }),
+    ).toEqual({ kind: "keep", pluginId: "SynaraComputerUsePluginV3" });
+  });
+
+  it("has no plan when no Synara plugin exists anywhere", () => {
+    expect(resolveSynaraPluginLoad({ loaded: ["kwin4_effect_something"], installed: [] })).toBe(
+      undefined,
+    );
   });
 });
 
@@ -241,7 +251,9 @@ describe("startNestedKWinSession", () => {
   });
 
   it("reports an uninstalled plugin as the reason and tears the session down", async () => {
-    const harness = new NestedHarness({ installed: [] });
+    // A compositor with nothing on disk auto-loads nothing either; a loaded
+    // plugin with no file behind it would now be kept rather than refused.
+    const harness = new NestedHarness({ installed: [], loaded: [] });
     await expect(startNestedKWinSession(harness.options())).rejects.toBeInstanceOf(
       ComputerBackendError,
     );

@@ -814,6 +814,9 @@ export function capabilitiesFromProviders(providers: PortalProviders): ComputerC
     // a portal or wlroots desktop, and a layer-shell marker is decoration.
     ghostCursor: false,
     sharedSeat: input?.sharedSeat === true,
+    // Tier 2 always drives the human's live session — portals and wlroots
+    // protocols have no notion of an offscreen desktop.
+    visibleDesktop: true,
   };
 }
 

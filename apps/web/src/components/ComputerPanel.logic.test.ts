@@ -48,6 +48,7 @@ function state(overrides: Partial<ThreadComputerState> = {}): ThreadComputerStat
       activation: true,
       ghostCursor: true,
       sharedSeat: false,
+      visibleDesktop: true,
     },
     windows: [],
     screenSize: { width: 5120, height: 2520 },
