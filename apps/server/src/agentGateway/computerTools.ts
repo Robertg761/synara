@@ -401,6 +401,10 @@ export function makeAgentGatewayComputerTools(
           ) {
             return approvalUnavailableResult(name);
           }
+          // Recorded before the call, because the call is what claims the
+          // desktop, and the badge has to name this thread from the first
+          // action rather than from the second.
+          manager.setThreadLabel(context.callerThreadId, context.callerThreadLabel);
           const value = await manager.withAgentActivity(context.callerThreadId, () =>
             run(args, context),
           );

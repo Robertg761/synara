@@ -155,6 +155,8 @@ export class ComputerManager {
   private readonly transport: FrameTransport<string, ComputerStreamFrame>;
   private readonly listeners = new Set<ComputerEventListener>();
   private readonly threads = new Map<string, ThreadComputerRuntimeState>();
+  /** Display names for the agent cursor badge, keyed by thread id. */
+  private readonly threadLabels = new Map<string, string>();
   private readonly backendUnsubscribe?: () => void;
   private readonly now: () => number;
   private readonly leaseIdleMs: number;
@@ -641,9 +643,45 @@ export class ComputerManager {
     }
     const changed = held?.threadId !== owner;
     this.lease = { threadId: owner, lastActivityMs: now };
-    // Both panels change: the new owner stops being blocked, and every other
-    // thread starts being.
-    if (changed) await this.publishAllThreads();
+    if (changed) {
+      await this.announceDrivingAgent(owner);
+      // Both panels change: the new owner stops being blocked, and every other
+      // thread starts being.
+      await this.publishAllThreads();
+    }
+  }
+
+  /**
+   * Names the thread driving the desktop so a backend that draws an agent
+   * cursor can label it. Best effort: a missing or failed label is a cosmetic
+   * loss, and must never turn into a refused action.
+   */
+  private async announceDrivingAgent(threadId: string | null): Promise<void> {
+    if (!this.backend.setDrivingAgent) return;
+    const label = threadId === null ? null : (this.threadLabels.get(threadId) ?? null);
+    await this.backend.setDrivingAgent(label).catch(() => undefined);
+  }
+
+  /**
+   * The display name for a thread's agent cursor badge. Pushed in by the tool
+   * layer, which is the only place that knows a thread's title, rather than
+   * queried from here — the manager is built without any orchestration
+   * dependency and reading a title on every action would put a database read
+   * inside the lease claim.
+   */
+  setThreadLabel(threadId: string, label: string | null): void {
+    const owner = agentThreadId(threadId);
+    if (owner === undefined) return;
+    const trimmed = label?.trim();
+    if (trimmed) {
+      if (this.threadLabels.get(owner) === trimmed) return;
+      this.threadLabels.set(owner, trimmed);
+    } else {
+      if (!this.threadLabels.delete(owner)) return;
+    }
+    // Only when this thread is the one on screen; every other thread's label is
+    // just recorded for whenever it takes the desktop.
+    if (this.lease?.threadId === owner) void this.announceDrivingAgent(owner);
   }
 
   /**
@@ -661,6 +699,7 @@ export class ComputerManager {
     const owner = agentThreadId(threadId);
     if (owner === undefined || this.lease?.threadId !== owner) return;
     this.lease = null;
+    await this.announceDrivingAgent(null);
     await this.publishAllThreads();
   }
 
@@ -730,6 +769,7 @@ export class ComputerManager {
 
   async handleThreadRemoved(threadId: string): Promise<void> {
     this.threads.delete(threadId);
+    this.threadLabels.delete(threadId);
     // Deleted after the thread state, so the resulting publish cannot recreate
     // it: a removed thread must not reappear as a lease holder.
     await this.releaseDesktopControl(threadId);

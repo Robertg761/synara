@@ -222,6 +222,12 @@ export class KWinComputerBackend implements ComputerBackend {
    */
   private readonly provisionPromises = new Map<boolean, Promise<ProvisionResult>>();
 
+  /**
+   * The thread currently holding the desktop, cached because the plugin loses it
+   * on every restart: a reconnect or an idle stop rebuilds the session, and the
+   * badge has to come back naming the same thread.
+   */
+  private drivingAgent: string | null = null;
   private dbus: KWinComputerDbus | undefined;
   private plugin: KWinComputerPluginApi | undefined;
   private pluginId: string | undefined;
@@ -468,6 +474,16 @@ export class KWinComputerBackend implements ComputerBackend {
   async clearFocusWindow(): Promise<void> {
     const plugin = await this.ensurePlugin();
     await this.pluginSuccess("clearFocusWindow", () => plugin.clearFocusWindow());
+  }
+
+  async setDrivingAgent(name: string | null): Promise<void> {
+    this.drivingAgent = name?.trim() ? name.trim() : null;
+    // Only pushed to a session that is already up. A start pushes the cached
+    // name itself, so naming a thread must not be what starts the session -
+    // the human would get an agent cursor before any agent asked for one.
+    const plugin = this.connectedPlugin();
+    if (!plugin || this.pluginHealth?.running !== true) return;
+    await this.pushDrivingAgent(plugin);
   }
 
   async launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult> {
@@ -850,6 +866,14 @@ export class KWinComputerBackend implements ComputerBackend {
     return this.connectPromise;
   }
 
+  /**
+   * Best effort on purpose: an older loaded plugin has no setAgentName, and an
+   * unnamed badge is not a reason to fail the session or the action.
+   */
+  private async pushDrivingAgent(plugin: KWinComputerPluginApi): Promise<void> {
+    await plugin.setAgentName(this.drivingAgent ?? "").catch(() => undefined);
+  }
+
   private async startPlugin(plugin: KWinComputerPluginApi): Promise<void> {
     if (this.disposed) throw new ComputerBackendError("KWin computer backend is disposed.");
     if (this.pluginHealth?.running === true) return;
@@ -863,6 +887,7 @@ export class KWinComputerBackend implements ComputerBackend {
         // A plugin build without setIdleTimeout keeps its own default deadline,
         // so an older loaded plugin must not fail the session.
         await plugin.setIdleTimeout(this.idleTimeoutMs).catch(() => undefined);
+        await this.pushDrivingAgent(plugin);
         const runningHealth = parseHealth(await plugin.healthJson());
         if (!runningHealth.ok || !runningHealth.running) {
           throw new ComputerBackendError("Synara KWin computer-use plugin is not running.");

@@ -102,6 +102,14 @@ class FakePlugin implements KWinComputerPluginApi {
     this.idleTimeoutMs = milliseconds;
     return true;
   };
+  agentName: string | undefined;
+  agentNameFailure: Error | undefined;
+  setAgentName = async (name: string) => {
+    this.calls.push({ method: "setAgentName", args: [name] });
+    if (this.agentNameFailure) throw this.agentNameFailure;
+    this.agentName = name;
+    return true;
+  };
   focusWindow = async (windowId: string) => this.recordInput("focusWindow", windowId);
   raiseWindowFailure: Error | undefined;
   raiseWindow = async (windowId: string) => {
@@ -453,6 +461,57 @@ describe("KWinComputerBackend", () => {
 
     await backend.focusWindow("window-1");
     expect(dbus.plugin.idleTimeoutMs).toBe(45_000);
+
+    await backend.dispose();
+  });
+
+  it("names the driving thread on the ghost cursor, and renames it live", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+
+    await backend.setDrivingAgent("Luna");
+    // Naming a thread must not be what starts the session: the human would get
+    // an agent cursor before any agent asked for one.
+    expect(dbus.plugin.calls.filter((call) => call.method === "start")).toHaveLength(0);
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.agentName).toBe("Luna");
+
+    await backend.setDrivingAgent("Nova");
+    expect(dbus.plugin.agentName).toBe("Nova");
+
+    await backend.setDrivingAgent(null);
+    expect(dbus.plugin.agentName).toBe("");
+
+    await backend.dispose();
+  });
+
+  it("renames the ghost cursor again after the plugin restarts the session", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.setDrivingAgent("Luna");
+    await backend.focusWindow("window-1");
+
+    // The plugin auto-stopped, so its own copy of the name went with it.
+    dbus.plugin.running = false;
+    dbus.plugin.agentName = undefined;
+
+    await backend.click({ x: 44, y: 44 });
+    expect(dbus.plugin.agentName).toBe("Luna");
+
+    await backend.dispose();
+  });
+
+  it("keeps the session usable when the plugin has no setAgentName", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.agentNameFailure = dbusError(
+      "org.freedesktop.DBus.Error.UnknownMethod",
+      "No such method 'setAgentName'",
+    );
+    const backend = makeBackend(dbus);
+
+    await backend.setDrivingAgent("Luna");
+    await expect(backend.focusWindow("window-1")).resolves.toBeUndefined();
 
     await backend.dispose();
   });

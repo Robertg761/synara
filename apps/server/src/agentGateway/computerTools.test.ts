@@ -31,7 +31,11 @@ function withoutClipboard(backend: FakeComputerBackend): FakeComputerBackend {
   });
 }
 
-function makeContext(provider: ProviderKind = "claudeAgent", threadId = THREAD): ToolContext {
+function makeContext(
+  provider: ProviderKind = "claudeAgent",
+  threadId = THREAD,
+  label: string | null = null,
+): ToolContext {
   return {
     principal: {
       kind: "provider-session",
@@ -41,6 +45,7 @@ function makeContext(provider: ProviderKind = "claudeAgent", threadId = THREAD):
       turnId: "turn-computer",
     },
     callerThreadId: threadId,
+    callerThreadLabel: label,
     callerSessionKey: "gateway-session:computer",
     callerProvider: provider,
     callerCapabilities: new Set(["computer:control"]),
@@ -61,15 +66,34 @@ async function setup(backend = new FakeComputerBackend()) {
     args: Record<string, unknown>,
     provider?: ProviderKind,
     threadId?: string,
+    label?: string | null,
   ): Promise<McpToolCallResult> => {
     const tool = byName.get(name);
     if (!tool) throw new Error(`no such tool: ${name}`);
-    return await Effect.runPromise(tool.handler(args, makeContext(provider, threadId)));
+    return await Effect.runPromise(tool.handler(args, makeContext(provider, threadId, label)));
   };
   return { backend, manager, tools, byName, call };
 }
 
 describe("agent gateway computer tools", () => {
+  it("carries the caller's name to the backend that draws the agent cursor", async () => {
+    // The tool layer is the only place that knows what a thread is called, and
+    // the badge on the human's desktop is the only reason it has to say so.
+    const names: Array<string | null> = [];
+    const backend = Object.assign(new FakeComputerBackend(), {
+      setDrivingAgent: async (name: string | null) => {
+        names.push(name);
+      },
+    });
+    const { call } = await setup(backend);
+
+    await call("computer_click", { x: 4, y: 4 }, "claudeAgent", THREAD, "Luna");
+    expect(names).toEqual(["Luna"]);
+
+    await call("computer_press_key", { key: "enter" }, "claudeAgent", THREAD, "Luna");
+    expect(names).toEqual(["Luna"]);
+  });
+
   it("exposes the full Phase 1 surface behind computer:control", async () => {
     const { tools } = await setup();
     expect(tools.map((tool) => tool.definition.name)).toEqual([

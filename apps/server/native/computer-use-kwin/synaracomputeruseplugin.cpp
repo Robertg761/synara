@@ -14,7 +14,6 @@
 #include "core/renderloop.h"
 #include "core/rendertarget.h"
 #include "cursor.h"
-#include "cursorsource.h"
 #include "effect/effecthandler.h"
 #include "input.h"
 #include "keyboard_input.h"
@@ -24,9 +23,7 @@
 #include "scene/scene.h"
 #include "pointer_input.h"
 #include "scene/imageitem.h"
-#include "scene/itemrenderer.h"
 #include "scene/workspacescene.h"
-#include "utils/cursortheme.h"
 #include "wayland/clientconnection.h"
 #include "wayland/display.h"
 #include "wayland/keyboard.h"
@@ -43,12 +40,17 @@
 #include <QBuffer>
 #include <QDBusConnection>
 #include <QDBusMessage>
+#include <QEasingCurve>
+#include <QFont>
+#include <QFontMetricsF>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeySequence>
 #include <QPainter>
+#include <QPainterPath>
+#include <QPen>
 #include <QThreadPool>
 
 #include <wayland-server-core.h>
@@ -61,6 +63,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -93,6 +96,30 @@ static constexpr int s_captureEncodeDeadlineMilliseconds = 5000;
 static constexpr int s_captureMaxNativeSide = 16384;
 static constexpr qint64 s_captureMaxNativePixels = 64LL * 1024 * 1024;
 static const QString s_captureSizeLimitReason = QStringLiteral("capture exceeds 16384 pixels per side or 64 megapixels");
+// The ghost cursor is drawn by the plugin instead of taken from the human's
+// cursor theme: a second arrow in their own theme is indistinguishable from
+// theirs, and being able to tell the two apart is the whole point of it.
+// A saturated violet and a light rim read against any wallpaper, so neither
+// colour depends on what is behind the cursor.
+static const QColor s_agentAccentColor = QColor(0x7c, 0x3a, 0xed);
+static const QColor s_agentRimColor = QColor(0xff, 0xff, 0xff);
+static const QColor s_agentInkColor = QColor(0x14, 0x0a, 0x2e, 0x99);
+// Stroke widths in multiples of the cursor size. Fixed widths would swallow the
+// accent colour at small cursor sizes and disappear at large ones, so the whole
+// glyph has to scale together.
+static constexpr qreal s_agentInkStrokeRatio = 0.085;
+static constexpr qreal s_agentRimStrokeRatio = 0.045;
+static constexpr qreal s_agentMinInkStrokeWidth = 1.8;
+static constexpr qreal s_agentMinRimStrokeWidth = 1.0;
+static constexpr int s_agentBadgeMinTextPixels = 11;
+// Elide width in multiples of the cursor size, so a long name is cut at the same
+// point relative to the badge whatever cursor size the human runs.
+static constexpr qreal s_agentBadgeMaxTextWidthRatio = 8;
+static constexpr int s_agentBadgeHoldMilliseconds = 2000;
+static constexpr int s_agentBadgeFadeMilliseconds = 320;
+// Shown when the server has not named the driving thread, so the badge still
+// says who is moving the cursor rather than disappearing.
+static const QString s_agentFallbackName = QStringLiteral("Agent");
 // The agent gets its own wl_seat so its pointer and keyboard focus are fully
 // independent of the user's real seat. Without this the plugin would have to
 // time-share the real seat's focus, and concurrent user input would cross
@@ -538,27 +565,241 @@ static bool renderCapturePart(WorkspaceScene *scene,
     return true;
 }
 
+// The arrow silhouette, tip first, in fractions of the cursor size. Proportions
+// follow a stock theme arrow so the ghost still reads as a pointer, and the tip
+// sits on the origin so the hotspot is exactly the point that gets clicked.
+static const QPointF s_agentCursorOutline[] = {
+    {0.00, 0.00},
+    {0.00, 0.76},
+    {0.19, 0.58},
+    {0.30, 0.88},
+    {0.44, 0.82},
+    {0.32, 0.54},
+    {0.56, 0.54},
+};
+
+static qreal agentInkStrokeWidth(qreal size)
+{
+    return std::max(s_agentMinInkStrokeWidth, size * s_agentInkStrokeRatio);
+}
+
+static qreal agentRimStrokeWidth(qreal size)
+{
+    return std::max(s_agentMinRimStrokeWidth, size * s_agentRimStrokeRatio);
+}
+
+/**
+ * Transparent room for the strokes, which extend outward past the silhouette on
+ * every side including the tip. In logical pixels, and therefore also the offset
+ * from the drawn image's corner to the hotspot.
+ */
+static qreal agentStrokeMargin(qreal size)
+{
+    return agentInkStrokeWidth(size) / 2 + 1;
+}
+
+static QPainterPath agentCursorPath(qreal size)
+{
+    QPainterPath path;
+    path.moveTo(s_agentCursorOutline[0] * size);
+    for (size_t i = 1; i < std::size(s_agentCursorOutline); ++i) {
+        path.lineTo(s_agentCursorOutline[i] * size);
+    }
+    path.closeSubpath();
+    return path;
+}
+
+static QImage renderAgentImage(const QSizeF &logicalSize, qreal devicePixelRatio, const std::function<void(QPainter &)> &paint)
+{
+    const QSize deviceSize(int(std::ceil(logicalSize.width() * devicePixelRatio)),
+                           int(std::ceil(logicalSize.height() * devicePixelRatio)));
+    QImage image(deviceSize, QImage::Format_ARGB32_Premultiplied);
+    if (image.isNull()) {
+        return image;
+    }
+    image.fill(Qt::transparent);
+    {
+        QPainter painter(&image);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setRenderHint(QPainter::TextAntialiasing, true);
+        // Scaled here rather than by letting QPainter pick the ratio up from the
+        // image, so the device pixel ratio is only ever applied once.
+        painter.scale(devicePixelRatio, devicePixelRatio);
+        paint(painter);
+    }
+    image.setDevicePixelRatio(devicePixelRatio);
+    return image;
+}
+
+static QImage renderAgentCursorImage(qreal size, qreal devicePixelRatio)
+{
+    const QPainterPath path = agentCursorPath(size);
+    const QRectF bounds = path.boundingRect();
+    const qreal margin = agentStrokeMargin(size);
+    const QSizeF logicalSize(bounds.right() + 2 * margin, bounds.bottom() + 2 * margin);
+    return renderAgentImage(logicalSize, devicePixelRatio, [&path, size, margin](QPainter &painter) {
+        painter.translate(margin, margin);
+        painter.setBrush(Qt::NoBrush);
+        QPen pen(s_agentInkColor, agentInkStrokeWidth(size));
+        pen.setJoinStyle(Qt::RoundJoin);
+        painter.setPen(pen);
+        painter.drawPath(path);
+        pen.setColor(s_agentRimColor);
+        pen.setWidthF(agentRimStrokeWidth(size));
+        painter.setPen(pen);
+        painter.drawPath(path);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(s_agentAccentColor);
+        painter.drawPath(path);
+    });
+}
+
+static QFont agentBadgeFont(qreal size)
+{
+    QFont font;
+    font.setPixelSize(std::max(s_agentBadgeMinTextPixels, int(std::lround(size * 0.5))));
+    font.setWeight(QFont::DemiBold);
+    return font;
+}
+
+static QImage renderAgentBadgeImage(const QString &name, qreal size, qreal devicePixelRatio)
+{
+    const QFont font = agentBadgeFont(size);
+    const QFontMetricsF metrics(font);
+    const QString text = metrics.elidedText(name, Qt::ElideRight, size * s_agentBadgeMaxTextWidthRatio);
+    const qreal paddingX = std::round(size * 0.30);
+    const qreal paddingY = std::round(size * 0.14);
+    const QSizeF body(std::ceil(metrics.horizontalAdvance(text) + 2 * paddingX),
+                      std::ceil(metrics.height() + 2 * paddingY));
+    const qreal margin = agentStrokeMargin(size);
+    const QSizeF logicalSize(body.width() + 2 * margin, body.height() + 2 * margin);
+    return renderAgentImage(logicalSize, devicePixelRatio, [&body, &font, &text, size, margin](QPainter &painter) {
+        const QRectF rect(margin, margin, body.width(), body.height());
+        const qreal radius = rect.height() / 2;
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(s_agentInkColor, agentInkStrokeWidth(size)));
+        painter.drawRoundedRect(rect, radius, radius);
+        painter.setPen(QPen(s_agentRimColor, agentRimStrokeWidth(size)));
+        painter.setBrush(s_agentAccentColor);
+        painter.drawRoundedRect(rect, radius, radius);
+        painter.setPen(s_agentRimColor);
+        painter.setFont(font);
+        painter.drawText(rect, Qt::AlignCenter, text);
+    });
+}
+
+static qreal agentCursorSize()
+{
+    const Cursor *cursor = Cursors::self() ? Cursors::self()->mouse() : nullptr;
+    const int size = cursor ? cursor->themeSize() : 0;
+    // The human's own cursor size, so the ghost is the same physical size as the
+    // pointer it sits beside; only the colour and the badge tell them apart.
+    return size > 0 ? qreal(size) : qreal(Cursor::defaultThemeSize());
+}
+
 SynaraAgentCursorItem::SynaraAgentCursorItem(Item *parent)
     : Item(parent)
 {
-    m_source = std::make_unique<ShapeCursorSource>();
-    m_source->setTheme(input()->pointer()->cursorTheme());
-    m_source->setShape(Qt::ArrowCursor);
+    m_badgeFade.setDuration(s_agentBadgeFadeMilliseconds);
+    m_badgeFade.setStartValue(1.0);
+    m_badgeFade.setEndValue(0.0);
+    m_badgeFade.setEasingCurve(QEasingCurve::InOutQuad);
+    connect(&m_badgeFade, &QVariantAnimation::valueChanged, this, [this](const QVariant &value) {
+        if (m_badgeItem) {
+            m_badgeItem->setOpacity(value.toReal());
+        }
+    });
+    connect(&m_badgeFade, &QVariantAnimation::finished, this, [this]() {
+        // A fully transparent badge is still a textured quad on every frame the
+        // ghost cursor moves, so it leaves the scene instead of sitting at zero.
+        if (m_badgeItem) {
+            m_badgeItem->setVisible(false);
+        }
+    });
+    m_badgeHoldTimer.setSingleShot(true);
+    m_badgeHoldTimer.setInterval(s_agentBadgeHoldMilliseconds);
+    connect(&m_badgeHoldTimer, &QTimer::timeout, &m_badgeFade, [this]() {
+        m_badgeFade.start();
+    });
 
     refresh();
-    connect(m_source.get(), &CursorSource::changed, this, &SynaraAgentCursorItem::refresh);
+
+    if (Cursor *cursor = Cursors::self() ? Cursors::self()->mouse() : nullptr) {
+        connect(cursor, &Cursor::themeChanged, this, &SynaraAgentCursorItem::refresh);
+    }
+    if (Workspace *workspace = Workspace::self()) {
+        connect(workspace, &Workspace::outputsChanged, this, &SynaraAgentCursorItem::refresh);
+    }
+}
+
+void SynaraAgentCursorItem::setAgentName(const QString &name)
+{
+    const QString trimmed = name.trimmed();
+    if (m_agentName == trimmed) {
+        return;
+    }
+    m_agentName = trimmed;
+    refresh();
+}
+
+void SynaraAgentCursorItem::setHotspot(const QPointF &position)
+{
+    setPosition(position);
+    if (std::abs(targetDevicePixelRatio() - m_devicePixelRatio) > 0.001) {
+        refresh();
+    }
+}
+
+void SynaraAgentCursorItem::noteActivity()
+{
+    if (!m_badgeItem) {
+        return;
+    }
+    m_badgeFade.stop();
+    m_badgeItem->setOpacity(1);
+    m_badgeItem->setVisible(true);
+    m_badgeHoldTimer.start();
+}
+
+qreal SynaraAgentCursorItem::targetDevicePixelRatio() const
+{
+    if (Workspace *workspace = Workspace::self()) {
+        if (LogicalOutput *output = workspace->outputAt(position())) {
+            return output->scale();
+        }
+    }
+    return 1;
 }
 
 void SynaraAgentCursorItem::refresh()
 {
+    m_cursorSize = agentCursorSize();
+    m_devicePixelRatio = targetDevicePixelRatio();
+
     // KWin 6.7 removed ItemRenderer::createImageItem(); ImageItem now has a
     // public constructor. This mirrors KWin's own CursorItem::refresh().
+    const QImage cursor = renderAgentCursorImage(m_cursorSize, m_devicePixelRatio);
     if (!m_imageItem) {
         m_imageItem = std::make_unique<ImageItem>(this);
     }
-    m_imageItem->setImage(m_source->image());
-    m_imageItem->setPosition(-m_source->hotspot());
-    m_imageItem->setSize(m_source->image().deviceIndependentSize());
+    const qreal margin = agentStrokeMargin(m_cursorSize);
+    m_imageItem->setImage(cursor);
+    m_imageItem->setPosition(QPointF(-margin, -margin));
+    m_imageItem->setSize(cursor.deviceIndependentSize());
+
+    const QImage badge = renderAgentBadgeImage(m_agentName.isEmpty() ? s_agentFallbackName : m_agentName,
+                                               m_cursorSize,
+                                               m_devicePixelRatio);
+    if (!m_badgeItem) {
+        m_badgeItem = std::make_unique<ImageItem>(this);
+        m_badgeItem->setVisible(false);
+    }
+    m_badgeItem->setImage(badge);
+    // Below and right of the hotspot, clear of the arrow, so the badge never
+    // covers the pixel the agent is about to click.
+    m_badgeItem->setPosition(QPointF(std::round(m_cursorSize * 0.55) - margin,
+                                     std::round(m_cursorSize * 0.90) - margin));
+    m_badgeItem->setSize(badge.deviceIndependentSize());
 }
 
 SynaraComputerUsePlugin::SynaraComputerUsePlugin()
@@ -711,6 +952,7 @@ QString SynaraComputerUsePlugin::stateJson() const
         // this is how it gets caught rather than argued about.
         {QStringLiteral("humanPosition"),
          pointToJson(input() && input()->pointer() ? input()->pointer()->pos() : QPointF())},
+        {QStringLiteral("agentName"), m_agentName.isEmpty() ? s_agentFallbackName : m_agentName},
         {QStringLiteral("pressedButtonCount"), m_pressedButtons.size()},
         {QStringLiteral("pressedKeyCount"), m_pressedKeys.size()},
         {QStringLiteral("idleTimeoutMs"), double(m_idleTimeoutMs)},
@@ -859,6 +1101,20 @@ bool SynaraComputerUsePlugin::setIdleTimeout(uint milliseconds)
     return true;
 }
 
+bool SynaraComputerUsePlugin::setAgentName(const QString &name)
+{
+    m_agentName = name.trimmed();
+    if (m_cursorItem) {
+        m_cursorItem->setAgentName(m_agentName);
+        // A handover mid-session has to announce itself, so the badge comes back
+        // for the new name rather than staying faded until the next action.
+        if (m_running) {
+            m_cursorItem->noteActivity();
+        }
+    }
+    return true;
+}
+
 void SynaraComputerUsePlugin::stopSession(StopReason reason)
 {
     m_idleTimer.stop();
@@ -944,6 +1200,9 @@ void SynaraComputerUsePlugin::noteActivity()
 {
     m_lastActivity.restart();
     armIdleTimer();
+    if (m_cursorItem) {
+        m_cursorItem->noteActivity();
+    }
 }
 
 void SynaraComputerUsePlugin::armIdleTimer()
@@ -1031,7 +1290,7 @@ bool SynaraComputerUsePlugin::movePointer(double x, double y)
 
     ensureCursorItem();
     if (m_cursorItem) {
-        m_cursorItem->setPosition(m_pos);
+        m_cursorItem->setHotspot(m_pos);
     }
 
     setTimestampNow();
@@ -1616,7 +1875,8 @@ void SynaraComputerUsePlugin::ensureCursorItem()
 
     m_cursorItem = std::make_unique<SynaraAgentCursorItem>(effects->scene()->overlayItem());
     m_cursorItem->setZ(1000);
-    m_cursorItem->setPosition(m_pos);
+    m_cursorItem->setAgentName(m_agentName);
+    m_cursorItem->setHotspot(m_pos);
     m_cursorItem->setVisible(m_running);
 }
 

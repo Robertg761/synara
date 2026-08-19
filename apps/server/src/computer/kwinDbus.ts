@@ -37,6 +37,8 @@ export interface KWinComputerPluginApi {
   readonly start: () => Promise<unknown>;
   readonly stop: () => Promise<unknown>;
   readonly setIdleTimeout: (milliseconds: number) => Promise<unknown>;
+  /** Names the thread driving the ghost cursor, for the on-screen badge. */
+  readonly setAgentName: (name: string) => Promise<unknown>;
   readonly focusWindow: (windowId: string) => Promise<unknown>;
   readonly raiseWindow: (windowId: string) => Promise<unknown>;
   readonly clearFocusWindow: () => Promise<unknown>;
@@ -221,6 +223,7 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
     start: () => invoke(iface, "start"),
     stop: () => invoke(iface, "stop"),
     setIdleTimeout: (milliseconds) => invoke(iface, "setIdleTimeout", milliseconds),
+    setAgentName: (name) => invoke(iface, "setAgentName", name),
     focusWindow: (windowId) => invoke(iface, "focusWindow", windowId),
     raiseWindow: (windowId) => invoke(iface, "raiseWindow", windowId),
     clearFocusWindow: () => invoke(iface, "clearFocusWindow"),

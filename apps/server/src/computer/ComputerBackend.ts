@@ -156,6 +156,13 @@ export interface ComputerBackend {
    */
   raiseWindow?(windowId: string): Promise<void>;
   clearFocusWindow?(): Promise<void>;
+  /**
+   * Names the thread currently holding the desktop, for backends that draw an
+   * agent cursor the human can see. `null` when nobody holds it. Best effort by
+   * design: a label is presentation, so failing to set one must never fail the
+   * action that changed the holder.
+   */
+  setDrivingAgent?(name: string | null): Promise<void>;
   launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult>;
   click(point: ComputerPoint): Promise<ComputerBackendActionResult | void>;
   doubleClick(point: ComputerPoint): Promise<ComputerBackendActionResult | void>;

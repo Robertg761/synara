@@ -16,9 +16,23 @@ the macOS comparison.
 
 - Runs inside KWin as a `KWin::Plugin`, so it has the compositor's authority over
   input routing.
-- The agent cursor is a KWin scene overlay `Item` (`ShapeCursorSource` +
-  `ImageItem`, z=1000, parented to `effects->scene()->overlayItem()`), not a
-  separate client window. This mirrors KWin's own `CursorItem`.
+- The agent cursor is a KWin scene overlay `Item` (z=1000, parented to
+  `effects->scene()->overlayItem()`), not a separate client window. This mirrors
+  KWin's own `CursorItem`, except that the arrow is drawn by the plugin with
+  `QPainter` rather than taken from the human's cursor theme: a second arrow in
+  their own theme is indistinguishable from theirs, and telling the two apart is
+  the whole point. It is a violet silhouette with a light rim and a dark outer
+  stroke, so it reads against any wallpaper, sized from the human's own
+  `themeSize` so both cursors are the same physical size.
+- A name badge — a pill naming the driving thread — is a second `ImageItem`
+  child of the cursor item, offset below-right of the hotspot so it never covers
+  the click point. It is fully opaque while the agent acts and fades out two
+  seconds after the last action. Being a child of the cursor item is what keeps
+  it out of `captureWindow`/`captureRegion`, which exclude that whole subtree by
+  rendering it into its own exclusive `ItemTreeView`.
+- Both images are rasterized at the scale of the output the hotspot is on and
+  redrawn when the cursor crosses onto an output with a different scale, when
+  the human's cursor theme changes, or when the outputs change.
 - The plugin creates a dedicated `SeatInterface` named `synara-agent` and
   delivers all agent input on it: pointer focus/motion/buttons via
   `notifyPointerEnter` / `notifyPointerMotion` / `notifyPointerButton`, keys via
@@ -33,12 +47,21 @@ the macOS comparison.
 
 Service `org.synara.ComputerUse`, path `/org/synara/ComputerUse`, interface
 `org.synara.ComputerUse1`. Methods: `healthJson`, `stateJson`, `windowsJson`,
-`start`, `stop`, `setIdleTimeout(u milliseconds) -> b`, `focusWindow`,
+`start`, `stop`, `setIdleTimeout(u milliseconds) -> b`,
+`setAgentName(s name) -> b`, `focusWindow`,
 `raiseWindow(s windowId) -> b`, `clearFocusWindow`, `movePointer`, `button`,
 `axis`, `key`, `captureWindow(s windowId, u maxDimension) -> ay`, and
 `captureRegion(i x, i y, u width, u height, u maxDimension) -> ay`. One signal:
 `sessionStopped(s reason)`, emitted whenever a running session ends, with the
 reason `request`, `idle-timeout`, or `user-release`.
+
+`setAgentName(name)` sets the text on the cursor's name badge and always returns
+`true`; an empty string clears it back to `Agent`. The plugin has no way to know
+which thread is driving it, so the server names the lease holder — it caches the
+name and resends it after every session start, because the plugin forgets it
+along with the rest of the session. Setting it mid-session brings the badge back
+at full opacity, so a handover announces itself instead of happening silently.
+`stateJson` reports the current name as `agentName`.
 
 `windowsJson` reports windows topmost-first. Each entry carries `stackingIndex`
 (`0` is the topmost reported window, increasing downward) and `occludedBy`, the

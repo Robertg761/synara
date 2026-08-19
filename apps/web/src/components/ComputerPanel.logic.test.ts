@@ -225,7 +225,11 @@ describe("computer panel state helpers", () => {
       }),
     ).toBeNull();
     expect(
-      computerReleaseControlHint({ availability: undefined, visibleDesktop: true, agentActive: true }),
+      computerReleaseControlHint({
+        availability: undefined,
+        visibleDesktop: true,
+        agentActive: true,
+      }),
     ).toBeNull();
   });
 

@@ -479,6 +479,42 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await withoutClipboard.dispose();
   });
 
+  it("tells the backend which thread is driving, so the agent cursor can name it", async () => {
+    const backend = new FakeComputerBackend();
+    const names: Array<string | null> = [];
+    const drivable = Object.assign(backend, {
+      setDrivingAgent: async (name: string | null) => {
+        names.push(name);
+      },
+    });
+    const manager = new ComputerManager({ backend: drivable });
+
+    // Pane input belongs to the human, who is not an agent and takes no lease.
+    await manager.click(undefined, { x: 10, y: 10 });
+    expect(names).toEqual([]);
+
+    manager.setThreadLabel("thread-1", "Luna");
+    await manager.click("thread-1", { x: 10, y: 10 });
+    expect(names).toEqual(["Luna"]);
+
+    // A rename while this thread is on screen reaches the badge immediately.
+    manager.setThreadLabel("thread-1", "Luna · seat fix");
+    expect(names).toEqual(["Luna", "Luna · seat fix"]);
+
+    // A thread the tool layer never named still takes the desktop; the plugin
+    // falls back to a generic label rather than showing a thread id.
+    await manager.releaseDesktopControl("thread-1");
+    await manager.click("thread-2", { x: 10, y: 10 });
+    expect(names).toEqual(["Luna", "Luna · seat fix", null, null]);
+
+    // Labelling a thread that is not driving records it without touching the
+    // badge the human is currently looking at.
+    manager.setThreadLabel("thread-1", "Luna again");
+    expect(names).toHaveLength(4);
+
+    await manager.dispose();
+  });
+
   it("asks the UI to open the pane once per thread, and only for agent actions", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });

@@ -251,6 +251,9 @@ export function makeAgentGatewayMcpTransport(input: {
           turnId: callerWriteAuthority?.turnId ?? null,
         },
         callerThreadId,
+        // The nickname first: a subagent that has one is known by it, and its
+        // title describes the work rather than who is doing it.
+        callerThreadLabel: callerThread.value.subagentNickname ?? callerThread.value.title ?? null,
         callerSessionKey: callerSession.sessionKey,
         callerProvider: callerSession.provider,
         callerCapabilities: callerSession.capabilities,

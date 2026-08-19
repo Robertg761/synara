@@ -19,8 +19,10 @@
 #include <QPointer>
 #include <QPointF>
 #include <QSet>
+#include <QString>
 #include <QThreadPool>
 #include <QTimer>
+#include <QVariantAnimation>
 
 #include <memory>
 
@@ -35,10 +37,16 @@ class LogicalOutput;
 class SynaraVirtualInputDevice;
 class RenderLoop;
 class SeatInterface;
-class ShapeCursorSource;
 class SurfaceInterface;
 class Window;
 
+/**
+ * The ghost cursor: a second pointer drawn beside the human's own.
+ *
+ * Both the arrow and the name badge are children of this item, which is what
+ * keeps them out of the plugin's screenshots - captures exclude this whole
+ * subtree by rendering it into its own exclusive ItemTreeView.
+ */
 class SynaraAgentCursorItem : public Item
 {
     Q_OBJECT
@@ -46,11 +54,27 @@ class SynaraAgentCursorItem : public Item
 public:
     explicit SynaraAgentCursorItem(Item *parent);
 
+    /** The name shown on the badge. Empty falls back to a generic label. */
+    void setAgentName(const QString &name);
+    /** Positions the item by its hotspot, redrawing if the output scale changed. */
+    void setHotspot(const QPointF &position);
+    /** Shows the badge and restarts its fade, for every pointer move and action. */
+    void noteActivity();
+
 private:
     void refresh();
+    qreal targetDevicePixelRatio() const;
 
+    QString m_agentName;
+    // What the current images were drawn for. The arrow and the badge are
+    // rasterized at one output's scale, so a move onto a differently scaled
+    // output has to redraw them rather than let the renderer resample.
+    qreal m_devicePixelRatio = 0;
+    qreal m_cursorSize = 0;
     std::unique_ptr<ImageItem> m_imageItem;
-    std::unique_ptr<ShapeCursorSource> m_source;
+    std::unique_ptr<ImageItem> m_badgeItem;
+    QTimer m_badgeHoldTimer;
+    QVariantAnimation m_badgeFade;
 };
 
 class SynaraComputerUsePlugin : public Plugin, public QDBusContext
@@ -67,6 +91,7 @@ public:
     Q_INVOKABLE bool start();
     Q_INVOKABLE bool stop();
     Q_INVOKABLE bool setIdleTimeout(uint milliseconds);
+    Q_INVOKABLE bool setAgentName(const QString &name);
     Q_INVOKABLE bool focusWindow(const QString &windowId);
     Q_INVOKABLE bool raiseWindow(const QString &windowId);
     Q_INVOKABLE bool clearFocusWindow();
@@ -198,6 +223,9 @@ private:
     double m_directAxisRemainderH = 0;
     double m_directAxisRemainderV = 0;
     std::unique_ptr<SynaraAgentCursorItem> m_cursorItem;
+    // Held here and not only on the cursor item, because the server names the
+    // session before the first start() and the item is built lazily.
+    QString m_agentName;
     QList<quint32> m_pressedKeys;
     QSet<quint32> m_pressedButtons;
     QSet<RenderLoop *> m_renderLoops;
