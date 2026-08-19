@@ -52,6 +52,7 @@
 #include <QThreadPool>
 
 #include <wayland-server-core.h>
+#include <wayland-server-protocol.h>
 
 #include <algorithm>
 #include <atomic>
@@ -622,6 +623,10 @@ SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
     }
     releasePressedState();
     detachInputDevice();
+    // Both paths, because a session can end with either outstanding and a client
+    // left holding an enter keeps drawing hover and believing it has focus.
+    directPointerLeave();
+    directKeyboardLeave();
     if (m_seat) {
         m_seat->notifyPointerLeave();
         m_seat->setFocusedKeyboardSurface(nullptr);
@@ -662,6 +667,9 @@ QString SynaraComputerUsePlugin::healthJson() const
         // The agent owns this compositor, so it drives the only seat in it and
         // reaches every client, Chromium and Xwayland included.
         {QStringLiteral("ownsCompositor"), m_ownsCompositor},
+        // Clients that skipped the agent seat are driven through their own seat0
+        // resources instead of being refused, so reach is every window.
+        {QStringLiteral("directInjection"), !m_ownsCompositor},
         {QStringLiteral("overlay"), bool(m_cursorItem)},
         {QStringLiteral("workspace"), Workspace::self() != nullptr},
         // Read from inside the compositor because that is the only place it is
@@ -693,7 +701,16 @@ QString SynaraComputerUsePlugin::stateJson() const
         // The agent owns this compositor, so it drives the only seat in it and
         // reaches every client, Chromium and Xwayland included.
         {QStringLiteral("ownsCompositor"), m_ownsCompositor},
+        // Clients that skipped the agent seat are driven through their own seat0
+        // resources instead of being refused, so reach is every window.
+        {QStringLiteral("directInjection"), !m_ownsCompositor},
         {QStringLiteral("position"), pointToJson(m_pos)},
+        // The human's own cursor, reported next to the agent's because the one
+        // property this whole design rests on is that these two move
+        // independently. Anything that makes them track each other is a bug, and
+        // this is how it gets caught rather than argued about.
+        {QStringLiteral("humanPosition"),
+         pointToJson(input() && input()->pointer() ? input()->pointer()->pos() : QPointF())},
         {QStringLiteral("pressedButtonCount"), m_pressedButtons.size()},
         {QStringLiteral("pressedKeyCount"), m_pressedKeys.size()},
         {QStringLiteral("idleTimeoutMs"), double(m_idleTimeoutMs)},
@@ -850,6 +867,10 @@ void SynaraComputerUsePlugin::stopSession(StopReason reason)
     }
     releasePressedState();
     detachInputDevice();
+    // Both paths, because a session can end with either outstanding and a client
+    // left holding an enter keeps drawing hover and believing it has focus.
+    directPointerLeave();
+    directKeyboardLeave();
     if (m_seat) {
         m_seat->notifyPointerLeave();
         m_seat->setFocusedKeyboardSurface(nullptr);
@@ -951,7 +972,7 @@ bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
     // Before adopting the target, not after: focusing a window that cannot
     // receive the agent's keys would report success and then swallow everything
     // typed into it.
-    if (!requireAgentSeatClient(window)) {
+    if (!requireReachableClient(window)) {
         return false;
     }
     m_targetWindow = window;
@@ -1028,7 +1049,7 @@ bool SynaraComputerUsePlugin::button(uint button, bool pressed)
     if (!updatePointerFocus()) {
         return false;
     }
-    if (!requireAgentSeatClient(m_pointerWindow)) {
+    if (!requireReachableClient(m_pointerWindow)) {
         return false;
     }
     if (!m_ownsCompositor) {
@@ -1050,7 +1071,7 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
     if (!updatePointerFocus()) {
         return false;
     }
-    if (!requireAgentSeatClient(m_pointerWindow)) {
+    if (!requireReachableClient(m_pointerWindow)) {
         return false;
     }
 
@@ -1061,6 +1082,11 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
         if (vertical != 0) {
             m_inputDevice->sendAxis(PointerAxis::Vertical, vertical * 15.0 / 120.0, int(vertical));
         }
+        return true;
+    }
+
+    if (m_directPointerSurface) {
+        directPointerAxis(horizontal, vertical);
         return true;
     }
 
@@ -1086,7 +1112,7 @@ bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
     if (!updateKeyboardFocus()) {
         return false;
     }
-    if (!requireAgentSeatClient(m_keyboardWindow)) {
+    if (!requireReachableClient(m_keyboardWindow)) {
         return false;
     }
 
@@ -1107,6 +1133,11 @@ void SynaraComputerUsePlugin::sendButton(quint32 code, bool pressed)
 
     if (m_ownsCompositor) {
         m_inputDevice->sendButton(code, pressed);
+        return;
+    }
+
+    if (m_directPointerSurface) {
+        directPointerButton(code, pressed);
         return;
     }
 
@@ -1135,16 +1166,22 @@ void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
         return;
     }
 
-    setTimestampNow();
-    // Delivered on the agent's own seat, never through KWin's real keyboard
-    // pipeline, so the user's focus and typing are untouched.
-    m_seat->notifyKeyboardKey(keyCode,
-                              pressed ? KeyboardKeyState::Pressed : KeyboardKeyState::Released,
-                              waylandServer()->display()->nextSerial());
+    if (m_directKeyboardSurface) {
+        directKeyboardKey(keyCode, pressed);
+    } else {
+        setTimestampNow();
+        // Delivered on the agent's own seat, never through KWin's real keyboard
+        // pipeline, so the user's focus and typing are untouched.
+        m_seat->notifyKeyboardKey(keyCode,
+                                  pressed ? KeyboardKeyState::Pressed : KeyboardKeyState::Released,
+                                  waylandServer()->display()->nextSerial());
+    }
+
     if (m_xkbState) {
         // evdev keycode -> xkb keycode offset is 8.
         xkb_state_update_key(m_xkbState, keyCode + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
         syncModifiers();
+        directKeyboardModifiers();
     }
 }
 
@@ -1677,22 +1714,316 @@ bool SynaraComputerUsePlugin::clientBoundAgentSeat(const SurfaceInterface *surfa
     return probe.bound;
 }
 
+
+namespace
+{
+struct ResourceCollector
+{
+    const char *klass;
+    QList<wl_resource *> *out;
+};
+
+wl_iterator_result collectResource(wl_resource *resource, void *data)
+{
+    auto *collector = static_cast<ResourceCollector *>(data);
+    const char *klass = wl_resource_get_class(resource);
+    if (klass && std::strcmp(klass, collector->klass) == 0) {
+        collector->out->append(resource);
+    }
+    return WL_ITERATOR_CONTINUE;
+}
+
+/**
+ * Every input resource of one class this client holds.
+ *
+ * Safe to treat as seat0's because this is only ever called for a client that
+ * did not bind the agent seat, and seat0 is then the only seat it has.
+ */
+QList<wl_resource *> clientInputResources(const SurfaceInterface *surface, const char *klass)
+{
+    QList<wl_resource *> resources;
+    if (!surface) {
+        return resources;
+    }
+    ClientConnection *connection = surface->client();
+    if (!connection) {
+        return resources;
+    }
+    wl_client *client = connection->client();
+    if (!client) {
+        return resources;
+    }
+    ResourceCollector collector{klass, &resources};
+    wl_client_for_each_resource(client, collectResource, &collector);
+    return resources;
+}
+
+quint32 directTimestampMs()
+{
+    return quint32(std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count());
+}
+
+quint32 nextDirectSerial()
+{
+    return waylandServer() && waylandServer()->display() ? waylandServer()->display()->nextSerial() : 0;
+}
+
+/**
+ * Whether the human's own seat currently has this surface focused.
+ *
+ * The one thing direct injection must never do is take focus away from the
+ * person using the machine. Sending our leave to a surface KWin has genuinely
+ * focused would do exactly that, so every leave is gated on this.
+ */
+bool humanHoldsPointer(const SurfaceInterface *surface)
+{
+    SeatInterface *seat = waylandServer() ? waylandServer()->seat() : nullptr;
+    return seat && seat->focusedPointerSurface() == surface;
+}
+
+bool humanHoldsKeyboard(const SurfaceInterface *surface)
+{
+    SeatInterface *seat = waylandServer() ? waylandServer()->seat() : nullptr;
+    return seat && seat->focusedKeyboardSurface() == surface;
+}
+}
+
+/**
+ * Injection straight into one client's own input resources.
+ *
+ * This is the mechanism the macOS version uses, expressed in Wayland terms: hand
+ * the events to the target process, stamped with window-local coordinates, and
+ * leave the shared pointer alone. It exists because the agent seat cannot reach
+ * Chromium or Xwayland, which bind the first seat the compositor advertises and
+ * ignore every later one. Those clients did bind seat0, so their wl_pointer and
+ * wl_keyboard resources are right there; we write to them without going through
+ * SeatInterface, which is what would move the human's focus.
+ *
+ * KWin does not know these events happened, which is the point and also the
+ * whole cost: our own enter/leave bookkeeping is the only record, and when the
+ * human genuinely focuses the same window KWin's events and ours interleave on
+ * one resource. That is survivable - the client simply sees two things using it,
+ * exactly as a macOS app does - and it is bounded by never sending a leave to a
+ * surface the human's seat has focused.
+ */
+bool SynaraComputerUsePlugin::useDirectInjection(const Window *window) const
+{
+    if (m_ownsCompositor || !window) {
+        return false;
+    }
+    return !clientBoundAgentSeat(window->surface());
+}
+
+void SynaraComputerUsePlugin::directPointerEnter(Window *window)
+{
+    SurfaceInterface *surface = window ? window->surface() : nullptr;
+    if (!surface) {
+        return;
+    }
+    if (m_directPointerSurface && m_directPointerSurface != surface) {
+        directPointerLeave();
+    }
+
+    const QPointF local = window->inputTransformation().map(m_pos);
+    const quint32 serial = nextDirectSerial();
+    const bool reenter = m_directPointerSurface != surface;
+    m_directPointerSurface = surface;
+
+    for (wl_resource *resource : clientInputResources(surface, "wl_pointer")) {
+        if (reenter) {
+            wl_pointer_send_enter(resource,
+                                  serial,
+                                  surface->resource(),
+                                  wl_fixed_from_double(local.x()),
+                                  wl_fixed_from_double(local.y()));
+        }
+        wl_pointer_send_motion(resource, directTimestampMs(), wl_fixed_from_double(local.x()), wl_fixed_from_double(local.y()));
+        if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION) {
+            wl_pointer_send_frame(resource);
+        }
+    }
+}
+
+void SynaraComputerUsePlugin::directPointerMotion(Window *window)
+{
+    directPointerEnter(window);
+}
+
+void SynaraComputerUsePlugin::directPointerLeave()
+{
+    SurfaceInterface *surface = m_directPointerSurface;
+    m_directPointerSurface.clear();
+    if (!surface || humanHoldsPointer(surface)) {
+        return;
+    }
+    const quint32 serial = nextDirectSerial();
+    for (wl_resource *resource : clientInputResources(surface, "wl_pointer")) {
+        wl_pointer_send_leave(resource, serial, surface->resource());
+        if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION) {
+            wl_pointer_send_frame(resource);
+        }
+    }
+}
+
+void SynaraComputerUsePlugin::directPointerButton(quint32 code, bool pressed)
+{
+    SurfaceInterface *surface = m_directPointerSurface;
+    if (!surface) {
+        return;
+    }
+    const quint32 serial = nextDirectSerial();
+    const quint32 time = directTimestampMs();
+    for (wl_resource *resource : clientInputResources(surface, "wl_pointer")) {
+        wl_pointer_send_button(resource,
+                               serial,
+                               time,
+                               code,
+                               pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
+        if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION) {
+            wl_pointer_send_frame(resource);
+        }
+    }
+}
+
+void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertical)
+{
+    SurfaceInterface *surface = m_directPointerSurface;
+    if (!surface) {
+        return;
+    }
+    const quint32 time = directTimestampMs();
+    for (wl_resource *resource : clientInputResources(surface, "wl_pointer")) {
+        const int version = wl_resource_get_version(resource);
+        if (version >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION) {
+            wl_pointer_send_axis_source(resource, WL_POINTER_AXIS_SOURCE_WHEEL);
+        }
+        if (horizontal != 0) {
+            wl_pointer_send_axis(resource,
+                                 time,
+                                 WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+                                 wl_fixed_from_double(horizontal * 15.0 / 120.0));
+            if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION) {
+                wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, int(horizontal / 120.0));
+            }
+        }
+        if (vertical != 0) {
+            wl_pointer_send_axis(resource,
+                                 time,
+                                 WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                 wl_fixed_from_double(vertical * 15.0 / 120.0));
+            if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION) {
+                wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, int(vertical / 120.0));
+            }
+        }
+        if (version >= WL_POINTER_FRAME_SINCE_VERSION) {
+            wl_pointer_send_frame(resource);
+        }
+    }
+}
+
+void SynaraComputerUsePlugin::directKeyboardEnter(Window *window)
+{
+    SurfaceInterface *surface = window ? window->surface() : nullptr;
+    if (!surface) {
+        return;
+    }
+    if (m_directKeyboardSurface == surface) {
+        return;
+    }
+    if (m_directKeyboardSurface) {
+        directKeyboardLeave();
+    }
+    m_directKeyboardSurface = surface;
+
+    // No keymap is sent with this enter, and none is needed: the client bound
+    // seat0 and already has that seat's keymap, which is the same physical
+    // layout the agent's xkb state mirrors.
+    wl_array keys;
+    wl_array_init(&keys);
+    for (quint32 key : std::as_const(m_pressedKeys)) {
+        if (auto *slot = static_cast<quint32 *>(wl_array_add(&keys, sizeof(quint32)))) {
+            *slot = key;
+        }
+    }
+    const quint32 serial = nextDirectSerial();
+    for (wl_resource *resource : clientInputResources(surface, "wl_keyboard")) {
+        wl_keyboard_send_enter(resource, serial, surface->resource(), &keys);
+    }
+    wl_array_release(&keys);
+    directKeyboardModifiers();
+}
+
+void SynaraComputerUsePlugin::directKeyboardLeave()
+{
+    SurfaceInterface *surface = m_directKeyboardSurface;
+    m_directKeyboardSurface.clear();
+    if (!surface || humanHoldsKeyboard(surface)) {
+        return;
+    }
+    const quint32 serial = nextDirectSerial();
+    for (wl_resource *resource : clientInputResources(surface, "wl_keyboard")) {
+        wl_keyboard_send_leave(resource, serial, surface->resource());
+    }
+}
+
+void SynaraComputerUsePlugin::directKeyboardKey(quint32 keyCode, bool pressed)
+{
+    SurfaceInterface *surface = m_directKeyboardSurface;
+    if (!surface) {
+        return;
+    }
+    const quint32 serial = nextDirectSerial();
+    const quint32 time = directTimestampMs();
+    for (wl_resource *resource : clientInputResources(surface, "wl_keyboard")) {
+        wl_keyboard_send_key(resource,
+                             serial,
+                             time,
+                             keyCode,
+                             pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
+    }
+}
+
+void SynaraComputerUsePlugin::directKeyboardModifiers()
+{
+    SurfaceInterface *surface = m_directKeyboardSurface;
+    if (!surface || !m_xkbState) {
+        return;
+    }
+    const quint32 serial = nextDirectSerial();
+    const quint32 depressed = xkb_state_serialize_mods(m_xkbState, XKB_STATE_MODS_DEPRESSED);
+    const quint32 latched = xkb_state_serialize_mods(m_xkbState, XKB_STATE_MODS_LATCHED);
+    const quint32 locked = xkb_state_serialize_mods(m_xkbState, XKB_STATE_MODS_LOCKED);
+    const quint32 group = xkb_state_serialize_layout(m_xkbState, XKB_STATE_LAYOUT_EFFECTIVE);
+    for (wl_resource *resource : clientInputResources(surface, "wl_keyboard")) {
+        wl_keyboard_send_modifiers(resource, serial, depressed, latched, locked, group);
+    }
+}
+
 /**
  * Refuse, out loud, rather than inject into a client that cannot hear us.
  *
- * Wayland delivers input per resource, so a seat the client never bound has
- * nowhere to send to and drops the event without an error at any layer. The
- * caller then believes it clicked. Two whole classes of application land here
- * and neither can be talked out of it: Chromium (so every Electron app) keeps a
- * single wl_seat and ignores every one advertised after it, and Xwayland does
- * the same for every X11 client behind it. Both bind seat0 because the
- * compositor advertises it before this plugin is ever loaded.
+ * Wayland delivers input per resource, so an event sent to a resource a client
+ * does not hold is dropped with no error at any layer and the caller believes it
+ * clicked. Almost nothing reaches this refusal now: a client that skipped the
+ * agent seat is driven through its own seat0 resources instead. What is left is
+ * a client holding no input resources at all - it never asked its seat for a
+ * pointer or a keyboard - and no coordinate would have worked there.
  */
-bool SynaraComputerUsePlugin::requireAgentSeatClient(const Window *window)
+bool SynaraComputerUsePlugin::requireReachableClient(const Window *window)
 {
     // There is no second seat in a compositor the agent owns, so every client is
     // reachable and this refusal cannot apply.
-    if (m_ownsCompositor || !window || clientBoundAgentSeat(window->surface())) {
+    if (m_ownsCompositor || !window) {
+        return true;
+    }
+    const SurfaceInterface *surface = window->surface();
+    if (clientBoundAgentSeat(surface)) {
+        return true;
+    }
+    if (!clientInputResources(surface, "wl_pointer").isEmpty()
+        || !clientInputResources(surface, "wl_keyboard").isEmpty()) {
         return true;
     }
 
@@ -1704,12 +2035,10 @@ bool SynaraComputerUsePlugin::requireAgentSeatClient(const Window *window)
         name = QStringLiteral("This window");
     }
     sendErrorReply(s_seatUnsupportedErrorName,
-                   QStringLiteral("%1 never bound the %2 seat, so input to it is dropped silently and the "
-                                  "action would have no effect. Chromium and Electron applications keep only "
-                                  "the first seat the compositor advertises, and every X11 application behind "
-                                  "Xwayland does the same. Drive this application in a nested agent session "
-                                  "instead, where the agent's seat is the only one.")
-                       .arg(name, s_agentSeatName));
+                   QStringLiteral("%1 holds no pointer or keyboard on any seat, so input to it is dropped "
+                                  "silently and the action would have no effect. Nothing aimed at this "
+                                  "window will work until it asks its seat for input.")
+                       .arg(name));
     return false;
 }
 
@@ -1741,10 +2070,7 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
         // at this point, therefore fails the injection instead: the caller can
         // recover from a refusal and cannot recover from a click it never made.
         if (!usableWindow(m_targetWindow) || !m_targetWindow->hitTest(m_pos)) {
-            if (m_pointerWindow && m_seat) {
-                m_seat->notifyPointerLeave();
-            }
-            m_pointerWindow.clear();
+            clearPointerDelivery();
             return false;
         }
         window = m_targetWindow;
@@ -1753,10 +2079,7 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
     }
 
     if (!window) {
-        if (m_pointerWindow && m_seat) {
-            m_seat->notifyPointerLeave();
-        }
-        m_pointerWindow.clear();
+        clearPointerDelivery();
         return false;
     }
 
@@ -1769,17 +2092,43 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
         return true;
     }
 
-    if (m_pointerWindow == window) {
+    // Which path this window takes can change under us - a client can bind the
+    // agent seat at any time - so the old delivery is always torn down by the
+    // same call that knows how it was made.
+    if (useDirectInjection(window)) {
+        if (m_pointerWindow != window) {
+            clearPointerDelivery();
+            m_pointerWindow = window;
+        }
+        directPointerMotion(window);
+        return true;
+    }
+
+    if (m_pointerWindow == window && !m_directPointerSurface) {
         m_seat->notifyPointerMotion(m_pos);
         return true;
     }
 
-    if (m_pointerWindow) {
-        m_seat->notifyPointerLeave();
-    }
+    clearPointerDelivery();
     m_pointerWindow = window;
     m_seat->notifyPointerEnter(window->surface(), m_pos, window->inputTransformation());
     return true;
+}
+
+/**
+ * Undo whichever enter is outstanding, without needing to be told which.
+ *
+ * The direct surface is set only by the direct path and the seat's focus only by
+ * the seat path, so each is torn down by exactly the code that made it.
+ */
+void SynaraComputerUsePlugin::clearPointerDelivery()
+{
+    if (m_directPointerSurface) {
+        directPointerLeave();
+    } else if (m_pointerWindow && m_seat) {
+        m_seat->notifyPointerLeave();
+    }
+    m_pointerWindow.clear();
 }
 
 bool SynaraComputerUsePlugin::updateKeyboardFocus()
@@ -1818,6 +2167,21 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
         return true;
     }
 
+    if (useDirectInjection(window)) {
+        if (m_keyboardWindow != window) {
+            // Released on the surface that saw the press, before anything moves.
+            releasePressedKeys();
+            clearKeyboardDelivery();
+            m_keyboardWindow = window;
+        }
+        directKeyboardEnter(window);
+        // Still borrowed, not real: this is the human's compositor, and a
+        // toolkit gates its shortcut matcher on the window being active whether
+        // the keys arrived on a seat or straight down the socket.
+        updateWindowActivation(window);
+        return true;
+    }
+
     if (!m_seat) {
         return false;
     }
@@ -1842,6 +2206,7 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
     // client believe the agent is holding Ctrl, and then delivers it the orphaned
     // release, so a half-finished chord leaks into an unrelated window.
     releasePressedKeys();
+    clearKeyboardDelivery();
 
     m_keyboardWindow = window;
     m_seat->setFocusedKeyboardSurface(window->surface(), m_pressedKeys);
@@ -1849,13 +2214,21 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
     return true;
 }
 
+/** The keyboard twin of clearPointerDelivery. */
+void SynaraComputerUsePlugin::clearKeyboardDelivery()
+{
+    if (m_directKeyboardSurface) {
+        directKeyboardLeave();
+    } else if (m_seat) {
+        m_seat->setFocusedKeyboardSurface(nullptr);
+    }
+}
+
 void SynaraComputerUsePlugin::clearKeyboardFocus()
 {
     m_keyboardWindow.clear();
     clearWindowActivation();
-    if (m_seat) {
-        m_seat->setFocusedKeyboardSurface(nullptr);
-    }
+    clearKeyboardDelivery();
 }
 
 void SynaraComputerUsePlugin::updateWindowActivation(Window *window)

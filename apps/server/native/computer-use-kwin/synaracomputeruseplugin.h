@@ -124,7 +124,22 @@ private:
     // the events are dropped on the floor with no error anywhere - the failure
     // mode that makes a click look like it simply did not work.
     bool clientBoundAgentSeat(const SurfaceInterface *surface) const;
-    bool requireAgentSeatClient(const Window *window);
+    // Whether this window has to be driven by writing straight to its own input
+    // resources rather than through the agent seat, which is true exactly of the
+    // clients that never bound that seat.
+    bool useDirectInjection(const Window *window) const;
+    bool requireReachableClient(const Window *window);
+    void directPointerEnter(Window *window);
+    void directPointerMotion(Window *window);
+    void directPointerLeave();
+    void directPointerButton(quint32 code, bool pressed);
+    void directPointerAxis(double horizontal, double vertical);
+    void directKeyboardEnter(Window *window);
+    void directKeyboardLeave();
+    void directKeyboardKey(quint32 keyCode, bool pressed);
+    void directKeyboardModifiers();
+    void clearPointerDelivery();
+    void clearKeyboardDelivery();
     bool updatePointerFocus();
     bool updateKeyboardFocus();
     void clearKeyboardFocus();
@@ -167,6 +182,11 @@ private:
     xkb_state *m_xkbState = nullptr;
     std::unique_ptr<SynaraVirtualInputDevice> m_inputDevice;
     bool m_deviceAttached = false;
+    // The surfaces currently holding a direct-injection enter, which is the only
+    // record of it: nothing in KWin knows these events were sent, so the leave
+    // has to be driven from here or the client keeps believing it has focus.
+    QPointer<SurfaceInterface> m_directPointerSurface;
+    QPointer<SurfaceInterface> m_directKeyboardSurface;
     std::unique_ptr<SynaraAgentCursorItem> m_cursorItem;
     QList<quint32> m_pressedKeys;
     QSet<quint32> m_pressedButtons;
