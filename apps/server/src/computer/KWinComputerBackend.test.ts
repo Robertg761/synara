@@ -11,6 +11,8 @@ import type { ComputerHealth, ComputerWindow } from "@synara/contracts";
 import {
   KWinComputerBackend,
   newestPluginId,
+  prebuiltPluginRoot,
+  resolveInstallScriptPath,
   type KWinComputerBackendOptions,
 } from "./KWinComputerBackend.ts";
 import { MAX_COMPUTER_CLIPBOARD_BYTES, type ComputerResolvedTarget } from "./ComputerBackend.ts";
@@ -217,6 +219,13 @@ function makeBackend(
     // Never let a test read the real installer stamp or spawn kwin_wayland.
     installStampPath: options.installStampPath ?? join(tmpdir(), "synara-absent-install.stamp"),
     runningKwinVersion: options.runningKwinVersion ?? (async () => undefined),
+    // Provisioning compiles a KWin plugin and writes it into the developer's own
+    // home directory, so no test gets the real one by omission.
+    provisionPlugin:
+      options.provisionPlugin ??
+      (async () => {
+        throw new Error("provisionPlugin was not stubbed in this test");
+      }),
   });
 }
 
@@ -604,15 +613,108 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
-  it("reports an installed-plugin diagnostic when the KWin bus has no candidate", async () => {
+  it("installs the plugin itself when nothing is installed, and loads what it installed", async () => {
     const dbus = new FakeDbus();
-    const backend = makeBackend(dbus, { installedPluginIds: async () => [] });
+    let installed: readonly string[] = [];
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => installed,
+      provisionPlugin: async () => {
+        installed = ["SynaraComputerUsePluginV1"];
+        return {
+          action: "installed-prebuilt",
+          pluginId: "SynaraComputerUsePluginV1",
+          requiresRelogin: false,
+          summary: "The computer-use plugin is installed and ready.",
+        };
+      },
+    });
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(dbus.calls.some((call) => call.method === "LoadPlugin")).toBe(true);
+    await backend.dispose();
+  });
+
+  it("says a login is needed when the install landed outside what this session scans", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => [],
+      // The directory it installed into is not one this compositor was told
+      // about, so the rescan still finds nothing.
+      provisionPlugin: async () => ({
+        action: "installed-prebuilt",
+        pluginId: "SynaraComputerUsePluginV1",
+        requiresRelogin: true,
+        summary: "The computer-use plugin is installed. Log out and back in once to finish.",
+      }),
+    });
+
+    const availability = await backend.availability();
+    const message = availability.kind === "backend-unavailable" ? availability.message : "";
+    expect(message).toContain("Log out and back in once");
+    await backend.dispose();
+  });
+
+  it("reports an installed-plugin diagnostic when installing is not possible either", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => [],
+      provisionPlugin: async () => {
+        throw new Error("kwin-devel headers are missing");
+      },
+    });
 
     const availability = await backend.availability();
     expect(availability).toMatchObject({ kind: "backend-unavailable" });
     const message = availability.kind === "backend-unavailable" ? availability.message : "";
-    expect(message).toContain("No installed SynaraComputerUsePluginVn");
+    expect(message).toContain("kwin-devel headers are missing");
     expect(message).toContain("scripts/install-and-load.sh");
+    await backend.dispose();
+  });
+
+  it("falls back to a source build when the shipped binary is refused too", async () => {
+    const dbus = new FakeDbus();
+    let installed = ["SynaraComputerUsePluginV2"];
+    // Only the locally built one loads: the shipped binary matches this KWin
+    // version but was compiled against a different distribution's Qt.
+    dbus.loadPlugin = async (pluginId: string) => pluginId === "SynaraComputerUsePluginV4";
+    const attempts: boolean[] = [];
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => installed,
+      provisionPlugin: async ({ allowPrebuilt }) => {
+        attempts.push(allowPrebuilt);
+        installed = [allowPrebuilt ? "SynaraComputerUsePluginV3" : "SynaraComputerUsePluginV4"];
+        return {
+          action: allowPrebuilt ? "installed-prebuilt" : "installed-from-source",
+          pluginId: installed[0]!,
+          requiresRelogin: false,
+          summary: "The computer-use plugin is installed and ready.",
+        };
+      },
+    });
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(attempts).toEqual([true, false]);
+    await backend.dispose();
+  });
+
+  it("reinstalls once when KWin refuses the installed plugin, then loads the new id", async () => {
+    const dbus = new FakeDbus();
+    let installed = ["SynaraComputerUsePluginV2"];
+    dbus.loadPlugin = async (pluginId: string) => pluginId === "SynaraComputerUsePluginV3";
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => installed,
+      provisionPlugin: async () => {
+        installed = ["SynaraComputerUsePluginV3"];
+        return {
+          action: "installed-prebuilt",
+          pluginId: "SynaraComputerUsePluginV3",
+          requiresRelogin: false,
+          summary: "The computer-use plugin is installed and ready.",
+        };
+      },
+    });
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
     await backend.dispose();
   });
 
@@ -1657,5 +1759,35 @@ describe("KWinComputerBackend KWin crash recovery", () => {
     ]);
 
     await backend.dispose();
+  });
+});
+
+describe("plugin source and prebuilt lookup", () => {
+  it("prefers a bundled installer script and falls back to the checkout layout", () => {
+    const bundled = join("/app", "computer-use-kwin", "scripts", "install-and-load.sh");
+    expect(resolveInstallScriptPath("/app", undefined, (candidate) => candidate === bundled)).toBe(
+      bundled,
+    );
+    expect(resolveInstallScriptPath("/repo/apps/server/src/computer", undefined, () => false)).toBe(
+      join(
+        "/repo/apps/server/src/computer",
+        "..",
+        "..",
+        "native",
+        "computer-use-kwin",
+        "scripts",
+        "install-and-load.sh",
+      ),
+    );
+  });
+
+  it("lets an explicit directory win, and only when it really holds a manifest", () => {
+    const configured = "/opt/prebuilt";
+    expect(prebuiltPluginRoot("/app", configured, (candidate) => candidate === configured)).toBe(
+      configured,
+    );
+    // A path that was pointed at but holds nothing is not a prebuilt root: this
+    // is the difference between installing a shipped binary and building one.
+    expect(prebuiltPluginRoot("/app", configured, () => false)).toBeUndefined();
   });
 });

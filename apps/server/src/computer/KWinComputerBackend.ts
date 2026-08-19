@@ -1,7 +1,9 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { promisify } from "node:util";
+import { join, resolve } from "node:path";
 
 import type {
   ComputerAvailability,
@@ -17,6 +19,7 @@ import type {
   ComputerUiNode,
   ComputerWindow,
 } from "@synara/contracts";
+import { describeErrorMessage } from "@synara/shared/errorMessages";
 
 import {
   ComputerBackendError,
@@ -61,6 +64,11 @@ import {
 } from "./kwinDbus.ts";
 import { EVDEV_BUTTON_CODES, keyStrokeForKey, qwertyTextKeyStrokes } from "./evdevInput.ts";
 import {
+  provisionKWinPlugin,
+  resolveInstallTarget,
+  type ProvisionResult,
+} from "./kwinPluginProvisioning.ts";
+import {
   glidePointerToDeadline,
   POINTER_SEQUENCE_OPERATIONS,
   pressButtonOnce,
@@ -102,6 +110,13 @@ const INSTALL_SCRIPT_PATH = "apps/server/native/computer-use-kwin/scripts/instal
 const ENABLE_REBUILD_SCRIPT_PATH = "apps/server/native/computer-use-kwin/systemd/enable.sh";
 const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
 const KWIN_VERSION_PROBE_TIMEOUT_MS = 2_000;
+/**
+ * A cold cmake configure plus build of the plugin, generously bounded. Long
+ * because it is a C++ build on the user's machine and a false timeout would
+ * throw away minutes of work that was about to succeed.
+ */
+const PLUGIN_BUILD_TIMEOUT_MS = 10 * 60 * 1_000;
+const execFileAsync = promisify(execFile);
 const MAX_PLUGIN_ID = /^SynaraComputerUsePlugin(?:V(\d+))?$/;
 const INSTALLED_PLUGIN_FILE = /^(SynaraComputerUsePluginV(\d+))\.so$/;
 /** Names this backend in a capture failure, which reaches a tool call verbatim. */
@@ -160,6 +175,14 @@ export interface KWinComputerBackendOptions {
   readonly readInstallStamp?: () => Promise<string | undefined>;
   /** Running KWin version, read only to explain a load refusal. */
   readonly runningKwinVersion?: () => Promise<string | undefined>;
+  /**
+   * Installs the plugin for the running KWin. Called at most twice per backend -
+   * once as-is, and once more with shipped binaries excluded after KWin refuses
+   * one - and only after connecting has already found nothing loadable.
+   */
+  readonly provisionPlugin?: (options: {
+    readonly allowPrebuilt: boolean;
+  }) => Promise<ProvisionResult>;
 }
 
 /**
@@ -188,6 +211,16 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly readInstallStamp: () => Promise<string | undefined>;
   private readonly runningKwinVersion: () => Promise<string | undefined>;
   private runningKwinVersionPromise: Promise<string | undefined> | undefined;
+  private readonly provisionPlugin: (options: {
+    readonly allowPrebuilt: boolean;
+  }) => Promise<ProvisionResult>;
+  /**
+   * Memoized so the reconnect loop cannot start a second install - or a second
+   * source build, which takes minutes - while the first is still running. Keyed
+   * by attempt because the source-only retry is a different install, not a
+   * repeat of the first.
+   */
+  private readonly provisionPromises = new Map<boolean, Promise<ProvisionResult>>();
 
   private dbus: KWinComputerDbus | undefined;
   private plugin: KWinComputerPluginApi | undefined;
@@ -256,6 +289,21 @@ export class KWinComputerBackend implements ComputerBackend {
       options.readInstallStamp ??
       (() => readInstallStamp(options.installStampPath ?? defaultInstallStampPath()));
     this.runningKwinVersion = options.runningKwinVersion ?? detectRunningKwinVersion;
+    this.provisionPlugin =
+      options.provisionPlugin ??
+      (({ allowPrebuilt }) =>
+        provisionKWinPlugin({
+          target: resolveInstallTarget(SYSTEM_QT_PLUGIN_ROOTS),
+          listInstalled: () => listPluginFiles(resolveInstallTarget(SYSTEM_QT_PLUGIN_ROOTS)),
+          kwinVersion: () => this.probeRunningKwinVersion(),
+          arch: process.arch,
+          prebuiltRoot: allowPrebuilt ? prebuiltPluginRoot() : undefined,
+          buildFromSource: buildPluginFromSource,
+          // Provisioning only runs once connecting has established that nothing
+          // installed will load, so there is nothing current by construction.
+          isCurrent: async () => false,
+          stampPath: options.installStampPath ?? defaultInstallStampPath(),
+        }));
     this.healthState = new ComputerHealthState({
       readStatus: () => ({
         status: this.connectedPlugin()
@@ -872,22 +920,85 @@ export class KWinComputerBackend implements ComputerBackend {
         loaded = [];
       }
     }
-    const plan = resolveSynaraPluginLoad({ loaded, installed: await this.installedPluginIds() });
+    let plan = resolveSynaraPluginLoad({ loaded, installed: await this.installedPluginIds() });
     if (!plan) {
-      throw new ComputerBackendError(
-        "No installed SynaraComputerUsePluginVn was found in the KWin plugin directories. " +
-          `Build, install, and load it with ${INSTALL_SCRIPT_PATH}.`,
-      );
+      // Nothing to load: this is a machine that has the update but has never had
+      // the plugin, which is the ordinary first-run case rather than an error.
+      const installed = await this.provisionOnce().catch((error: unknown) => {
+        throw new ComputerBackendError(
+          "No SynaraComputerUsePluginVn is installed, and installing one failed: " +
+            `${describeErrorMessage(error, "the installer gave no reason")}. ` +
+            `You can build and install it yourself with ${INSTALL_SCRIPT_PATH}.`,
+        );
+      });
+      plan = resolveSynaraPluginLoad({ loaded, installed: await this.installedPluginIds() });
+      // The install landed somewhere this compositor was never told to scan,
+      // which is the one case that needs the user to log out once. Its own
+      // summary says so, in those words.
+      if (!plan) throw new ComputerBackendError(installed.summary);
     }
     if (plan.kind === "replace") {
       // A false reply means the id was already gone, which is the state the
       // unload was after, so the replies are deliberately ignored.
       for (const staleId of plan.unload) await dbus.unloadPlugin(staleId);
-      const accepted = await dbus.loadPlugin(plan.pluginId);
-      if (!accepted) throw new ComputerBackendError(await this.describeLoadRefusal(plan.pluginId));
+      if (!(await dbus.loadPlugin(plan.pluginId))) {
+        // Overwhelmingly a KWin upgrade under an installed plugin, and
+        // reinstalling is the fix for exactly that - so try it before reporting
+        // the refusal the user cannot act on.
+        let accepted: string | undefined;
+        let refusedId = plan.pluginId;
+        for (const candidate of await this.reprovisionAfterRefusal(plan.pluginId)) {
+          await dbus.unloadPlugin(refusedId);
+          if (await dbus.loadPlugin(candidate)) {
+            accepted = candidate;
+            break;
+          }
+          refusedId = candidate;
+        }
+        if (!accepted) throw new ComputerBackendError(await this.describeLoadRefusal(refusedId));
+        plan = { kind: "replace", unload: plan.unload, pluginId: accepted };
+      }
     }
     const plugin = await dbus.connectPlugin();
     return await this.finishPluginConnection(plugin, plan.pluginId);
+  }
+
+  /**
+   * Installs the plugin, at most once per backend.
+   *
+   * The user's side of "enable computer use" is the toggle; everything under it
+   * happens here. It writes the session env script, installs a shipped binary
+   * for this KWin when there is one, and builds against the local headers when
+   * there is not.
+   */
+  private async provisionOnce(allowPrebuilt = true): Promise<ProvisionResult> {
+    const pending =
+      this.provisionPromises.get(allowPrebuilt) ?? this.provisionPlugin({ allowPrebuilt });
+    this.provisionPromises.set(allowPrebuilt, pending);
+    return await pending;
+  }
+
+  /**
+   * The plugin ids worth trying after KWin refused `refusedId`, in order.
+   *
+   * Failures are swallowed on purpose: the caller's next move is to report the
+   * refusal, and a build error here would replace that accurate message with a
+   * less useful one about cmake.
+   */
+  private async reprovisionAfterRefusal(refusedId: string): Promise<readonly string[]> {
+    const ids: string[] = [];
+    const first = await this.provisionOnce().catch(() => undefined);
+    if (first?.pluginId && first.pluginId !== refusedId) ids.push(first.pluginId);
+    // A shipped binary can be built for the right KWin version and still be
+    // wrong for this distribution's Qt or libstdc++, and KWin refuses it in
+    // exactly the same wordless way. Building against the local headers is the
+    // answer to that, so it gets its own attempt rather than being written off
+    // as the same failure.
+    if (!first || first.action === "installed-prebuilt") {
+      const source = await this.provisionOnce(false).catch(() => undefined);
+      if (source?.pluginId && source.pluginId !== refusedId) ids.push(source.pluginId);
+    }
+    return ids;
   }
 
   /**
@@ -1303,12 +1414,82 @@ export async function scanInstalledPluginIds(
   return [...ids].toSorted((left, right) => pluginVersion(right) - pluginVersion(left));
 }
 
+/**
+ * Where the app's shipped plugin binaries live.
+ *
+ * Absent on a checkout that was never packaged, which is the developer case:
+ * provisioning then falls through to a source build, which is what a developer
+ * wants anyway.
+ */
+export function prebuiltPluginRoot(
+  moduleDirectory: string = import.meta.dirname,
+  configuredDirectory: string | undefined = process.env.SYNARA_KWIN_PREBUILT_DIR,
+  hasManifest: (candidate: string) => boolean = (candidate) =>
+    existsSync(join(candidate, "manifest.json")),
+): string | undefined {
+  const candidates = [
+    ...(configuredDirectory ? [resolve(configuredDirectory)] : []),
+    join(moduleDirectory, "computer-use-kwin", "prebuilt"),
+    join(moduleDirectory, "..", "..", "native", "computer-use-kwin", "prebuilt"),
+  ];
+  return candidates.find(hasManifest);
+}
+
+async function listPluginFiles(target: {
+  readonly pluginDirectory: string;
+}): Promise<readonly string[]> {
+  return await readdir(target.pluginDirectory).catch(() => []);
+}
+
+/**
+ * Builds the plugin against the local KWin headers and resolves the built `.so`.
+ *
+ * The build itself lives in the installer script rather than here so there is
+ * exactly one of it; `--build-only` is that script with its install, load, and
+ * stamp steps removed, and it prints the path as its last line.
+ */
+async function buildPluginFromSource(): Promise<string> {
+  const script = resolveInstallScriptPath(import.meta.dirname);
+  const { stdout } = await execFileAsync("bash", [script, "--build-only"], {
+    timeout: PLUGIN_BUILD_TIMEOUT_MS,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const path = stdout.trimEnd().split("\n").at(-1)?.trim();
+  if (!path) throw new ComputerBackendError(`${INSTALL_SCRIPT_PATH} --build-only printed no path.`);
+  return path;
+}
+
+/**
+ * The installer script on disk, bundled beside this module in a packaged build
+ * and up in `native/` in a checkout.
+ */
+export function resolveInstallScriptPath(
+  moduleDirectory: string,
+  configuredDirectory: string | undefined = process.env.SYNARA_KWIN_SOURCE_DIR,
+  sourceExists: (candidate: string) => boolean = existsSync,
+): string {
+  const relative = join("scripts", "install-and-load.sh");
+  const candidates = [
+    ...(configuredDirectory ? [join(resolve(configuredDirectory), relative)] : []),
+    join(moduleDirectory, "computer-use-kwin", relative),
+  ];
+  return (
+    candidates.find(sourceExists) ??
+    join(moduleDirectory, "..", "..", "native", "computer-use-kwin", relative)
+  );
+}
+
+const SYSTEM_QT_PLUGIN_ROOTS = ["/usr/lib64/qt6/plugins", "/usr/lib/qt6/plugins"] as const;
+
 function defaultPluginDirectories(): readonly string[] {
   const configured = process.env.SYNARA_KWIN_PLUGIN_DIR;
   return [
     ...(configured ? [configured] : []),
-    "/usr/lib64/qt6/plugins/kwin/plugins",
-    "/usr/lib/qt6/plugins/kwin/plugins",
+    // Listed first among the unconfigured directories because it is where
+    // provisioning installs, and a user-owned build is by definition newer than
+    // whatever a package once dropped in /usr.
+    resolveInstallTarget(SYSTEM_QT_PLUGIN_ROOTS).pluginDirectory,
+    ...SYSTEM_QT_PLUGIN_ROOTS.map((root) => join(root, "kwin", "plugins")),
   ];
 }
 

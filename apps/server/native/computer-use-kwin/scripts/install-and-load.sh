@@ -4,7 +4,20 @@ set -euo pipefail
 umask 077
 
 PLUGIN_PREFIX="SynaraComputerUsePlugin"
-PLUGIN_DIR="${SYNARA_KWIN_PLUGIN_DIR:-/usr/lib64/qt6/plugins/kwin/plugins}"
+
+# The plugin goes in the user's home by default, and /usr is only used when the
+# caller points here explicitly. KWin finds plugins through Qt's library paths,
+# and the Plasma session env script Synara writes puts this root on
+# QT_PLUGIN_PATH - so a normal install needs no root at all. The lib64/lib split
+# is read off the system Qt rather than guessed, because it is a distro
+# packaging choice; keep this in sync with resolveInstallTarget() in
+# apps/server/src/computer/kwinPluginProvisioning.ts.
+if [[ -d /usr/lib64/qt6/plugins ]]; then
+    USER_QT_PLUGIN_ROOT="$HOME/.local/lib64/qt6/plugins"
+else
+    USER_QT_PLUGIN_ROOT="$HOME/.local/lib/qt6/plugins"
+fi
+PLUGIN_DIR="${SYNARA_KWIN_PLUGIN_DIR:-$USER_QT_PLUGIN_ROOT/kwin/plugins}"
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 CACHE_ROOT="${SYNARA_KWIN_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/synara/kwin-computer-use-plugin}"
 STATE_ROOT="${SYNARA_KWIN_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/synara/kwin-computer-use-plugin}"
@@ -14,6 +27,7 @@ LOCK_FILE="$STATE_ROOT/install.lock"
 
 FORCE=0
 NONINTERACTIVE=0
+BUILD_ONLY=0
 
 usage() {
     cat <<EOF
@@ -25,6 +39,12 @@ loads the new id into the current KWin session.
 
   --force           create and load a new version even when the signature is unchanged
   --noninteractive  pass -n to sudo, for user systemd services
+  --build-only      build against the local KWin headers, print the built .so
+                    path, and stop. Nothing is installed, loaded, or stamped,
+                    and no session bus is needed. This is what Synara's own
+                    provisioning calls when it has no prebuilt for this KWin:
+                    the build lives here so there is exactly one of it, and the
+                    install and load stay on the caller.
 EOF
 }
 
@@ -51,6 +71,10 @@ while [[ $# -gt 0 ]]; do
             NONINTERACTIVE=1
             shift
             ;;
+        --build-only)
+            BUILD_ONLY=1
+            shift
+            ;;
         --help|-h)
             usage
             exit 0
@@ -71,15 +95,43 @@ need_command grep
 need_command sort
 need_command flock
 need_command mktemp
-need_command busctl
-need_command sudo
+if (( BUILD_ONLY == 0 )); then
+    need_command busctl
+fi
 
-[[ -d "$PLUGIN_DIR" ]] || die "KWin plugin directory does not exist: $PLUGIN_DIR"
+mkdir -p "$PLUGIN_DIR" || die "Cannot create the KWin plugin directory: $PLUGIN_DIR"
+
+# Only a caller who aimed this at a system directory pays for sudo, and they find
+# out now rather than after a full build.
+NEEDS_SUDO=0
+if (( BUILD_ONLY == 0 )) && [[ ! -w "$PLUGIN_DIR" ]]; then
+    NEEDS_SUDO=1
+    need_command sudo
+    log "$PLUGIN_DIR is not writable; installing with sudo"
+fi
 
 mkdir -p "$CACHE_ROOT" "$STATE_ROOT"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     log "another rebuild or install is already running"
+    exit 0
+fi
+
+BUILT_PLUGIN_RELATIVE="kwin/plugins/${PLUGIN_PREFIX}.so"
+
+build_plugin() {
+    log "configuring the plugin build in $BUILD_DIR"
+    cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake --build "$BUILD_DIR"
+    [[ -f "$BUILD_DIR/$BUILT_PLUGIN_RELATIVE" ]] ||
+        die "CMake did not produce $BUILD_DIR/$BUILT_PLUGIN_RELATIVE"
+}
+
+if (( BUILD_ONLY )); then
+    build_plugin
+    # The only thing on stdout that is not a log line, because the caller reads
+    # the last line as the path.
+    printf '%s\n' "$BUILD_DIR/$BUILT_PLUGIN_RELATIVE"
     exit 0
 fi
 
@@ -207,17 +259,36 @@ unload_plugin() {
     log "unloaded $plugin_id"
 }
 
-sudo_install() {
+install_plugin() {
     local source_path="$1"
     local destination_path="$2"
     local sudo_options=()
 
+    if (( NEEDS_SUDO == 0 )); then
+        install -m 755 "$source_path" "$destination_path" ||
+            die "install failed for $destination_path"
+        return 0
+    fi
     if (( NONINTERACTIVE )); then
         sudo_options=(-n)
     fi
     if ! sudo "${sudo_options[@]}" install -m 755 "$source_path" "$destination_path"; then
         die "sudo install failed for $destination_path"
     fi
+}
+
+remove_plugin() {
+    local path="$1"
+    local sudo_options=()
+
+    if (( NEEDS_SUDO == 0 )); then
+        rm -f "$path"
+        return $?
+    fi
+    if (( NONINTERACTIVE )); then
+        sudo_options=(-n)
+    fi
+    sudo "${sudo_options[@]}" rm -f "$path"
 }
 
 plugin_id=""
@@ -229,17 +300,13 @@ if (( FORCE == 0 )) && [[ "$installed_signature" == "$current_signature" ]] && v
 fi
 
 if (( needs_install )); then
-    log "configuring the plugin build in $BUILD_DIR"
-    cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    cmake --build "$BUILD_DIR"
-
-    built_plugin="$BUILD_DIR/kwin/plugins/${PLUGIN_PREFIX}.so"
-    [[ -f "$built_plugin" ]] || die "CMake did not produce $built_plugin"
+    build_plugin
+    built_plugin="$BUILD_DIR/$BUILT_PLUGIN_RELATIVE"
 
     plugin_id="$(next_plugin_id)"
     destination="$PLUGIN_DIR/$plugin_id.so"
     log "installing $plugin_id to $destination"
-    sudo_install "$built_plugin" "$destination"
+    install_plugin "$built_plugin" "$destination"
 else
     destination="$PLUGIN_DIR/$plugin_id.so"
 fi
@@ -288,12 +355,7 @@ printf '%s\n' "$health_response"
 # Only the id that just passed its health check may stay on disk.
 prune_old_plugins() {
     local path name removed=0
-    local sudo_options=()
     local plugin_files=()
-
-    if (( NONINTERACTIVE )); then
-        sudo_options=(-n)
-    fi
 
     shopt -s nullglob
     plugin_files=("$PLUGIN_DIR"/${PLUGIN_PREFIX}*.so)
@@ -306,7 +368,7 @@ prune_old_plugins() {
             continue
         fi
         unload_plugin "$name"
-        if sudo "${sudo_options[@]}" rm -f "$path"; then
+        if remove_plugin "$path"; then
             removed=$((removed + 1))
         fi
     done
