@@ -119,6 +119,17 @@ private:
         UserRelease,
     };
 
+    /**
+     * Which of the two focus rules a window has to satisfy.
+     *
+     * They differ over popups: a menu is a legitimate pointer target and never a
+     * keyboard one.
+     */
+    enum class InputKind {
+        Pointer,
+        Keyboard,
+    };
+
     static QString toJson(const QJsonObject &object);
     static QString toJson(const QJsonArray &array);
     static QString stopReasonName(StopReason reason);
@@ -141,9 +152,20 @@ private:
     void ensureCursorItem();
     void setCursorVisible(bool visible);
     QPointF confinedPoint(const QPointF &point) const;
-    Window *windowAt(const QPointF &point) const;
+    Window *windowAt(const QPointF &point, InputKind kind) const;
     Window *findWindowById(const QString &windowId) const;
+    // Every requirement of a window that can be aimed at except taking input.
+    bool presentWindow(const Window *window) const;
+    // Aimable and focusable: the rule for the keyboard, for an explicit target,
+    // and for anything the agent is told it may focus.
     bool usableWindow(const Window *window) const;
+    // Aimable and clickable, which includes popups. KWin's popups answer
+    // `wantsInput` false by construction, so the keyboard's rule would refuse
+    // every menu the pointer has to be able to reach.
+    bool pointerUsableWindow(const Window *window) const;
+    // The deepest popup transient of this window covering this point, so a menu
+    // the target opened is clickable while the target still owns the pointer.
+    Window *popupTransientAt(const Window *ancestor, const QPointF &point) const;
     // Whether this window's application bound the agent seat at all. A client
     // that never bound it still has its surfaces delivered to by the seat, and
     // the events are dropped on the floor with no error anywhere - the failure

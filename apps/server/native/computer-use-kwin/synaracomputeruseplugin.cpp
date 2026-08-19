@@ -1902,7 +1902,15 @@ QPointF SynaraComputerUsePlugin::confinedPoint(const QPointF &point) const
                    std::clamp(point.y(), geometry.y(), geometry.y() + geometry.height() - 1));
 }
 
-Window *SynaraComputerUsePlugin::windowAt(const QPointF &point) const
+/**
+ * Topmost window at @p point that can take input of this kind.
+ *
+ * The kind matters because a popup takes the pointer and not the keyboard: a
+ * click has to reach the menu drawn under the cursor, while a keystroke has to
+ * reach a window that can be focused, which is the same window it reached
+ * before any menu opened.
+ */
+Window *SynaraComputerUsePlugin::windowAt(const QPointF &point, InputKind kind) const
 {
     if (!Workspace::self()) {
         return nullptr;
@@ -1913,7 +1921,8 @@ Window *SynaraComputerUsePlugin::windowAt(const QPointF &point) const
     while (it != stacking.begin()) {
         --it;
         Window *window = *it;
-        if (!usableWindow(window)) {
+        const bool usable = kind == InputKind::Pointer ? pointerUsableWindow(window) : usableWindow(window);
+        if (!usable) {
             continue;
         }
         if (window->hitTest(point)) {
@@ -2377,7 +2386,13 @@ bool SynaraComputerUsePlugin::requireReachableClient(const Window *window, bool 
     return false;
 }
 
-bool SynaraComputerUsePlugin::usableWindow(const Window *window) const
+/**
+ * On screen, on this desktop, and finished enough to be aimed at.
+ *
+ * Everything except whether the window takes input at all, which is the one
+ * requirement the pointer and the keyboard disagree about.
+ */
+bool SynaraComputerUsePlugin::presentWindow(const Window *window) const
 {
     return window
         && !window->isDeleted()
@@ -2389,8 +2404,71 @@ bool SynaraComputerUsePlugin::usableWindow(const Window *window) const
         && !window->isMinimized()
         && !window->isHidden()
         && !window->isHiddenByShowDesktop()
-        && window->readyForPainting()
-        && window->wantsInput();
+        && window->readyForPainting();
+}
+
+bool SynaraComputerUsePlugin::usableWindow(const Window *window) const
+{
+    return presentWindow(window) && window->wantsInput();
+}
+
+/**
+ * The pointer's version of usableWindow, which also accepts popups.
+ *
+ * `wantsInput` is a statement about keyboard focus, and KWin's XdgPopupWindow
+ * answers it `false` unconditionally - a menu never wants to be activated, it
+ * borrows the keyboard through the compositor's popup grab instead. Gating the
+ * pointer on it too is why a context menu, a dropdown, or a combo popup could
+ * never be clicked: the hit test skipped it and the click landed on whatever
+ * the menu was drawn over. The human's compositor delivers those clicks, so
+ * this was our filter refusing them, not Wayland.
+ *
+ * `isPopupWindow` is the right predicate for that: XdgPopupWindow returns true
+ * from it for every xdg_popup, and the base implementation adds the
+ * window-type popups (combo box, dropdown, menu, tooltip) that managed X11 and
+ * internal windows declare. Nothing else widens: `presentWindow` still demands
+ * `isClient`, and `hitTest` still honours the surface's input region, so a
+ * tooltip that takes no input is not hit even though it is a popup.
+ */
+bool SynaraComputerUsePlugin::pointerUsableWindow(const Window *window) const
+{
+    return presentWindow(window) && (window->wantsInput() || window->isPopupWindow());
+}
+
+/**
+ * The deepest popup in @p ancestor's transient tree that owns @p point.
+ *
+ * A menu is a window of its own, transient for the window that opened it, so an
+ * agent that scopes itself to a window and then opens that window's context
+ * menu is aiming at something that is not its target. Walking down from the
+ * target rather than back up from whatever the stacking order returns keeps
+ * this off the motion path's budget: for the overwhelmingly common target with
+ * no transients it is one empty list.
+ *
+ * Deepest first, because a submenu is transient for the menu that spawned it
+ * and is drawn above it. The walk descends through transients that are not
+ * popups - a menu opened from a modal dialog is still the target's descendant -
+ * but only a popup is ever returned, so a dialog keeps its existing behaviour
+ * of having to be targeted in its own right.
+ */
+Window *SynaraComputerUsePlugin::popupTransientAt(const Window *ancestor, const QPointF &point) const
+{
+    if (!ancestor) {
+        return nullptr;
+    }
+    const QList<Window *> &transients = ancestor->transients();
+    for (Window *transient : transients) {
+        if (!transient) {
+            continue;
+        }
+        if (Window *deeper = popupTransientAt(transient, point)) {
+            return deeper;
+        }
+        if (transient->isPopupWindow() && pointerUsableWindow(transient) && transient->hitTest(point)) {
+            return transient;
+        }
+    }
+    return nullptr;
 }
 
 bool SynaraComputerUsePlugin::updatePointerFocus()
@@ -2404,13 +2482,24 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
         // nothing. A target that has gone away, or that does not accept input
         // at this point, therefore fails the injection instead: the caller can
         // recover from a refusal and cannot recover from a click it never made.
-        if (!usableWindow(m_targetWindow) || !m_targetWindow->hitTest(m_pos)) {
+        //
+        // The target's own menus are the exception, and they have to be, because
+        // they are separate windows: the target still owns the point a dropdown
+        // is drawn over, so refusing everything that is not the target itself
+        // sent the click straight through the open menu into the window behind
+        // it. A popup the target opened is the target as far as the caller is
+        // concerned, and taking it first is what makes the menu item, rather
+        // than what it covers, receive the press.
+        if (Window *popup = popupTransientAt(m_targetWindow, m_pos)) {
+            window = popup;
+        } else if (!pointerUsableWindow(m_targetWindow) || !m_targetWindow->hitTest(m_pos)) {
             clearPointerDelivery();
             return false;
+        } else {
+            window = m_targetWindow;
         }
-        window = m_targetWindow;
     } else {
-        window = windowAt(m_pos);
+        window = windowAt(m_pos, InputKind::Pointer);
     }
 
     if (!window) {
@@ -2487,7 +2576,12 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
     } else if (usableWindow(m_pointerWindow)) {
         window = m_pointerWindow;
     } else {
-        window = windowAt(m_pos);
+        // Reached whenever the pointer sits on a popup, among other things: a
+        // menu cannot be focused, and KWin's own popup filter has already given
+        // it the human seat's keyboard for the duration of its grab. The
+        // keyboard therefore stays on the focusable window under the cursor,
+        // which is where it was before the menu opened.
+        window = windowAt(m_pos, InputKind::Keyboard);
     }
 
     if (!window) {

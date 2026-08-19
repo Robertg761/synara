@@ -84,6 +84,17 @@ does nothing rather than an error. If the target has gone away, or does not
 accept input at the current pointer position, `button` and `axis` return `false`
 instead of retargeting — the same rule the keyboard already follows.
 
+The target's own menus are the one exception, and they have to be: a popup is a
+window of its own, so scoping to a window would otherwise make that window's
+context menu unclickable. A click is accepted when it lands on the target **or**
+on a popup in the target's transient tree, deepest first (a submenu is transient
+for the menu that opened it and drawn above it). Popups are pointer targets
+generally, not only under an explicit target: KWin's `XdgPopupWindow` answers
+`wantsInput()` false by construction, so the plugin gates the pointer on
+"focusable **or** popup" and the keyboard on `wantsInput()` alone. Nothing ever
+focuses or activates a popup; menu key navigation works through KWin's own popup
+filter, which holds seat0's keyboard for the duration of the grab.
+
 Each `windowsJson` entry also carries `active`: whether the compositor reports
 the window as activated to its client. This matters because toolkits gate
 keyboard-shortcut dispatch on activation, not on keyboard focus. Qt's shortcut
@@ -200,6 +211,37 @@ a running server the hotkey is the user's toggle.
 
 Unlike the idle timeout, this is a human takeover, so the server does not
 restart the session behind the user's back.
+
+## Known limitations
+
+**Drag-and-drop and titlebar moves are refused by design.** A client starts a
+drag with `wl_data_device.start_drag` and asks to be moved with
+`xdg_toplevel.move`; both carry the serial of the button press that began the
+gesture, and KWin validates it against a real implicit pointer grab
+(`SeatInterface::hasImplicitPointerGrab`, which requires that button to still be
+down on that seat). Direct injection mints its serials from the display counter
+and writes to the client's own resources, so seat0 never saw the press: the drag
+is silently cancelled (`DragAndDropInputFilter` falls through to
+`source->dndCancelled()`) and the move request is dropped
+(`implicitGrabPositionBySerial` returns nothing). The agent seat holds a real
+grab but KWin's single drag filter listens only to `waylandServer()->seat()`, so
+a drag started there reaches nobody, and a titlebar move would anchor at
+`input()->globalPointer()` — the human's cursor.
+
+Every mechanism that would fix this drives the human's seat or their cursor,
+which is precisely what the dedicated seat exists to avoid, so all of them are
+refused. Press-move-release pointer drags are unaffected on both paths and are
+what `computer_drag` does (text selection, sliders, canvas strokes, in-client
+resize handles); only the protocol-level DnD handshake is out. Between windows,
+use the application's keyboard-driven equivalent — cut/copy and paste, a
+"Move to…" action, a file dialog. Windows are moved by asking the compositor,
+not by dragging their titlebar.
+
+**Xwayland's own menus are not pointer targets.** An X11 client's menus are
+override-redirect windows, which KWin models as unmanaged `X11Window`s that
+answer `isClient()` false, and every targeting predicate here starts there. A
+click aimed at one lands on whatever it is drawn over. Wayland-native menus,
+including Chromium's and Electron's, are `xdg_popup`s and are targetable.
 
 ## Build (Fedora KDE)
 
