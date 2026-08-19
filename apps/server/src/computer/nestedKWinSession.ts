@@ -26,6 +26,7 @@ import { randomBytes } from "node:crypto";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
+import { asRecord, parseJsonPayload } from "./computerGeometry.ts";
 import {
   resolveSynaraPluginLoad,
   scanInstalledPluginIds,
@@ -93,6 +94,11 @@ export interface NestedKWinSession {
   readonly size: NestedSize;
   /** The plugin id explicitly loaded, after every shadowing id was unloaded. */
   readonly pluginId: string;
+  /**
+   * The nested Xwayland's display name, so X11 clients can be launched into
+   * this session. Undefined only if the compositor started without one.
+   */
+  readonly xDisplay: string | undefined;
   readonly dispose: () => Promise<void>;
 }
 
@@ -162,12 +168,14 @@ export async function startNestedKWinSession(
 
     const dbus = await connectDbus(busAddress);
     let pluginId: string;
+    let xDisplay: string | undefined;
     try {
       pluginId = await loadNestedPlugin(dbus, await installedPluginIds());
+      xDisplay = await readXDisplay(dbus);
     } finally {
       await dbus.close().catch(() => undefined);
     }
-    return { busAddress, waylandDisplay, size, pluginId, dispose };
+    return { busAddress, waylandDisplay, size, pluginId, xDisplay, dispose };
   } catch (error) {
     await dispose();
     throw error instanceof ComputerBackendError
@@ -182,10 +190,17 @@ export async function startNestedKWinSession(
 export function nestedSessionEnv(session: {
   readonly busAddress: string;
   readonly waylandDisplay: string;
+  readonly xDisplay?: string | undefined;
 }): NodeJS.ProcessEnv {
   return {
     WAYLAND_DISPLAY: session.waylandDisplay,
     DBUS_SESSION_BUS_ADDRESS: session.busAddress,
+    // Always set, never merely omitted. A child inherits the server's own
+    // environment underneath this one, so an absent key leaves the human's
+    // DISPLAY in place and an X11 client opens on their screen while the agent
+    // drives the nested one. Empty is a display name Xlib rejects, so a client
+    // with nowhere to go fails instead of going somewhere wrong.
+    DISPLAY: session.xDisplay ?? "",
     // Qt defaults to whatever platform plugin the ambient session suggests, and
     // an app that picks xcb here would never reach the nested compositor.
     QT_QPA_PLATFORM: "wayland",
@@ -313,6 +328,24 @@ export function parseNestedSizeEnv(value: string | undefined): NestedSize | unde
  * loaded. `resolveSynaraPluginLoad` owns the unload-all-then-load-newest
  * doctrine; this only adds the nested session's error sentences.
  */
+/**
+ * The nested Xwayland's display name, which only the plugin can answer.
+ *
+ * KWin picks the number for the Xwayland it starts and publishes it by setenv
+ * on itself: nothing appears on the bus and nothing usable appears in its
+ * output. The plugin runs inside that process, so it reads the variable and
+ * reports it. A failure here is not fatal - Wayland clients do not need it.
+ */
+async function readXDisplay(dbus: KWinComputerDbus): Promise<string | undefined> {
+  try {
+    const plugin = await dbus.connectPlugin();
+    const display = asRecord(parseJsonPayload(await plugin.healthJson())).xDisplay;
+    return typeof display === "string" && display.length > 0 ? display : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function loadNestedPlugin(
   dbus: KWinComputerDbus,
   installed: readonly string[],
@@ -359,6 +392,10 @@ function compositorArgs(
 ): readonly string[] {
   return [
     ...(mode === "virtual" ? ["--virtual"] : []),
+    // X11 clients are one of the two families the agent's dedicated seat on the
+    // human's desktop cannot reach, and this session is where they are supposed
+    // to be driven instead, so it has to be able to run them at all.
+    "--xwayland",
     "--no-global-shortcuts",
     "--socket",
     socketName,
@@ -382,7 +419,16 @@ function compositorEnv(
   mode: NestedSessionMode,
   hostEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...hostEnv, DBUS_SESSION_BUS_ADDRESS: busAddress };
+  const env: NodeJS.ProcessEnv = {
+    ...hostEnv,
+    DBUS_SESSION_BUS_ADDRESS: busAddress,
+    // Nobody but the agent uses this compositor, so the plugin drives its one
+    // seat as an ordinary input device instead of adding a second seat nothing
+    // has to bind. That is what lets Chromium, Electron, and every X11 client
+    // behind Xwayland be driven here: they each keep only the first seat, and
+    // here the first seat is the one being driven.
+    SYNARA_COMPUTER_USE_OWNS_COMPOSITOR: "1",
+  };
   if (mode === "virtual") delete env.WAYLAND_DISPLAY;
   delete env.DISPLAY;
   return env;

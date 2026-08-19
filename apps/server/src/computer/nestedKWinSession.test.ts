@@ -48,8 +48,25 @@ describe("nested session environment", () => {
     ).toEqual({
       WAYLAND_DISPLAY: "synara-nested-1",
       DBUS_SESSION_BUS_ADDRESS: BUS_ADDRESS,
+      DISPLAY: "",
       QT_QPA_PLATFORM: "wayland",
     });
+  });
+
+  it("points an X11 child at the nested Xwayland rather than the human's display", () => {
+    expect(
+      nestedSessionEnv({
+        busAddress: BUS_ADDRESS,
+        waylandDisplay: "synara-nested-1",
+        xDisplay: ":9",
+      }),
+    ).toMatchObject({ DISPLAY: ":9" });
+    // Emptied rather than left out: the child inherits the server's environment
+    // underneath this one, so omitting the key would leave the human's display
+    // in place and open an X11 client on their screen.
+    expect(
+      nestedSessionEnv({ busAddress: BUS_ADDRESS, waylandDisplay: "synara-nested-1" }),
+    ).toMatchObject({ DISPLAY: "" });
   });
 
   it("is opt-in through the environment, which also names the mode", () => {
@@ -72,6 +89,7 @@ describe("nested session environment", () => {
       waylandDisplay: "synara-nested-1",
       size: { width: 1_920, height: 1_080 },
       pluginId: "SynaraComputerUsePluginV3",
+      xDisplay: undefined,
       dispose: async () => undefined,
     };
     const options = nestedKWinBackendOptions(session);
@@ -136,6 +154,7 @@ describe("startNestedKWinSession", () => {
     expect(harness.spawns[1]?.command).toBe("kwin_wayland");
     expect(harness.spawns[1]?.args).toEqual([
       "--virtual",
+      "--xwayland",
       "--no-global-shortcuts",
       "--socket",
       "synara-test-1",
@@ -151,8 +170,12 @@ describe("startNestedKWinSession", () => {
       "unloadPlugin:SynaraComputerUsePlugin",
       "unloadPlugin:SynaraComputerUsePluginV3",
       "loadPlugin:SynaraComputerUsePluginV3",
+      "connectPlugin",
       "close",
     ]);
+    // Only the plugin inside the compositor knows which display KWin gave the
+    // Xwayland it started, and an X11 client cannot be launched here without it.
+    expect(session.xDisplay).toBe(":9");
 
     await session.dispose();
     expect(harness.spawns.map((spawn) => spawn.child.signal)).toEqual(["SIGTERM", "SIGTERM"]);
@@ -180,6 +203,7 @@ describe("startNestedKWinSession", () => {
     );
 
     expect(harness.spawns[1]?.args).toEqual([
+      "--xwayland",
       "--no-global-shortcuts",
       "--socket",
       "synara-test-2",
@@ -318,7 +342,14 @@ class FakeDbus implements KWinComputerDbus {
     this.calls.push(`unloadPlugin:${pluginId}`);
     return true;
   };
-  connectPlugin = async () => ({}) as KWinComputerPluginApi;
+  xDisplay: string | undefined = ":9";
+  connectPlugin = async () => {
+    this.calls.push("connectPlugin");
+    return {
+      healthJson: async () =>
+        JSON.stringify({ ok: true, ...(this.xDisplay ? { xDisplay: this.xDisplay } : {}) }),
+    } as KWinComputerPluginApi;
+  };
   onDisconnect = () => () => undefined;
   close = async () => {
     this.calls.push("close");

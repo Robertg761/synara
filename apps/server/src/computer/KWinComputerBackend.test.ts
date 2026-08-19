@@ -114,6 +114,8 @@ class FakePlugin implements KWinComputerPluginApi {
     if (this.running) this.position = this.clampPointer?.(x, y) ?? { x, y };
     return this.recordInput("movePointer", x, y);
   };
+  /** Fails one input method, the way the plugin refuses an unreachable client. */
+  inputFailure: { readonly method: string; readonly error: Error } | undefined;
   button = async (code: number, pressed: boolean) => this.recordInput("button", code, pressed);
   axis = async (horizontal: number, vertical: number) =>
     this.recordInput("axis", horizontal, vertical);
@@ -143,6 +145,7 @@ class FakePlugin implements KWinComputerPluginApi {
   /** Mirrors the plugin refusing every input while the session is stopped. */
   private recordInput(method: string, ...args: readonly unknown[]): boolean {
     this.calls.push({ method, args });
+    if (this.inputFailure?.method === method) throw this.inputFailure.error;
     return this.running;
   }
 }
@@ -496,6 +499,32 @@ describe("KWinComputerBackend", () => {
     const backend = makeBackend(dbus);
 
     await expect(backend.focusWindow("window-1")).rejects.toThrow(/hand control back/);
+
+    await backend.dispose();
+  });
+
+  it("passes through the plugin's reason for an application it cannot reach", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.focusWindow("window-1");
+
+    // The plugin's own text names the application and the remedy, and no
+    // coordinate in that application would have worked, so the reason has to
+    // survive intact rather than becoming a generic rejection.
+    dbus.plugin.inputFailure = {
+      method: "button",
+      error: dbusError(
+        "org.synara.ComputerUse.Error.SeatUnsupported",
+        "Code never bound the synara-agent seat, so input to it is dropped silently.",
+      ),
+    };
+
+    const refused = backend.click({ x: 44, y: 44 });
+    await expect(refused).rejects.toThrow(/Code never bound the synara-agent seat/);
+    await expect(refused).rejects.toMatchObject({ retryable: false });
+    // A refusal is not a fault: the session stays up and the connection stays open.
+    expect(dbus.calls.some((call) => call.method === "close")).toBe(false);
+    await expect(backend.listWindows()).resolves.toHaveLength(1);
 
     await backend.dispose();
   });

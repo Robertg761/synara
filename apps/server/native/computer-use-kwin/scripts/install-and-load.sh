@@ -280,6 +280,43 @@ if ! health_response="$(busctl --user call org.synara.ComputerUse /org/synara/Co
 fi
 printf '%s\n' "$health_response"
 
+# Superseded builds are deleted, not merely unloaded. KWin auto-loads any plugin
+# in this directory whose metadata does not opt out, so an old build silently
+# comes back on the next compositor start and races the current one for the
+# org.synara.ComputerUse name - and the oldest registrant wins, which shadows the
+# build that was just installed and makes an explicit LoadPlugin answer false.
+# Only the id that just passed its health check may stay on disk.
+prune_old_plugins() {
+    local path name removed=0
+    local sudo_options=()
+    local plugin_files=()
+
+    if (( NONINTERACTIVE )); then
+        sudo_options=(-n)
+    fi
+
+    shopt -s nullglob
+    plugin_files=("$PLUGIN_DIR"/${PLUGIN_PREFIX}*.so)
+    shopt -u nullglob
+
+    for path in "${plugin_files[@]}"; do
+        name="${path##*/}"
+        name="${name%.so}"
+        if [[ "$name" == "$plugin_id" ]] || ! valid_plugin_id "$name"; then
+            continue
+        fi
+        unload_plugin "$name"
+        if sudo "${sudo_options[@]}" rm -f "$path"; then
+            removed=$((removed + 1))
+        fi
+    done
+    if (( removed )); then
+        log "removed $removed superseded plugin build(s)"
+    fi
+}
+
+prune_old_plugins
+
 if (( needs_install )); then
     stamp_tmp="$(mktemp "$STATE_ROOT/install.stamp.XXXXXX")"
     {

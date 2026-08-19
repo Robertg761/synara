@@ -92,6 +92,12 @@ const CONTROL_RELEASED_ERROR_TYPE = "org.synara.ComputerUse.Error.ControlRelease
 const CONTROL_RELEASED_MESSAGE =
   `Computer control was released with the ${RELEASE_CONTROL_HOTKEY} hotkey. ` +
   `Press ${RELEASE_CONTROL_HOTKEY} again to hand control back.`;
+/**
+ * The plugin declining to inject into an application that never bound the
+ * agent's seat. Its own text names the application and the remedy, so it is
+ * passed through verbatim rather than replaced.
+ */
+const SEAT_UNSUPPORTED_ERROR_TYPE = "org.synara.ComputerUse.Error.SeatUnsupported";
 const INSTALL_SCRIPT_PATH = "apps/server/native/computer-use-kwin/scripts/install-and-load.sh";
 const ENABLE_REBUILD_SCRIPT_PATH = "apps/server/native/computer-use-kwin/systemd/enable.sh";
 const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
@@ -1215,6 +1221,13 @@ export class KWinComputerBackend implements ComputerBackend {
     if (dbusErrorType(error) === CONTROL_RELEASED_ERROR_TYPE) {
       return new ComputerBackendError(CONTROL_RELEASED_MESSAGE, { cause: error });
     }
+    // Never retryable, and deliberately not a rejectedOperation: the caller must
+    // read this reason rather than the generic "aim elsewhere in the window"
+    // advice a refused injection otherwise carries, because no coordinate in
+    // this application would have worked.
+    if (dbusErrorType(error) === SEAT_UNSUPPORTED_ERROR_TYPE) {
+      return new ComputerBackendError(dbusErrorText(error), { cause: error });
+    }
     if (isConnectionLevelFailure(error)) {
       this.recordHealthFailure(error);
       this.invalidateConnection();
@@ -1410,6 +1423,13 @@ function dbusErrorType(error: unknown): string | undefined {
   if (typeof type === "string") return type;
   const message = error instanceof Error ? error.message : String(error);
   return message.match(/org\.(?:synara\.ComputerUse|freedesktop\.DBus)\.Error\.[\w.]+/)?.[0];
+}
+
+/** The `text` a D-Bus error reply carried, which dbus-next also uses as its message. */
+function dbusErrorText(error: unknown): string {
+  const text = errorField(error, "text");
+  if (typeof text === "string" && text.length > 0) return text;
+  return error instanceof Error ? error.message : String(error);
 }
 
 function errorCause(error: unknown): unknown {

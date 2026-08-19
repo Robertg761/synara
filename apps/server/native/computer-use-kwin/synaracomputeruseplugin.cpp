@@ -8,6 +8,7 @@
 #include "synaracomputerusebuildinfo.h"
 
 #include "core/backendoutput.h"
+#include "core/inputdevice.h"
 #include "core/output.h"
 #include "core/outputlayer.h"
 #include "core/renderloop.h"
@@ -26,6 +27,7 @@
 #include "scene/itemrenderer.h"
 #include "scene/workspacescene.h"
 #include "utils/cursortheme.h"
+#include "wayland/clientconnection.h"
 #include "wayland/display.h"
 #include "wayland/keyboard.h"
 #include "wayland/seat.h"
@@ -49,11 +51,14 @@
 #include <QPainter>
 #include <QThreadPool>
 
+#include <wayland-server-core.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -72,6 +77,10 @@ static const QString s_kwinVersion = QStringLiteral(SYNARA_COMPUTER_USE_KWIN_VER
 static const QString s_agentCursorName = QStringLiteral("synara-agent");
 static const QString s_captureErrorName = QStringLiteral("org.synara.ComputerUse.Error.CaptureFailed");
 static const QString s_releasedErrorName = QStringLiteral("org.synara.ComputerUse.Error.ControlReleased");
+// A window whose application never bound the agent seat. Distinct from every
+// other refusal here because nothing is wrong with the request, the target, or
+// the plugin: the application simply cannot be reached on a second seat.
+static const QString s_seatUnsupportedErrorName = QStringLiteral("org.synara.ComputerUse.Error.SeatUnsupported");
 // A dead server must never leave the agent seat alive, so the session's
 // deadline lives here rather than in the server that may have crashed.
 static constexpr uint s_defaultIdleTimeoutMs = 5 * 60 * 1000;
@@ -88,6 +97,22 @@ static const QString s_captureSizeLimitReason = QStringLiteral("capture exceeds 
 // time-share the real seat's focus, and concurrent user input would cross
 // over (agent keys landing in the user's window and vice versa).
 static const QString s_agentSeatName = QStringLiteral("synara-agent");
+
+/**
+ * Set only by the server when it spawns a nested compositor for the agent.
+ *
+ * Deliberately an environment variable and not a D-Bus method. The choice is a
+ * property of the compositor instance, fixed before the first client connects,
+ * and reading it from the environment makes the dangerous direction structurally
+ * impossible: the human's compositor is started by their own session, so nothing
+ * reachable over the bus can talk this plugin into driving their seat.
+ */
+static const char *s_ownsCompositorEnv = "SYNARA_COMPUTER_USE_OWNS_COMPOSITOR";
+
+static bool readOwnsCompositor()
+{
+    return qgetenv(s_ownsCompositorEnv) == QByteArrayLiteral("1");
+}
 
 // Meta+Shift+Esc is unused by stock Plasma (kill-window is Ctrl+Alt+Esc) and
 // mirrors the muscle memory of Ctrl+Shift+Esc elsewhere. The user's real seat
@@ -301,6 +326,104 @@ static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &na
     return png;
 }
 
+/**
+ * The agent as an ordinary input device, for a compositor it owns outright.
+ *
+ * The dedicated seat exists so the agent can drive the desktop without touching
+ * the human's pointer, and it is the right answer whenever a human is present.
+ * It has one cost, which no amount of care removes: a client that never bound
+ * that seat cannot be reached on it. Chromium binds exactly one wl_seat and
+ * Xwayland does the same for every X11 client behind it, and both take the one
+ * the compositor advertised first.
+ *
+ * A nested session has no human to protect, so there the agent stops being a
+ * second seat and becomes a device on the first one. Events enter KWin's normal
+ * input stack, which means focus follows clicks, global shortcuts fire, Xwayland
+ * forwards to X11 clients, and Chromium's single seat is the seat being driven.
+ * KWin draws the cursor, so there is no ghost cursor here and none is wanted.
+ */
+class SynaraVirtualInputDevice : public InputDevice
+{
+public:
+    explicit SynaraVirtualInputDevice(QObject *parent = nullptr)
+        : InputDevice(parent)
+    {
+    }
+
+    QString name() const override
+    {
+        return QStringLiteral("Synara Agent Input");
+    }
+    bool isEnabled() const override
+    {
+        return true;
+    }
+    void setEnabled(bool) override
+    {
+    }
+    bool isKeyboard() const override
+    {
+        return true;
+    }
+    bool isPointer() const override
+    {
+        return true;
+    }
+    bool isTouchpad() const override
+    {
+        return false;
+    }
+    bool isTouch() const override
+    {
+        return false;
+    }
+    bool isTabletTool() const override
+    {
+        return false;
+    }
+    bool isTabletPad() const override
+    {
+        return false;
+    }
+    bool isTabletModeSwitch() const override
+    {
+        return false;
+    }
+    bool isLidSwitch() const override
+    {
+        return false;
+    }
+
+    void sendMotionAbsolute(const QPointF &pos)
+    {
+        Q_EMIT pointerMotionAbsolute(pos, timestamp(), this);
+        Q_EMIT pointerFrame(this);
+    }
+    void sendButton(quint32 button, bool pressed)
+    {
+        Q_EMIT pointerButtonChanged(button,
+                                    pressed ? PointerButtonState::Pressed : PointerButtonState::Released,
+                                    timestamp(),
+                                    this);
+        Q_EMIT pointerFrame(this);
+    }
+    void sendKey(quint32 key, bool pressed)
+    {
+        Q_EMIT keyChanged(key, pressed ? KeyboardKeyState::Pressed : KeyboardKeyState::Released, timestamp(), this);
+    }
+    void sendAxis(PointerAxis axis, qreal delta, qint32 delta120)
+    {
+        Q_EMIT pointerAxisChanged(axis, delta, delta120, PointerAxisSource::Wheel, false, timestamp(), this);
+        Q_EMIT pointerFrame(this);
+    }
+
+private:
+    static std::chrono::microseconds timestamp()
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
+    }
+};
+
 struct SynaraComputerUsePlugin::CaptureRequest
 {
     CaptureRequest(const QDBusConnection &connection, const QDBusMessage &message)
@@ -441,6 +564,7 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
     : Plugin()
     , m_idleTimeoutMs(s_defaultIdleTimeoutMs)
     , m_pos(Cursors::self()->mouse()->pos())
+    , m_ownsCompositor(readOwnsCompositor())
 {
     m_encodePool.setMaxThreadCount(1);
 
@@ -465,9 +589,13 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
         }
     });
 
-    ensureSeat();
-    ensureCursorItem();
-    setCursorVisible(false);
+    if (m_ownsCompositor) {
+        ensureInputDevice();
+    } else {
+        ensureSeat();
+        ensureCursorItem();
+        setCursorVisible(false);
+    }
 
     if (effects) {
         for (LogicalOutput *output : effects->screens()) {
@@ -493,6 +621,7 @@ SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
         failCapture(m_captureRequest, QStringLiteral("capture canceled: plugin destroyed"));
     }
     releasePressedState();
+    detachInputDevice();
     if (m_seat) {
         m_seat->notifyPointerLeave();
         m_seat->setFocusedKeyboardSurface(nullptr);
@@ -519,7 +648,7 @@ QString SynaraComputerUsePlugin::toJson(const QJsonArray &array)
 QString SynaraComputerUsePlugin::healthJson() const
 {
     QJsonObject health{
-        {QStringLiteral("ok"), bool(m_seat)},
+        {QStringLiteral("ok"), inputReady()},
         {QStringLiteral("running"), m_running},
         {QStringLiteral("service"), s_service},
         {QStringLiteral("path"), s_path},
@@ -528,10 +657,20 @@ QString SynaraComputerUsePlugin::healthJson() const
         {QStringLiteral("gitHash"), s_gitHash},
         {QStringLiteral("buildTimestamp"), s_buildTimestamp},
         {QStringLiteral("kwinVersion"), s_kwinVersion},
-        {QStringLiteral("seat"), s_agentSeatName},
-        {QStringLiteral("dedicatedSeat"), true},
+        {QStringLiteral("seat"), m_ownsCompositor ? QStringLiteral("seat0") : s_agentSeatName},
+        {QStringLiteral("dedicatedSeat"), !m_ownsCompositor},
+        // The agent owns this compositor, so it drives the only seat in it and
+        // reaches every client, Chromium and Xwayland included.
+        {QStringLiteral("ownsCompositor"), m_ownsCompositor},
         {QStringLiteral("overlay"), bool(m_cursorItem)},
         {QStringLiteral("workspace"), Workspace::self() != nullptr},
+        // Read from inside the compositor because that is the only place it is
+        // known: KWin picks the display number for the Xwayland it starts and
+        // publishes it by setenv on itself, with nothing on the bus and nothing
+        // in its output to parse. A server that wants to launch an X11 client
+        // into this session needs the answer, and guessing it races every other
+        // Xwayland on the machine.
+        {QStringLiteral("xDisplay"), qEnvironmentVariable("DISPLAY")},
         {QStringLiteral("effects"), effects != nullptr},
         {QStringLiteral("capture"), effects && effects->isOpenGLCompositing() && effects->openglContext()},
         {QStringLiteral("idleTimeoutMs"), double(m_idleTimeoutMs)},
@@ -549,8 +688,11 @@ QString SynaraComputerUsePlugin::stateJson() const
 {
     QJsonObject state{
         {QStringLiteral("running"), m_running},
-        {QStringLiteral("seat"), s_agentSeatName},
-        {QStringLiteral("dedicatedSeat"), true},
+        {QStringLiteral("seat"), m_ownsCompositor ? QStringLiteral("seat0") : s_agentSeatName},
+        {QStringLiteral("dedicatedSeat"), !m_ownsCompositor},
+        // The agent owns this compositor, so it drives the only seat in it and
+        // reaches every client, Chromium and Xwayland included.
+        {QStringLiteral("ownsCompositor"), m_ownsCompositor},
         {QStringLiteral("position"), pointToJson(m_pos)},
         {QStringLiteral("pressedButtonCount"), m_pressedButtons.size()},
         {QStringLiteral("pressedKeyCount"), m_pressedKeys.size()},
@@ -667,12 +809,17 @@ bool SynaraComputerUsePlugin::start()
         }
         return false;
     }
-    ensureSeat();
-    if (!m_seat) {
+    if (m_ownsCompositor) {
+        ensureInputDevice();
+    } else {
+        ensureSeat();
+    }
+    if (!inputReady()) {
         return false;
     }
     m_running = true;
     m_stopReason.clear();
+    attachInputDevice();
     setCursorVisible(true);
     movePointer(m_pos.x(), m_pos.y());
     noteActivity();
@@ -702,6 +849,7 @@ void SynaraComputerUsePlugin::stopSession(StopReason reason)
         failCapture(m_captureRequest, QStringLiteral("capture canceled by stop"));
     }
     releasePressedState();
+    detachInputDevice();
     if (m_seat) {
         m_seat->notifyPointerLeave();
         m_seat->setFocusedKeyboardSurface(nullptr);
@@ -800,6 +948,12 @@ bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
     if (!usableWindow(window)) {
         return false;
     }
+    // Before adopting the target, not after: focusing a window that cannot
+    // receive the agent's keys would report success and then swallow everything
+    // typed into it.
+    if (!requireAgentSeatClient(window)) {
+        return false;
+    }
     m_targetWindow = window;
     m_targetRequested = true;
     updatePointerFocus();
@@ -840,12 +994,18 @@ bool SynaraComputerUsePlugin::movePointer(double x, double y)
     if (!requireRunning()) {
         return false;
     }
-    ensureSeat();
-    if (!m_seat) {
+    if (!inputReady()) {
         return false;
     }
 
     m_pos = confinedPoint(QPointF(x, y));
+    if (m_ownsCompositor) {
+        // KWin owns the cursor and the focus that follows it, so the move is the
+        // whole action: no ghost cursor to reposition, no focus to maintain.
+        m_inputDevice->sendMotionAbsolute(m_pos);
+        return true;
+    }
+
     ensureCursorItem();
     if (m_cursorItem) {
         m_cursorItem->setPosition(m_pos);
@@ -862,14 +1022,18 @@ bool SynaraComputerUsePlugin::button(uint button, bool pressed)
     if (!requireRunning()) {
         return false;
     }
-    ensureSeat();
-    if (!m_seat) {
+    if (!inputReady()) {
         return false;
     }
     if (!updatePointerFocus()) {
         return false;
     }
-    updateKeyboardFocus();
+    if (!requireAgentSeatClient(m_pointerWindow)) {
+        return false;
+    }
+    if (!m_ownsCompositor) {
+        updateKeyboardFocus();
+    }
 
     sendButton(button, pressed);
     return true;
@@ -880,12 +1044,24 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
     if (!requireRunning()) {
         return false;
     }
-    ensureSeat();
-    if (!m_seat) {
+    if (!inputReady()) {
         return false;
     }
     if (!updatePointerFocus()) {
         return false;
+    }
+    if (!requireAgentSeatClient(m_pointerWindow)) {
+        return false;
+    }
+
+    if (m_ownsCompositor) {
+        if (horizontal != 0) {
+            m_inputDevice->sendAxis(PointerAxis::Horizontal, horizontal * 15.0 / 120.0, int(horizontal));
+        }
+        if (vertical != 0) {
+            m_inputDevice->sendAxis(PointerAxis::Vertical, vertical * 15.0 / 120.0, int(vertical));
+        }
+        return true;
     }
 
     setTimestampNow();
@@ -904,11 +1080,13 @@ bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
     if (!requireRunning()) {
         return false;
     }
-    ensureSeat();
-    if (!m_seat) {
+    if (!inputReady()) {
         return false;
     }
     if (!updateKeyboardFocus()) {
+        return false;
+    }
+    if (!requireAgentSeatClient(m_keyboardWindow)) {
         return false;
     }
 
@@ -918,13 +1096,18 @@ bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
 
 void SynaraComputerUsePlugin::sendButton(quint32 code, bool pressed)
 {
-    if (!m_seat) {
+    if (!inputReady()) {
         return;
     }
     if (pressed) {
         m_pressedButtons.insert(code);
     } else {
         m_pressedButtons.remove(code);
+    }
+
+    if (m_ownsCompositor) {
+        m_inputDevice->sendButton(code, pressed);
+        return;
     }
 
     setTimestampNow();
@@ -934,7 +1117,7 @@ void SynaraComputerUsePlugin::sendButton(quint32 code, bool pressed)
 
 void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
 {
-    if (!m_seat) {
+    if (!inputReady()) {
         return;
     }
     if (pressed) {
@@ -943,6 +1126,13 @@ void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
         }
     } else {
         m_pressedKeys.removeOne(keyCode);
+    }
+
+    if (m_ownsCompositor) {
+        // Through KWin's keyboard pipeline, which owns the xkb state, so there
+        // is nothing to mirror here and modifiers need no separate sync.
+        m_inputDevice->sendKey(keyCode, pressed);
+        return;
     }
 
     setTimestampNow();
@@ -1309,8 +1499,50 @@ void SynaraComputerUsePlugin::failCapture(std::shared_ptr<CaptureRequest> reques
     }
 }
 
+bool SynaraComputerUsePlugin::inputReady() const
+{
+    return m_ownsCompositor ? bool(m_inputDevice) : bool(m_seat);
+}
+
+void SynaraComputerUsePlugin::ensureInputDevice()
+{
+    if (!m_inputDevice) {
+        m_inputDevice = std::make_unique<SynaraVirtualInputDevice>(this);
+    }
+}
+
+/**
+ * Only while a session runs, so a stopped agent is not merely ignored but
+ * absent: KWin counts attached devices when it decides whether a pointer exists
+ * at all, and a device that is present but idle still asserts one.
+ */
+void SynaraComputerUsePlugin::attachInputDevice()
+{
+    if (m_deviceAttached || !m_inputDevice || !input()) {
+        return;
+    }
+    input()->addInputDevice(m_inputDevice.get());
+    m_deviceAttached = true;
+}
+
+void SynaraComputerUsePlugin::detachInputDevice()
+{
+    if (!m_deviceAttached) {
+        return;
+    }
+    m_deviceAttached = false;
+    if (m_inputDevice && input()) {
+        input()->removeInputDevice(m_inputDevice.get());
+    }
+}
+
 void SynaraComputerUsePlugin::ensureSeat()
 {
+    // A compositor the agent owns is driven through its own input stack, and a
+    // second seat there would reintroduce the very clients it cannot reach.
+    if (m_ownsCompositor) {
+        return;
+    }
     if (m_seat || !waylandServer() || !waylandServer()->display()) {
         return;
     }
@@ -1336,7 +1568,10 @@ void SynaraComputerUsePlugin::ensureSeat()
 
 void SynaraComputerUsePlugin::ensureCursorItem()
 {
-    if (m_cursorItem || !effects || !effects->scene()) {
+    // The ghost cursor exists to be a second cursor beside the human's. In a
+    // compositor the agent owns there is only one cursor and KWin draws it, so a
+    // ghost would be a duplicate drawn on top of the real one.
+    if (m_ownsCompositor || m_cursorItem || !effects || !effects->scene()) {
         return;
     }
 
@@ -1400,6 +1635,84 @@ Window *SynaraComputerUsePlugin::findWindowById(const QString &windowId) const
     });
 }
 
+namespace
+{
+struct AgentSeatProbe
+{
+    const SeatInterface *seat;
+    bool bound;
+};
+
+// wl_seat is the resource to look for, not wl_pointer or wl_keyboard: a client
+// that bound the seat but has not yet asked it for a pointer is still reachable,
+// it just has not gotten around to it. A client that never bound the seat cannot
+// become reachable at all.
+wl_iterator_result probeAgentSeatResource(wl_resource *resource, void *data)
+{
+    auto *probe = static_cast<AgentSeatProbe *>(data);
+    const char *klass = wl_resource_get_class(resource);
+    if (klass && std::strcmp(klass, "wl_seat") == 0 && SeatInterface::get(resource) == probe->seat) {
+        probe->bound = true;
+        return WL_ITERATOR_STOP;
+    }
+    return WL_ITERATOR_CONTINUE;
+}
+}
+
+bool SynaraComputerUsePlugin::clientBoundAgentSeat(const SurfaceInterface *surface) const
+{
+    if (!m_seat || !surface) {
+        return false;
+    }
+    ClientConnection *connection = surface->client();
+    if (!connection) {
+        return false;
+    }
+    wl_client *client = connection->client();
+    if (!client) {
+        return false;
+    }
+    AgentSeatProbe probe{m_seat, false};
+    wl_client_for_each_resource(client, probeAgentSeatResource, &probe);
+    return probe.bound;
+}
+
+/**
+ * Refuse, out loud, rather than inject into a client that cannot hear us.
+ *
+ * Wayland delivers input per resource, so a seat the client never bound has
+ * nowhere to send to and drops the event without an error at any layer. The
+ * caller then believes it clicked. Two whole classes of application land here
+ * and neither can be talked out of it: Chromium (so every Electron app) keeps a
+ * single wl_seat and ignores every one advertised after it, and Xwayland does
+ * the same for every X11 client behind it. Both bind seat0 because the
+ * compositor advertises it before this plugin is ever loaded.
+ */
+bool SynaraComputerUsePlugin::requireAgentSeatClient(const Window *window)
+{
+    // There is no second seat in a compositor the agent owns, so every client is
+    // reachable and this refusal cannot apply.
+    if (m_ownsCompositor || !window || clientBoundAgentSeat(window->surface())) {
+        return true;
+    }
+
+    QString name = window->resourceClass();
+    if (name.isEmpty()) {
+        name = window->caption();
+    }
+    if (name.isEmpty()) {
+        name = QStringLiteral("This window");
+    }
+    sendErrorReply(s_seatUnsupportedErrorName,
+                   QStringLiteral("%1 never bound the %2 seat, so input to it is dropped silently and the "
+                                  "action would have no effect. Chromium and Electron applications keep only "
+                                  "the first seat the compositor advertises, and every X11 application behind "
+                                  "Xwayland does the same. Drive this application in a nested agent session "
+                                  "instead, where the agent's seat is the only one.")
+                       .arg(name, s_agentSeatName));
+    return false;
+}
+
 bool SynaraComputerUsePlugin::usableWindow(const Window *window) const
 {
     return window
@@ -1447,6 +1760,15 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
         return false;
     }
 
+    if (m_ownsCompositor) {
+        // The scoping above still applies - an explicit target must own the
+        // point, or the click is refused rather than delivered to whatever
+        // covers it - but the delivery itself is KWin's, and it derives pointer
+        // focus from the cursor position the motion already set.
+        m_pointerWindow = window;
+        return true;
+    }
+
     if (m_pointerWindow == window) {
         m_seat->notifyPointerMotion(m_pos);
         return true;
@@ -1480,7 +1802,23 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
         window = windowAt(m_pos);
     }
 
-    if (!window || !m_seat) {
+    if (!window) {
+        return false;
+    }
+
+    if (m_ownsCompositor) {
+        // Real activation, not the borrowed `activated` flag the shared desktop
+        // needs: this compositor's focus is the agent's to move, so the window
+        // becomes genuinely active and its shortcut handling works for the same
+        // reason it works for a human.
+        m_keyboardWindow = window;
+        if (Workspace::self() && Workspace::self()->activeWindow() != window) {
+            Workspace::self()->activateWindow(window);
+        }
+        return true;
+    }
+
+    if (!m_seat) {
         return false;
     }
     if (m_keyboardWindow == window) {

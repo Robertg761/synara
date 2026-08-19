@@ -32,9 +32,11 @@ namespace KWin
 
 class ImageItem;
 class LogicalOutput;
+class SynaraVirtualInputDevice;
 class RenderLoop;
 class SeatInterface;
 class ShapeCursorSource;
+class SurfaceInterface;
 class Window;
 
 class SynaraAgentCursorItem : public Item
@@ -106,12 +108,23 @@ private:
     void sendButton(quint32 code, bool pressed);
     void sendKey(quint32 keyCode, bool pressed);
     void ensureSeat();
+    /** Whether whichever input path this compositor uses is actually usable. */
+    bool inputReady() const;
+    void ensureInputDevice();
+    void attachInputDevice();
+    void detachInputDevice();
     void ensureCursorItem();
     void setCursorVisible(bool visible);
     QPointF confinedPoint(const QPointF &point) const;
     Window *windowAt(const QPointF &point) const;
     Window *findWindowById(const QString &windowId) const;
     bool usableWindow(const Window *window) const;
+    // Whether this window's application bound the agent seat at all. A client
+    // that never bound it still has its surfaces delivered to by the seat, and
+    // the events are dropped on the floor with no error anywhere - the failure
+    // mode that makes a click look like it simply did not work.
+    bool clientBoundAgentSeat(const SurfaceInterface *surface) const;
+    bool requireAgentSeatClient(const Window *window);
     bool updatePointerFocus();
     bool updateKeyboardFocus();
     void clearKeyboardFocus();
@@ -146,8 +159,14 @@ private:
     // so the input path can refuse rather than retarget.
     bool m_targetRequested = false;
     QPointer<Window> m_activatedWindow;
+    // Whether this compositor belongs to the agent alone, which is true of a
+    // nested session and never of the human's desktop. Fixed for the plugin's
+    // lifetime: it decides which of the two input paths below exists at all.
+    const bool m_ownsCompositor;
     SeatInterface *m_seat = nullptr;
     xkb_state *m_xkbState = nullptr;
+    std::unique_ptr<SynaraVirtualInputDevice> m_inputDevice;
+    bool m_deviceAttached = false;
     std::unique_ptr<SynaraAgentCursorItem> m_cursorItem;
     QList<quint32> m_pressedKeys;
     QSet<quint32> m_pressedButtons;
