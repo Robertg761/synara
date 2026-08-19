@@ -972,7 +972,9 @@ bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
     // Before adopting the target, not after: focusing a window that cannot
     // receive the agent's keys would report success and then swallow everything
     // typed into it.
-    if (!requireReachableClient(window)) {
+    // Probed here rather than reused: this window has not been arrived on yet, so
+    // no path decision has been taken for it.
+    if (!requireReachableClient(window, useDirectInjection(window))) {
         return false;
     }
     m_targetWindow = window;
@@ -1049,7 +1051,7 @@ bool SynaraComputerUsePlugin::button(uint button, bool pressed)
     if (!updatePointerFocus()) {
         return false;
     }
-    if (!requireReachableClient(m_pointerWindow)) {
+    if (!requireReachableClient(m_pointerWindow, m_pointerDirect)) {
         return false;
     }
     if (!m_ownsCompositor) {
@@ -1071,7 +1073,7 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
     if (!updatePointerFocus()) {
         return false;
     }
-    if (!requireReachableClient(m_pointerWindow)) {
+    if (!requireReachableClient(m_pointerWindow, m_pointerDirect)) {
         return false;
     }
 
@@ -1112,7 +1114,7 @@ bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
     if (!updateKeyboardFocus()) {
         return false;
     }
-    if (!requireReachableClient(m_keyboardWindow)) {
+    if (!requireReachableClient(m_keyboardWindow, m_keyboardDirect)) {
         return false;
     }
 
@@ -1758,6 +1760,54 @@ QList<wl_resource *> clientInputResources(const SurfaceInterface *surface, const
     return resources;
 }
 
+wl_iterator_result probeInputResource(wl_resource *resource, void *data)
+{
+    const char *klass = wl_resource_get_class(resource);
+    if (klass && (std::strcmp(klass, "wl_pointer") == 0 || std::strcmp(klass, "wl_keyboard") == 0)) {
+        *static_cast<bool *>(data) = true;
+        return WL_ITERATOR_STOP;
+    }
+    return WL_ITERATOR_CONTINUE;
+}
+
+/** Whether this client holds a pointer or a keyboard at all, on any seat. */
+bool clientHoldsInputResource(const SurfaceInterface *surface)
+{
+    if (!surface) {
+        return false;
+    }
+    ClientConnection *connection = surface->client();
+    if (!connection) {
+        return false;
+    }
+    wl_client *client = connection->client();
+    if (!client) {
+        return false;
+    }
+    bool found = false;
+    wl_client_for_each_resource(client, probeInputResource, &found);
+    return found;
+}
+
+/**
+ * Whole wheel clicks owed to a client too old for wl_pointer.axis_value120.
+ *
+ * That event carries only whole clicks, so any delta under one click truncates
+ * to zero and a small scroll becomes a no-op in every client that acts on the
+ * discrete event rather than the continuous one. The sub-click part is carried
+ * in @p remainder instead, so repeated small deltas still add up to a click.
+ */
+int takeDiscreteSteps(double &remainder, double delta120)
+{
+    if (delta120 == 0) {
+        return 0;
+    }
+    remainder += delta120;
+    const double steps = std::trunc(remainder / 120.0);
+    remainder -= steps * 120.0;
+    return int(steps);
+}
+
 quint32 directTimestampMs()
 {
     return quint32(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1855,6 +1905,10 @@ void SynaraComputerUsePlugin::directPointerLeave()
 {
     SurfaceInterface *surface = m_directPointerSurface;
     m_directPointerSurface.clear();
+    // Owed clicks belong to the surface that was being scrolled; the next one
+    // must not inherit them.
+    m_directAxisRemainderH = 0;
+    m_directAxisRemainderV = 0;
     if (!surface || humanHoldsPointer(surface)) {
         return;
     }
@@ -1894,7 +1948,20 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
         return;
     }
     const quint32 time = directTimestampMs();
-    for (wl_resource *resource : clientInputResources(surface, "wl_pointer")) {
+    const QList<wl_resource *> resources = clientInputResources(surface, "wl_pointer");
+
+    // The remainder is only spent on resources that cannot be told about a
+    // fraction of a click, so it is only taken when the client has one. Taking it
+    // unconditionally would leave a value120-only client carrying a balance it
+    // can never use, and hand the next old client a click it did not scroll.
+    const bool needsDiscrete = std::any_of(resources.cbegin(), resources.cend(), [](wl_resource *resource) {
+        const int version = wl_resource_get_version(resource);
+        return version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && version < WL_POINTER_AXIS_VALUE120_SINCE_VERSION;
+    });
+    const int horizontalSteps = needsDiscrete ? takeDiscreteSteps(m_directAxisRemainderH, horizontal) : 0;
+    const int verticalSteps = needsDiscrete ? takeDiscreteSteps(m_directAxisRemainderV, vertical) : 0;
+
+    for (wl_resource *resource : resources) {
         const int version = wl_resource_get_version(resource);
         if (version >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION) {
             wl_pointer_send_axis_source(resource, WL_POINTER_AXIS_SOURCE_WHEEL);
@@ -1904,8 +1971,12 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
                                  time,
                                  WL_POINTER_AXIS_HORIZONTAL_SCROLL,
                                  wl_fixed_from_double(horizontal * 15.0 / 120.0));
-            if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION) {
-                wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, int(horizontal / 120.0));
+            // value120 supersedes axis_discrete for the clients that have it, and
+            // the two must not both be sent for one scroll.
+            if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
+                wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, int(horizontal));
+            } else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && horizontalSteps != 0) {
+                wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, horizontalSteps);
             }
         }
         if (vertical != 0) {
@@ -1913,8 +1984,10 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
                                  time,
                                  WL_POINTER_AXIS_VERTICAL_SCROLL,
                                  wl_fixed_from_double(vertical * 15.0 / 120.0));
-            if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION) {
-                wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, int(vertical / 120.0));
+            if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
+                wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, int(vertical));
+            } else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && verticalSteps != 0) {
+                wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, verticalSteps);
             }
         }
         if (version >= WL_POINTER_FRAME_SINCE_VERSION) {
@@ -2011,19 +2084,21 @@ void SynaraComputerUsePlugin::directKeyboardModifiers()
  * a client holding no input resources at all - it never asked its seat for a
  * pointer or a keyboard - and no coordinate would have worked there.
  */
-bool SynaraComputerUsePlugin::requireReachableClient(const Window *window)
+bool SynaraComputerUsePlugin::requireReachableClient(const Window *window, bool directInjection)
 {
     // There is no second seat in a compositor the agent owns, so every client is
     // reachable and this refusal cannot apply.
     if (m_ownsCompositor || !window) {
         return true;
     }
-    const SurfaceInterface *surface = window->surface();
-    if (clientBoundAgentSeat(surface)) {
+    // The agent seat carries the event itself for a client that bound it, so the
+    // only unreachable client is one being written to directly with nothing to
+    // write to. The caller passes the path decision taken when the pointer or the
+    // keyboard arrived, so this costs no second walk of the client's resources.
+    if (!directInjection) {
         return true;
     }
-    if (!clientInputResources(surface, "wl_pointer").isEmpty()
-        || !clientInputResources(surface, "wl_keyboard").isEmpty()) {
+    if (clientHoldsInputResource(window->surface())) {
         return true;
     }
 
@@ -2092,26 +2167,29 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
         return true;
     }
 
-    // Which path this window takes can change under us - a client can bind the
-    // agent seat at any time - so the old delivery is always torn down by the
-    // same call that knows how it was made.
-    if (useDirectInjection(window)) {
-        if (m_pointerWindow != window) {
-            clearPointerDelivery();
-            m_pointerWindow = window;
+    // Which path this window takes is decided on arrival and held for the stay,
+    // because the probe walks every resource the client holds and a motion stream
+    // is not the place to pay for that per event. A client that binds the agent
+    // seat while the pointer already sits on it keeps the seat0 resources the
+    // direct path is writing to, so it stays reachable until the next leave and
+    // re-enter re-decides. The old delivery is always torn down by the same call
+    // that knows how it was made.
+    if (m_pointerWindow != window) {
+        clearPointerDelivery();
+        m_pointerWindow = window;
+        m_pointerDirect = useDirectInjection(window);
+        if (!m_pointerDirect) {
+            m_seat->notifyPointerEnter(window->surface(), m_pos, window->inputTransformation());
+            return true;
         }
+    }
+
+    if (m_pointerDirect) {
         directPointerMotion(window);
         return true;
     }
 
-    if (m_pointerWindow == window && !m_directPointerSurface) {
-        m_seat->notifyPointerMotion(m_pos);
-        return true;
-    }
-
-    clearPointerDelivery();
-    m_pointerWindow = window;
-    m_seat->notifyPointerEnter(window->surface(), m_pos, window->inputTransformation());
+    m_seat->notifyPointerMotion(m_pos);
     return true;
 }
 
@@ -2129,6 +2207,7 @@ void SynaraComputerUsePlugin::clearPointerDelivery()
         m_seat->notifyPointerLeave();
     }
     m_pointerWindow.clear();
+    m_pointerDirect = false;
 }
 
 bool SynaraComputerUsePlugin::updateKeyboardFocus()
@@ -2167,13 +2246,31 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
         return true;
     }
 
-    if (useDirectInjection(window)) {
-        if (m_keyboardWindow != window) {
-            // Released on the surface that saw the press, before anything moves.
-            releasePressedKeys();
-            clearKeyboardDelivery();
-            m_keyboardWindow = window;
+    // Decided on arrival and held for the stay, for the same reason the pointer's
+    // is: the probe is a full walk of the client's resources and a keystroke
+    // stream would pay for it per key.
+    if (m_keyboardWindow != window) {
+        // Released on the surface that saw the press, before anything moves.
+        releasePressedKeys();
+        clearKeyboardDelivery();
+        m_keyboardWindow = window;
+        m_keyboardDirect = useDirectInjection(window);
+        if (!m_keyboardDirect) {
+            if (!m_seat) {
+                return false;
+            }
+            // Keys still held while focus migrates were released above, on the
+            // surface that saw the press. Handing the pressed-key array to the
+            // next surface makes that client believe the agent is holding Ctrl,
+            // and then delivers it the orphaned release, so a half-finished chord
+            // leaks into an unrelated window.
+            m_seat->setFocusedKeyboardSurface(window->surface(), m_pressedKeys);
+            updateWindowActivation(window);
+            return true;
         }
+    }
+
+    if (m_keyboardDirect) {
         directKeyboardEnter(window);
         // Still borrowed, not real: this is the human's compositor, and a
         // toolkit gates its shortcut matcher on the window being active whether
@@ -2185,31 +2282,18 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
     if (!m_seat) {
         return false;
     }
-    if (m_keyboardWindow == window) {
-        // Re-borrowing is not enough once KWin has revoked the window's active
-        // flag: that revocation means the human's seat focus churned through the
-        // window, and the leave that seat sent reset the client's keyboard-focus
-        // state. Verified live: re-sending xdg `activated` alone leaves Qt's
-        // shortcut matcher dead, while a fresh enter on our seat revives it. So
-        // cycle our keyboard focus too, carrying any held keys, and let
-        // updateWindowActivation re-assert the flag.
-        if (!window->isActive() && m_seat && window->surface()) {
-            m_seat->setFocusedKeyboardSurface(nullptr);
-            m_seat->setFocusedKeyboardSurface(window->surface(), m_pressedKeys);
-        }
-        updateWindowActivation(window);
-        return true;
+
+    // Re-borrowing is not enough once KWin has revoked the window's active flag:
+    // that revocation means the human's seat focus churned through the window,
+    // and the leave that seat sent reset the client's keyboard-focus state.
+    // Verified live: re-sending xdg `activated` alone leaves Qt's shortcut
+    // matcher dead, while a fresh enter on our seat revives it. So cycle our
+    // keyboard focus too, carrying any held keys, and let updateWindowActivation
+    // re-assert the flag.
+    if (!window->isActive() && window->surface()) {
+        m_seat->setFocusedKeyboardSurface(nullptr);
+        m_seat->setFocusedKeyboardSurface(window->surface(), m_pressedKeys);
     }
-
-    // Keys still held while focus migrates must be released on the surface that
-    // saw the press. Handing the pressed-key array to the next surface makes that
-    // client believe the agent is holding Ctrl, and then delivers it the orphaned
-    // release, so a half-finished chord leaks into an unrelated window.
-    releasePressedKeys();
-    clearKeyboardDelivery();
-
-    m_keyboardWindow = window;
-    m_seat->setFocusedKeyboardSurface(window->surface(), m_pressedKeys);
     updateWindowActivation(window);
     return true;
 }
@@ -2227,6 +2311,7 @@ void SynaraComputerUsePlugin::clearKeyboardDelivery()
 void SynaraComputerUsePlugin::clearKeyboardFocus()
 {
     m_keyboardWindow.clear();
+    m_keyboardDirect = false;
     clearWindowActivation();
     clearKeyboardDelivery();
 }
@@ -2316,7 +2401,10 @@ void SynaraComputerUsePlugin::forgetPressedKeys()
 
 void SynaraComputerUsePlugin::releasePressedState()
 {
-    if (!m_seat) {
+    // Whichever path this compositor uses, because a stop that skips the release
+    // latches the held button or modifier in the client for good. Callers run
+    // this before detachInputDevice(), while the path can still carry events.
+    if (!inputReady()) {
         return;
     }
 

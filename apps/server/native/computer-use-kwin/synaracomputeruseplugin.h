@@ -128,7 +128,7 @@ private:
     // resources rather than through the agent seat, which is true exactly of the
     // clients that never bound that seat.
     bool useDirectInjection(const Window *window) const;
-    bool requireReachableClient(const Window *window);
+    bool requireReachableClient(const Window *window, bool directInjection);
     void directPointerEnter(Window *window);
     void directPointerMotion(Window *window);
     void directPointerLeave();
@@ -187,6 +187,16 @@ private:
     // has to be driven from here or the client keeps believing it has focus.
     QPointer<SurfaceInterface> m_directPointerSurface;
     QPointer<SurfaceInterface> m_directKeyboardSurface;
+    // Which path the current pointer and keyboard windows are being driven by,
+    // decided when the pointer or the keyboard arrived on them. Only meaningful
+    // alongside the window it was taken for, and reset with it.
+    bool m_pointerDirect = false;
+    bool m_keyboardDirect = false;
+    // Scroll owed to a client whose wl_pointer predates axis_value120 and can only
+    // be told about whole wheel clicks. In value120 units, and belonging to the
+    // surface currently holding the direct-injection pointer enter.
+    double m_directAxisRemainderH = 0;
+    double m_directAxisRemainderV = 0;
     std::unique_ptr<SynaraAgentCursorItem> m_cursorItem;
     QList<quint32> m_pressedKeys;
     QSet<quint32> m_pressedButtons;
