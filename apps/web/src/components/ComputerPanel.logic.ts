@@ -1,12 +1,14 @@
-import type {
-  ComputerAvailability,
-  ComputerFrameHeader,
-  ComputerHealth,
-  ComputerInputModifier,
-  ComputerPoint,
-  ComputerRect,
-  ComputerScreenSize,
-  ThreadComputerState,
+import {
+  COMPUTER_KWIN_BACKEND,
+  COMPUTER_RELEASE_CONTROL_HOTKEY,
+  type ComputerAvailability,
+  type ComputerFrameHeader,
+  type ComputerHealth,
+  type ComputerInputModifier,
+  type ComputerPoint,
+  type ComputerRect,
+  type ComputerScreenSize,
+  type ThreadComputerState,
 } from "@synara/contracts";
 
 export interface ComputerFrameGateState {
@@ -164,6 +166,41 @@ function computerHealthDetail(health: ComputerHealth): string {
   }
   if (health.reconnects > 0) parts.push(`Reconnects since startup: ${health.reconnects}.`);
   return parts.join(" ");
+}
+
+/**
+ * The emergency-release hint for the viewport, or null where it would be a lie.
+ *
+ * The hotkey is a compositor shortcut the KWin plugin registers, so it exists
+ * only on that backend: the portal backend has nothing bound and would leave
+ * the human pressing keys at a desktop that keeps being driven. It also has to
+ * be the human's own compositor: a nested, offscreen KWin session registers the
+ * same shortcut, but the host desktop the human is typing at never routes keys
+ * into it. The hint is also only worth the pixels while the agent is acting.
+ */
+export interface ComputerReleaseControlHint {
+  readonly text: string;
+  /** Whether it is worth the pixels right now; the text stays put so it can fade. */
+  readonly visible: boolean;
+}
+
+export function computerReleaseControlHint(input: {
+  readonly availability: ComputerAvailability | undefined;
+  readonly visibleDesktop: boolean;
+  readonly agentActive: boolean;
+}): ComputerReleaseControlHint | null {
+  const availability = input.availability;
+  if (
+    availability?.kind !== "available" ||
+    availability.backend !== COMPUTER_KWIN_BACKEND ||
+    !input.visibleDesktop
+  ) {
+    return null;
+  }
+  return {
+    text: `Press ${COMPUTER_RELEASE_CONTROL_HOTKEY} to stop the agent at any time.`,
+    visible: input.agentActive,
+  };
 }
 
 export function shouldSubscribeToComputerStream(input: {

@@ -3,7 +3,11 @@
 // Layer: Settings UI components
 // Exports: ComputerSettingsPanel
 
-import type { ComputerCapabilities } from "@synara/contracts";
+import {
+  COMPUTER_KWIN_BACKEND,
+  COMPUTER_RELEASE_CONTROL_HOTKEY,
+  type ComputerCapabilities,
+} from "@synara/contracts";
 import { useQuery } from "@tanstack/react-query";
 
 import type { AppSettingsBinding } from "~/appSettings";
@@ -84,6 +88,13 @@ export function ComputerSettingsPanel({
   const backend =
     status?.availability.kind === "available" ? (status.availability.backend ?? null) : null;
   const health = status?.health;
+  // The emergency release is a shortcut the KWin plugin registers with the
+  // compositor. No other backend binds it, and a nested offscreen session never
+  // hears the human's keys, so only the visible KWin desktop may promise it.
+  const dedicatedSeatDescription =
+    backend === COMPUTER_KWIN_BACKEND && status?.capabilities.visibleDesktop === true
+      ? `The agent drives its own seat, so your cursor and focus stay untouched. Press ${COMPUTER_RELEASE_CONTROL_HOTKEY} at any time to stop it from acting on the desktop, and press it again to let it resume.`
+      : "The agent drives its own seat, so your cursor and focus stay untouched.";
   const healthNotes = [
     ...(health?.status === "awaiting-consent"
       ? ["Waiting for you to answer the desktop's permission dialog."]
@@ -151,7 +162,7 @@ export function ComputerSettingsPanel({
               description={
                 status.capabilities.sharedSeat
                   ? "The agent shares your seat: the real cursor moves and real focus follows, and it yields whenever you touch the mouse or keyboard."
-                  : "The agent drives its own seat, so your cursor and focus stay untouched."
+                  : dedicatedSeatDescription
               }
               status={capabilitySummary(status.capabilities)}
             />

@@ -62,6 +62,25 @@ const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
  */
 export const COMPUTER_CONTROL_DENIED_ACTIVITY_KIND = "computer.control-denied";
 
+/**
+ * The backend name reported in `ComputerAvailability.backend` by the KWin
+ * plugin backend. Shared because the hotkey below exists only there, so every
+ * surface that advertises it has to recognise that one backend by name.
+ */
+export const COMPUTER_KWIN_BACKEND = "kwin";
+
+/**
+ * The human's emergency release: it takes the desktop back from the agent and
+ * latches until it is pressed again, which hands control back.
+ *
+ * Must match `releaseShortcut()` in the KWin plugin
+ * (`apps/server/native/computer-use-kwin/synaracomputeruseplugin.cpp`), which
+ * registers it with KGlobalAccel. It is a compositor shortcut and therefore
+ * exists only on the KWin backend: no other backend binds it, so no surface may
+ * advertise it unless `ComputerAvailability.backend` is `COMPUTER_KWIN_BACKEND`.
+ */
+export const COMPUTER_RELEASE_CONTROL_HOTKEY = "Meta+Shift+Esc";
+
 export const ComputerId = TrimmedNonEmptyString.check(
   Schema.isMaxLength(COMPUTER_ID_MAX_LENGTH),
 ).check(Schema.isPattern(/^[A-Za-z0-9._:-]+$/));

@@ -11,6 +11,7 @@ import {
   computerContainRect,
   computerCursorPosition,
   computerKeyCommand,
+  computerReleaseControlHint,
   computerStreamRegion,
   computerViewportPointToDesktop,
   computerWheelScrollDelta,
@@ -183,6 +184,49 @@ describe("computer panel state helpers", () => {
         threadState: state({ availability: { kind: "backend-unavailable", message: "off" } }),
       }),
     ).toBe(false);
+  });
+
+  it("offers the release hotkey only on the KWin backend driving a visible desktop", () => {
+    expect(
+      computerReleaseControlHint({
+        availability: { kind: "available", backend: "kwin" },
+        visibleDesktop: true,
+        agentActive: true,
+      }),
+    ).toEqual({ text: "Press Meta+Shift+Esc to stop the agent at any time.", visible: true });
+    expect(
+      computerReleaseControlHint({
+        availability: { kind: "available", backend: "kwin" },
+        visibleDesktop: true,
+        agentActive: false,
+      })?.visible,
+    ).toBe(false);
+    // A nested, offscreen KWin session registers the shortcut too, but the host
+    // desktop the human types at never routes keys into it.
+    expect(
+      computerReleaseControlHint({
+        availability: { kind: "available", backend: "kwin" },
+        visibleDesktop: false,
+        agentActive: true,
+      }),
+    ).toBeNull();
+    expect(
+      computerReleaseControlHint({
+        availability: { kind: "available", backend: "portal" },
+        visibleDesktop: true,
+        agentActive: true,
+      }),
+    ).toBeNull();
+    expect(
+      computerReleaseControlHint({
+        availability: { kind: "backend-unavailable", message: "off" },
+        visibleDesktop: true,
+        agentActive: true,
+      }),
+    ).toBeNull();
+    expect(
+      computerReleaseControlHint({ availability: undefined, visibleDesktop: true, agentActive: true }),
+    ).toBeNull();
   });
 
   it("contains a multi-monitor desktop and maps the agent cursor", () => {

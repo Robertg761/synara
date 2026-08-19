@@ -5,19 +5,21 @@ import { homedir } from "node:os";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
 
-import type {
-  ComputerAvailability,
-  ComputerCapabilities,
-  ComputerHealth,
-  ComputerId,
-  ComputerLaunchAppResult,
-  ComputerPoint,
-  ComputerRect,
-  ComputerScreenshot,
-  ComputerScreenSize,
-  ComputerState,
-  ComputerUiNode,
-  ComputerWindow,
+import {
+  COMPUTER_KWIN_BACKEND,
+  COMPUTER_RELEASE_CONTROL_HOTKEY,
+  type ComputerAvailability,
+  type ComputerCapabilities,
+  type ComputerHealth,
+  type ComputerId,
+  type ComputerLaunchAppResult,
+  type ComputerPoint,
+  type ComputerRect,
+  type ComputerScreenshot,
+  type ComputerScreenSize,
+  type ComputerState,
+  type ComputerUiNode,
+  type ComputerWindow,
 } from "@synara/contracts";
 import { describeErrorMessage } from "@synara/shared/errorMessages";
 
@@ -94,12 +96,10 @@ const KWIN_RECONNECT_MAX_DELAY_MS = 5_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
 const MIN_IDLE_TIMEOUT_MS = 1_000;
 const MAX_IDLE_TIMEOUT_MS = 60 * 60 * 1_000;
-/** Must match `releaseShortcut()` in the KWin plugin. */
-const RELEASE_CONTROL_HOTKEY = "Meta+Shift+Esc";
 const CONTROL_RELEASED_ERROR_TYPE = "org.synara.ComputerUse.Error.ControlReleased";
 const CONTROL_RELEASED_MESSAGE =
-  `Computer control was released with the ${RELEASE_CONTROL_HOTKEY} hotkey. ` +
-  `Press ${RELEASE_CONTROL_HOTKEY} again to hand control back.`;
+  `Computer control was released with the ${COMPUTER_RELEASE_CONTROL_HOTKEY} hotkey. ` +
+  `Press ${COMPUTER_RELEASE_CONTROL_HOTKEY} again to hand control back.`;
 /**
  * The plugin declining to inject into an application that never bound the
  * agent's seat. Its own text names the application and the remedy, so it is
@@ -360,7 +360,7 @@ export class KWinComputerBackend implements ComputerBackend {
       }
       this.pluginHealth = health;
       this.publishHealth();
-      return { kind: "available", backend: "kwin" };
+      return { kind: "available", backend: COMPUTER_KWIN_BACKEND };
     } catch (error) {
       const failure = this.reportPluginFailure(error);
       // A refusal the reconnect path never sees — no installed plugin, a KWin

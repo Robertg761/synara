@@ -13,6 +13,7 @@ import {
   computerContainRect,
   computerCursorPosition,
   computerKeyCommand,
+  computerReleaseControlHint,
   computerStreamRegion,
   computerViewportPointToDesktop,
   computerWheelScrollDelta,
@@ -31,6 +32,9 @@ import { Button } from "./ui/button";
  * short enough that scrolling still tracks the hand.
  */
 const COMPUTER_SCROLL_FLUSH_MS = 50;
+
+/** The viewport's overlay hints: one line each, fading rather than popping. */
+const VIEWPORT_HINT_CLASS = "transition-opacity duration-220 motion-reduce:transition-none";
 
 function inputErrorMessage(error: unknown): string {
   return error instanceof Error && error.message.length > 0
@@ -99,6 +103,13 @@ export default function ComputerPanel(props: {
     cursor: threadState?.cursor,
     screenSize,
     containRect,
+  });
+  // The emergency release is a KWin compositor shortcut, so this is null on
+  // every other backend rather than an unbound key the human would trust.
+  const releaseControlHint = computerReleaseControlHint({
+    availability: threadState?.availability,
+    visibleDesktop: threadState?.capabilities.visibleDesktop ?? false,
+    agentActive: threadState?.agentActive ?? false,
   });
 
   // ── User input ─────────────────────────────────────────────────────
@@ -367,14 +378,18 @@ export default function ComputerPanel(props: {
               onFocus={() => setInputFocused(true)}
               onBlur={() => setInputFocused(false)}
             />
-            <p
-              className={cn(
-                "pointer-events-none absolute inset-x-0 bottom-3 text-center text-[10px] text-white/70 transition-opacity duration-220 motion-reduce:transition-none",
-                interactive && !inputFocused ? "opacity-100" : "opacity-0",
-              )}
-            >
-              Click the desktop to send keystrokes
-            </p>
+            <div className="pointer-events-none absolute inset-x-0 bottom-3 flex flex-col items-center gap-0.5 px-4 text-center text-[10px] text-white/70">
+              {releaseControlHint ? (
+                <p className={cn(VIEWPORT_HINT_CLASS, !releaseControlHint.visible && "opacity-0")}>
+                  {releaseControlHint.text}
+                </p>
+              ) : null}
+              <p
+                className={cn(VIEWPORT_HINT_CLASS, !(interactive && !inputFocused) && "opacity-0")}
+              >
+                Click the desktop to send keystrokes
+              </p>
+            </div>
             {streamStatus.kind !== "streaming" ? (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-8 text-center">
                 <ComputerStreamStatus status={streamStatus} />
