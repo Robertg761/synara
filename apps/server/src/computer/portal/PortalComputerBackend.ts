@@ -72,6 +72,7 @@ import {
   pressKeyStroke,
 } from "../pointerSequencing.ts";
 import { SharedSeatArbiter } from "../sharedSeatArbiter.ts";
+import { clampUtf8Bytes } from "../utf8Truncation.ts";
 import {
   connectGnomeShellExtension,
   GnomeShellWindowProvider,
@@ -974,9 +975,7 @@ function describeSlot(capability: string, slot: ProviderSlot<unknown>): string |
  * back out.
  */
 function clampClipboard(text: string): string {
-  const bytes = Buffer.from(text, "utf8");
-  if (bytes.byteLength <= MAX_COMPUTER_CLIPBOARD_BYTES) return text;
-  return bytes.subarray(0, MAX_COMPUTER_CLIPBOARD_BYTES).toString("utf8");
+  return clampUtf8Bytes(text, MAX_COMPUTER_CLIPBOARD_BYTES);
 }
 
 function delay(milliseconds: number): Promise<void> {

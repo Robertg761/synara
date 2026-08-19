@@ -17,6 +17,7 @@
 import { Socket } from "node:net";
 
 import { ComputerBackendError, MAX_COMPUTER_CLIPBOARD_BYTES } from "../ComputerBackend.ts";
+import { decodeUtf8Clamped } from "../utf8Truncation.ts";
 import type { PortalSession } from "./portalSession.ts";
 import type { PortalClipboardProvider, PortalProviderId } from "./providers.ts";
 
@@ -63,7 +64,9 @@ export class PortalSelectionClipboardProvider implements PortalClipboardProvider
       try {
         const fd = await this.session.selectionRead(mimeType);
         const bytes = await this.readFd(fd, MAX_COMPUTER_CLIPBOARD_BYTES);
-        return bytes.toString("utf8");
+        // The read stops at a byte count, which can land inside a multi-byte
+        // character, so the tail is trimmed back to a whole one here.
+        return decodeUtf8Clamped(bytes, MAX_COMPUTER_CLIPBOARD_BYTES);
       } catch (error) {
         // The portal answers with an error for a type the current owner does
         // not offer, so the loop is the negotiation: try the types we can
