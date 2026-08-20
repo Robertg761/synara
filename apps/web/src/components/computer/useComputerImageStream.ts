@@ -27,6 +27,22 @@ export type ComputerImageStreamStatus =
   | { readonly kind: "streaming" }
   | { readonly kind: "error"; readonly message: string };
 
+/**
+ * Keeps the previous status object when nothing about it actually changed. A
+ * decoded frame reports "streaming" at stream rate, and a fresh object every
+ * time would re-render the whole pane once per frame for no visible difference.
+ */
+export function mergeComputerImageStreamStatus(
+  previous: ComputerImageStreamStatus,
+  next: ComputerImageStreamStatus,
+): ComputerImageStreamStatus {
+  if (previous.kind !== next.kind) return next;
+  if (previous.kind === "error" && next.kind === "error" && previous.message !== next.message) {
+    return next;
+  }
+  return previous;
+}
+
 function isImageBitmapAvailable(): boolean {
   return typeof Blob === "function" && typeof globalThis.createImageBitmap === "function";
 }
@@ -68,7 +84,8 @@ export function useComputerImageStream(input: {
     let pendingFrame: ComputerFrame | null = null;
 
     const setCurrentStatus = (next: ComputerImageStreamStatus) => {
-      if (isCurrent() && !disposed) setStatus(next);
+      if (!isCurrent() || disposed) return;
+      setStatus((previous) => mergeComputerImageStreamStatus(previous, next));
     };
 
     const decodeFrame = async (frame: ComputerFrame): Promise<void> => {
@@ -76,12 +93,13 @@ export function useComputerImageStream(input: {
       decoding = true;
       let bitmap: ImageBitmap | null = null;
       try {
-        const bytes = frame.payload.slice();
-        const buffer = bytes.buffer.slice(
-          bytes.byteOffset,
-          bytes.byteOffset + bytes.byteLength,
-        ) as ArrayBuffer;
-        bitmap = await globalThis.createImageBitmap(new Blob([buffer], { type: "image/png" }));
+        // The payload is a view over that message's own buffer, and the Blob
+        // constructor copies the bytes it is given, so this is the only copy a
+        // multi-megabyte frame needs. The cast narrows the decoder's
+        // `ArrayBufferLike` to what `Blob` accepts: this buffer came from a
+        // WebSocket message, which is never shared memory.
+        const payload = frame.payload as Uint8Array<ArrayBuffer>;
+        bitmap = await globalThis.createImageBitmap(new Blob([payload], { type: "image/png" }));
         if (!isCurrent() || disposed) return;
         const canvas = canvasRef.current;
         const context = canvas?.getContext("2d");

@@ -97,7 +97,6 @@ describe("computer frame gate", () => {
     expect(next.action).toBe("decode");
     expect(next.requestResync).toBe(true);
     expect(next.state.lastSequence).toBe(13);
-    expect(next.state.droppedSinceResync).toBe(2);
   });
 
   it("handles uint32 sequence wraparound", () => {

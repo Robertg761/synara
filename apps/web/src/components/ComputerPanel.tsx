@@ -2,6 +2,7 @@ import type { ComputerActionResult, ComputerScreenSize, ThreadId } from "@synara
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useThreadComputerStateSeed } from "~/hooks/useThreadComputerStateSeed";
+import { disclosureFadeClassName } from "~/lib/disclosureMotion";
 import type { DockPaneRuntimeMode } from "~/lib/dockPaneActivation";
 import { CursorClickIcon, LoaderCircleIcon, MonitorIcon, XIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
@@ -32,9 +33,6 @@ import { Button } from "./ui/button";
  * short enough that scrolling still tracks the hand.
  */
 const COMPUTER_SCROLL_FLUSH_MS = 50;
-
-/** The viewport's overlay hints: one line each, fading rather than popping. */
-const VIEWPORT_HINT_CLASS = "transition-opacity duration-220 motion-reduce:transition-none";
 
 function inputErrorMessage(error: unknown): string {
   return error instanceof Error && error.message.length > 0
@@ -177,17 +175,12 @@ export default function ComputerPanel(props: {
       if (!interactive) return;
       const point = desktopPointFromEvent(event.nativeEvent);
       if (!point) return;
-      // `detail` is the browser's own double-click pairing. Two separate single
-      // clicks cannot substitute: each pays a round trip and a pointer glide,
-      // which lands them too far apart for a toolkit to pair them.
-      const isDoubleClick = event.detail === 2;
-      sendInput(() =>
-        ensureNativeApi().computer.inputClick({
-          x: point.x,
-          y: point.y,
-          ...(isDoubleClick ? { clickCount: 2 } : {}),
-        }),
-      );
+      // One press per DOM click, including the second click of a double. The
+      // browser already sent the first click as its own event, so upgrading this
+      // one to the backend's double-click would put three presses on the desktop
+      // and read as a triple click. Two plain presses land inside the toolkit's
+      // pairing interval on their own, and that is what makes the double.
+      sendInput(() => ensureNativeApi().computer.inputClick({ x: point.x, y: point.y }));
     },
     [desktopPointFromEvent, interactive, sendInput],
   );
@@ -269,6 +262,12 @@ export default function ComputerPanel(props: {
       if (timer !== null) clearTimeout(timer);
     };
   }, [desktopPointFromEvent, interactive, sendInput]);
+
+  // The pane's own input failure outranks the session's last error: it is the
+  // one the human just caused and can act on. The row keeps its height either
+  // way, so an empty message stays invisible rather than showing a bare rule.
+  const errorMessage = inputError ?? threadState?.lastError ?? "";
+  const hasError = errorMessage.length > 0;
 
   const header = (
     <div className="flex h-full w-full min-w-0 items-center gap-2">
@@ -380,13 +379,11 @@ export default function ComputerPanel(props: {
             />
             <div className="pointer-events-none absolute inset-x-0 bottom-3 flex flex-col items-center gap-0.5 px-4 text-center text-[10px] text-white/70">
               {releaseControlHint ? (
-                <p className={cn(VIEWPORT_HINT_CLASS, !releaseControlHint.visible && "opacity-0")}>
+                <p className={disclosureFadeClassName(releaseControlHint.visible)}>
                   {releaseControlHint.text}
                 </p>
               ) : null}
-              <p
-                className={cn(VIEWPORT_HINT_CLASS, !(interactive && !inputFocused) && "opacity-0")}
-              >
+              <p className={disclosureFadeClassName(interactive && !inputFocused)}>
                 Click the desktop to send keystrokes
               </p>
             </div>
@@ -410,15 +407,16 @@ export default function ComputerPanel(props: {
       </div>
       <p
         role="status"
-        className={cn(
-          "line-clamp-2 flex shrink-0 items-center px-3 text-destructive text-xs transition-opacity duration-220 motion-reduce:transition-none",
-          (inputError ?? threadState?.lastError)
-            ? "border-border border-t opacity-100"
-            : "border-transparent border-t opacity-0",
+        className={disclosureFadeClassName(
+          hasError,
+          cn(
+            "line-clamp-2 flex shrink-0 items-center border-t px-3 text-destructive text-xs",
+            hasError ? "border-border" : "border-transparent",
+          ),
         )}
         style={{ height: "1.875rem" }}
       >
-        {inputError ?? threadState?.lastError ?? ""}
+        {errorMessage}
       </p>
     </DiffPanelShell>
   );

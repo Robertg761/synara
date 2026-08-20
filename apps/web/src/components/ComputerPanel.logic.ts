@@ -13,7 +13,6 @@ import {
 
 export interface ComputerFrameGateState {
   readonly lastSequence: number | null;
-  readonly droppedSinceResync: number;
 }
 
 export type ComputerFrameGateAction = "ignore" | "drop-stale" | "decode";
@@ -28,11 +27,7 @@ const UINT32_MODULUS = 0x1_0000_0000;
 const UINT32_HALF_RANGE = 0x8000_0000;
 
 export function createComputerFrameGateState(): ComputerFrameGateState {
-  return { lastSequence: null, droppedSinceResync: 0 };
-}
-
-export function resetComputerFrameGate(): ComputerFrameGateState {
-  return createComputerFrameGateState();
+  return { lastSequence: null };
 }
 
 export function stepComputerFrameGate(
@@ -45,30 +40,16 @@ export function stepComputerFrameGate(
   }
 
   if (state.lastSequence === null) {
-    return {
-      state: { lastSequence: header.sequence, droppedSinceResync: 0 },
-      action: "decode",
-      requestResync: false,
-    };
+    return { state: { lastSequence: header.sequence }, action: "decode", requestResync: false };
   }
 
   const distance = (header.sequence - state.lastSequence + UINT32_MODULUS) % UINT32_MODULUS;
   if (distance === 0 || distance >= UINT32_HALF_RANGE) {
-    return {
-      state: {
-        ...state,
-        droppedSinceResync: state.droppedSinceResync + 1,
-      },
-      action: "drop-stale",
-      requestResync: false,
-    };
+    return { state, action: "drop-stale", requestResync: false };
   }
 
   return {
-    state: {
-      lastSequence: header.sequence,
-      droppedSinceResync: distance > 1 ? state.droppedSinceResync + distance - 1 : 0,
-    },
+    state: { lastSequence: header.sequence },
     action: "decode",
     requestResync: distance > 1,
   };
