@@ -3,6 +3,8 @@ import type { EventEmitter } from "node:events";
 
 import type dbusModule from "dbus-next";
 
+import { unwrapDbusValue, withDbusTimeout } from "./dbusPlumbing.ts";
+
 export const KWIN_SERVICE = "org.kde.KWin";
 export const KWIN_PLUGINS_PATH = "/Plugins";
 export const KWIN_PLUGINS_INTERFACE = "org.kde.KWin.Plugins";
@@ -274,44 +276,19 @@ export async function invokeKWinDbusMethod(
 
 const invoke = invokeKWinDbusMethod;
 
-function unwrapDbusValue(value: unknown): unknown {
-  if (isDbusVariant(value)) {
-    return unwrapDbusValue((value as { readonly value: unknown }).value);
-  }
-  return value;
-}
-
-function isDbusVariant(
-  value: unknown,
-): value is { readonly signature: string; readonly value: unknown } {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { readonly signature?: unknown }).signature === "string" &&
-    "value" in value
-  );
-}
-
 function isCaptureMethod(methodName: string): boolean {
   return methodName === "captureWindow" || methodName === "captureRegion";
 }
 
+/**
+ * A KWin call that never answers is connection-level: `KWinDbusTimeoutError` is
+ * what the backend reads to decide the plugin proxy is gone and reconnect, so
+ * the type matters as much as the message. Failures KWin does report travel
+ * untouched, being already about the call rather than the connection.
+ */
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, methodName: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new KWinDbusTimeoutError(methodName, timeoutMs));
-    }, timeoutMs);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
+  return withDbusTimeout(promise, timeoutMs, {
+    onTimeout: () => new KWinDbusTimeoutError(methodName, timeoutMs),
   });
 }
 

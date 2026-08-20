@@ -295,6 +295,10 @@
     "./lengthPrefixedRecords": {
       "types": "./src/lengthPrefixedRecords.ts",
       "import": "./src/lengthPrefixedRecords.ts"
+    },
+    "./uiTreeTargeting": {
+      "types": "./src/uiTreeTargeting.ts",
+      "import": "./src/uiTreeTargeting.ts"
     }
   },
   "scripts": {

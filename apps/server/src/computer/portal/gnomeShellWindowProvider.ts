@@ -33,6 +33,7 @@ import type { ComputerWindow } from "@synara/contracts";
 
 import { ComputerBackendError } from "../ComputerBackend.ts";
 import { parseWindows, unwrapDbusValue } from "../computerGeometry.ts";
+import { withDbusTimeout } from "../dbusPlumbing.ts";
 import {
   COMPUTER_INTERFACE,
   COMPUTER_OBJECT_PATH,
@@ -402,22 +403,16 @@ export async function connectGnomeShellExtension(
   }
 }
 
+/**
+ * A plain `Error` on purpose: the only caller catches it and rewrites it into
+ * the `ComputerBackendError` that names the extension, so a richer type here
+ * would be discarded. `asError` is still applied to a reported failure, because
+ * dbus-next can reject with a non-Error and that caller reads `.message`.
+ */
 function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${KWIN_DBUS_DEFAULT_TIMEOUT_MS} ms`));
-    }, KWIN_DBUS_DEFAULT_TIMEOUT_MS);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(asError(error));
-      },
-    );
+  return withDbusTimeout(promise, KWIN_DBUS_DEFAULT_TIMEOUT_MS, {
+    onTimeout: () => new Error(`${label} timed out after ${KWIN_DBUS_DEFAULT_TIMEOUT_MS} ms`),
+    onRejected: asError,
   });
 }
 

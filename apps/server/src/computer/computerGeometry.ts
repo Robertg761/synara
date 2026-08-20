@@ -7,11 +7,13 @@
  * written against, so a second backend has to produce exactly the same numbers
  * or every coordinate the model learned on one desktop is wrong on the other.
  *
- * The payload helpers live here rather than in a module of their own because
- * `parseWindows` is the only reason they exist: window JSON arrives either as a
- * plain string or wrapped in a D-Bus variant, depending on which transport
- * carried it, and the KWin plugin and the planned GNOME Shell extension emit
- * the identical document.
+ * The payload helpers live here because `parseWindows` is the reason they
+ * exist: window JSON arrives either as a plain string or wrapped in a D-Bus
+ * variant, depending on which transport carried it, and the KWin plugin and the
+ * GNOME Shell extension emit the identical document. The variant unwrapping
+ * itself is `dbusPlumbing.ts`, shared with the callers that never touch
+ * geometry, and re-exported here because this is the import every parser
+ * already reaches for.
  */
 import type {
   ComputerPoint,
@@ -22,6 +24,7 @@ import type {
 } from "@synara/contracts";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
+import { unwrapDbusValue } from "./dbusPlumbing.ts";
 
 const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
 const PNG_IHDR = Uint8Array.of(0x49, 0x48, 0x44, 0x52);
@@ -30,24 +33,7 @@ const DEFAULT_CAPTURE_SOURCE = "The desktop capture";
 
 // ── Payload decoding ─────────────────────────────────────────────────
 
-/** Unwraps a `dbus-next` variant, however many layers deep it was wrapped. */
-export function unwrapDbusValue(value: unknown): unknown {
-  if (isDbusVariant(value)) {
-    return unwrapDbusValue((value as { readonly value: unknown }).value);
-  }
-  return value;
-}
-
-function isDbusVariant(
-  value: unknown,
-): value is { readonly signature: string; readonly value: unknown } {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { readonly signature?: unknown }).signature === "string" &&
-    "value" in value
-  );
-}
+export { unwrapDbusValue };
 
 /**
  * A JSON document that may still be a string, a variant-wrapped string, or an

@@ -64,6 +64,16 @@ describe("KWin D-Bus calls", () => {
     }
   });
 
+  it("passes a failure KWin reported through untouched", async () => {
+    // Only a timeout is connection-level. A call KWin answered with an error
+    // says nothing about the connection, so wrapping it in the type that drives
+    // a reconnect would tear down a session over a bad argument.
+    const reported = new Error("org.freedesktop.DBus.Error.InvalidArgs");
+    await expect(
+      invokeKWinDbusMethod({ focusWindow: () => Promise.reject(reported) }, "focusWindow"),
+    ).rejects.toBe(reported);
+  });
+
   it("keeps a one-element loaded plugin array as an array", () => {
     expect(readStringArray(["onlyPlugin"])).toEqual(["onlyPlugin"]);
     expect(readStringArray({ signature: "as", value: ["onlyPlugin"] })).toEqual(["onlyPlugin"]);

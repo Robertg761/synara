@@ -29,6 +29,8 @@ import type { EventEmitter } from "node:events";
 import type dbusModule from "dbus-next";
 import type { DbusBus } from "dbus-next";
 
+import { withDbusTimeout } from "../dbusPlumbing.ts";
+
 /**
  * A D-Bus variant, in the shape both dbus-next and `unwrapDbusValue` already
  * use. Callers build plain objects and the bus implementation turns them into
@@ -348,29 +350,24 @@ function waitForConnect(bus: EventEmitter & { name: string | null }): Promise<vo
   });
 }
 
+/**
+ * Every way a portal call can fail comes back as a `PortalBusError`, including
+ * the ones the bus reported itself: the D-Bus error name is what tells consent
+ * denial apart from a missing portal backend, and it is only reachable off the
+ * raw reply, so it is lifted onto the error here rather than left in a `cause`
+ * nobody unwraps.
+ */
 function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new PortalBusError(`${label} did not answer within ${BUS_CALL_TIMEOUT_MS} ms.`));
-    }, BUS_CALL_TIMEOUT_MS);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        const name =
-          isPlainRecord(error) && typeof error.type === "string" ? error.type : undefined;
-        reject(
-          new PortalBusError(`${label} failed: ${describe(error)}`, {
-            ...(name ? { errorName: name } : {}),
-            cause: error,
-          }),
-        );
-      },
-    );
+  return withDbusTimeout(promise, BUS_CALL_TIMEOUT_MS, {
+    onTimeout: () =>
+      new PortalBusError(`${label} did not answer within ${BUS_CALL_TIMEOUT_MS} ms.`),
+    onRejected: (error) => {
+      const name = isPlainRecord(error) && typeof error.type === "string" ? error.type : undefined;
+      return new PortalBusError(`${label} failed: ${describe(error)}`, {
+        ...(name ? { errorName: name } : {}),
+        cause: error,
+      });
+    },
   });
 }
 
