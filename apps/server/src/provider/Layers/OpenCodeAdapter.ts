@@ -46,7 +46,6 @@ import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewa
 import {
   acquireAgentGatewaySessionLease,
   cancelAgentGatewayTurn,
-  computerControlSessionLeaseOptions,
   type AgentGatewaySessionLease,
   withAgentGatewayTurnCancellation,
 } from "../../agentGateway/sessionLease.ts";
@@ -3569,7 +3568,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                 agentGatewayCredentials,
                 input.threadId,
                 provider,
-                computerControlSessionLeaseOptions(input.enableComputerControl),
+                input,
               );
           const agentGatewayConnection = agentGatewaySessionLease?.connection;
           const poolIsolationKey = agentGatewayConnection ? randomUUID() : undefined;

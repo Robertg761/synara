@@ -58,8 +58,8 @@ import {
 import { SYNARA_GATEWAY_HARNESS_POLICY } from "./agentGateway/harnessPolicy.ts";
 import {
   AGENT_GATEWAY_TURN_AUTHORITY_RETIRED,
+  type AgentGatewayCapabilityInput,
   type AgentGatewaySessionLease,
-  type AgentGatewaySessionLeaseOptions,
 } from "./agentGateway/sessionLease.ts";
 import { isNonFatalCodexErrorMessage } from "./codexErrorClassification.ts";
 import { buildCodexProcessEnv } from "./codexProcessEnv.ts";
@@ -279,7 +279,8 @@ export interface CodexAppServerStartSessionInput {
   readonly resumeCursor?: unknown;
   readonly forkSourceResumeCursor?: unknown;
   readonly providerOptions?: ProviderSessionStartInput["providerOptions"];
-  readonly agentGatewaySessionLeaseOptions?: AgentGatewaySessionLeaseOptions;
+  /** Session-start facts the gateway lease derives its capabilities from. */
+  readonly agentGatewayCapabilityInput?: AgentGatewayCapabilityInput;
   readonly runtimeMode: RuntimeMode;
 }
 
@@ -976,7 +977,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         readonly endpointUrl: () => string;
         readonly acquireSessionLease: (
           threadId: ThreadId,
-          options?: AgentGatewaySessionLeaseOptions,
+          capabilityInput?: AgentGatewayCapabilityInput,
         ) => AgentGatewaySessionLease;
       }
     | undefined;
@@ -990,7 +991,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         readonly endpointUrl: () => string;
         readonly acquireSessionLease: (
           threadId: ThreadId,
-          options?: AgentGatewaySessionLeaseOptions,
+          capabilityInput?: AgentGatewayCapabilityInput,
         ) => AgentGatewaySessionLease;
       };
       readonly teardownProcessTree?: typeof teardownProviderProcessTree;
@@ -1081,7 +1082,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       });
       gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(
         threadId,
-        input.agentGatewaySessionLeaseOptions,
+        input.agentGatewayCapabilityInput,
       );
       const child = spawnCodexAppServer({
         binaryPath: codexBinaryPath,
@@ -1867,6 +1868,8 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           : {}),
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
       });
+      // A fork carries no session-start capability facts (ProviderForkThreadInput
+      // has none), so the forked runtime leases the base capabilities only.
       gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
       const child = spawnCodexAppServer({
         binaryPath: codexBinaryPath,

@@ -226,7 +226,28 @@ validationLayer("CodexAdapterLive validation", (it) => {
         effort: "high",
         serviceTier: "fast",
         runtimeMode: "full-access",
+        // The manager owns Codex session restarts, so it carries the capability
+        // facts its gateway lease derives from.
+        agentGatewayCapabilityInput: { enableComputerControl: false },
       });
+    }),
+  );
+  it.effect("carries computer control into the manager's gateway lease facts", () =>
+    Effect.gen(function* () {
+      validationManager.startSessionImpl.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      yield* adapter.startSession({
+        provider: "codex",
+        threadId: asThreadId("thread-computer"),
+        enableComputerControl: true,
+        runtimeMode: "full-access",
+      });
+
+      assert.deepStrictEqual(
+        validationManager.startSessionImpl.mock.calls[0]?.[0]?.agentGatewayCapabilityInput,
+        { enableComputerControl: true },
+      );
     }),
   );
   it.effect("forwards an external fork cursor when starting a session", () =>
@@ -247,6 +268,7 @@ validationLayer("CodexAdapterLive validation", (it) => {
         threadId: asThreadId("thread-import"),
         forkSourceResumeCursor,
         runtimeMode: "full-access",
+        agentGatewayCapabilityInput: { enableComputerControl: false },
       });
     }),
   );

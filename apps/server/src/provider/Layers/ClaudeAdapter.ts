@@ -96,7 +96,6 @@ import { PROVIDER_ADAPTER_RUNTIME_EVENT_BUFFER_CAPACITY } from "../Services/Prov
 import {
   acquireAgentGatewaySessionLease,
   cancelAgentGatewayTurn,
-  computerControlSessionLeaseOptions,
   type AgentGatewaySessionLease,
   withAgentGatewayTurnCancellation,
 } from "../../agentGateway/sessionLease.ts";
@@ -5154,7 +5153,7 @@ function makeClaudeAdapter(options?: ClaudeAdapterLiveOptions) {
           agentGatewayCredentials,
           threadId,
           PROVIDER,
-          computerControlSessionLeaseOptions(input.enableComputerControl),
+          input,
         );
         const queryOptions: ClaudeQueryOptions = {
           ...(input.cwd ? { cwd: input.cwd } : {}),

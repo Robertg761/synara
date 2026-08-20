@@ -11,6 +11,8 @@ import { makeAgentGatewayInFlightRequestRegistry } from "./inFlightRequestRegist
 import { makeAgentGatewayMcpTransport } from "./mcpTransport.ts";
 import {
   acquireAgentGatewaySessionLease,
+  AGENT_GATEWAY_NO_CAPABILITIES,
+  type AgentGatewayCapabilityInput,
   type AgentGatewaySessionLease,
   type AgentGatewaySessionLeaseOptions,
 } from "./sessionLease.ts";
@@ -61,7 +63,7 @@ function makeThread(threadId: string): OrchestrationThreadShell {
 function makeTransport(input: {
   readonly tools: ReadonlyArray<ToolEntry>;
   readonly threads: ReadonlyArray<OrchestrationThreadShell>;
-  readonly leaseOptions?: AgentGatewaySessionLeaseOptions;
+  readonly leaseCapabilities?: AgentGatewayCapabilityInput;
 }) {
   const threads = new Map(input.threads.map((thread) => [String(thread.id), thread]));
   let nextSession = 0;
@@ -121,7 +123,7 @@ function makeTransport(input: {
       credentials,
       ThreadId.makeUnsafe(threadId),
       "codex",
-      input.leaseOptions,
+      input.leaseCapabilities ?? AGENT_GATEWAY_NO_CAPABILITIES,
     );
     if (!lease) throw new Error("Expected gateway session lease");
     tokenAliases.set(tokenAlias, lease.connection.bearerToken);
@@ -523,7 +525,7 @@ describe("makeAgentGatewayMcpTransport tools/list", () => {
       const transport = makeTransport({
         threads: [makeThread("thread-computer")],
         tools: catalog,
-        leaseOptions: { additionalCapabilities: ["computer:control"] },
+        leaseCapabilities: { enableComputerControl: true },
       });
       const response = yield* post(transport, "token-1", listBody);
       assert.equal(response.status, 200);
