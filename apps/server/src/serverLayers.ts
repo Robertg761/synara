@@ -134,6 +134,7 @@ export function makeServerRuntimeServicesLayer(
       Layer.provideMerge(profileStatsArchiveLayer),
       Layer.provideMerge(OrchestrationLayerLive),
       Layer.provideMerge(TerminalLayerLive),
+      Layer.provideMerge(GitCoreLive),
     ),
     DeviceServiceLive,
   );

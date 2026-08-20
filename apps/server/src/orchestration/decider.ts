@@ -47,6 +47,7 @@ import {
   listActiveProjectsByWorkspaceRoot,
   listActiveSpaces,
   listThreadsByProjectId,
+  requireApprovalNotResponded,
   requireProject,
   requireProjectAbsent,
   requireProjectHasNoThreads,
@@ -1938,6 +1939,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         readModel,
         command,
         threadId: command.threadId,
+      });
+      yield* requireApprovalNotResponded({
+        readModel,
+        command,
+        threadId: command.threadId,
+        requestId: command.requestId,
+        ...(command.lifecycleGeneration !== undefined
+          ? { lifecycleGeneration: command.lifecycleGeneration }
+          : {}),
       });
       return {
         ...withEventBase({
