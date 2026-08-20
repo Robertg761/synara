@@ -99,6 +99,7 @@ public:
     Q_INVOKABLE bool clearFocusWindow();
     Q_INVOKABLE bool movePointer(double x, double y);
     Q_INVOKABLE bool button(uint button, bool pressed);
+    /** Deltas are desktop pixels, not wheel notches. Positive is right and down. */
     Q_INVOKABLE bool axis(double horizontal, double vertical);
     Q_INVOKABLE bool key(uint keyCode, bool pressed);
     Q_INVOKABLE QByteArray captureWindow(const QString &windowId, uint maxDimension);
@@ -206,6 +207,7 @@ private:
     void clearKeyboardFocus();
     void updateWindowActivation(Window *window);
     void clearWindowActivation();
+    void releasePressedButtons();
     void releasePressedKeys();
     void forgetPressedKeys();
     void releasePressedState();

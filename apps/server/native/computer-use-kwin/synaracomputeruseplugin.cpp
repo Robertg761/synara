@@ -1463,6 +1463,33 @@ bool SynaraComputerUsePlugin::button(uint button, bool pressed)
     return true;
 }
 
+// Pixels per wheel notch. The whole stack speaks pixels - the tool surface, the
+// computer pane, and the `axis` D-Bus method below - while a wheel speaks
+// notches, so the conversion lives at the one place the two meet. Keep in sync
+// with SCROLL_STEP_PX in apps/server/native/computer-desktop-helper/src/wayland.c.
+static constexpr double s_scrollPixelsPerNotch = 15.0;
+
+/**
+ * The value120 half of a wheel event for a scroll of @p pixels.
+ *
+ * value120 counts 1/120ths of a notch, so a single pixel is already eight of
+ * them and nothing a caller can ask for rounds away. Clamped because the
+ * protocol field is an int32 and a runaway accumulator must not wrap.
+ */
+static int scrollValue120(double pixels)
+{
+    if (!std::isfinite(pixels)) {
+        return 0;
+    }
+    const double units = std::round(pixels * 120.0 / s_scrollPixelsPerNotch);
+    return int(std::clamp(units, double(std::numeric_limits<int>::min()), double(std::numeric_limits<int>::max())));
+}
+
+/**
+ * Scrolls by @p horizontal and @p vertical desktop pixels, not wheel notches.
+ *
+ * Positive is right and down, matching wl_pointer's axis directions.
+ */
 bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 {
     if (!requireRunning()) {
@@ -1483,10 +1510,10 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 
     if (m_ownsCompositor) {
         if (horizontal != 0) {
-            m_inputDevice->sendAxis(PointerAxis::Horizontal, horizontal * 15.0 / 120.0, int(horizontal));
+            m_inputDevice->sendAxis(PointerAxis::Horizontal, horizontal, scrollValue120(horizontal));
         }
         if (vertical != 0) {
-            m_inputDevice->sendAxis(PointerAxis::Vertical, vertical * 15.0 / 120.0, int(vertical));
+            m_inputDevice->sendAxis(PointerAxis::Vertical, vertical, scrollValue120(vertical));
         }
         return true;
     }
@@ -1498,10 +1525,10 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 
     setTimestampNow();
     if (horizontal != 0) {
-        m_seat->notifyPointerAxis(Qt::Horizontal, horizontal * 15.0 / 120.0, int(horizontal), PointerAxisSource::Wheel);
+        m_seat->notifyPointerAxis(Qt::Horizontal, horizontal, scrollValue120(horizontal), PointerAxisSource::Wheel);
     }
     if (vertical != 0) {
-        m_seat->notifyPointerAxis(Qt::Vertical, vertical * 15.0 / 120.0, int(vertical), PointerAxisSource::Wheel);
+        m_seat->notifyPointerAxis(Qt::Vertical, vertical, scrollValue120(vertical), PointerAxisSource::Wheel);
     }
     m_seat->notifyPointerFrame();
     return true;
@@ -2411,6 +2438,8 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
     }
     const quint32 time = directTimestampMs();
     const QList<wl_resource *> resources = clientInputResources(surface, "wl_pointer");
+    const int horizontalV120 = scrollValue120(horizontal);
+    const int verticalV120 = scrollValue120(vertical);
 
     // The remainder is only spent on resources that cannot be told about a
     // fraction of a click, so it is only taken when the client has one. Taking it
@@ -2420,8 +2449,8 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
         const int version = wl_resource_get_version(resource);
         return version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && version < WL_POINTER_AXIS_VALUE120_SINCE_VERSION;
     });
-    const int horizontalSteps = needsDiscrete ? takeDiscreteSteps(m_directAxisRemainderH, horizontal) : 0;
-    const int verticalSteps = needsDiscrete ? takeDiscreteSteps(m_directAxisRemainderV, vertical) : 0;
+    const int horizontalSteps = needsDiscrete ? takeDiscreteSteps(m_directAxisRemainderH, horizontalV120) : 0;
+    const int verticalSteps = needsDiscrete ? takeDiscreteSteps(m_directAxisRemainderV, verticalV120) : 0;
 
     for (wl_resource *resource : resources) {
         const int version = wl_resource_get_version(resource);
@@ -2432,11 +2461,11 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
             wl_pointer_send_axis(resource,
                                  time,
                                  WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-                                 wl_fixed_from_double(horizontal * 15.0 / 120.0));
+                                 wl_fixed_from_double(horizontal));
             // value120 supersedes axis_discrete for the clients that have it, and
             // the two must not both be sent for one scroll.
             if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
-                wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, int(horizontal));
+                wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, horizontalV120);
             } else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && horizontalSteps != 0) {
                 wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, horizontalSteps);
             }
@@ -2445,9 +2474,9 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
             wl_pointer_send_axis(resource,
                                  time,
                                  WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                 wl_fixed_from_double(vertical * 15.0 / 120.0));
+                                 wl_fixed_from_double(vertical));
             if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
-                wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, int(vertical));
+                wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, verticalV120);
             } else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && verticalSteps != 0) {
                 wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, verticalSteps);
             }
@@ -2817,6 +2846,12 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
     // re-enter re-decides. The old delivery is always torn down by the same call
     // that knows how it was made.
     if (m_pointerWindow != window) {
+        // Released on the surface that saw the press, before anything moves, for
+        // the same reason the keyboard does it below: a button still held while
+        // the pointer migrates would stay down in the window being left - nothing
+        // else will ever send it a release - and the matching release would land
+        // on the new window as a press it never got.
+        releasePressedButtons();
         clearPointerDelivery();
         m_pointerWindow = window;
         m_pointerDirect = useDirectInjection(window);
@@ -3019,6 +3054,14 @@ void SynaraComputerUsePlugin::clearWindowActivation()
     window->setActive(false);
 }
 
+void SynaraComputerUsePlugin::releasePressedButtons()
+{
+    const auto buttons = m_pressedButtons.values();
+    for (quint32 button : buttons) {
+        sendButton(button, false);
+    }
+}
+
 void SynaraComputerUsePlugin::releasePressedKeys()
 {
     const auto keys = m_pressedKeys;
@@ -3057,10 +3100,7 @@ void SynaraComputerUsePlugin::releasePressedState()
 
     // Bypasses the public entry points: a release must land even when the
     // session is already stopping, and it must never re-target focus.
-    const auto buttons = m_pressedButtons.values();
-    for (quint32 button : buttons) {
-        sendButton(button, false);
-    }
+    releasePressedButtons();
     releasePressedKeys();
 }
 

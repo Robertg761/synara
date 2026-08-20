@@ -56,6 +56,12 @@ Service `org.synara.ComputerUse`, path `/org/synara/ComputerUse`, interface
 `sessionStopped(s reason)`, emitted whenever a running session ends, with the
 reason `request`, `idle-timeout`, or `user-release`.
 
+`axis(d horizontal, d vertical) -> b` takes desktop pixels, not wheel notches,
+which is the unit the whole computer-use stack speaks; positive is right and
+down. The plugin converts to the wheel's own units on the way out, at 15 pixels
+per notch — the same constant the wlroots helper uses — so a client that reads
+only the discrete half of a wheel event still moves.
+
 `setAgentName(name)` sets the text on the cursor's name badge and always returns
 `true`; an empty string clears it back to `Agent`. The plugin has no way to know
 which thread is driving it, so the server names the lease holder — it caches the

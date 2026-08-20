@@ -24,6 +24,7 @@ STATE_ROOT="${SYNARA_KWIN_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/syna
 BUILD_DIR="${SYNARA_KWIN_BUILD_DIR:-$CACHE_ROOT/build}"
 STAMP_FILE="$STATE_ROOT/install.stamp"
 LOCK_FILE="$STATE_ROOT/install.lock"
+BUILD_LOCK_FILE="$STATE_ROOT/build.lock"
 
 FORCE=0
 NONINTERACTIVE=0
@@ -111,15 +112,38 @@ if (( BUILD_ONLY == 0 )) && [[ ! -w "$PLUGIN_DIR" ]]; then
 fi
 
 mkdir -p "$CACHE_ROOT" "$STATE_ROOT"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    log "another rebuild or install is already running"
-    exit 0
+
+# Two locks, because --build-only shares the build directory with a full install
+# but nothing else. Taking the install lock for a build that installs and stamps
+# nothing would make two concurrent --build-only runs fight over a lock neither
+# of them needs; sharing one build directory is the collision that is real.
+# Ordering is always install then build, and --build-only only ever takes the
+# second, so the two can never deadlock.
+if (( BUILD_ONLY == 0 )); then
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        die "another install is already running"
+    fi
 fi
+
+# Bounded rather than non-blocking: the caller of --build-only wants the built
+# path, and a concurrent build will produce exactly the one it is waiting for.
+BUILD_LOCK_WAIT_SECONDS=900
+
+take_build_lock() {
+    exec 8>"$BUILD_LOCK_FILE"
+    if flock -n 8; then
+        return 0
+    fi
+    log "another build is already running; waiting up to ${BUILD_LOCK_WAIT_SECONDS}s for it"
+    flock -w "$BUILD_LOCK_WAIT_SECONDS" 8 ||
+        die "timed out after ${BUILD_LOCK_WAIT_SECONDS}s waiting for the build lock: $BUILD_LOCK_FILE"
+}
 
 BUILT_PLUGIN_RELATIVE="kwin/plugins/${PLUGIN_PREFIX}.so"
 
 build_plugin() {
+    take_build_lock
     log "configuring the plugin build in $BUILD_DIR"
     cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build "$BUILD_DIR"
