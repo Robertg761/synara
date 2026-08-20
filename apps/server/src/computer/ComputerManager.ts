@@ -128,6 +128,17 @@ export interface ComputerCapturedWindow {
 }
 
 /**
+ * Post-action perception: the capture, or the discovery that the acted-on
+ * window no longer exists. The disappearance is a result in its own right —
+ * usually meaning the action closed the window — never a cue to photograph
+ * whatever window happens to hold focus instead, which on a live desktop is
+ * the human's.
+ */
+export type ComputerActionObservation =
+  | ComputerCapturedWindow
+  | { readonly targetWindowClosed: true };
+
+/**
  * Refusal raised when another thread owns the desktop. It extends
  * `ComputerBackendError` so every existing catch site keeps classifying it,
  * and carries `retryable` because the desktop does come free again — the
@@ -275,9 +286,12 @@ export class ComputerManager {
    * input is going", at window resolution rather than as a workspace-wide
    * downscale that loses small text.
    */
-  async captureFocusedWindow(maxDimension?: number): Promise<ComputerCapturedWindow> {
+  async captureFocusedWindow(
+    maxDimension?: number,
+    options: { readonly agentFocusOnly?: boolean } = {},
+  ): Promise<ComputerCapturedWindow> {
     const limit = maxDimension === undefined ? {} : { maxDimension };
-    const window = await this.focusedCapturableWindow();
+    const window = await this.focusedCapturableWindow(options.agentFocusOnly === true);
     if (window) {
       return {
         screenshot: await this.backend.captureScreenshot({
@@ -301,15 +315,22 @@ export class ComputerManager {
   /**
    * Best-effort perception for an action that already happened: wait for the
    * UI to settle, then capture the window the action affected — the caller's
-   * hint when it named one, otherwise whatever holds focus. Failures return no
-   * screenshot instead of throwing, because the action itself succeeded and a
-   * capture problem must not turn that success into an error. The hint falls
-   * back to focus rather than failing outright: the action may have closed the
-   * very window it targeted.
+   * hint when it named one, otherwise the agent's own focus target. Failures
+   * return no screenshot instead of throwing, because the action itself
+   * succeeded and a capture problem must not turn that success into an error.
+   *
+   * A hinted window that has vanished is reported as `targetWindowClosed`,
+   * never replaced by another window. The E2E run that forced this rule ended
+   * with the close-Firefox click's "fallback" screenshot handing the agent
+   * the human's own browser — the focused window is the human's whenever the
+   * agent's target is gone — which both leaked their screen and convinced the
+   * agent its click had landed there. For the same reason the untargeted path
+   * only ever observes the agent's focus target or the whole workspace,
+   * never the compositor-active (human's) window.
    */
   async captureActionScreenshot(
     windowIdHint?: string,
-  ): Promise<ComputerCapturedWindow | undefined> {
+  ): Promise<ComputerActionObservation | undefined> {
     if (!this.backendCapabilities.capture) return undefined;
     if (this.actionSettleMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.actionSettleMs));
@@ -324,11 +345,19 @@ export class ComputerManager {
           windowId: windowIdHint,
         };
       } catch {
-        // Fall through to the focused window.
+        try {
+          const stillListed = (await this.backend.listWindows()).some(
+            (window) => window.id === windowIdHint,
+          );
+          if (!stillListed) return { targetWindowClosed: true };
+        } catch {
+          // The listing failed too; report nothing rather than guessing.
+        }
+        return undefined;
       }
     }
     try {
-      return await this.captureFocusedWindow();
+      return await this.captureFocusedWindow(undefined, { agentFocusOnly: true });
     } catch {
       return undefined;
     }
@@ -339,13 +368,18 @@ export class ComputerManager {
    * target first, then the window the compositor reports active, then the
    * topmost visible one. Windows without bounds cannot be captured — wlroots
    * exposes no geometry — so they are skipped rather than attempted.
+   * `agentFocusOnly` stops after the first step: action observation must not
+   * drift to the human's active window when the agent's focus is nowhere.
    */
-  private async focusedCapturableWindow(): Promise<ComputerWindow | undefined> {
+  private async focusedCapturableWindow(
+    agentFocusOnly = false,
+  ): Promise<ComputerWindow | undefined> {
     const candidates = (await this.backend.listWindows()).filter(
       (window) => window.bounds !== undefined && window.visible && !window.minimized,
     );
+    const agentFocused = candidates.find((window) => window.focused);
+    if (agentFocused !== undefined || agentFocusOnly) return agentFocused;
     return (
-      candidates.find((window) => window.focused) ??
       candidates.find((window) => window.active === true) ??
       candidates.toSorted(
         (first, second) =>

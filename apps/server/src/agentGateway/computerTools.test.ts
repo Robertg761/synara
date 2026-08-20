@@ -409,6 +409,33 @@ describe("agent gateway computer tools", () => {
     });
   });
 
+  it("reports a closed target instead of photographing another window", async () => {
+    const backend = new FakeComputerBackend();
+    const originalClick = backend.click.bind(backend);
+    backend.click = async (target) => {
+      const result = await originalClick(target);
+      // The click closed every window: by observation time the target is gone,
+      // and the one thing the result must not contain is a screenshot of
+      // whatever window remains focused — on a live desktop, the human's.
+      backend.emitWindowsChanged([]);
+      return result;
+    };
+    const { call } = await setup(backend);
+
+    const result = await call("computer_click", {
+      x: 1_100,
+      y: 200,
+      window_id: "fake-calculator",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.content.map((entry) => entry.type)).toEqual(["text"]);
+    const text = result.content.find((entry) => entry.type === "text");
+    expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
+      action: "computer_click",
+      targetWindowClosed: true,
+    });
+  });
+
   it("skips the post-action screenshot when the model opts out", async () => {
     const { backend, call } = await setup();
     const result = await call("computer_type_text", { text: "hi", include_screenshot: false });

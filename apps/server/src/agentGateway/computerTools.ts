@@ -131,7 +131,7 @@ const POINTER_COORDINATE_NOTE =
  * on the result directly instead of spending a separate perception round trip
  * — the see-act loop is one model turn per action, not two.
  */
-const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected (or the whole workspace when no window has focus); ${SCREENSHOT_MAPPING_NOTE}. Read the next state from that screenshot instead of making a separate screenshot call.`;
+const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected (or the whole workspace when no window has focus); ${SCREENSHOT_MAPPING_NOTE}. Read the next state from that screenshot instead of making a separate screenshot call. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
 
 const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
   include_screenshot: {
@@ -455,6 +455,13 @@ export function makeAgentGatewayComputerTools(
     if (readBooleanArg(args, "include_screenshot") === false) return result;
     const capture = await manager.captureActionScreenshot(result.windowId);
     if (!capture) return result;
+    if ("targetWindowClosed" in capture) {
+      return {
+        ...result,
+        targetWindowClosed: true,
+        note: "The window this action targeted no longer exists — the action likely closed it, so no post-action screenshot was taken. Use computer_list_windows or computer_get_state to see the desktop now.",
+      };
+    }
     const { bytesBase64, ...metadata } = capture.screenshot;
     return screenshotResult(
       {

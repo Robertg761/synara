@@ -919,20 +919,64 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
-  it("captures the action's window on a hint, falls back to focus, and never throws", async () => {
+  it("captures the action's window on a hint, reports a vanished target, and never throws", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend, actionSettleMs: 0 });
 
     const hinted = await manager.captureActionScreenshot("fake-calculator");
-    expect(hinted?.windowId).toBe("fake-calculator");
+    expect(hinted !== undefined && "windowId" in hinted ? hinted.windowId : undefined).toBe(
+      "fake-calculator",
+    );
 
-    // A hint naming a window the action closed degrades to the focused one.
+    // A hint naming a window the action closed is a result in its own right,
+    // never a substitute capture of whatever holds focus — on a live desktop
+    // the focused window is the human's once the agent's target is gone.
     const closed = await manager.captureActionScreenshot("gone-window");
-    expect(closed?.windowId).toBe("fake-terminal");
+    expect(closed).toEqual({ targetWindowClosed: true });
+
+    // A transient capture failure on a window that still exists yields no
+    // screenshot, not a picture of some other window.
+    backend.failNext("captureScreenshot");
+    expect(await manager.captureActionScreenshot("fake-calculator")).toBeUndefined();
 
     // A capture failure returns nothing rather than failing the finished action.
     backend.failNext("captureScreenshot");
     expect(await manager.captureActionScreenshot()).toBeUndefined();
+
+    await manager.dispose();
+  });
+
+  it("observes only the agent's focus target after an untargeted action, never the active window", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    // No window holds the agent's focus; the human's browser is active and
+    // topmost. Action observation must widen to the workspace rather than
+    // zoom into the human's window.
+    backend.emitWindowsChanged([
+      {
+        id: "human-browser",
+        title: "Browser",
+        bounds: { x: 100, y: 100, width: 1_200, height: 800 },
+        focused: false,
+        active: true,
+        minimized: false,
+        visible: true,
+        stackingIndex: 0,
+      },
+    ]);
+    const observed = await manager.captureActionScreenshot();
+    expect(observed !== undefined && "windowId" in observed ? observed.windowId : undefined).toBe(
+      undefined,
+    );
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toMatchObject({
+      kind: "region",
+    });
+
+    // The perception path keeps its wider fallback: an explicit untargeted
+    // screenshot request may still show the active window.
+    const perception = await manager.captureFocusedWindow();
+    expect(perception.windowId).toBe("human-browser");
 
     await manager.dispose();
   });
