@@ -2332,13 +2332,40 @@ const make = Effect.gen(function* () {
       // be answered. Settle those rows now instead of waiting for a
       // `session.started` that an interrupt alone never produces.
       if (shouldApplyThreadLifecycle && isTerminalTurnEvent && eventTurnId !== undefined) {
-        // Turn-scoped only: overlapping sends share a lifecycle generation, so
-        // a sibling turn's interaction must survive this turn's terminal event.
+        // Turn-scoped by default: overlapping sends share a lifecycle
+        // generation, so a sibling turn's interaction must survive this turn's
+        // terminal event.
+        //
+        // Rows with no turn id are the exception, and a strictly turn-scoped
+        // filter can never match them. A provider can open an interaction that
+        // names no turn at all — a Codex MCP elicitation carries no `turnId` in
+        // its JSON-RPC params, and Claude's `canUseTool` falls back to
+        // `undefined` when no turn state is bound — and an interrupt emits no
+        // `session.exited`, so nothing settled those rows until the next server
+        // boot: "Awaiting Input" on an idle thread, exactly what this block
+        // exists to prevent. Settle them here, but only once this terminal
+        // event drains the thread's last outstanding turn, because while a
+        // sibling turn is still running it may be the one blocked on the
+        // request. Keep honouring the generation the row was opened in: a
+        // stale terminal event is accepted upstream when it still names the
+        // binding's active turn, and it must not settle a newer generation's
+        // live request.
+        const remainingOutstandingTurns = (yield* Ref.get(outstandingTurnIdsByThreadRef)).get(
+          thread.id,
+        );
+        const settlesTurnlessRows = (remainingOutstandingTurns?.size ?? 0) === 0;
+        const terminalGeneration = event.lifecycleGeneration;
         yield* settleUnanswerablePendingInteractions(
           thread.id,
           event,
           now,
-          (row) => row.turnId === eventTurnId,
+          (row) =>
+            row.turnId === eventTurnId ||
+            (row.turnId === null &&
+              settlesTurnlessRows &&
+              (terminalGeneration === undefined ||
+                row.lifecycleGeneration === null ||
+                row.lifecycleGeneration === terminalGeneration)),
         );
       } else if (shouldApplyThreadLifecycle && event.type === "session.exited") {
         // The whole session is gone, so every turn in its generation dies with

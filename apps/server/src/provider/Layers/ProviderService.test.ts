@@ -1134,6 +1134,62 @@ routing.layer("ProviderServiceLive routing", (it) => {
       }),
     );
 
+    it.effect("settles a stale resolution without reviving a stopped thread's binding", () =>
+      Effect.gen(function* () {
+        const directory = yield* ProviderSessionDirectory;
+        const threadId = asThreadId("thread-stale-resolution-stopped-binding");
+        yield* staleSettlementRouting.codex.waitForRuntimeSubscribers();
+
+        // A stopped thread: the user stopped the turn, the generation was
+        // retired (no current generation), and `session.exited` already parked
+        // the binding. The dying runtime's cancellation still has to settle the
+        // durable pending row, but it must never flip the binding back to a
+        // live-looking "running" with a fresh liveness stamp — the UI would
+        // show "Working" for a process that no longer exists.
+        yield* directory.upsert({
+          threadId,
+          provider: "codex",
+          status: "stopped",
+          lifecycleGeneration: "old-generation",
+          runtimePayload: {
+            activeTurnId: null,
+            lastRuntimeEvent: "session.exited",
+            lastRuntimeEventAt: "2026-07-14T13:59:00.000Z",
+          },
+        });
+
+        staleSettlementRouting.codex.emit({
+          type: "user-input.resolved",
+          eventId: asEventId("stale-resolution-stopped-binding"),
+          provider: "codex",
+          threadId,
+          turnId: TurnId.makeUnsafe("turn-stopped-by-user"),
+          requestId: RuntimeRequestId.makeUnsafe("request-cancelled-after-stop"),
+          createdAt: "2026-07-14T14:00:00.000Z",
+          lifecycleGeneration: "old-generation",
+          payload: { answers: { cancelled: true } },
+        });
+
+        yield* waitUntil(
+          () => staleSettlementPersistedEvents.has("stale-resolution-stopped-binding"),
+          500,
+          10,
+          "stale user-input.resolved on a stopped thread to be persisted",
+        );
+        assert.equal(
+          staleSettlementPersistedEvents.get("stale-resolution-stopped-binding")?.type,
+          "user-input.resolved",
+        );
+
+        const bindingAfter = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        assert.equal(bindingAfter?.status, "stopped");
+        const payloadAfter = asRuntimePayloadRecord(bindingAfter?.runtimePayload);
+        assert.equal(payloadAfter.activeTurnId, null);
+        assert.equal(payloadAfter.lastRuntimeEvent, "session.exited");
+        assert.equal(payloadAfter.lastRuntimeEventAt, "2026-07-14T13:59:00.000Z");
+      }),
+    );
+
     it.effect("recovers instead of routing into a session whose binding generation is stale", () =>
       Effect.gen(function* () {
         const provider = yield* ProviderService;
