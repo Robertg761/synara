@@ -222,21 +222,50 @@ extract_plugin_ids() {
         sort -u || true
 }
 
+# The next id must outrank every version KWin could know about, not just the
+# ones in the target directory. A machine can carry installs in more than one
+# root (an earlier sudo install under /usr next to the home-directory root), and
+# KWin pins a plugin id for the life of the compositor once it has loaded it -
+# numbering from one root alone can hand back an id the compositor has already
+# pinned to an older library, which fails at load with no reason given.
 next_plugin_id() {
-    local path name version max_version=0
+    local path name version max_version=0 dir
     local plugin_files=()
+    local search_dirs=("$PLUGIN_DIR"
+        /usr/lib64/qt6/plugins/kwin/plugins
+        /usr/lib/qt6/plugins/kwin/plugins
+        "$HOME/.local/lib64/qt6/plugins/kwin/plugins"
+        "$HOME/.local/lib/qt6/plugins/kwin/plugins")
 
-    shopt -s nullglob
-    plugin_files=("$PLUGIN_DIR"/${PLUGIN_PREFIX}*.so)
-    shopt -u nullglob
-
-    for path in "${plugin_files[@]}"; do
-        name="${path##*/}"
-        if [[ "$name" =~ ^${PLUGIN_PREFIX}V([0-9]+)\.so$ ]]; then
-            version="${BASH_REMATCH[1]}"
-            if (( version > max_version )); then
-                max_version="$version"
+    for dir in "${search_dirs[@]}"; do
+        shopt -s nullglob
+        plugin_files=("$dir"/${PLUGIN_PREFIX}*.so)
+        shopt -u nullglob
+        for path in "${plugin_files[@]}"; do
+            name="${path##*/}"
+            if [[ "$name" =~ ^${PLUGIN_PREFIX}V([0-9]+)\.so$ ]]; then
+                version="${BASH_REMATCH[1]}"
+                if (( version > max_version )); then
+                    max_version="$version"
+                fi
             fi
+        done
+    done
+
+    # The compositor's own lists cover ids whose files are gone but whose
+    # libraries are still pinned in the running process.
+    local kwin_ids response property
+    for property in LoadedPlugins AvailablePlugins; do
+        if response="$(busctl --user get-property org.kde.KWin /Plugins org.kde.KWin.Plugins "$property" 2>/dev/null)"; then
+            kwin_ids="$(extract_plugin_ids "$response")"
+            while IFS= read -r name; do
+                if [[ "$name" =~ ^${PLUGIN_PREFIX}V([0-9]+)$ ]]; then
+                    version="${BASH_REMATCH[1]}"
+                    if (( version > max_version )); then
+                        max_version="$version"
+                    fi
+                fi
+            done <<< "$kwin_ids"
         fi
     done
 
@@ -309,6 +338,19 @@ if (( needs_install )); then
     install_plugin "$built_plugin" "$destination"
 else
     destination="$PLUGIN_DIR/$plugin_id.so"
+fi
+
+# Before touching anything that is loaded, make sure the running compositor can
+# actually see the file that was just installed. AvailablePlugins rescans the
+# plugin roots on read, so a fresh install shows up immediately - unless the
+# install landed in a root the compositor was never told about (QT_PLUGIN_PATH
+# is read once, at KWin startup). Failing here, with everything still loaded,
+# beats the alternative: unloading the working plugin and then discovering the
+# replacement is invisible.
+if available_response="$(busctl --user get-property org.kde.KWin /Plugins org.kde.KWin.Plugins AvailablePlugins 2>/dev/null)"; then
+    if [[ "$available_response" != *"\"$plugin_id\""* ]]; then
+        die "KWin cannot see $plugin_id in $PLUGIN_DIR. The compositor reads QT_PLUGIN_PATH once at startup, so a first install into this root needs one log-out/log-in before it can load - or rerun with SYNARA_KWIN_PLUGIN_DIR pointing at a directory this session already scans (for a system-wide install: /usr/lib64/qt6/plugins/kwin/plugins, which needs sudo). Nothing was unloaded."
+    fi
 fi
 
 # Loaded-plugin discovery also differs by KWin version: prefer the

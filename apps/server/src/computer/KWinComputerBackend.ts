@@ -332,7 +332,13 @@ export class KWinComputerBackend implements ComputerBackend {
       (({ allowPrebuilt }) =>
         provisionKWinPlugin({
           target: resolveInstallTarget(SYSTEM_QT_PLUGIN_ROOTS),
-          listInstalled: () => listPluginFiles(resolveInstallTarget(SYSTEM_QT_PLUGIN_ROOTS)),
+          // Numbering scans every root a plugin could live in, not just the
+          // install target: an earlier sudo install under /usr must be
+          // outranked too, or the new id collides with one the running
+          // compositor may already have pinned to an older library — a load
+          // failure KWin reports as nothing but `b false`.
+          listInstalled: () =>
+            listPluginFiles(options.pluginDirectories ?? defaultPluginDirectories()),
           kwinVersion: () => this.probeRunningKwinVersion(),
           arch: process.arch,
           prebuiltRoot: allowPrebuilt ? prebuiltPluginRoot() : undefined,
@@ -1564,10 +1570,11 @@ export function prebuiltPluginRoot(
   return candidates.find(hasManifest);
 }
 
-async function listPluginFiles(target: {
-  readonly pluginDirectory: string;
-}): Promise<readonly string[]> {
-  return await readdir(target.pluginDirectory).catch(() => []);
+async function listPluginFiles(directories: readonly string[]): Promise<readonly string[]> {
+  const listings = await Promise.all(
+    directories.map((directory) => readdir(directory).catch(() => [] as string[])),
+  );
+  return listings.flat();
 }
 
 /**
