@@ -45,19 +45,48 @@ export class JsonRpcStdioRequestTimeoutError extends Error {
   }
 }
 
+/**
+ * Notified for each line the framer had to drop, either because it outgrew the
+ * frame budget or because it was not valid UTF-8.
+ *
+ * By the time this runs the framer has already resynchronized past the offending
+ * line, so a handler that returns normally lets framing continue with the next
+ * one. The default handler rethrows, which keeps a framing failure fatal for the
+ * callers that treat transport errors as session-ending.
+ */
+export type JsonRpcStdioLineErrorHandler = (error: JsonRpcStdioTransportError) => void;
+
+function rethrowLineError(error: JsonRpcStdioTransportError): never {
+  throw error;
+}
+
 /** Raw-byte JSONL framing. Retaining bytes until newline keeps split UTF-8 safe. */
 export class JsonRpcStdioFramer {
   private readonly chunks: Buffer[] = [];
   private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   private frameBytes = 0;
   private ended = false;
+  /** Set while the remainder of a dropped line is being skipped to its newline. */
+  private skipping = false;
 
-  constructor(readonly maxFrameBytes = JSONRPC_STDIO_MAX_FRAME_BYTES) {
+  constructor(
+    readonly maxFrameBytes = JSONRPC_STDIO_MAX_FRAME_BYTES,
+    private readonly onLineError: JsonRpcStdioLineErrorHandler = rethrowLineError,
+  ) {
     if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes <= 0) {
       throw new RangeError("JSON-RPC stdio frame budget must be a positive safe integer");
     }
   }
 
+  /**
+   * Frames a chunk, returning every complete line it completed.
+   *
+   * A line that cannot be framed costs exactly that line: its bytes are dropped,
+   * the scan continues to the next newline (across chunks if the line is still
+   * arriving), and the failure is reported through `onLineError` once the whole
+   * chunk has been consumed. Reporting last is what keeps a throwing handler
+   * from leaving unread bytes behind and desynchronizing the next chunk.
+   */
   push(chunk: Buffer | Uint8Array | string): ReadonlyArray<string> {
     if (this.ended) {
       throw this.makeTransportError({
@@ -74,17 +103,32 @@ export class JsonRpcStdioFramer {
           ? chunk
           : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     const frames: string[] = [];
+    const errors: JsonRpcStdioTransportError[] = [];
     let start = 0;
 
     while (start < bytes.length) {
       const newline = bytes.indexOf(0x0a, start);
       const end = newline === -1 ? bytes.length : newline;
-      this.append(bytes.subarray(start, end));
+      if (!this.skipping) {
+        const overflow = this.append(bytes.subarray(start, end));
+        if (overflow) {
+          this.discardFrame();
+          this.skipping = true;
+          errors.push(overflow);
+        }
+      }
       if (newline === -1) break;
-      frames.push(this.takeFrame());
       start = newline + 1;
+      if (this.skipping) {
+        this.skipping = false;
+        continue;
+      }
+      const frame = this.takeFrame();
+      if (typeof frame === "string") frames.push(frame);
+      else errors.push(frame);
     }
 
+    for (const error of errors) this.onLineError(error);
     return frames;
   }
 
@@ -101,8 +145,8 @@ export class JsonRpcStdioFramer {
 
   /** Discards buffered bytes and permanently closes this framer. */
   close(): void {
-    this.chunks.length = 0;
-    this.frameBytes = 0;
+    this.discardFrame();
+    this.skipping = false;
     this.ended = true;
   }
 
@@ -119,11 +163,17 @@ export class JsonRpcStdioFramer {
     return new JsonRpcStdioTransportError(input);
   }
 
-  private append(chunk: Buffer): void {
-    if (chunk.length === 0) return;
+  private discardFrame(): void {
+    this.chunks.length = 0;
+    this.frameBytes = 0;
+  }
+
+  /** Returns the overflow error instead of throwing, so the caller can resync. */
+  private append(chunk: Buffer): JsonRpcStdioTransportError | undefined {
+    if (chunk.length === 0) return undefined;
     const observedBytes = this.frameBytes + chunk.length;
     if (observedBytes > this.maxFrameBytes) {
-      throw this.makeTransportError({
+      return this.makeTransportError({
         reason: "frame-too-large",
         maxBytes: this.maxFrameBytes,
         observedBytes,
@@ -131,17 +181,18 @@ export class JsonRpcStdioFramer {
     }
     this.chunks.push(Buffer.from(chunk));
     this.frameBytes = observedBytes;
+    return undefined;
   }
 
-  private takeFrame(): string {
+  /** The decoded line, or the decode failure. Either way the bytes are consumed. */
+  private takeFrame(): string | JsonRpcStdioTransportError {
     let frame = Buffer.concat(this.chunks, this.frameBytes);
     if (frame.at(-1) === 0x0d) frame = frame.subarray(0, -1);
-    this.chunks.length = 0;
-    this.frameBytes = 0;
+    this.discardFrame();
     try {
       return this.decoder.decode(frame);
     } catch (cause) {
-      throw this.makeTransportError({
+      return this.makeTransportError({
         reason: "invalid-utf8",
         maxBytes: this.maxFrameBytes,
         observedBytes: frame.length,

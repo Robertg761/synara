@@ -28,6 +28,48 @@ describe("shared JSON-RPC stdio transport", () => {
     );
   });
 
+  it("stays usable after a framing failure instead of wedging on the leftovers", () => {
+    const framer = new JsonRpcStdioFramer(8);
+
+    expect(framer.push(Buffer.from("1234"))).toEqual([]);
+    expect(() => framer.push(Buffer.from("56789"))).toThrowError(
+      expect.objectContaining({ reason: "frame-too-large" }),
+    );
+    // The partial line used to be retained, so it both re-threw on every later
+    // push and would have been spliced onto whatever line arrived next.
+    expect(framer.bufferedBytes).toBe(0);
+    expect(framer.push(Buffer.from('tail\n{"id":1}\n'))).toEqual(['{"id":1}']);
+  });
+
+  it("skips an oversized line across chunks and resumes at the next newline", () => {
+    const errors: JsonRpcStdioTransportError[] = [];
+    const framer = new JsonRpcStdioFramer(16, (error) => errors.push(error));
+
+    expect(framer.push(Buffer.from("x".repeat(24)))).toEqual([]);
+    expect(framer.push(Buffer.from("still the same oversized line"))).toEqual([]);
+    expect(framer.push(Buffer.from('tail\n{"id":1}\n'))).toEqual(['{"id":1}']);
+
+    // One report for one bad line, not one per chunk it spanned.
+    expect(errors.map((error) => error.reason)).toEqual(["frame-too-large"]);
+    expect(framer.bufferedBytes).toBe(0);
+  });
+
+  it("charges a bad line to itself and still returns its chunk's good frames", () => {
+    const errors: JsonRpcStdioTransportError[] = [];
+    const framer = new JsonRpcStdioFramer(64, (error) => errors.push(error));
+
+    const frames = framer.push(
+      Buffer.concat([
+        Buffer.from('{"id":1}\n'),
+        Buffer.from([0xff, 0x0a]),
+        Buffer.from('{"id":2}\n'),
+      ]),
+    );
+
+    expect(frames).toEqual(['{"id":1}', '{"id":2}']);
+    expect(errors.map((error) => error.reason)).toEqual(["invalid-utf8"]);
+  });
+
   it("permanently closes a framer and rejects pushes after terminal end", () => {
     const framer = new JsonRpcStdioFramer(64);
     framer.push(Buffer.from('{"id":1}'));

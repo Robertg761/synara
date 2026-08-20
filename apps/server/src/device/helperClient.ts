@@ -210,7 +210,9 @@ export class HelperClient {
     });
     this.process = child;
     this.exited = false;
-    this.stdoutFramer = new JsonRpcStdioFramer(MAX_CONTROL_LINE_BYTES);
+    this.stdoutFramer = new JsonRpcStdioFramer(MAX_CONTROL_LINE_BYTES, (error) =>
+      this.handleControlLineError(error),
+    );
     this.stdinWriter = new JsonRpcStdioWriter(child.stdin);
     this.requestRegistry = new JsonRpcStdioRequestRegistry({
       requestTimeoutMs: this.requestTimeoutMs,
@@ -459,19 +461,33 @@ export class HelperClient {
         if (trimmed.length > 0) this.handleControlLine(trimmed);
       }
     } catch (error) {
-      if (error instanceof JsonRpcStdioTransportError && error.reason === "invalid-utf8") {
-        // Malformed control output is ignored, as non-JSON helper diagnostics
-        // are. The framer still owns the fatal UTF-8 decision.
-        return;
-      }
-      const message =
-        error instanceof JsonRpcStdioTransportError && error.reason === "frame-too-large"
-          ? "Device helper control line exceeded limit"
-          : error instanceof Error
-            ? error.message
-            : String(error);
-      this.fail(new DeviceHelperError("helper_protocol_error", message, { cause: error }));
+      // Only a push after `close()` reaches here; per-line failures are reported
+      // through `handleControlLineError` and never abort the chunk.
+      const message = error instanceof Error ? error.message : String(error);
+      this.rejectInFlight(
+        new DeviceHelperError("helper_protocol_error", message, { cause: error }),
+      );
     }
+  }
+
+  /**
+   * A line the framer had to drop. The framer has already resynchronized, so
+   * this only decides how loudly to react.
+   *
+   * Undecodable bytes are ignored exactly like the non-JSON diagnostics the
+   * helper also writes to stdout. An oversized line is louder, because it means
+   * a response we were waiting for is gone: in-flight requests are rejected so
+   * callers fail fast instead of sitting out the full timeout. Neither case
+   * touches the process or the write path — the helper is still there, and the
+   * next request has to be able to reach it.
+   */
+  private handleControlLineError(error: JsonRpcStdioTransportError): void {
+    if (error.reason !== "frame-too-large") return;
+    this.rejectInFlight(
+      new DeviceHelperError("helper_protocol_error", "Device helper control line exceeded limit", {
+        cause: error,
+      }),
+    );
   }
 
   private handleControlLine(line: string): void {
@@ -501,7 +517,24 @@ export class HelperClient {
     });
   }
 
-  /** Reject everything in flight; used on exit, spawn failure, and disposal. */
+  /**
+   * Reject everything in flight without ending the transport.
+   *
+   * Used for protocol-level damage, which costs us the responses we were waiting
+   * on but leaves a live helper on the other end of a still-usable stdin.
+   */
+  private rejectInFlight(error: DeviceHelperError): void {
+    this.requestRegistry?.rejectAll(error);
+  }
+
+  /**
+   * Reject everything in flight and close the write path for good; used on exit,
+   * spawn failure, and disposal.
+   *
+   * Closing the writer is irreversible and `start()` will not rebuild it while a
+   * process is set, so this must stay reserved for a helper that is actually
+   * gone.
+   */
   private fail(error: DeviceHelperError): void {
     this.requestRegistry?.processExited(error);
     this.stdinWriter?.close(error);

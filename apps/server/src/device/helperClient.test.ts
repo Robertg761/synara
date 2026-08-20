@@ -271,6 +271,48 @@ describe("helper stdio control channel", () => {
     }
   });
 
+  it("keeps serving requests after an oversized control line", async () => {
+    const client = makeControlClient((child, request) => {
+      if (request.method === "oversized") {
+        child.stdout.emit("data", Buffer.from(`${"x".repeat(4 * 1024 * 1024 + 1)}\n`));
+        return;
+      }
+      child.stdout.emit(
+        "data",
+        Buffer.from(`${JSON.stringify({ id: request.id, result: "ok" })}\n`),
+      );
+    });
+    try {
+      await expect(client.request("oversized")).rejects.toMatchObject({
+        code: "helper_protocol_error",
+      });
+      // A protocol error costs the in-flight response, not the write path: the
+      // helper is still running and the next call has to reach it.
+      await expect(client.request("after")).resolves.toBe("ok");
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("ignores an undecodable control line without losing the response beside it", async () => {
+    const client = makeControlClient((child, request) => {
+      child.stdout.emit(
+        "data",
+        Buffer.concat([
+          // Helper diagnostics that are not valid UTF-8, then the real response,
+          // in one read.
+          Buffer.from([0xff, 0xfe, 0x0a]),
+          Buffer.from(`${JSON.stringify({ id: request.id, result: "survived" })}\n`),
+        ]),
+      );
+    });
+    try {
+      await expect(client.request("noisy")).resolves.toBe("survived");
+    } finally {
+      await client.dispose();
+    }
+  });
+
   it("rejects a pending request when the helper exits", async () => {
     const client = makeControlClient((child) => {
       child.emit("exit", 7, null);
