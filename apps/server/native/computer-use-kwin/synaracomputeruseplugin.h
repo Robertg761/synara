@@ -34,6 +34,7 @@ namespace KWin
 
 class ImageItem;
 class LogicalOutput;
+class SynaraHumanInputSpy;
 class SynaraVirtualInputDevice;
 class RenderLoop;
 class SeatInterface;
@@ -91,6 +92,7 @@ public:
     Q_INVOKABLE bool start();
     Q_INVOKABLE bool stop();
     Q_INVOKABLE bool setIdleTimeout(uint milliseconds);
+    Q_INVOKABLE bool setHumanActiveGuardMs(uint milliseconds);
     Q_INVOKABLE bool setAgentName(const QString &name);
     Q_INVOKABLE bool focusWindow(const QString &windowId);
     Q_INVOKABLE bool raiseWindow(const QString &windowId);
@@ -166,6 +168,18 @@ private:
     // The deepest popup transient of this window covering this point, so a menu
     // the target opened is clickable while the target still owns the pointer.
     Window *popupTransientAt(const Window *ancestor, const QPointF &point) const;
+    // Whether this window is a popup somewhere below that window in the transient
+    // tree, which is how a menu counts as the window that opened it.
+    bool popupInTransientTree(const Window *ancestor, const Window *candidate) const;
+    // How long ago the human last touched their own devices, or -1 when nothing
+    // has been observed yet.
+    qint64 humanInputAgeMilliseconds() const;
+    // The window seat0 currently has keyboard focus on: the one window on this
+    // desktop the agent has no business typing into while its owner is there.
+    Window *humanFocusWindow() const;
+    // Refuses a mutating action aimed at the window the human is working in,
+    // sending the D-Bus error the server turns into a retryable refusal.
+    bool refuseIfHumanActive(const Window *window);
     // Whether this window's application bound the agent seat at all. A client
     // that never bound it still has its surfaces delivered to by the seat, and
     // the events are dropped on the floor with no error anywhere - the failure
@@ -208,6 +222,12 @@ private:
     bool m_running = false;
     bool m_releasedByUser = false;
     uint m_idleTimeoutMs;
+    // How recently seat0 must have seen the human for the agent to give way on
+    // their focused window. 0 disables the guard entirely.
+    uint m_humanActiveGuardMs;
+    // Where "the human just did something" comes from. Only ever installed on
+    // the human's own compositor; see the class comment in the .cpp.
+    std::unique_ptr<SynaraHumanInputSpy> m_humanInputSpy;
     QString m_stopReason;
     QTimer m_idleTimer;
     QElapsedTimer m_lastActivity;

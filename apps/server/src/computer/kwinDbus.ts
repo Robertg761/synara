@@ -37,6 +37,12 @@ export interface KWinComputerPluginApi {
   readonly start: () => Promise<unknown>;
   readonly stop: () => Promise<unknown>;
   readonly setIdleTimeout: (milliseconds: number) => Promise<unknown>;
+  /**
+   * How recently the human's own seat must have been active for the plugin to
+   * refuse a mutating action aimed at the window they are focused on. `0`
+   * disables the guard. Absent on plugin builds older than Phase 4.
+   */
+  readonly setHumanActiveGuardMs: (milliseconds: number) => Promise<unknown>;
   /** Names the thread driving the ghost cursor, for the on-screen badge. */
   readonly setAgentName: (name: string) => Promise<unknown>;
   readonly focusWindow: (windowId: string) => Promise<unknown>;
@@ -223,6 +229,7 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
     start: () => invoke(iface, "start"),
     stop: () => invoke(iface, "stop"),
     setIdleTimeout: (milliseconds) => invoke(iface, "setIdleTimeout", milliseconds),
+    setHumanActiveGuardMs: (milliseconds) => invoke(iface, "setHumanActiveGuardMs", milliseconds),
     setAgentName: (name) => invoke(iface, "setAgentName", name),
     focusWindow: (windowId) => invoke(iface, "focusWindow", windowId),
     raiseWindow: (windowId) => invoke(iface, "raiseWindow", windowId),

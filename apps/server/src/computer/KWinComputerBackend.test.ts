@@ -78,7 +78,20 @@ class FakePlugin implements KWinComputerPluginApi {
       kwinVersion: "6.7.3",
       ...(this.workspace ? { workspaceGeometry: this.workspace } : {}),
     });
-  stateJson = async () => JSON.stringify({ position: this.position, targetWindowId: "window-1" });
+  /** The plugin's human-active introspection, absent until a test sets it. */
+  humanState:
+    | {
+        readonly humanFocusWindowId?: string;
+        readonly msSinceHumanInput?: number;
+        readonly ownsCompositor?: boolean;
+      }
+    | undefined;
+  stateJson = async () =>
+    JSON.stringify({
+      position: this.position,
+      targetWindowId: "window-1",
+      ...(this.humanState ?? {}),
+    });
   windowsJson = async () => JSON.stringify(this.windows);
   start = async () => {
     this.calls.push({ method: "start", args: [] });
@@ -100,6 +113,14 @@ class FakePlugin implements KWinComputerPluginApi {
     this.calls.push({ method: "setIdleTimeout", args: [milliseconds] });
     if (this.idleTimeoutFailure) throw this.idleTimeoutFailure;
     this.idleTimeoutMs = milliseconds;
+    return true;
+  };
+  humanActiveGuardMs: number | undefined;
+  humanActiveGuardFailure: Error | undefined;
+  setHumanActiveGuardMs = async (milliseconds: number) => {
+    this.calls.push({ method: "setHumanActiveGuardMs", args: [milliseconds] });
+    if (this.humanActiveGuardFailure) throw this.humanActiveGuardFailure;
+    this.humanActiveGuardMs = milliseconds;
     return true;
   };
   agentName: string | undefined;
@@ -593,6 +614,117 @@ describe("KWinComputerBackend", () => {
     // A refusal is not a fault: the session stays up and the connection stays open.
     expect(dbus.calls.some((call) => call.method === "close")).toBe(false);
     await expect(backend.listWindows()).resolves.toHaveLength(1);
+
+    await backend.dispose();
+  });
+
+  it("refuses a mutating action the plugin declined as the human's window", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.focusWindow("window-1");
+
+    dbus.plugin.inputFailure = {
+      method: "button",
+      error: dbusError(
+        "org.synara.ComputerUse.Error.HumanActive",
+        "The human is using Firefox right now - their keyboard focus is on it and their own " +
+          "devices were active 300 ms ago - so nothing was sent to it.",
+      ),
+    };
+
+    const refused = backend.click({ x: 44, y: 44 });
+    // The token both tiers refuse with, so the tool surface and the panel copy
+    // do not have to know which desktop produced it.
+    await expect(refused).rejects.toThrow(/computer_human_active/);
+    await expect(refused).rejects.toThrow(/The human is using Firefox/);
+    await expect(refused).rejects.toMatchObject({ retryable: true });
+    // A refusal is not a fault: the session and the connection both survive it.
+    expect(dbus.calls.some((call) => call.method === "close")).toBe(false);
+    await expect(backend.listWindows()).resolves.toHaveLength(1);
+
+    await backend.dispose();
+  });
+
+  it("configures the plugin human-active guard on every session start", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { humanActiveGuardMs: 1_500 });
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.calls).toContainEqual({
+      method: "setHumanActiveGuardMs",
+      args: [1_500],
+    });
+    expect(dbus.plugin.humanActiveGuardMs).toBe(1_500);
+
+    await backend.dispose();
+  });
+
+  it("defaults the human-active guard to the shared two-second threshold", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.humanActiveGuardMs).toBe(2_000);
+
+    await backend.dispose();
+  });
+
+  it("takes the human-active guard from SYNARA_COMPUTER_HUMAN_ACTIVE_MS", async () => {
+    vi.stubEnv("SYNARA_COMPUTER_HUMAN_ACTIVE_MS", "5000");
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.humanActiveGuardMs).toBe(5_000);
+
+    await backend.dispose();
+  });
+
+  it("disables the human-active guard when the environment sets it to zero", async () => {
+    vi.stubEnv("SYNARA_COMPUTER_HUMAN_ACTIVE_MS", "0");
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.humanActiveGuardMs).toBe(0);
+
+    await backend.dispose();
+  });
+
+  it("clamps a human-active guard below the plugin's floor", async () => {
+    vi.stubEnv("SYNARA_COMPUTER_HUMAN_ACTIVE_MS", "5");
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+
+    await backend.focusWindow("window-1");
+    expect(dbus.plugin.humanActiveGuardMs).toBe(100);
+
+    await backend.dispose();
+  });
+
+  it.each(["not-a-number", "", "-1", "60001"])(
+    "falls back to the default human-active guard for %j",
+    async (value) => {
+      vi.stubEnv("SYNARA_COMPUTER_HUMAN_ACTIVE_MS", value);
+      const dbus = new FakeDbus();
+      const backend = makeBackend(dbus);
+
+      await backend.focusWindow("window-1");
+      expect(dbus.plugin.humanActiveGuardMs).toBe(2_000);
+
+      await backend.dispose();
+    },
+  );
+
+  it("keeps the session usable when the plugin has no setHumanActiveGuardMs", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.humanActiveGuardFailure = dbusError(
+      "org.freedesktop.DBus.Error.UnknownMethod",
+      "No such method 'setHumanActiveGuardMs'",
+    );
+    const backend = makeBackend(dbus);
+
+    await expect(backend.focusWindow("window-1")).resolves.toBeUndefined();
 
     await backend.dispose();
   });
@@ -1150,6 +1282,100 @@ describe("KWinComputerBackend", () => {
 
     expect(writes).toBe(0);
     expect(dbus.plugin.calls.filter((call) => call.method === "key")).toHaveLength(4);
+    await backend.dispose();
+  });
+
+  it("refuses a semantic write into the window the human is working in", async () => {
+    const dbus = new FakeDbus();
+    let writes = 0;
+    const backend = makeBackend(dbus, {
+      glideDurationMs: 0,
+      atspi: {
+        readTrees: async () => [],
+        setText: async () => {
+          writes += 1;
+          return true;
+        },
+        dispose: async () => undefined,
+      },
+    });
+    await backend.availability();
+    dbus.plugin.humanState = { humanFocusWindowId: "window-1", msSinceHumanInput: 300 };
+
+    const refused = backend.setValue(resolvedTarget({ editable: true }), "ab");
+    await expect(refused).rejects.toThrow(/computer_human_active/);
+    await expect(refused).rejects.toThrow(/Terminal/);
+    await expect(refused).rejects.toMatchObject({ retryable: true });
+
+    // An AT-SPI write never reaches the plugin, so this check is the only thing
+    // between it and the human's window — and the focusing click is refused too.
+    expect(writes).toBe(0);
+    expect(dbus.plugin.calls.some((call) => call.method === "button")).toBe(false);
+    await backend.dispose();
+  });
+
+  it("refuses a semantic activate aimed at the human's window", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.availability();
+    dbus.plugin.humanState = { humanFocusWindowId: "window-1", msSinceHumanInput: 0 };
+
+    await expect(
+      backend.performAction(resolvedTarget({ editable: false }), "activate"),
+    ).rejects.toThrow(/computer_human_active/);
+    expect(dbus.plugin.calls.some((call) => call.method === "button")).toBe(false);
+
+    await backend.dispose();
+  });
+
+  it.each([
+    ["the human went quiet", { humanFocusWindowId: "window-1", msSinceHumanInput: 9_000 }],
+    ["they are in another window", { humanFocusWindowId: "window-9", msSinceHumanInput: 10 }],
+    ["nothing has focus", { humanFocusWindowId: "", msSinceHumanInput: 10 }],
+    ["no input has been observed", { humanFocusWindowId: "window-1", msSinceHumanInput: -1 }],
+    ["the plugin is older and reports neither", {}],
+    [
+      "the agent owns the compositor",
+      { humanFocusWindowId: "window-1", msSinceHumanInput: 10, ownsCompositor: true },
+    ],
+  ])("allows a semantic write when %s", async (_label, humanState) => {
+    const dbus = new FakeDbus();
+    const writes: AtspiTextWrite[] = [];
+    const backend = makeBackend(dbus, {
+      glideDurationMs: 0,
+      atspi: {
+        readTrees: async () => [],
+        setText: async (write) => {
+          writes.push(write);
+          return true;
+        },
+        dispose: async () => undefined,
+      },
+    });
+    await backend.availability();
+    dbus.plugin.humanState = humanState;
+
+    await expect(backend.setValue(resolvedTarget({ editable: true }), "ab")).resolves.toMatchObject(
+      {
+        value: "ab",
+      },
+    );
+    expect(writes).toHaveLength(1);
+
+    await backend.dispose();
+  });
+
+  it("skips the semantic-write guard entirely when it is disabled", async () => {
+    vi.stubEnv("SYNARA_COMPUTER_HUMAN_ACTIVE_MS", "0");
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0 });
+    await backend.availability();
+    dbus.plugin.humanState = { humanFocusWindowId: "window-1", msSinceHumanInput: 0 };
+
+    await expect(
+      backend.performAction(resolvedTarget({ editable: false }), "activate"),
+    ).resolves.toMatchObject({ windowId: "window-1" });
+
     await backend.dispose();
   });
 

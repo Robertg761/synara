@@ -16,6 +16,7 @@
 #include "cursor.h"
 #include "effect/effecthandler.h"
 #include "input.h"
+#include "input_event_spy.h"
 #include "keyboard_input.h"
 #include "opengl/eglcontext.h"
 #include "opengl/glframebuffer.h"
@@ -85,11 +86,22 @@ static const QString s_releasedErrorName = QStringLiteral("org.synara.ComputerUs
 // other refusal here because nothing is wrong with the request, the target, or
 // the plugin: the application simply cannot be reached on a second seat.
 static const QString s_seatUnsupportedErrorName = QStringLiteral("org.synara.ComputerUse.Error.SeatUnsupported");
+// The human is working in the window this action was aimed at. Retryable, and
+// nothing was injected: two cursors do not make the window someone is typing in
+// a valid target.
+static const QString s_humanActiveErrorName = QStringLiteral("org.synara.ComputerUse.Error.HumanActive");
 // A dead server must never leave the agent seat alive, so the session's
 // deadline lives here rather than in the server that may have crashed.
 static constexpr uint s_defaultIdleTimeoutMs = 5 * 60 * 1000;
 static constexpr uint s_minIdleTimeoutMs = 1000;
 static constexpr uint s_maxIdleTimeoutMs = 60 * 60 * 1000;
+// Matches DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS in sharedSeatArbiter.ts, so Tier 1
+// and Tier 2 hand back the same refusal after the same quiet period. The server
+// pushes its own value after every start(); this is what an unconfigured plugin
+// uses on its own.
+static constexpr uint s_defaultHumanActiveGuardMs = 2000;
+static constexpr uint s_minHumanActiveGuardMs = 100;
+static constexpr uint s_maxHumanActiveGuardMs = 60 * 1000;
 static const QString s_releaseActionName = QStringLiteral("SynaraReleaseComputerControl");
 static constexpr int s_captureRenderDeadlineMilliseconds = 2000;
 static constexpr int s_captureEncodeDeadlineMilliseconds = 5000;
@@ -141,6 +153,90 @@ static bool readOwnsCompositor()
 {
     return qgetenv(s_ownsCompositorEnv) == QByteArrayLiteral("1");
 }
+
+/**
+ * When the human last touched their own keyboard, mouse, touchpad or tablet.
+ *
+ * An `InputEventSpy` and not `waylandServer()->seat()->timestamp()`, and the
+ * difference is the whole reason this guard can be trusted. A spy is called from
+ * `InputRedirection` before any filter runs, so it sees exactly the events that
+ * entered the compositor from a real device - which is precisely the set neither
+ * agent path can produce. Agent input on the dedicated seat is delivered on a
+ * second `SeatInterface` that KWin's input pipeline knows nothing about, and
+ * direct per-client injection writes to `wl_pointer`/`wl_keyboard` resources
+ * without going through a seat at all. Neither ever reaches a spy, so there is
+ * nothing here to misattribute. (KWin tracks its own user activity the same way:
+ * `InputRedirection` keeps a `m_userActivitySpy`.)
+ *
+ * The seat timestamp would have been the shorter route and it is the wrong one
+ * on two counts: it is whatever was last handed to `setTimestamp`, which is a
+ * value written by anything that forwards events through seat0 rather than a
+ * statement about a device, and it carries the libinput event clock, which we
+ * would then have to assume is the same clock we read back. Stamping the arrival
+ * here with `QElapsedTimer` removes both questions - one clock, one writer.
+ */
+class SynaraHumanInputSpy : public InputEventSpy
+{
+public:
+    /** Milliseconds since the last real device event, or -1 if there has been none. */
+    qint64 ageMilliseconds() const
+    {
+        return m_lastInput.isValid() ? m_lastInput.elapsed() : -1;
+    }
+
+    void pointerMotion(PointerMotionEvent *) override
+    {
+        note();
+    }
+    void pointerButton(PointerButtonEvent *) override
+    {
+        note();
+    }
+    void pointerAxis(PointerAxisEvent *) override
+    {
+        note();
+    }
+    void keyboardKey(KeyboardKeyEvent *) override
+    {
+        note();
+    }
+    void touchDown(TouchDownEvent *) override
+    {
+        note();
+    }
+    void touchMotion(TouchMotionEvent *) override
+    {
+        note();
+    }
+    void touchUp(TouchUpEvent *) override
+    {
+        note();
+    }
+    void tabletToolAxisEvent(TabletToolAxisEvent *) override
+    {
+        note();
+    }
+    void tabletToolTipEvent(TabletToolTipEvent *) override
+    {
+        note();
+    }
+    void tabletToolButtonEvent(TabletToolButtonEvent *) override
+    {
+        note();
+    }
+    void tabletPadButtonEvent(TabletPadButtonEvent *) override
+    {
+        note();
+    }
+
+private:
+    void note()
+    {
+        m_lastInput.restart();
+    }
+
+    QElapsedTimer m_lastInput;
+};
 
 // Meta+Shift+Esc is unused by stock Plasma (kill-window is Ctrl+Alt+Esc) and
 // mirrors the muscle memory of Ctrl+Shift+Esc elsewhere. The user's real seat
@@ -805,6 +901,7 @@ void SynaraAgentCursorItem::refresh()
 SynaraComputerUsePlugin::SynaraComputerUsePlugin()
     : Plugin()
     , m_idleTimeoutMs(s_defaultIdleTimeoutMs)
+    , m_humanActiveGuardMs(s_defaultHumanActiveGuardMs)
     , m_pos(Cursors::self()->mouse()->pos())
     , m_ownsCompositor(readOwnsCompositor())
 {
@@ -837,6 +934,13 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
         ensureSeat();
         ensureCursorItem();
         setCursorVisible(false);
+        // Only on the human's own compositor. In a compositor the agent owns,
+        // the agent's own virtual device feeds this very pipeline, so the spy
+        // would report the agent as the human and the guard would deadlock it.
+        if (input()) {
+            m_humanInputSpy = std::make_unique<SynaraHumanInputSpy>();
+            input()->installInputEventSpy(m_humanInputSpy.get());
+        }
     }
 
     if (effects) {
@@ -858,6 +962,10 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
 SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
 {
     m_idleTimer.stop();
+    // Before anything else touches input: ~InputEventSpy uninstalls itself from
+    // InputRedirection, and that has to happen while InputRedirection is still
+    // the one this was installed into.
+    m_humanInputSpy.reset();
     m_encodePool.waitForDone();
     if (m_captureRequest) {
         failCapture(m_captureRequest, QStringLiteral("capture canceled: plugin destroyed"));
@@ -979,6 +1087,15 @@ QString SynaraComputerUsePlugin::stateJson() const
     // True while the agent, rather than the compositor, is the reason the focused
     // window reports itself active to its client.
     state.insert(QStringLiteral("borrowedActivation"), !m_activatedWindow.isNull());
+    // The human-active guard, laid out so a server or a diagnosing human can see
+    // each half of the rule separately: which window is theirs, and how long ago
+    // they last touched anything. `msSinceHumanInput` is -1 when no real device
+    // event has been observed yet, which is not the same as "a long time ago".
+    const Window *human = humanFocusWindow();
+    state.insert(QStringLiteral("humanFocusWindowId"),
+                 human ? human->internalId().toString(QUuid::WithoutBraces) : QString());
+    state.insert(QStringLiteral("msSinceHumanInput"), double(humanInputAgeMilliseconds()));
+    state.insert(QStringLiteral("humanActiveGuardMs"), double(m_humanActiveGuardMs));
     if (m_targetRequested && !usableWindow(m_targetWindow)) {
         state.insert(QStringLiteral("targetLost"), true);
     }
@@ -1098,6 +1215,24 @@ bool SynaraComputerUsePlugin::setIdleTimeout(uint milliseconds)
     }
     m_idleTimeoutMs = milliseconds;
     armIdleTimer();
+    return true;
+}
+
+/**
+ * How recently seat0 must have seen the human for the agent to give way on their
+ * focused window. `0` disables the guard.
+ *
+ * Clamped rather than trusted: a value below the floor would refuse nothing that
+ * matters while still costing a focus lookup per action, and one above the
+ * ceiling would lock the agent out of a window for a minute after a stray mouse
+ * nudge, which is indistinguishable from the feature being broken.
+ */
+bool SynaraComputerUsePlugin::setHumanActiveGuardMs(uint milliseconds)
+{
+    if (milliseconds != 0 && (milliseconds < s_minHumanActiveGuardMs || milliseconds > s_maxHumanActiveGuardMs)) {
+        return false;
+    }
+    m_humanActiveGuardMs = milliseconds;
     return true;
 }
 
@@ -1313,6 +1448,13 @@ bool SynaraComputerUsePlugin::button(uint button, bool pressed)
     if (!requireReachableClient(m_pointerWindow, m_pointerDirect)) {
         return false;
     }
+    // The release half of a press the agent already delivered is never refused:
+    // the client is holding that button down because of us, and leaving it held
+    // is worse than the press was.
+    const bool completingPress = !pressed && m_pressedButtons.contains(button);
+    if (!completingPress && refuseIfHumanActive(m_pointerWindow)) {
+        return false;
+    }
     if (!m_ownsCompositor) {
         updateKeyboardFocus();
     }
@@ -1333,6 +1475,9 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
         return false;
     }
     if (!requireReachableClient(m_pointerWindow, m_pointerDirect)) {
+        return false;
+    }
+    if (refuseIfHumanActive(m_pointerWindow)) {
         return false;
     }
 
@@ -1374,6 +1519,12 @@ bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
         return false;
     }
     if (!requireReachableClient(m_keyboardWindow, m_keyboardDirect)) {
+        return false;
+    }
+    // Same exemption the pointer makes, and it matters more here: refusing the
+    // release of a held Ctrl leaves the client believing a modifier is down.
+    const bool completingPress = !pressed && m_pressedKeys.contains(keyCode);
+    if (!completingPress && refuseIfHumanActive(m_keyboardWindow)) {
         return false;
     }
 
@@ -2090,6 +2241,18 @@ quint32 nextDirectSerial()
 }
 
 /**
+ * The surface the human's own seat is typing into, if any.
+ *
+ * Two callers with two different questions: the leave gating below, and the
+ * human-active guard, which needs the window rather than the surface.
+ */
+SurfaceInterface *humanKeyboardSurface()
+{
+    SeatInterface *seat = waylandServer() ? waylandServer()->seat() : nullptr;
+    return seat ? seat->focusedKeyboardSurface() : nullptr;
+}
+
+/**
  * Whether the human's own seat currently has this surface focused.
  *
  * The one thing direct injection must never do is take focus away from the
@@ -2104,9 +2267,39 @@ bool humanHoldsPointer(const SurfaceInterface *surface)
 
 bool humanHoldsKeyboard(const SurfaceInterface *surface)
 {
-    SeatInterface *seat = waylandServer() ? waylandServer()->seat() : nullptr;
-    return seat && seat->focusedKeyboardSurface() == surface;
+    // A null focus must never match a null surface: that would read "nobody has
+    // focus" as "the human has this one".
+    return surface && humanKeyboardSurface() == surface;
 }
+}
+
+/**
+ * The window seat0 has keyboard focus on.
+ *
+ * Resolved through the workspace rather than `WaylandServer::findWindow`, which
+ * only knows the windows it registered itself: an Xwayland client's surface is
+ * focusable by the human and would come back as no window at all, which is the
+ * one answer this must never give.
+ */
+Window *SynaraComputerUsePlugin::humanFocusWindow() const
+{
+    // There is no second seat in a compositor the agent owns - seat0 is the
+    // agent's - so there is no human focus to report.
+    if (m_ownsCompositor || !Workspace::self()) {
+        return nullptr;
+    }
+    const SurfaceInterface *surface = humanKeyboardSurface();
+    if (!surface) {
+        return nullptr;
+    }
+    return Workspace::self()->findWindow([surface](const Window *window) {
+        return window->surface() == surface;
+    });
+}
+
+qint64 SynaraComputerUsePlugin::humanInputAgeMilliseconds() const
+{
+    return m_humanInputSpy ? m_humanInputSpy->ageMilliseconds() : -1;
 }
 
 /**
@@ -2387,6 +2580,77 @@ bool SynaraComputerUsePlugin::requireReachableClient(const Window *window, bool 
 }
 
 /**
+ * Give way to the person at the keyboard, on their own window.
+ *
+ * The agent has its own cursor and its own seat, which is what lets it work
+ * while the human works - but the sixth E2E run showed the limit of that: a
+ * correctly aimed click landed on the compose dialog the human was typing in.
+ * Input isolation held (they did not lose a keystroke), and the action was still
+ * wrong. So one window is off the table while its owner is in it, and every
+ * other window on the desktop stays available.
+ *
+ * There is deliberately **no attribution epsilon** here, unlike the shared-seat
+ * arbiter that does the same job for Tier 2. That module has to subtract the
+ * agent's own input from what it observes, because on a portal backend the agent
+ * drives seat0 itself. On this desktop the agent's events never enter seat0 (the
+ * dedicated seat is a second `SeatInterface`, and direct injection writes to
+ * client resources without a seat), so every event the spy saw is the human's by
+ * construction, and there is nothing to subtract.
+ *
+ * Refused rather than delayed: the caller can retry, and a compositor that
+ * queued the agent's click until the human paused would deliver it into a window
+ * whose state had moved on.
+ */
+bool SynaraComputerUsePlugin::refuseIfHumanActive(const Window *window)
+{
+    // Off entirely in a compositor the agent owns. There the agent's input rides
+    // seat0, so recency would count its own events and lock it out for good, and
+    // there is no human in that compositor to protect in the first place.
+    if (m_ownsCompositor || m_humanActiveGuardMs == 0 || !window) {
+        return false;
+    }
+    const qint64 age = humanInputAgeMilliseconds();
+    if (age < 0 || age > qint64(m_humanActiveGuardMs)) {
+        return false;
+    }
+    const Window *human = humanFocusWindow();
+    if (!human) {
+        return false;
+    }
+    // A menu takes the keyboard focus of the person using it, so when their
+    // focus sits on a popup, the window that opened it is what they are working
+    // in: walk up to the nearest non-popup ancestor first. Without this, an
+    // agent click into the parent would be allowed - and a click outside an open
+    // menu is exactly what dismisses it.
+    while (human->isPopupWindow() && human->transientFor()) {
+        human = human->transientFor();
+    }
+    // Their open menu is their window: a popup is a window of its own, transient
+    // for the one that opened it, and clicking into it is clicking into what
+    // they are doing.
+    if (window != human && !popupInTransientTree(human, window)) {
+        return false;
+    }
+
+    QString title = human->caption();
+    if (title.isEmpty()) {
+        title = human->resourceClass();
+    }
+    if (title.isEmpty()) {
+        title = QStringLiteral("the focused window");
+    }
+    sendErrorReply(s_humanActiveErrorName,
+                   QStringLiteral("The human is using %1 right now - their keyboard focus is on it and "
+                                  "their own devices were active %2 ms ago - so nothing was sent to it. "
+                                  "Every other window is still available, and this action can be retried "
+                                  "once they have been idle for %3 ms.")
+                       .arg(title)
+                       .arg(age)
+                       .arg(m_humanActiveGuardMs));
+    return true;
+}
+
+/**
  * On screen, on this desktop, and finished enough to be aimed at.
  *
  * Everything except whether the window takes input at all, which is the one
@@ -2469,6 +2733,35 @@ Window *SynaraComputerUsePlugin::popupTransientAt(const Window *ancestor, const 
         }
     }
     return nullptr;
+}
+
+/**
+ * Whether @p candidate is a popup somewhere below @p ancestor in the transient
+ * tree.
+ *
+ * The same walk as popupTransientAt with a different question - descending
+ * through transients that are not popups, because a menu opened from a modal
+ * dialog is still the dialog owner's descendant, and answering only for popups,
+ * because a dialog is a window in its own right and is targeted as one.
+ */
+bool SynaraComputerUsePlugin::popupInTransientTree(const Window *ancestor, const Window *candidate) const
+{
+    if (!ancestor || !candidate) {
+        return false;
+    }
+    const QList<Window *> &transients = ancestor->transients();
+    for (const Window *transient : transients) {
+        if (!transient) {
+            continue;
+        }
+        if (transient == candidate && transient->isPopupWindow()) {
+            return true;
+        }
+        if (popupInTransientTree(transient, candidate)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool SynaraComputerUsePlugin::updatePointerFocus()

@@ -48,6 +48,7 @@ the macOS comparison.
 Service `org.synara.ComputerUse`, path `/org/synara/ComputerUse`, interface
 `org.synara.ComputerUse1`. Methods: `healthJson`, `stateJson`, `windowsJson`,
 `start`, `stop`, `setIdleTimeout(u milliseconds) -> b`,
+`setHumanActiveGuardMs(u milliseconds) -> b`,
 `setAgentName(s name) -> b`, `focusWindow`,
 `raiseWindow(s windowId) -> b`, `clearFocusWindow`, `movePointer`, `button`,
 `axis`, `key`, `captureWindow(s windowId, u maxDimension) -> ay`, and
@@ -211,6 +212,46 @@ a running server the hotkey is the user's toggle.
 
 Unlike the idle timeout, this is a human takeover, so the server does not
 restart the session behind the user's back.
+
+## Human-active guard
+
+The agent has its own cursor and its own seat, which is what lets it work while
+you work. One window is still off the table: the one you are typing in. A
+`button`, `axis`, or `key` whose resolved target is the window seat0 has keyboard
+focus on, while seat0 has seen input inside the guard window, is refused with
+`org.synara.ComputerUse.Error.HumanActive`. Nothing is injected, the error names
+the window and the age of your last input, and the server turns it into a
+retryable refusal carrying `computer_human_active` — the same token Tier 2's
+shared-seat arbiter uses, so a caller never has to know which desktop refused.
+
+- Recency comes from a `KWin::InputEventSpy`, not from
+  `SeatInterface::timestamp()`. A spy is called from `InputRedirection` before
+  any filter, so it sees exactly the events real devices produced — and neither
+  agent path can produce one, because the dedicated seat is a second
+  `SeatInterface` outside that pipeline and direct injection writes to client
+  resources without a seat at all. There is therefore **no attribution epsilon**
+  here, unlike the Tier 2 arbiter that has to subtract the agent's own input from
+  what it observes.
+- Exempt: `movePointer` (a ghost cursor gliding over your window disturbs
+  nothing — the refusal belongs on the action, same reasoning as
+  `SeatUnsupported`), all perception, the clipboard, `focusWindow` and
+  `raiseWindow` (focusing your window is harmless precisely because the `key`
+  that follows is refused).
+- A popup in the transient tree of the focused window counts as that window: an
+  open menu is part of what you are doing.
+- The release half of a press the agent already delivered is never refused — a
+  latched button or a stuck Ctrl in your window is worse than the press was.
+- `SYNARA_COMPUTER_USE_OWNS_COMPOSITOR=1` disables the guard entirely. There the
+  agent's input rides seat0, so recency would count its own events, and there is
+  no human in that compositor to protect.
+- `setHumanActiveGuardMs(u milliseconds)` reconfigures it; `0` disables it,
+  anything else outside 100 ms – 60 s is rejected with `false`. The server sends
+  its configured value right after `start()`, and
+  `SYNARA_COMPUTER_HUMAN_ACTIVE_MS` overrides that value with the same parsing
+  rules the idle timeout uses (default 2000 ms).
+- `stateJson` reports `humanFocusWindowId` (empty when nothing has focus),
+  `msSinceHumanInput` (`-1` when no real device event has been observed at all,
+  which is not the same as a long quiet period) and `humanActiveGuardMs`.
 
 ## Known limitations
 

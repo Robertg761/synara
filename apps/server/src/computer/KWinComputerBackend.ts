@@ -58,6 +58,7 @@ import {
   workspaceRectFromWindows,
 } from "./computerGeometry.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
+import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./sharedSeatArbiter.ts";
 import {
   createSessionKWinComputerDbus,
   KWinDbusTimeoutError,
@@ -106,6 +107,18 @@ const CONTROL_RELEASED_MESSAGE =
  * passed through verbatim rather than replaced.
  */
 const SEAT_UNSUPPORTED_ERROR_TYPE = "org.synara.ComputerUse.Error.SeatUnsupported";
+/**
+ * The plugin declining to act on the window the human is working in.
+ *
+ * Tier 2's arbiter refuses the same situation from the server side with the same
+ * `computer_human_active` token (`sharedSeatArbiter.ts`), because the caller
+ * that matters — the tool surface, and the panel copy explaining why the agent
+ * paused — treats both identically: wait, then try again.
+ */
+const HUMAN_ACTIVE_ERROR_TYPE = "org.synara.ComputerUse.Error.HumanActive";
+/** Guard window bounds, mirroring the plugin's own clamp. */
+const MIN_HUMAN_ACTIVE_GUARD_MS = 100;
+const MAX_HUMAN_ACTIVE_GUARD_MS = 60 * 1_000;
 const INSTALL_SCRIPT_PATH = "apps/server/native/computer-use-kwin/scripts/install-and-load.sh";
 const ENABLE_REBUILD_SCRIPT_PATH = "apps/server/native/computer-use-kwin/systemd/enable.sh";
 const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
@@ -133,6 +146,13 @@ interface KWinHealth {
 interface KWinPluginState {
   readonly position: ComputerPoint | null;
   readonly targetWindowId: string | null;
+  /**
+   * The human-active guard's two halves, as the plugin reports them. Both are
+   * `undefined` on a loaded plugin older than Phase 4, which is the one case a
+   * server-side check has to skip rather than guess at.
+   */
+  readonly humanFocusWindowId: string | undefined;
+  readonly msSinceHumanInput: number | undefined;
 }
 
 export interface KWinComputerBackendOptions {
@@ -164,6 +184,13 @@ export interface KWinComputerBackendOptions {
    * Falls back to `SYNARA_COMPUTER_IDLE_TIMEOUT_MS`, then to five minutes.
    */
   readonly idleTimeoutMs?: number;
+  /**
+   * How recently the human's own seat must have been active for a mutating
+   * action aimed at their focused window to be refused. `0` disables the guard.
+   * Falls back to `SYNARA_COMPUTER_HUMAN_ACTIVE_MS`, then to the threshold Tier
+   * 2's arbiter uses.
+   */
+  readonly humanActiveGuardMs?: number;
   /**
    * Whether the driven compositor renders on the human's own display. True for
    * the host session (the default), false when the backend is bound to a
@@ -205,6 +232,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly stillIntervalMs: number;
   private readonly captureMaxDimension: number;
   private readonly idleTimeoutMs: number;
+  private readonly humanActiveGuardMs: number;
   private readonly atspi: AtspiTreeReader;
   private readonly dbusFactory: () => Promise<KWinComputerDbus>;
   private readonly installedPluginIds: () => Promise<readonly string[]>;
@@ -277,6 +305,10 @@ export class KWinComputerBackend implements ComputerBackend {
     );
     this.idleTimeoutMs = normalizeIdleTimeout(
       options.idleTimeoutMs ?? parseIdleTimeoutEnv(process.env.SYNARA_COMPUTER_IDLE_TIMEOUT_MS),
+    );
+    this.humanActiveGuardMs = normalizeHumanActiveGuard(
+      options.humanActiveGuardMs ??
+        parseHumanActiveGuardEnv(process.env.SYNARA_COMPUTER_HUMAN_ACTIVE_MS),
     );
     this.atspi = options.atspi ?? new AtspiHelperClient();
     this.dbus = options.dbus;
@@ -639,6 +671,9 @@ export class KWinComputerBackend implements ComputerBackend {
     target: ComputerResolvedTarget,
     value: string,
   ): Promise<ComputerBackendActionResult> {
+    // Ahead of the click, so a refusal costs the human nothing at all: the click
+    // that focuses the control is itself a mutation of their window.
+    await this.guardHumanActiveWindow(await this.ensurePlugin(), target.node.windowId);
     const clicked = await this.click(target.point);
     if (!(await this.writeValueThroughAtspi(target, value))) await this.typeText(value);
     return {
@@ -682,6 +717,7 @@ export class KWinComputerBackend implements ComputerBackend {
     action: string,
   ): Promise<ComputerBackendActionResult> {
     if (action === "activate" || action === "click") {
+      await this.guardHumanActiveWindow(await this.ensurePlugin(), target.node.windowId);
       const clicked = await this.click(target.point);
       return {
         ...clicked,
@@ -887,6 +923,10 @@ export class KWinComputerBackend implements ComputerBackend {
         // A plugin build without setIdleTimeout keeps its own default deadline,
         // so an older loaded plugin must not fail the session.
         await plugin.setIdleTimeout(this.idleTimeoutMs).catch(() => undefined);
+        // Same tolerance, same reason: a plugin that predates the human-active
+        // guard keeps its own default rather than failing the session over a
+        // method it has never heard of.
+        await plugin.setHumanActiveGuardMs(this.humanActiveGuardMs).catch(() => undefined);
         await this.pushDrivingAgent(plugin);
         const runningHealth = parseHealth(await plugin.healthJson());
         if (!runningHealth.ok || !runningHealth.running) {
@@ -1129,7 +1169,65 @@ export class KWinComputerBackend implements ComputerBackend {
     const targetWindowId =
       asString(parsed.targetWindowId) ?? asString(parsed.focusedWindowId) ?? null;
     if (position) this.currentPoint = position;
-    return { position, targetWindowId };
+    // The plugin reports an empty id for "nobody has focus", which is a real
+    // answer and not a missing field; a missing field is an older plugin.
+    const humanFocusWindowId = asString(parsed.humanFocusWindowId);
+    const msSinceHumanInput =
+      typeof parsed.msSinceHumanInput === "number" && Number.isFinite(parsed.msSinceHumanInput)
+        ? parsed.msSinceHumanInput
+        : undefined;
+    // Nothing to protect in a compositor the agent owns, and reporting a guard
+    // there would refuse the agent on its own input.
+    const guarded = parsed.ownsCompositor !== true;
+    return {
+      position,
+      targetWindowId,
+      humanFocusWindowId: guarded ? humanFocusWindowId : undefined,
+      msSinceHumanInput: guarded ? msSinceHumanInput : undefined,
+    };
+  }
+
+  /**
+   * Refuses a semantic write aimed at the window the human is working in.
+   *
+   * The plugin's own guard covers everything it injects, and an AT-SPI write
+   * goes nowhere near it: `setText` reaches the application over the
+   * accessibility bus, so the one thing standing between it and the human's
+   * half-written message is this check. It reads the guard's two halves out of a
+   * fresh `stateJson` — the state has to be sampled before the action, never
+   * after — and skips when the loaded plugin does not report them, which is the
+   * honest answer for a version-skewed session rather than a refusal built on a
+   * field that was never there.
+   */
+  private async guardHumanActiveWindow(
+    plugin: KWinComputerPluginApi,
+    windowId: string | null | undefined,
+  ): Promise<void> {
+    if (this.humanActiveGuardMs === 0 || !windowId) return;
+    const state = await this.readPluginState(plugin);
+    const { humanFocusWindowId, msSinceHumanInput } = state;
+    if (humanFocusWindowId === undefined || msSinceHumanInput === undefined) return;
+    // -1 is the plugin saying it has observed no real device event at all, which
+    // is not the same as a long quiet period and is not grounds for refusing.
+    if (msSinceHumanInput < 0 || msSinceHumanInput > this.humanActiveGuardMs) return;
+    if (humanFocusWindowId !== windowId) return;
+
+    const title = (await this.listWindows().catch(() => [])).find(
+      (window) => window.id === windowId,
+    )?.title;
+    throw this.humanActiveError(
+      `The human is using ${title ?? "the focused window"} right now — their keyboard focus is ` +
+        `on it and their own devices were active ${msSinceHumanInput} ms ago — so nothing was ` +
+        `written to it. Every other window is still available, and this action can be retried ` +
+        `once they have been idle for ${this.humanActiveGuardMs} ms.`,
+    );
+  }
+
+  private humanActiveError(detail: string, cause?: unknown): ComputerBackendError {
+    return new ComputerBackendError(`${HUMAN_ACTIVE_REFUSAL}: ${detail}`, {
+      retryable: true,
+      ...(cause === undefined ? {} : { cause }),
+    });
   }
 
   /**
@@ -1363,6 +1461,12 @@ export class KWinComputerBackend implements ComputerBackend {
     // this application would have worked.
     if (dbusErrorType(error) === SEAT_UNSUPPORTED_ERROR_TYPE) {
       return new ComputerBackendError(dbusErrorText(error), { cause: error });
+    }
+    // Retryable, and carrying the token both tiers refuse with. Nothing was
+    // injected, so the caller's move is to wait and try again — the same answer
+    // the shared-seat arbiter gives on a portal backend.
+    if (dbusErrorType(error) === HUMAN_ACTIVE_ERROR_TYPE) {
+      return this.humanActiveError(dbusErrorText(error), error);
     }
     if (isConnectionLevelFailure(error)) {
       this.recordHealthFailure(error);
@@ -1696,6 +1800,33 @@ function readByteArray(value: unknown): Uint8Array {
     return Uint8Array.from(unwrapped as number[]);
   }
   throw new ComputerBackendError("Synara KWin capture returned invalid PNG bytes.");
+}
+
+/**
+ * `SYNARA_COMPUTER_HUMAN_ACTIVE_MS` is an operator override, read the same way
+ * the idle timeout is: `0` turns the guard off on purpose, anything that is not
+ * a millisecond count inside the plugin's own range is a typo and is dropped so
+ * the default applies. A malformed value must never be the reason the agent
+ * starts typing into a window someone is working in.
+ */
+function parseHumanActiveGuardEnv(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const milliseconds = Number(value);
+  if (
+    !Number.isFinite(milliseconds) ||
+    milliseconds < 0 ||
+    milliseconds > MAX_HUMAN_ACTIVE_GUARD_MS
+  ) {
+    return undefined;
+  }
+  return milliseconds;
+}
+
+function normalizeHumanActiveGuard(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS;
+  const milliseconds = Math.floor(value);
+  if (milliseconds <= 0) return 0;
+  return Math.max(MIN_HUMAN_ACTIVE_GUARD_MS, Math.min(MAX_HUMAN_ACTIVE_GUARD_MS, milliseconds));
 }
 
 /**
