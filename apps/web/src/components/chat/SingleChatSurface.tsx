@@ -97,9 +97,7 @@ import {
   CHAT_MAIN_CONTENT_SURFACE_CLASS_NAME,
   CHAT_MAIN_VIEWPORT_SHELL_CLASS_NAME,
 } from "./composerPickerStyles";
-import { routeSingleBrowserPanelOpenRequest } from "./browserPanelOpenRequest";
-import { routeSingleComputerPaneOpenRequest } from "./computerPaneOpenRequest";
-import { routeSingleDevicePaneOpenRequest } from "./devicePaneOpenRequest";
+import { routeSingleDockPaneOpenRequest } from "./dockPaneOpenRequest";
 import {
   pullRequestDetailInputFromPane,
   pullRequestPaneTabLabel,
@@ -598,17 +596,28 @@ export function SingleChatSurface(props: {
     setDockOpen,
   ]);
 
+  // Panes that follow a cross-thread open request all route the same way:
+  // replace the current entry so the agent's redirect does not pile up history.
+  const navigateToThreadInPlace = (threadId: ThreadId) => {
+    void navigate({
+      to: "/$threadId",
+      params: { threadId },
+      replace: true,
+    });
+  };
+
   useBrowserPanelDesktopBridge({
     onToggle: () => {
       requestImmediateDockHydration("browser");
       toggleSingletonPane(props.threadId, { kind: "browser" });
     },
     onOpen: (requestedThreadId) => {
-      routeSingleBrowserPanelOpenRequest({
+      routeSingleDockPaneOpenRequest({
         currentThreadId: props.threadId,
         requestedThreadId,
-        requestImmediateBrowserHydration: () => requestImmediateDockHydration("browser"),
-        openBrowserPane: (threadId) => openPane(threadId, { kind: "browser" }),
+        requestImmediateHydration: () => requestImmediateDockHydration("browser"),
+        openPane: (threadId) => openPane(threadId, { kind: "browser" }),
+        crossThread: { kind: "refuse" },
       });
     },
   });
@@ -616,18 +625,12 @@ export function SingleChatSurface(props: {
   useDeviceEventBridge({
     onOpenPaneRequested: hasDeviceSupport
       ? (event) => {
-          routeSingleDevicePaneOpenRequest({
+          routeSingleDockPaneOpenRequest({
             currentThreadId: props.threadId,
             requestedThreadId: event.threadId,
-            requestImmediateDeviceHydration: () => requestImmediateDockHydration("device"),
-            openDevicePane: (threadId) => openPane(threadId, { kind: "device" }),
-            navigateToThread: (threadId) => {
-              void navigate({
-                to: "/$threadId",
-                params: { threadId },
-                replace: true,
-              });
-            },
+            requestImmediateHydration: () => requestImmediateDockHydration("device"),
+            openPane: (threadId) => openPane(threadId, { kind: "device" }),
+            crossThread: { kind: "navigate", navigateToThread: navigateToThreadInPlace },
           });
         }
       : null,
@@ -635,18 +638,12 @@ export function SingleChatSurface(props: {
   useComputerEventBridge({
     onOpenPaneRequested: appSettings.autoOpenComputerPane
       ? (event) => {
-          routeSingleComputerPaneOpenRequest({
+          routeSingleDockPaneOpenRequest({
             currentThreadId: props.threadId,
             requestedThreadId: event.threadId,
-            requestImmediateComputerHydration: () => requestImmediateDockHydration("computer"),
-            openComputerPane: (threadId) => openPane(threadId, { kind: "computer" }),
-            navigateToThread: (threadId) => {
-              void navigate({
-                to: "/$threadId",
-                params: { threadId },
-                replace: true,
-              });
-            },
+            requestImmediateHydration: () => requestImmediateDockHydration("computer"),
+            openPane: (threadId) => openPane(threadId, { kind: "computer" }),
+            crossThread: { kind: "navigate", navigateToThread: navigateToThreadInPlace },
           });
         }
       : null,
