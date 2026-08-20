@@ -1,0 +1,252 @@
+# Prebuilt desktop-helper binaries, one per distribution we can reach.
+#
+# `synara-computer-desktop-helper` is the C process that owns the Wayland
+# connection on every non-KDE Wayland desktop. Until now the only way to get one
+# was `build.sh`, which needs a compiler, pkg-config, wayland-scanner, and the
+# libwayland and libxkbcommon headers on the user's own machine - the same ask
+# that made the KWin plugin unusable for anyone who had not already installed a
+# toolchain, and worse here, because packaged builds ship no `native/` sources to
+# run the script against at all.
+#
+# So the binaries get built here instead, in the same distribution containers the
+# KWin plugin uses. The helper links that distribution's libwayland-client,
+# libxkbcommon, and glibc, so a build belongs to the system it was compiled on
+# and the manifest records which one: `/etc/os-release` ID and VERSION_ID plus
+# the architecture, which is the whole key, and the build glibc, which is the
+# guard. Synara picks a build by that key at probe time and falls back to
+# `build.sh` when there is no match - so a distribution missing from this matrix
+# costs a user a local build, not the feature.
+#
+# The artifacts land in `apps/server/native/computer-desktop-helper/prebuilt/`,
+# next to the `manifest.json` the assemble job writes. Packaging has to carry
+# that directory into `dist/computer-desktop-helper/prebuilt/` for a packaged app
+# to see it; `desktopHelperPrebuilt.ts` looks in both places.
+name: Desktop Helper Prebuilds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+    paths:
+      - "apps/server/native/computer-desktop-helper/**"
+  # The rolling distributions move their libraries on their own schedule, and an
+  # entry keyed on the distribution alone has to be rebuilt to stay true of it.
+  schedule:
+    - cron: "0 6 1 * *"
+
+permissions: {}
+
+concurrency:
+  group: desktop-helper-prebuilds-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.distro.id }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    container: ${{ matrix.distro.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        distro:
+          - { id: fedora-43, image: "fedora:43" }
+          - { id: fedora-44, image: "fedora:44" }
+          - { id: debian-trixie, image: "debian:trixie" }
+          - { id: ubuntu-2604, image: "ubuntu:26.04" }
+          - { id: opensuse-tumbleweed, image: "opensuse/tumbleweed" }
+          - { id: arch, image: "archlinux:latest" }
+        exclude:
+          # Arch publishes no official arm64 image.
+          - arch: arm64
+            distro: { id: arch, image: "archlinux:latest" }
+    steps:
+      - name: Install the toolchain and the Wayland development packages
+        id: deps
+        shell: bash
+        # A distribution that has renamed one of these is a gap in the matrix,
+        # not a broken build: it is reported and skipped, and its users get a
+        # local build.
+        continue-on-error: true
+        env:
+          DISTRO_ID: ${{ matrix.distro.id }}
+        run: |
+          set -euxo pipefail
+          case "$DISTRO_ID" in
+            fedora-*)
+              dnf -y install gcc pkgconf-pkg-config wayland-devel libxkbcommon-devel \
+                coreutils grep gawk git
+              ;;
+            debian-*|ubuntu-*)
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              # wayland-scanner is packaged apart from the headers on Debian and
+              # Ubuntu; libwayland-dev alone builds nothing.
+              apt-get install -y --no-install-recommends gcc libc6-dev pkg-config \
+                libwayland-dev libwayland-bin libxkbcommon-dev \
+                coreutils grep gawk ca-certificates git
+              ;;
+            opensuse-*)
+              zypper --non-interactive refresh
+              zypper --non-interactive install gcc pkgconf-pkg-config wayland-devel \
+                libxkbcommon-devel coreutils grep gawk git
+              ;;
+            arch)
+              # Arch ships headers and tools in the runtime packages; there is no
+              # -devel split to install.
+              pacman -Syu --noconfirm gcc pkgconf wayland libxkbcommon \
+                coreutils grep gawk git
+              ;;
+            *)
+              echo "::error::No package recipe for $DISTRO_ID"
+              exit 1
+              ;;
+          esac
+          # build.sh invokes `cc`, which every one of these images provides
+          # through its compiler package - except when a distribution moves that
+          # symlink into a package we did not ask for. Cheaper to insure against
+          # than to discover on a release tag.
+          command -v cc >/dev/null 2>&1 || ln -s "$(command -v gcc)" /usr/local/bin/cc
+
+      - name: Checkout
+        if: steps.deps.outcome == 'success'
+        uses: actions/checkout@v6
+
+      - name: Read the system this build belongs to
+        if: steps.deps.outcome == 'success'
+        id: system
+        shell: bash
+        # Read off the container rather than declared in this file, so the
+        # manifest describes the system the binary was actually linked against.
+        #
+        # A rolling distribution's VERSION_ID is either absent (Arch) or a
+        # snapshot date that no user's machine will ever equal (Tumbleweed), so
+        # recording it would produce an entry that can never match. Those get an
+        # empty version, which the runtime reads as "this ID, any version", and
+        # the glibc floor below is what keeps that honest.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . /etc/os-release
+          os_id="${ID:-}"
+          os_version_id="${VERSION_ID:-}"
+          [ -n "$os_id" ] || { echo "::error::/etc/os-release declares no ID"; exit 1; }
+          case "$os_id" in
+            arch|opensuse-tumbleweed|gentoo|nixos) os_version_id="" ;;
+          esac
+          glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' || true)"
+          if [ -z "$glibc" ]; then
+            glibc="$(ldd --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+(\.[0-9]+)+$' || true)"
+          fi
+          [ -n "$glibc" ] || { echo "::error::Could not read a glibc version"; exit 1; }
+          {
+            echo "os_id=$os_id"
+            echo "os_version_id=$os_version_id"
+            echo "glibc=$glibc"
+          } >>"$GITHUB_OUTPUT"
+          echo "Building on $os_id ${os_version_id:-(rolling)} against glibc $glibc"
+
+      - name: Build the helper
+        if: steps.deps.outcome == 'success'
+        id: build
+        shell: bash
+        env:
+          OS_ID: ${{ steps.system.outputs.os_id }}
+          OS_VERSION_ID: ${{ steps.system.outputs.os_version_id }}
+          GLIBC: ${{ steps.system.outputs.glibc }}
+          ARCH: ${{ matrix.arch }}
+          DISTRO_ID: ${{ matrix.distro.id }}
+        run: |
+          set -euo pipefail
+          built="$(bash apps/server/native/computer-desktop-helper/build.sh "$PWD/build-out" | tail -n 1)"
+          [ -x "$built" ] || { echo "::error::build.sh printed no usable path"; exit 1; }
+          # The one thing that can be checked without a compositor, and the one
+          # that catches a missing shared library: the binary starts, resolves
+          # its links, and answers its own protocol version.
+          "$built" --version
+          mkdir -p out
+          name="synara-computer-desktop-helper-${OS_ID}${OS_VERSION_ID:+-$OS_VERSION_ID}-${ARCH}"
+          cp "$built" "out/$name"
+          # The entry the assemble job folds into manifest.json. Written here
+          # because this is the only place that knows what was actually linked.
+          cat >"out/${name}.json" <<EOF
+          {
+            "osId": "$OS_ID",
+            "osVersionId": "$OS_VERSION_ID",
+            "arch": "$ARCH",
+            "glibc": "$GLIBC",
+            "file": "$name",
+            "builtOn": "$DISTRO_ID"
+          }
+          EOF
+
+      - name: Upload
+        if: steps.deps.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-helper-${{ matrix.distro.id }}-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble the manifest
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download every build
+        uses: actions/download-artifact@v6
+        with:
+          path: downloaded
+          merge-multiple: true
+
+      - name: Write manifest.json
+        shell: bash
+        # Checksums are computed here, over the bytes that will actually ship, so
+        # the runtime check verifies the same file this job produced rather than
+        # a claim made upstream of it. A duplicate (osId, osVersionId, arch) is a
+        # real ambiguity - two images that describe themselves identically - and
+        # the first wins, deterministically, by sorted build id.
+        run: |
+          set -euo pipefail
+          mkdir -p prebuilt
+          python3 - <<'PY'
+          import hashlib, json, pathlib, shutil
+
+          source = pathlib.Path("downloaded")
+          out = pathlib.Path("prebuilt")
+          builds, seen = [], set()
+          for entry in sorted(source.glob("synara-computer-desktop-helper-*.json")):
+              meta = json.loads(entry.read_text())
+              key = (meta["osId"], meta["osVersionId"], meta["arch"])
+              binary = source / meta["file"]
+              if key in seen or not binary.is_file():
+                  print(f"skipping {meta['file']}: duplicate or missing")
+                  continue
+              seen.add(key)
+              meta["sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+              shutil.copy2(binary, out / meta["file"])
+              (out / meta["file"]).chmod(0o755)
+              builds.append(meta)
+
+          (out / "manifest.json").write_text(json.dumps({"builds": builds}, indent=2) + "\n")
+          print(f"{len(builds)} build(s) in the manifest")
+          PY
+          cat prebuilt/manifest.json
+
+      - name: Upload the drop-in directory
+        uses: actions/upload-artifact@v4
+        with:
+          # Unpacks over apps/server/native/computer-desktop-helper/prebuilt/,
+          # which is where the server looks when no
+          # SYNARA_COMPUTER_HELPER_PREBUILT_DIR is set.
+          name: desktop-helper-prebuilt
+          path: prebuilt/
+          if-no-files-found: error

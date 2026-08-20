@@ -23,6 +23,26 @@ retrying, no policy, no waiting, no state beyond the input it is holding down.
 Everything above the wire — eased pointer glides, hotkey release order, capture
 scaling policy, health accounting — is TypeScript, shared with the KDE backend.
 
+## Getting one
+
+Synara installs a helper by itself when it can. On the first probe, if nothing
+is at the path below, it looks for a binary that shipped with the build and was
+compiled for this system, verifies its checksum, and installs it — no compiler,
+no headers, no script. `.github/workflows/desktop-helper-prebuilds.yml` builds
+those in the same distribution containers the KWin plugin uses and writes them,
+with a `manifest.json`, into `prebuilt/`.
+
+A build is claimed by the system it was compiled on: `/etc/os-release`'s `ID`
+and `VERSION_ID` plus the architecture, matched exactly, because the binary
+links that distribution's libwayland, libxkbcommon, and glibc. Rolling
+distributions (Arch, Tumbleweed) have no version worth matching on, so their
+entries carry the ID alone and the recorded build glibc is what keeps that safe.
+`SYNARA_COMPUTER_HELPER_PREBUILT_DIR` points the lookup somewhere else;
+`desktopHelperInstall.ts` is the whole of it.
+
+A system no container in the matrix resembles gets the build below, which is
+also what a contributor changing the C wants.
+
 ## Building
 
 ```sh
