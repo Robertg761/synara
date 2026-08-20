@@ -326,8 +326,28 @@ def set_text(params):
     return {"ok": result is None or bool(result)}
 
 
+def read_request_lines():
+    """Requests, one per line, decoded so that a bad byte costs one request.
+
+    ``for line in sys.stdin`` decodes strictly, so a single non-UTF-8 byte
+    anywhere in the stream raises ``UnicodeDecodeError`` out of the ``for``
+    itself — outside any handler — and the helper dies mid-conversation, taking
+    every outstanding request with it. Reading the underlying binary buffer and
+    decoding each line with ``errors="replace"`` turns that into one request
+    that fails to parse and one error reply, which is what the caller can act
+    on.
+    """
+    for raw in sys.stdin.buffer:
+        yield raw.decode("utf-8", errors="replace")
+
+
 def main():
-    for line in sys.stdin:
+    for line in read_request_lines():
+        # Reset per iteration. Carrying the previous request's id into this
+        # one's failure reply attributes the error to a request that already
+        # succeeded, and leaves the request that actually failed with no reply
+        # at all — the caller waits for it until its timeout.
+        request_id = None
         try:
             message = json.loads(line)
             request_id = message.get("id")
@@ -344,7 +364,7 @@ def main():
             emit(
                 {
                     "jsonrpc": "2.0",
-                    "id": locals().get("request_id"),
+                    "id": request_id,
                     "error": {"code": -32000, "message": str(error)},
                 }
             )

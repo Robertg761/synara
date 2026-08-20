@@ -95,7 +95,8 @@ function extensionWindow(overrides: Record<string, unknown> = {}): Record<string
     minimized: false,
     maximized: false,
     fullscreen: false,
-    focused: true,
+    // No `focused`: the extension does not report one, because there is no
+    // agent seat on GNOME to be focused. See the `focused` test below.
     active: true,
     windowType: "normal",
     monitor: 1,
@@ -144,7 +145,6 @@ describe("GnomeShellWindowProvider", () => {
           appId: "org.gnome.Nautilus.desktop",
           pid: 5122,
           bounds: { x: 1300, y: 260, width: 900, height: 700 },
-          focused: false,
           active: false,
           minimized: true,
           visible: false,
@@ -163,7 +163,7 @@ describe("GnomeShellWindowProvider", () => {
         appName: "org.gnome.Calculator.desktop",
         pid: 4711,
         bounds: { x: 1280, y: 240, width: 400, height: 600 },
-        focused: true,
+        focused: false,
         active: true,
         minimized: false,
         visible: true,
@@ -183,6 +183,27 @@ describe("GnomeShellWindowProvider", () => {
         occludedBy: ["42"],
       },
     ]);
+  });
+
+  it("never reports a window as focused, because GNOME has no agent seat to focus it", async () => {
+    // `focused` means the agent seat's input target everywhere in this stack,
+    // and ComputerManager's `agentFocusOnly` guard uses it to keep post-action
+    // observation off the human's screen. mutter's has_focus() is the *human's*
+    // keyboard focus, so an extension reporting it as `focused` would aim that
+    // observation straight at whatever they are typing into. It is reported as
+    // `active`, and `focused` is forced false even when the document carries it
+    // — an older installed extension must not be able to reintroduce the leak.
+    const extension = fakeExtension({
+      windows: JSON.stringify([
+        extensionWindow({ focused: true, active: true }),
+        extensionWindow({ id: "43", stackingIndex: 1, focused: true, active: false }),
+      ]),
+    });
+
+    const windows = await providerFor(extension).listWindows();
+
+    expect(windows.map((window) => window.focused)).toEqual([false, false]);
+    expect(windows.map((window) => window.active)).toEqual([true, false]);
   });
 
   it("keeps the extension's ids, so a window stays addressable as it changes", async () => {

@@ -270,11 +270,16 @@ function windowsJson() {
       minimized: window.minimized === true,
       maximized: isMaximized(window),
       fullscreen: typeof window.is_fullscreen === "function" ? window.is_fullscreen() : false,
-      focused: window.has_focus(),
-      // On mutter the focused window *is* the activated one: there is a single
-      // focus window per display and toolkits gate shortcut dispatch on it.
-      // Reported separately anyway so the field means the same thing here as
-      // it does on KWin, where the two can differ.
+      // `active`, and deliberately no `focused`. In Synara's window document
+      // `focused` means the *agent seat's* input target — on KWin it comes from
+      // the agent seat alone, and the server's post-action observation only
+      // photographs a window it believes the agent is driving. There is no
+      // agent seat on GNOME: input arrives through the RemoteDesktop portal on
+      // the human's own seat, so no window is ever the agent's focus target
+      // here. `has_focus()` is mutter's keyboard focus, which is the human's
+      // window, and reporting it as `focused` would aim that observation at
+      // whatever the human is typing into. It is the human's *active* window,
+      // and `active` is the field that means that.
       active: window.has_focus(),
       windowType: windowTypeName(window),
       monitor: typeof window.get_monitor === "function" ? window.get_monitor() : -1,

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import type { PortalBus } from "./portalBus.ts";
 import {
+  callPortalRequest,
   PORTAL_RESPONSE_CANCELLED,
   PORTAL_RESPONSE_ENDED,
   PORTAL_RESPONSE_SUCCESS,
@@ -12,7 +14,7 @@ import {
   type PortalSessionConsent,
   type PortalSessionOptions,
 } from "./portalSession.ts";
-import { inMemoryRestoreTokenStore } from "./restoreTokenStore.ts";
+import { inMemoryRestoreTokenStore, type PortalRestoreTokenStore } from "./restoreTokenStore.ts";
 import { EVDEV_BUTTON_CODES } from "../evdevInput.ts";
 
 function sessionFor(
@@ -304,6 +306,53 @@ describe("PortalSession", () => {
     await session.dispose();
   });
 
+  it("does not cache a session the desktop ended while the grant was still being written down", async () => {
+    // The narrow window between `Start` being answered and the state being
+    // published. A screen that locks the instant the user clicks Share lands
+    // exactly here: `handleClosed` tears the session down, and the tail of
+    // `open()` used to put it straight back — `ensureOpen` returns a cached
+    // `state` without ever consulting `revoked`, so the dead handle would be
+    // served forever while every notify on it failed.
+    const portal = new FakePortalService({ screenCastVersion: 5, restoreToken: "token-race" });
+    const store = inMemoryRestoreTokenStore();
+    let revoked = false;
+    const restoreTokens: PortalRestoreTokenStore = {
+      read: (key) => store.read(key),
+      write: async (key, token) => {
+        if (!revoked) {
+          revoked = true;
+          portal.revokeSession();
+        }
+        await store.write(key, token);
+      },
+      clear: (key) => store.clear(key),
+    };
+    const { session } = sessionFor(portal, { restoreTokens });
+
+    await expect(session.ensureOpen()).rejects.toMatchObject({ retryable: true });
+    expect(session.isOpen()).toBe(false);
+    expect(session.consentState().state).not.toBe("granted");
+    // One refusal, not two: the revocation is spent by the action that hit it,
+    // and the next one asks the user again rather than refusing on a latch.
+    await expect(session.ensureOpen()).resolves.toMatchObject({ devices: 3 });
+    expect(portal.startCount()).toBe(2);
+    await session.dispose();
+  });
+
+  it("hands out the libei descriptor the GNOME live spike is owed, and owns none of it", async () => {
+    // The one native seam kept past the dead-scaffolding cull, because the
+    // Tier 2 plan and the GNOME live checklist both pin it as what the pending
+    // live spike times libei against. The contract it is kept under is that the
+    // caller owns the fd: nothing here tracks it and dispose() does not close
+    // it, so a caller that drops one leaks it.
+    const portal = new FakePortalService({ screenCastVersion: 5 });
+    const { session } = sessionFor(portal);
+
+    await expect(session.connectToEIS()).resolves.toEqual(expect.any(Number));
+    expect(portal.calls).toContain("org.freedesktop.portal.RemoteDesktop.ConnectToEIS");
+    await session.dispose();
+  });
+
   it("closes the session on disposal so the grant does not outlive the backend", async () => {
     const portal = new FakePortalService({ screenCastVersion: 5 });
     const { session } = sessionFor(portal);
@@ -353,6 +402,45 @@ describe("portal Request/Response convention", () => {
 
     await expect(session.ensureOpen()).rejects.toThrow(/does not honour handle_token/);
     await session.dispose();
+  });
+
+  it("observes its own rejection when the bus is already dead, rather than taking the server with it", async () => {
+    // `onDisconnected` calls back synchronously on a connection that has
+    // already failed, which rejects the response promise before anything is
+    // waiting on it; `bus.call` then throws on the same failure, so the
+    // `await` that would have observed the rejection is never reached. An
+    // unobserved rejection is a process-level `unhandledRejection`, i.e. the
+    // whole server going down because a desktop bus dropped.
+    const dropped = new Error("the session bus went away");
+    const dead: PortalBus = {
+      uniqueName: ":1.9",
+      call: () =>
+        Promise.reject(new Error(`The portal D-Bus connection is gone: ${dropped.message}`)),
+      subscribe: () => Promise.resolve(() => undefined),
+      onDisconnected: (listener) => {
+        listener(dropped);
+        return () => undefined;
+      },
+      close: () => Promise.resolve(),
+    };
+
+    const unhandled: unknown[] = [];
+    const record = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", record);
+    try {
+      await expect(
+        callPortalRequest(dead, {
+          interface: "org.freedesktop.portal.RemoteDesktop",
+          member: "CreateSession",
+        }),
+      ).rejects.toThrow(/connection is gone|went away/);
+      // Node reports an unobserved rejection a tick after it happened.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    } finally {
+      process.off("unhandledRejection", record);
+    }
+
+    expect(unhandled).toEqual([]);
   });
 
   it("keeps the response codes distinct, because 1 latches and 0 does not", () => {

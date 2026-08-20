@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -140,6 +141,11 @@ struct helper_wayland {
 
 	struct helper_held *held_buttons;
 	struct helper_held *held_keys;
+
+	/* Sub-notch scroll owed to the discrete half of a wheel event. See
+	 * `take_discrete_steps`. */
+	double axis_remainder_v;
+	double axis_remainder_h;
 
 	struct timespec started_at;
 	bool broken;
@@ -1038,6 +1044,10 @@ static void forget_virtual_devices(helper_wayland *state) {
 	}
 	forget_held(&state->held_keys);
 	forget_held(&state->held_buttons);
+	/* A balance carried against a pointer that no longer exists would be spent
+	 * by the next one, handing the human a notch nobody scrolled. */
+	state->axis_remainder_v = 0;
+	state->axis_remainder_h = 0;
 	reset_keymap(state);
 }
 
@@ -1188,24 +1198,58 @@ static double clamp_scroll(double delta) {
 	return delta;
 }
 
-static void send_axis(helper_wayland *state, uint32_t axis, double delta) {
+/*
+ * Whole wheel notches owed to a client that can only be told about whole ones.
+ *
+ * A notch is SCROLL_STEP_PX, so any delta smaller than that truncates to zero
+ * steps. Rounding it up instead — which is what this used to do — turns a 2 px
+ * trackpad nudge into a full notch, and a stack that speaks pixels end to end
+ * then scrolls seven times further than it was asked to. The sub-notch part is
+ * carried in @p remainder instead, so repeated small deltas still add up to a
+ * notch and nothing is invented. Same shape as `takeDiscreteSteps` in the KWin
+ * plugin, deliberately: one scroll must mean one thing on every desktop.
+ */
+static int32_t take_discrete_steps(double *remainder, double delta) {
+	if (delta == 0) return 0;
+	*remainder += delta;
+	double steps = trunc(*remainder / SCROLL_STEP_PX);
+	*remainder -= steps * SCROLL_STEP_PX;
+	return (int32_t)steps;
+}
+
+static void send_axis(helper_wayland *state, uint32_t axis, double delta, double *remainder) {
 	if (delta == 0) return;
-	int32_t steps = (int32_t)(delta / SCROLL_STEP_PX);
-	if (steps == 0) steps = delta > 0 ? 1 : -1;
+	int32_t steps = take_discrete_steps(remainder, delta);
 	zwlr_virtual_pointer_v1_axis_source(state->pointer, WL_POINTER_AXIS_SOURCE_WHEEL);
-	/* Both halves of a wheel event: GTK reads the discrete steps, and anything
+	/*
+	 * Both halves of a wheel event: GTK reads the discrete steps, and anything
 	 * that scrolls by pixels reads the value. Sending one without the other
-	 * makes a toolkit either ignore the scroll or jump a whole page. */
-	zwlr_virtual_pointer_v1_axis_discrete(state->pointer, now_ms(state), axis,
-	                                      wl_fixed_from_double(delta), steps);
+	 * makes a toolkit either ignore the scroll or jump a whole page.
+	 *
+	 * The protocol says `axis_discrete` "allows the client to extend data
+	 * normally sent using the axis event with discrete value" — it is an
+	 * annotation on an axis event, not a substitute for one, so the continuous
+	 * half goes out first and the discrete half extends it. A compositor that
+	 * takes the pixel delta only from `axis` sees nothing at all otherwise.
+	 * They are not additive: both carry the same delta, and the discrete
+	 * request names the notch count that delta amounts to.
+	 */
+	zwlr_virtual_pointer_v1_axis(state->pointer, now_ms(state), axis,
+	                             wl_fixed_from_double(delta));
+	if (steps != 0) {
+		zwlr_virtual_pointer_v1_axis_discrete(state->pointer, now_ms(state), axis,
+		                                      wl_fixed_from_double(delta), steps);
+	}
 }
 
 bool helper_wayland_pointer_axis(helper_wayland *state, double delta_x, double delta_y,
                                  helper_error *error) {
 	if (!ensure_pointer(state, error)) return false;
 	if (delta_x == 0 && delta_y == 0) return true;
-	send_axis(state, WL_POINTER_AXIS_VERTICAL_SCROLL, clamp_scroll(delta_y));
-	send_axis(state, WL_POINTER_AXIS_HORIZONTAL_SCROLL, clamp_scroll(delta_x));
+	send_axis(state, WL_POINTER_AXIS_VERTICAL_SCROLL, clamp_scroll(delta_y),
+	          &state->axis_remainder_v);
+	send_axis(state, WL_POINTER_AXIS_HORIZONTAL_SCROLL, clamp_scroll(delta_x),
+	          &state->axis_remainder_h);
 	zwlr_virtual_pointer_v1_frame(state->pointer);
 	wl_display_flush(state->display);
 	return true;

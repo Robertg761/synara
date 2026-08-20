@@ -680,6 +680,10 @@ int main(int argc, char **argv) {
 	write_line_or_die(&ready);
 	jw_free(&ready);
 
+	/* Always holds room for a terminating NUL past `pending_length`: the JSON
+	 * reader's number scan is `strtod`, which stops at the first byte that
+	 * cannot continue a number and does not know about `length`. A request line
+	 * ending in a digit would otherwise walk off the end of the allocation. */
 	char *pending = NULL;
 	size_t pending_length = 0;
 	size_t pending_capacity = 0;
@@ -764,9 +768,10 @@ int main(int argc, char **argv) {
 				remaining -= step;
 				continue;
 			}
-			if (pending_length + take > pending_capacity) {
+			/* `+ 1` so the NUL below always has somewhere to go. */
+			if (pending_length + take + 1 > pending_capacity) {
 				size_t capacity = pending_capacity == 0 ? 65536 : pending_capacity;
-				while (capacity < pending_length + take) capacity *= 2;
+				while (capacity < pending_length + take + 1) capacity *= 2;
 				char *grown = realloc(pending, capacity);
 				if (grown == NULL) {
 					fprintf(stderr, "out of memory buffering a request\n");
@@ -782,7 +787,10 @@ int main(int argc, char **argv) {
 			cursor += step;
 			remaining -= step;
 			if (newline == NULL) break; /* the rest of this line is in the next read */
-			if (pending_length > 0) handle_line(&context, pending, pending_length);
+			if (pending_length > 0) {
+				pending[pending_length] = '\0';
+				handle_line(&context, pending, pending_length);
+			}
 			pending_length = 0;
 		}
 		if (failed) break;

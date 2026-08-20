@@ -271,6 +271,18 @@ export class GnomeShellWindowProvider implements PortalWindowProvider {
  * an unusable entry by design — a window with no id or no rect cannot be
  * addressed — but a non-empty document where *nothing* survived is a broken
  * extension, not an empty desktop, and the two must not look alike.
+ *
+ * `ComputerWindow.focused` is forced false on this provider, and that is a
+ * privacy decision rather than a simplification. Across this stack `focused`
+ * means *the agent seat's input target*: the KWin backend derives it only from
+ * the agent seat's target window, and `ComputerManager.focusedCapturableWindow`
+ * relies on that meaning for its `agentFocusOnly` guard, which stops post-action
+ * observation from photographing whatever the human is working in. The portal
+ * backend has no agent seat — input joins the human's — so no window is ever the
+ * agent's focus target here. mutter's `has_focus()` is the human's keyboard
+ * focus and is reported as `active`, which is the field that means that
+ * everywhere. Overwritten rather than trusted: an older extension that still
+ * sends `focused: true` must not be able to reintroduce the leak.
  */
 function translateWindows(payload: unknown): readonly ComputerWindow[] {
   const raw = unwrapDbusValue(payload);
@@ -286,13 +298,19 @@ function translateWindows(payload: unknown): readonly ComputerWindow[] {
   if (!Array.isArray(parsed)) {
     throw malformed("ListWindows() answered with a JSON document that is not an array of windows");
   }
-  const windows = parseWindows(parsed, null);
+  const windows = parseWindows(parsed.map(withoutAgentFocus), null);
   if (parsed.length > 0 && windows.length === 0) {
     throw malformed(
       `ListWindows() reported ${parsed.length} window(s), none of which carried a usable id and rect`,
     );
   }
   return windows;
+}
+
+/** See `translateWindows`: there is no agent-seat focus on the portal backend. */
+function withoutAgentFocus(entry: unknown): unknown {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return entry;
+  return { ...(entry as Record<string, unknown>), focused: false };
 }
 
 function unreachable(detail: string, cause?: unknown): ComputerBackendError {

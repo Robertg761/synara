@@ -168,13 +168,27 @@ export class PortalSession {
   /** A grant that existed and was taken away, which is not the same as no grant. */
   private revoked = false;
   private revokedReason: string | undefined;
+  /**
+   * Bumped by every `Closed`, including the ones `handleClosed` decides it has
+   * nothing to do about.
+   *
+   * `open()` reads it before its first call and again before it publishes the
+   * grant. A `Closed` that lands in the tail of `open()` — after `Start` was
+   * answered, while the restore token is being written — runs `handleClosed`
+   * against a session `open()` is about to overwrite: `state` goes back to
+   * `undefined` and `revoked` goes true, and then `this.state = state` puts the
+   * dead session back. `ensureOpen` returns a cached `state` without consulting
+   * `revoked`, so that session would be handed out forever while every notify
+   * on it failed. Comparing the counter across the awaits is what makes the
+   * revocation win.
+   */
+  private closedGeneration = 0;
   private disposed = false;
   private readonly subscriptions: (() => void)[] = [];
   private readonly closeListeners = new Set<(reason: string) => void>();
   private readonly selectionTransferListeners = new Set<
     (mimeType: string, serial: number) => void
   >();
-  private ownedMimeTypes: readonly string[] = [];
 
   constructor(options: PortalSessionOptions = {}) {
     this.connect = options.connect ?? (() => connectSessionPortalBus());
@@ -232,7 +246,6 @@ export class PortalSession {
     if (this.disposed) {
       throw refuse("The Synara portal session has been shut down.", false);
     }
-    if (this.state) return this.state;
     // A revoked grant refuses exactly once before it will re-open. Re-opening
     // silently would put a consent dialog in the middle of a hotkey and then
     // deliver the rest of the chord to whatever the user clicked; refusing
@@ -240,14 +253,22 @@ export class PortalSession {
     // the action that discovered the revocation, and letting the next one ask
     // again, is the only reading that keeps the session death a real kill
     // switch without making it terminal.
+    //
+    // Checked *before* the cached state, not after: a `state` that is set while
+    // `revoked` is also set is a session the desktop has already ended, and
+    // returning it would hand back a session nothing can be sent on. `open()`
+    // will not produce that combination, and this ordering is what keeps it
+    // from mattering if some other path ever does.
     if (this.revoked) {
       this.revoked = false;
+      this.state = undefined;
       throw refuse(
         this.revokedReason ??
           "The desktop ended Synara's remote-control session, so the action did not happen.",
         true,
       );
     }
+    if (this.state) return this.state;
     if (this.consent === "denied") {
       throw refuse(
         this.deniedReason ??
@@ -269,6 +290,7 @@ export class PortalSession {
   }
 
   private async open(): Promise<PortalSessionState> {
+    const generation = this.closedGeneration;
     const bus = await this.ensureBus();
     const sessionToken = portalHandleToken("synara_session");
 
@@ -402,6 +424,25 @@ export class PortalSession {
     const token = variantString(started.results.restore_token);
     if (token) await this.restoreTokens.write(this.restoreKey, token);
 
+    // The desktop can end the session between `Start` being answered and the
+    // grant being written down — a screen that locks the moment the user
+    // clicks Share is exactly that. `handleClosed` has already run by then, so
+    // publishing `state` here would resurrect a session the compositor has
+    // destroyed and cache it past every `revoked` check there is. The
+    // revocation wins, and it costs this one action, which is what a revocation
+    // costs everywhere else.
+    if (this.closedGeneration !== generation) {
+      await this.closeSession(bus, sessionHandle);
+      const reason =
+        this.revokedReason ??
+        "The desktop ended Synara's remote-control session while permission was still being set up, " +
+          "so the action did not happen. The next action will ask for permission again.";
+      // This refusal *is* the once-per-revocation refusal, so it is spent here
+      // rather than charged again to whoever calls `ensureOpen` next.
+      this.revoked = false;
+      throw refuse(reason, true);
+    }
+
     const state: PortalSessionState = {
       sessionHandle,
       devices: variantNumber(started.results.devices) ?? this.deviceTypes,
@@ -436,13 +477,15 @@ export class PortalSession {
    * permanently dead after a lunch break.
    */
   private handleClosed(reason: string): void {
+    // Bumped before the early return, so a `Closed` this method has nothing to
+    // do about still invalidates an `open()` that is in flight.
+    this.closedGeneration += 1;
     if (this.state === undefined && this.consent !== "awaiting") return;
     this.state = undefined;
     this.revoked = true;
     this.revokedReason =
       `${reason} The action did not happen. This is what a screen lock, a logout, or Stop in the ` +
       "screen-sharing indicator looks like; the next action will ask for permission again.";
-    this.ownedMimeTypes = [];
     for (const unsubscribe of this.subscriptions.splice(0)) unsubscribe();
     if (this.consent !== "denied") this.setConsent("not-requested", reason);
     for (const listener of [...this.closeListeners]) listener(reason);
@@ -631,7 +674,6 @@ export class PortalSession {
   async setSelection(mimeTypes: readonly string[]): Promise<void> {
     const state = await this.ensureOpen();
     const bus = this.requireBus();
-    this.ownedMimeTypes = [...mimeTypes];
     await bus.call({
       destination: PORTAL_BUS_NAME,
       path: PORTAL_OBJECT_PATH,
@@ -640,11 +682,6 @@ export class PortalSession {
       signature: "oa{sv}",
       body: [state.sessionHandle, { mime_types: portalStringArray(mimeTypes) }],
     });
-  }
-
-  /** The types this session last claimed, so a transfer can be answered honestly. */
-  claimedMimeTypes(): readonly string[] {
-    return this.ownedMimeTypes;
   }
 
   async onSelectionTransfer(
@@ -717,9 +754,19 @@ export class PortalSession {
    * The libei socket for this grant.
    *
    * Nothing in TypeScript can drive it: an EIS connection is a libei protocol
-   * on that descriptor, not a pipe of bytes. It exists here because the session
-   * is the only thing that can produce it, and the native input provider will
-   * need exactly this call when it is built.
+   * on that descriptor, not a pipe of bytes. It is kept — the only member of
+   * this section that is — because `docs/computer-use-tier2-plan.md` (phase B3)
+   * and `docs/computer-use-gnome-live-checklist.md` both pin it as the thing
+   * the pending GNOME live spike times libei against, and the session is the
+   * only object that can produce the fd. Input ships today through
+   * `NotifyPointer*` on this session, so nothing on the production path calls
+   * this.
+   *
+   * **fd contract: the caller owns the descriptor.** It is a real, open fd on
+   * this process, it is not tracked here, and `dispose()` will not close it —
+   * closing the bus destroys the session, not descriptors already handed out.
+   * Whoever calls this must `close()` it (or hand it to something that will) on
+   * every path, including failure, or the spike leaks one fd per attempt.
    */
   async connectToEIS(): Promise<number> {
     const state = await this.ensureOpen();
@@ -729,18 +776,6 @@ export class PortalSession {
       "oa{sv}",
       [state.sessionHandle, {}],
       "open a libei input connection",
-    );
-  }
-
-  /** The PipeWire remote for the granted streams. Same story as `connectToEIS`. */
-  async openPipeWireRemote(): Promise<number> {
-    const state = await this.ensureOpen();
-    return await this.callForFd(
-      PORTAL_SCREENCAST_INTERFACE,
-      "OpenPipeWireRemote",
-      "oa{sv}",
-      [state.sessionHandle, {}],
-      "open the PipeWire stream for this screen",
     );
   }
 

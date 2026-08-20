@@ -759,6 +759,27 @@ describe("PortalComputerBackend perception", () => {
     expect(screenshot.region).toEqual({ x: 1800, y: 1000, width: 120, height: 80 });
   });
 
+  it("falls back to the configured ceiling when maxDimension is not a number of pixels", async () => {
+    // `Math.max(1, Math.min(32768, Math.floor(NaN)))` is NaN, and it used to
+    // flow all the way into captureRegion — a request for a NaN-by-NaN image
+    // instead of a refusal or a clamp. The KWin backend guards for finiteness
+    // in `normalizeDimension`; both clamps have to agree, because a screenshot
+    // must mean the same thing on either desktop.
+    const capture = fakeCapture();
+    const backend = backendWith(providersOf({ capture: resolvedProvider(capture) }), {
+      captureMaxDimension: Number.NaN,
+    });
+    const screenshot = await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 0, y: 0, width: 1920, height: 1080 },
+      maxDimension: Number.NaN,
+    });
+
+    expect(capture.requests.at(-1)).toEqual({ x: 0, y: 0, width: 1920, height: 1080 });
+    expect(Number.isFinite(screenshot.scale)).toBe(true);
+    expect(screenshot.region).toEqual({ x: 0, y: 0, width: 1920, height: 1080 });
+  });
+
   it("refuses a region entirely off the desktop rather than returning blank pixels", async () => {
     const backend = backendWith(providersOf());
 

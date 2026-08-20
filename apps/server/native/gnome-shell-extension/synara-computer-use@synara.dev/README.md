@@ -141,7 +141,6 @@ sentence saying what went wrong. Nothing ever answers with an empty list to mean
     "minimized": false,
     "maximized": false,
     "fullscreen": false,
-    "focused": true,
     "active": true,
     "windowType": "normal",
     "monitor": 1,
@@ -165,10 +164,19 @@ sentence saying what went wrong. Nothing ever answers with an empty list to mean
   translucent or oddly shaped window above still counts. Overstating occlusion
   is the safe direction: the remedy either way is to scope the click to a
   window.
-- **`focused`/`active`** are both `has_focus()`. mutter has one focus window per
-  display, so on GNOME they cannot differ; the pair exists because on KWin they
-  can, and toolkits gate keyboard-shortcut dispatch on activation rather than on
-  focus.
+- **`active`** is `has_focus()`: mutter's single focus window, which is the
+  window the _human_ is working in.
+- **`focused` is deliberately never sent.** In Synara's window document
+  `focused` means the _agent seat's_ input target, not the desktop's keyboard
+  focus. On KWin the two are different things — the agent has its own seat — and
+  the server's post-action observation only photographs a window `focused`
+  identifies, precisely so it never captures what the human is doing. GNOME has
+  no agent seat: input comes through the RemoteDesktop portal on the human's own
+  seat, so there is no window this extension could honestly call the agent's
+  focus. Reporting `has_focus()` there would point that observation straight at
+  the human's window. The server also forces the field to `false` on this
+  provider, so an older extension that still sends it cannot reintroduce the
+  leak.
 - Override-redirect surfaces (menus, tooltips, drag icons) are excluded. They
   cannot be activated, raised, or closed, and listing windows the other methods
   refuse would be a window model that lies about itself.

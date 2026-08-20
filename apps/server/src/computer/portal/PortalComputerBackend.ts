@@ -188,13 +188,7 @@ export class PortalComputerBackend implements ComputerBackend {
     this.resolveApp = options.resolveApp ?? resolveAppLaunchOnHost;
     this.glideDurationMs = Math.max(0, options.glideDurationMs ?? DEFAULT_GLIDE_DURATION_MS);
     this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
-    this.captureMaxDimension = Math.max(
-      1,
-      Math.min(
-        32_768,
-        Math.floor(options.captureMaxDimension ?? DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION),
-      ),
-    );
+    this.captureMaxDimension = normalizeDimension(options.captureMaxDimension);
     this.consent =
       options.consent ?? (options.probe.portal.present ? "not-requested" : "not-required");
     this.capabilitySet = capabilitiesFromProviders(options.providers);
@@ -372,10 +366,7 @@ export class PortalComputerBackend implements ComputerBackend {
   async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
     this.throwIfDisposed();
     this.primeSeatArbiterOnce();
-    const maxDimension = Math.max(
-      1,
-      Math.min(32_768, Math.floor(request.maxDimension ?? this.captureMaxDimension)),
-    );
+    const maxDimension = normalizeDimension(request.maxDimension, this.captureMaxDimension);
     if (request.kind === "window") {
       const windows = await this.listWindows();
       const window = windows.find((candidate) => candidate.id === request.windowId);
@@ -976,6 +967,25 @@ function describeSlot(capability: string, slot: ProviderSlot<unknown>): string |
  */
 function clampClipboard(text: string): string {
   return clampUtf8Bytes(text, MAX_COMPUTER_CLIPBOARD_BYTES);
+}
+
+/**
+ * A capture ceiling that is a real number of pixels.
+ *
+ * The finite check is the load-bearing half. `maxDimension` reaches here from a
+ * tool call, and `Math.max(1, Math.min(32768, Math.floor(NaN)))` is `NaN`, which
+ * then flows into `captureRegion` as a scale factor and produces a request for a
+ * NaN-by-NaN image rather than a refusal. The same normalisation exists as
+ * `normalizeDimension` on the KWin backend; the two clamps must agree, because
+ * a screenshot has to mean the same thing on both.
+ */
+function normalizeDimension(
+  value: number | undefined,
+  fallback: number = DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
+): number {
+  const requested = value ?? fallback;
+  if (!Number.isFinite(requested)) return fallback;
+  return Math.max(1, Math.min(32_768, Math.floor(requested)));
 }
 
 function delay(milliseconds: number): Promise<void> {

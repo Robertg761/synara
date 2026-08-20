@@ -290,13 +290,46 @@ static json_value *json_parse_value(json_parser *parser) {
 	if (json_literal(parser, "null")) {
 		return json_new(JSON_NULL);
 	}
-	char *end = NULL;
-	double number = strtod(parser->text + parser->offset, &end);
-	if (end == parser->text + parser->offset) {
+	/*
+	 * The number is copied out before `strtod` sees it. `strtod` stops at the
+	 * first byte that cannot continue a number and knows nothing about
+	 * `length`, so handing it `text + offset` directly reads past the end of a
+	 * buffer whose last byte is a digit — the exact shape of a request line
+	 * ending in a coordinate. Every other reader here is bounded by `length`,
+	 * and this is the one that was not.
+	 */
+	size_t start = parser->offset;
+	size_t scan = start;
+	if (scan < parser->length && (parser->text[scan] == '-' || parser->text[scan] == '+')) scan++;
+	while (scan < parser->length) {
+		char digit = parser->text[scan];
+		bool numeric = (digit >= '0' && digit <= '9') || digit == '.' || digit == 'e' ||
+		               digit == 'E' || digit == '+' || digit == '-';
+		if (!numeric) break;
+		scan++;
+	}
+	char token[512];
+	size_t span = scan - start;
+	if (span == 0) {
 		json_fail(parser, "expected a value");
 		return NULL;
 	}
-	parser->offset = (size_t)(end - parser->text);
+	if (span >= sizeof(token)) {
+		json_fail(parser, "number is too long");
+		return NULL;
+	}
+	memcpy(token, parser->text + start, span);
+	token[span] = '\0';
+	char *end = NULL;
+	double number = strtod(token, &end);
+	/* `strtod` is the real parser; the scan above only bounds it, so a token
+	 * like `1-2` stops after `1` here and the trailing content is caught by
+	 * whoever asked for the value. */
+	if (end == token) {
+		json_fail(parser, "expected a value");
+		return NULL;
+	}
+	parser->offset = start + (size_t)(end - token);
 	json_value *value = json_new(JSON_NUMBER);
 	if (value == NULL) return NULL;
 	value->number = number;

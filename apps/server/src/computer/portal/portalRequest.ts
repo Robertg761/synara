@@ -83,6 +83,15 @@ export async function callPortalRequest(
     settle = (response) => resolve(response);
     fail = reject;
   });
+  // `answered` is rejected from callbacks, not from the await below, and two of
+  // those callbacks can fire before anything is waiting on it: `onDisconnected`
+  // calls back synchronously on a bus that is already dead, and `bus.call` then
+  // throws on the same failure, so the `return await answered` that would have
+  // observed the rejection is never reached. An unobserved rejection is a
+  // process-level `unhandledRejection`, which is the whole server going down
+  // because a desktop bus dropped. The handler makes the rejection observed
+  // exactly once here; every real consumer still awaits `answered` itself.
+  answered.catch(() => undefined);
 
   const unsubscribe = await bus.subscribe(
     { path: requestPath, interface: PORTAL_REQUEST_INTERFACE, member: "Response" },
