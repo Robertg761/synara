@@ -1,0 +1,65 @@
+import { Effect } from "effect";
+import { describe, expect, it } from "vitest";
+
+import { FakeComputerBackend } from "../FakeComputerBackend.ts";
+import { ComputerService, type ComputerServiceShape } from "../Services/ComputerService.ts";
+import { makeComputerServiceLayer } from "./ComputerService.ts";
+
+/** Builds the service exactly as the server does, then runs `body` against it. */
+async function withComputerService(
+  backend: FakeComputerBackend,
+  body: (service: ComputerServiceShape) => Promise<void>,
+): Promise<void> {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ComputerService;
+        yield* Effect.promise(() => body(service));
+      }).pipe(Effect.provide(makeComputerServiceLayer({ backend }))),
+    ),
+  );
+}
+
+describe("ComputerServiceLive", () => {
+  /**
+   * The regression this pins is a cold KDE machine having its compositor
+   * provisioned by the act of starting the server. Boot decides availability
+   * from the passive probe, and seeding a thread's panel — which the web
+   * composer does for every ordinary chat — must not upgrade that to the
+   * establishing read either.
+   */
+  it("boots and seeds a thread without ever asking the backend for the desktop", async () => {
+    const backend = new FakeComputerBackend();
+
+    await withComputerService(backend, async (service) => {
+      expect(service.supported).toBe(true);
+      expect(service.availability).toEqual({ kind: "available", backend: "fake" });
+      expect(backend.calls.map((call) => call.method)).toEqual(["probeAvailability"]);
+
+      const seeded = await service.manager.getThreadState("thread-boot");
+      expect(seeded.availability).toEqual({ kind: "available", backend: "fake" });
+      expect(seeded.windows).toEqual([]);
+      expect(backend.calls.map((call) => call.method)).toEqual([
+        "probeAvailability",
+        "probeAvailability",
+      ]);
+    });
+  });
+
+  it("keeps the configured override ahead of both reads", async () => {
+    const backend = new FakeComputerBackend();
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const service = yield* ComputerService;
+          expect(service.supported).toBe(false);
+          expect(service.availability).toMatchObject({ kind: "backend-unavailable" });
+          // An operator switching the feature off is not a question for the
+          // desktop, so neither read runs at all.
+          expect(backend.calls).toEqual([]);
+        }).pipe(Effect.provide(makeComputerServiceLayer({ backend, supported: false }))),
+      ),
+    );
+  });
+});

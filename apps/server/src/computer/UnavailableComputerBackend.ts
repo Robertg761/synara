@@ -56,6 +56,11 @@ export class UnavailableComputerBackend implements ComputerBackend {
     return Promise.resolve({ kind: "backend-unavailable", message: this.message });
   }
 
+  /** The failure is already known and already free to read, so both agree. */
+  probeAvailability(): Promise<ComputerAvailability> {
+    return this.availability();
+  }
+
   health(): ComputerHealth {
     return {
       status: "unavailable",

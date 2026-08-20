@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 
 import type { ProviderKind } from "@synara/contracts";
 
-import { MAX_COMPUTER_CLIPBOARD_BYTES } from "../computer/ComputerBackend.ts";
+import {
+  COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+  MAX_COMPUTER_CLIPBOARD_BYTES,
+} from "../computer/ComputerBackend.ts";
 import { ComputerManager } from "../computer/ComputerManager.ts";
 import { FakeComputerBackend } from "../computer/FakeComputerBackend.ts";
 import {
@@ -391,6 +394,8 @@ describe("agent gateway computer tools", () => {
     expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
       kind: "window",
       windowId: "fake-terminal",
+      // Action observations spend a smaller pixel budget than perception ones.
+      maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
     });
   });
 
@@ -406,6 +411,8 @@ describe("agent gateway computer tools", () => {
     expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
       kind: "window",
       windowId: "fake-calculator",
+      // Action observations spend a smaller pixel budget than perception ones.
+      maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
     });
   });
 
@@ -461,6 +468,8 @@ describe("agent gateway computer tools", () => {
     expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
       kind: "window",
       windowId: "fake-calculator",
+      // Action observations spend a smaller pixel budget than perception ones.
+      maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
     });
 
     // The camel-case spelling works here for the same reason it does on targets.
@@ -489,6 +498,44 @@ describe("agent gateway computer tools", () => {
     // perception call the attached screenshot exists to remove.
     const schema = JSON.stringify(byName.get("computer_click")?.definition.inputSchema);
     expect(schema).toContain("Never pass false on the last action");
+  });
+
+  it("reports an unchanged screen instead of resending the identical image", async () => {
+    const { backend, call } = await setup();
+
+    const first = await call("computer_press_key", { key: "enter" });
+    expect(first.content.map((entry) => entry.type)).toEqual(["text", "image"]);
+
+    // The fake returns the same PNG for the same window, which is the live case
+    // this exists for: an action the desktop did not visibly react to. Sending
+    // the identical picture again costs a second copy of the same image tokens
+    // and tells the model nothing it is not already looking at.
+    const repeat = await call("computer_press_key", { key: "enter" });
+    expect(repeat.isError).not.toBe(true);
+    expect(repeat.content.map((entry) => entry.type)).toEqual(["text"]);
+    expect(resultJson(repeat)).toMatchObject({
+      action: "computer_press_key",
+      screenshotUnchanged: true,
+      note: expect.stringContaining("has not changed since your previous screenshot"),
+    });
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(2);
+
+    // A different window is a different picture, however identical its pixels.
+    const other = await call("computer_press_key", { key: "enter", window_id: "fake-calculator" });
+    expect(other.content.map((entry) => entry.type)).toEqual(["text", "image"]);
+  });
+
+  it("tells the model the observation is downscaled and what unchanged means", async () => {
+    const { byName } = await setup();
+    const description = byName.get("computer_click")?.definition.description ?? "";
+
+    expect(description).toContain(
+      `downscaled to at most ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION}`,
+    );
+    // Knowing where the detail went is the difference between zooming in and
+    // concluding the label is unreadable.
+    expect(description).toContain("computer_screenshot");
+    expect(description).toContain("screenshotUnchanged");
   });
 
   it("keeps a successful action result when the post-action capture fails", async () => {

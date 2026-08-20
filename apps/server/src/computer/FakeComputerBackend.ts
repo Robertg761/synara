@@ -117,6 +117,17 @@ export class FakeComputerBackend implements ComputerBackend {
     return this.currentAvailability;
   }
 
+  /**
+   * Recorded under its own name so a test can prove which of the two a caller
+   * used: the whole point of the passive probe is that the paths which must not
+   * touch the display server can be shown not to.
+   */
+  async probeAvailability(): Promise<ComputerAvailability> {
+    this.record("probeAvailability");
+    this.throwIfFailed("probeAvailability");
+    return this.currentAvailability;
+  }
+
   /** Not recorded as a call: reading health is a getter, not a backend operation. */
   health(): ComputerHealth {
     return this.currentHealth;

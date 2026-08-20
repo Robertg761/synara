@@ -61,15 +61,20 @@ import {
 import { ComputerHealthState } from "./computerHealthState.ts";
 import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./sharedSeatArbiter.ts";
 import {
+  COMPUTER_SERVICE,
   createSessionKWinComputerDbus,
+  KWIN_SERVICE,
   KWinDbusTimeoutError,
   type KWinComputerDbus,
   type KWinComputerPluginApi,
 } from "./kwinDbus.ts";
+import { sessionBusNameHasOwner } from "./sessionBusNames.ts";
 import { EVDEV_BUTTON_CODES, keyStrokeForKey, qwertyTextKeyStrokes } from "./evdevInput.ts";
 import {
   provisionKWinPlugin,
+  readPrebuiltManifest,
   resolveInstallTarget,
+  selectPrebuilt,
   type ProvisionResult,
 } from "./kwinPluginProvisioning.ts";
 import {
@@ -121,6 +126,26 @@ const HUMAN_ACTIVE_ERROR_TYPE = "org.synara.ComputerUse.Error.HumanActive";
 const MIN_HUMAN_ACTIVE_GUARD_MS = 100;
 const MAX_HUMAN_ACTIVE_GUARD_MS = 60 * 1_000;
 const INSTALL_SCRIPT_PATH = "apps/server/native/computer-use-kwin/scripts/install-and-load.sh";
+/** Said the same way by the passive probe and the establishing availability read. */
+const WAYLAND_REQUIRED_MESSAGE = "Linux computer control requires a Wayland session.";
+const NO_KWIN_MESSAGE =
+  "No KWin compositor is answering on the session bus, so there is no KDE desktop to drive.";
+const NO_PLUGIN_ANYWHERE_MESSAGE =
+  "KWin is running, but this machine has no Synara computer-use plugin: none is installed, none of " +
+  "the bundled builds matches the running KWin, and the cmake and KWin development headers needed " +
+  `to build one are not present. Install them, or build the plugin with ${INSTALL_SCRIPT_PATH}.`;
+/**
+ * Where a distribution puts `find_package(KWin)`'s config file, which is the
+ * one part of the development headers a source build cannot do without. The
+ * lib64/lib split and the Debian multiarch directories are packaging choices,
+ * so all of them are probed rather than derived.
+ */
+const KWIN_CMAKE_CONFIG_PATHS = [
+  "/usr/lib64/cmake/KWin/KWinConfig.cmake",
+  "/usr/lib/cmake/KWin/KWinConfig.cmake",
+  "/usr/lib/x86_64-linux-gnu/cmake/KWin/KWinConfig.cmake",
+  "/usr/lib/aarch64-linux-gnu/cmake/KWin/KWinConfig.cmake",
+] as const;
 const ENABLE_REBUILD_SCRIPT_PATH = "apps/server/native/computer-use-kwin/systemd/enable.sh";
 const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
 const KWIN_VERSION_PROBE_TIMEOUT_MS = 2_000;
@@ -168,6 +193,17 @@ export interface KWinComputerBackendOptions {
   readonly atspi?: AtspiTreeReader;
   readonly installedPluginIds?: () => Promise<readonly string[]>;
   readonly pluginDirectories?: readonly string[];
+  /**
+   * "Is anyone answering to this bus name?", for the passive probe only. A
+   * backend bound to a private bus (the nested Tier 3 session) answers yes
+   * without asking, because that session's compositor and plugin were started
+   * by this process and the ambient session bus knows nothing about either.
+   */
+  readonly busNameHasOwner?: (name: string) => Promise<boolean>;
+  /** Where the shipped plugin binaries live; probed for a version match. */
+  readonly prebuiltRoot?: () => string | undefined;
+  /** Whether this machine could build the plugin from source if it had to. */
+  readonly buildToolingPresent?: () => boolean;
   readonly platform?: string;
   readonly sessionType?: string;
   readonly now?: () => number;
@@ -237,6 +273,9 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly atspi: AtspiTreeReader;
   private readonly dbusFactory: () => Promise<KWinComputerDbus>;
   private readonly installedPluginIds: () => Promise<readonly string[]>;
+  private readonly busNameHasOwner: (name: string) => Promise<boolean>;
+  private readonly prebuiltRoot: () => string | undefined;
+  private readonly buildToolingPresent: () => boolean;
   private readonly readInstallStamp: () => Promise<string | undefined>;
   private readonly runningKwinVersion: () => Promise<string | undefined>;
   private runningKwinVersionPromise: Promise<string | undefined> | undefined;
@@ -324,6 +363,11 @@ export class KWinComputerBackend implements ComputerBackend {
     this.installedPluginIds =
       options.installedPluginIds ??
       (() => scanInstalledPluginIds(options.pluginDirectories ?? defaultPluginDirectories()));
+    this.busNameHasOwner =
+      options.busNameHasOwner ??
+      (options.busAddress ? async () => true : (name) => sessionBusNameHasOwner(name));
+    this.prebuiltRoot = options.prebuiltRoot ?? (() => prebuiltPluginRoot());
+    this.buildToolingPresent = options.buildToolingPresent ?? localBuildToolingPresent;
     this.readInstallStamp =
       options.readInstallStamp ??
       (() => readInstallStamp(options.installStampPath ?? defaultInstallStampPath()));
@@ -387,15 +431,78 @@ export class KWinComputerBackend implements ComputerBackend {
     };
   }
 
+  /**
+   * "Could this machine drive KWin?", answered without touching the compositor.
+   *
+   * Nothing here connects to the plugin, installs anything, or loads anything:
+   * the whole probe is the platform gate, two `NameHasOwner` questions on a
+   * connection that does not outlive them, and reads of the filesystem. That
+   * matters because this runs at boot and on every thread the UI renders, and
+   * `availability()` — which provisions, compiles on a cold machine, and loads
+   * a module into the live compositor — used to run there instead.
+   *
+   * The four ways to be available are four ways of saying "a plugin exists or
+   * could exist": one is already answering on the bus, one is installed on
+   * disk, one ships with the app for exactly this KWin, or this machine can
+   * compile one. A yes that turns out to be wrong costs the first real use one
+   * error card, which is the same card provisioning already produces; a no
+   * costs the user the feature, so the trade only runs one way.
+   */
+  async probeAvailability(): Promise<ComputerAvailability> {
+    if (this.platform !== "linux") {
+      return { kind: "unsupported-platform", platform: this.platform };
+    }
+    if (this.sessionType.toLowerCase() !== "wayland") {
+      return { kind: "backend-unavailable", message: WAYLAND_REQUIRED_MESSAGE };
+    }
+    if (!(await this.nameHasOwner(KWIN_SERVICE))) {
+      return { kind: "backend-unavailable", message: NO_KWIN_MESSAGE };
+    }
+    // Ordered by cost. A loaded plugin and an installed file are a bus round
+    // trip and a directory read; the prebuilt match runs `kwin_wayland
+    // --version`, so it only happens on a machine that has neither.
+    if (await this.nameHasOwner(COMPUTER_SERVICE)) return this.availableNow();
+    if ((await this.installedPluginIds().catch(() => [])).length > 0) return this.availableNow();
+    if (await this.hasMatchingPrebuilt()) return this.availableNow();
+    if (this.probeBuildTooling()) return this.availableNow();
+    return { kind: "backend-unavailable", message: NO_PLUGIN_ANYWHERE_MESSAGE };
+  }
+
+  private availableNow(): ComputerAvailability {
+    return { kind: "available", backend: COMPUTER_KWIN_BACKEND };
+  }
+
+  /** A probe never fails: an unanswerable question is a "no", not an error. */
+  private async nameHasOwner(name: string): Promise<boolean> {
+    return await this.busNameHasOwner(name).catch(() => false);
+  }
+
+  /** Whether a shipped binary was built for exactly the KWin running here. */
+  private async hasMatchingPrebuilt(): Promise<boolean> {
+    const root = this.prebuiltRoot();
+    if (!root) return false;
+    const [manifest, version] = await Promise.all([
+      readPrebuiltManifest(join(root, "manifest.json")).catch(() => undefined),
+      this.probeRunningKwinVersion(),
+    ]);
+    if (!manifest || !version) return false;
+    return selectPrebuilt(manifest, version, process.arch) !== undefined;
+  }
+
+  private probeBuildTooling(): boolean {
+    try {
+      return this.buildToolingPresent();
+    } catch {
+      return false;
+    }
+  }
+
   async availability(): Promise<ComputerAvailability> {
     if (this.platform !== "linux") {
       return { kind: "unsupported-platform", platform: this.platform };
     }
     if (this.sessionType.toLowerCase() !== "wayland") {
-      return {
-        kind: "backend-unavailable",
-        message: "Linux computer control requires a Wayland session.",
-      };
+      return { kind: "backend-unavailable", message: WAYLAND_REQUIRED_MESSAGE };
     }
     try {
       const plugin = await this.ensurePlugin({ start: false });
@@ -1599,6 +1706,28 @@ export function prebuiltPluginRoot(
     join(moduleDirectory, "..", "..", "native", "computer-use-kwin", "prebuilt"),
   ];
   return candidates.find(hasManifest);
+}
+
+/**
+ * Whether this machine could compile the plugin, decided by the two things a
+ * source build cannot proceed without: cmake on the path, and KWin's own cmake
+ * config file, which is the marker for the development headers.
+ *
+ * Deliberately not a build attempt, and deliberately not exhaustive — Qt, KF6,
+ * ECM and ninja are all needed too. This runs inside a probe that must stay
+ * free, and its only job is to tell "a machine where turning computer use on
+ * will plausibly work" from "a machine with no compiler in sight". The install
+ * script does the real check, with a message per missing package.
+ */
+export function localBuildToolingPresent(
+  exists: (path: string) => boolean = existsSync,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!KWIN_CMAKE_CONFIG_PATHS.some((path) => exists(path))) return false;
+  return (env.PATH ?? "")
+    .split(":")
+    .filter(Boolean)
+    .some((directory) => exists(join(directory, "cmake")));
 }
 
 async function listPluginFiles(directories: readonly string[]): Promise<readonly string[]> {

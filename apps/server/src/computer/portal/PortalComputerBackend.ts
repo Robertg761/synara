@@ -239,6 +239,17 @@ export class PortalComputerBackend implements ComputerBackend {
     return this.plan;
   }
 
+  /**
+   * The portal backend's availability is already the passive answer: it reads
+   * the desktop probe taken at construction and the provider plan derived from
+   * it, and starts no session, opens no dialog, and spawns no helper. So the
+   * two are the same call rather than a second implementation that could drift
+   * from the first.
+   */
+  probeAvailability(): Promise<ComputerAvailability> {
+    return this.availability();
+  }
+
   async availability(): Promise<ComputerAvailability> {
     if (this.platform !== "linux") {
       return { kind: "unsupported-platform", platform: this.platform };

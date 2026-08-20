@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   ComputerId,
   ComputerPoint,
@@ -24,6 +26,7 @@ import { FrameTransport, type FrameSink } from "@synara/shared/frameTransport";
 
 import {
   clampComputerMessage,
+  COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
   computerBackendActionResult,
   ComputerBackendError,
   type ComputerBackend,
@@ -145,15 +148,25 @@ export interface ComputerCapturedWindow {
 }
 
 /**
- * Post-action perception: the capture, or the discovery that the acted-on
- * window no longer exists. The disappearance is a result in its own right —
+ * Post-action perception: the capture, the discovery that the acted-on window
+ * no longer exists, or the discovery that its pixels are byte-for-byte what the
+ * caller was shown last time. The disappearance is a result in its own right —
  * usually meaning the action closed the window — never a cue to photograph
  * whatever window happens to hold focus instead, which on a live desktop is
- * the human's.
+ * the human's. An unchanged screen is a result too, and a far cheaper one to
+ * report than an identical image the caller already has in front of it.
  */
 export type ComputerActionObservation =
   | ComputerCapturedWindow
-  | { readonly targetWindowClosed: true };
+  | { readonly targetWindowClosed: true }
+  | { readonly screenshotUnchanged: true; readonly windowId?: string };
+
+/** The last observation handed out, identified so nothing else is compared to it. */
+interface ActionObservationMemory {
+  /** The window or region the pixels covered; a different one is never a repeat. */
+  readonly key: string;
+  readonly hash: string;
+}
 
 /**
  * Refusal raised when another thread owns the desktop. It extends
@@ -213,6 +226,19 @@ export class ComputerManager {
    */
   private readonly backendCapabilities: ComputerCapabilities;
   private lease: DesktopLease | null = null;
+  /**
+   * Whether anything has yet asked this backend for the desktop itself.
+   *
+   * Until something has, the manager must not: on KWin, the first backend call
+   * connects to the compositor, installs the plugin — building it from source
+   * on a machine that has never had it — and loads it into the running session.
+   * That is the right price for an agent's first tool call, a pane the user
+   * opened, or input they sent; it is the wrong price for rendering a chat,
+   * which is what seeds thread state. So state publishes read the passive probe
+   * until a real use flips this, and behave exactly as they always did after.
+   */
+  private backendEngaged = false;
+  private lastActionObservation: ActionObservationMemory | undefined;
   private streamAttached = false;
   private streamDesired = false;
   private streamEpoch = 0;
@@ -266,7 +292,25 @@ export class ComputerManager {
     return () => this.listeners.delete(listener);
   }
 
+  /**
+   * Marks the desktop as wanted, and repaints every panel once it is.
+   *
+   * Called by every path that is about to use the backend for a real reason —
+   * an agent tool call, a pane attach, pane input — and by nothing else. The
+   * republish is what keeps the pane honest: before this point its snapshot
+   * carries no windows and a placeholder screen size, and the frames that are
+   * about to arrive are letterboxed against exactly that size. It runs detached
+   * because the caller is on its way to the compositor and must not wait for a
+   * window enumeration to finish first.
+   */
+  private engageBackend(): void {
+    if (this.backendEngaged || this.disposed) return;
+    this.backendEngaged = true;
+    void this.publishAllThreads().catch(() => undefined);
+  }
+
   async availability(): Promise<ComputerAvailability> {
+    this.engageBackend();
     return await this.backend.availability();
   }
 
@@ -278,9 +322,17 @@ export class ComputerManager {
    * answer it.
    */
   async getStatus(): Promise<ComputerStatusResult> {
+    // Asked by the settings screen. Once something real has engaged the
+    // backend it gets the establishing read, because the screen exists to
+    // report what the desktop really is — but merely opening settings must
+    // not be the thing that installs and loads compositor code on a machine
+    // where nothing has ever used the feature, so before first engagement it
+    // answers from the side-effect-free probe.
     let availability: ComputerAvailability;
     try {
-      availability = await this.backend.availability();
+      availability = this.backendEngaged
+        ? await this.backend.availability()
+        : await this.backend.probeAvailability();
     } catch (error) {
       availability = { kind: "backend-unavailable", message: errorMessage(error) };
     }
@@ -293,6 +345,7 @@ export class ComputerManager {
   }
 
   async listWindows(): Promise<ComputerListWindowsResult> {
+    this.engageBackend();
     const [availability, windows] = await Promise.all([
       this.backend.availability(),
       this.backend.listWindows(),
@@ -306,11 +359,13 @@ export class ComputerManager {
       readonly includeText?: boolean;
     } = {},
   ): Promise<ComputerState> {
+    this.engageBackend();
     return await this.backend.getState(options);
   }
 
   /** Zoomed capture of one window or desktop region, with its pixel mapping. */
   async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
+    this.engageBackend();
     return await this.backend.captureScreenshot(request);
   }
 
@@ -325,6 +380,7 @@ export class ComputerManager {
     maxDimension?: number,
     options: { readonly agentFocusOnly?: boolean } = {},
   ): Promise<ComputerCapturedWindow> {
+    this.engageBackend();
     const limit = maxDimension === undefined ? {} : { maxDimension };
     const window = await this.focusedCapturableWindow(options.agentFocusOnly === true);
     if (window) {
@@ -367,18 +423,20 @@ export class ComputerManager {
     windowIdHint?: string,
   ): Promise<ComputerActionObservation | undefined> {
     if (!this.backendCapabilities.capture) return undefined;
+    this.engageBackend();
     if (this.actionSettleMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.actionSettleMs));
     }
     if (windowIdHint !== undefined) {
       try {
-        return {
+        return this.observeCapture({
           screenshot: await this.backend.captureScreenshot({
             kind: "window",
             windowId: windowIdHint,
+            maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
           }),
           windowId: windowIdHint,
-        };
+        });
       } catch {
         try {
           const stillListed = (await this.backend.listWindows()).some(
@@ -392,10 +450,55 @@ export class ComputerManager {
       }
     }
     try {
-      return await this.captureFocusedWindow(undefined, { agentFocusOnly: true });
+      return this.observeCapture(
+        await this.captureFocusedWindow(COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION, {
+          agentFocusOnly: true,
+        }),
+      );
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * The capture, or the news that it is the same picture as last time.
+   *
+   * A desktop that did not visibly react to an action produces a PNG identical
+   * to the one the caller is already looking at, and sending it again costs a
+   * second copy of the same image tokens to convey nothing. Byte equality is
+   * the whole test: it cannot be wrong about "nothing changed", where a
+   * threshold on similarity could be.
+   *
+   * Scoped to what the pixels cover, so a different window or a different
+   * region is never compared against them — two windows can be equally blank,
+   * and reporting the second as unchanged would hide the first sight of it.
+   */
+  private observeCapture(capture: ComputerCapturedWindow): ComputerActionObservation {
+    const region = capture.screenshot.region;
+    const key =
+      capture.windowId !== undefined
+        ? `window:${capture.windowId}`
+        : region
+          ? `region:${region.x},${region.y},${region.width}x${region.height}`
+          : undefined;
+    if (key === undefined) {
+      // Pixels that say nothing about what they cover cannot be compared: two
+      // unrelated captures would look like a repeat of each other.
+      this.lastActionObservation = undefined;
+      return capture;
+    }
+    const hash = createHash("sha256").update(capture.screenshot.bytesBase64).digest("hex");
+    const previous = this.lastActionObservation;
+    if (previous?.key === key && previous.hash === hash) {
+      return {
+        screenshotUnchanged: true,
+        ...(capture.windowId !== undefined ? { windowId: capture.windowId } : {}),
+      };
+    }
+    // Reset to what is being handed over: the memory tracks the last image the
+    // caller actually received, which is the only thing a repeat can repeat.
+    this.lastActionObservation = { key, hash };
+    return capture;
   }
 
   /**
@@ -425,6 +528,7 @@ export class ComputerManager {
   }
 
   async getScreenSize(): Promise<ComputerGetScreenSizeResult> {
+    this.engageBackend();
     const [availability, screenSize] = await Promise.all([
       this.backend.availability(),
       this.backend.getScreenSize(),
@@ -716,6 +820,10 @@ export class ComputerManager {
    * neither takes the lease nor is ever refused by it.
    */
   private async claimDesktopControl(threadId: string | undefined): Promise<void> {
+    // Before the early return, not after it: pane input belongs to no thread and
+    // takes no lease, but it is still the human asking this backend to drive
+    // their desktop, which is exactly what engagement means.
+    this.engageBackend();
     const owner = agentThreadId(threadId);
     if (owner === undefined) return;
     const now = this.now();
@@ -803,6 +911,9 @@ export class ComputerManager {
   }
 
   subscribeFrames(sink: FrameSink): () => void {
+    // A pane attach is a user asking to watch the desktop, which is a real use:
+    // the stream cannot exist without a connected backend anyway.
+    this.engageBackend();
     const unsubscribe = this.transport.subscribe(this.computerId, sink);
     this.streamDesired = true;
     this.streamEpoch += 1;
@@ -1175,15 +1286,27 @@ export class ComputerManager {
     if (!state) return undefined;
     if (increment) state.version += 1;
     try {
-      const [availability, windows, screenSize] = await Promise.all([
-        this.backend.availability(),
-        this.backend.listWindows(),
-        this.backend.getScreenSize(),
-      ]);
-      if (this.disposed || this.threads.get(threadId) !== state) return undefined;
-      state.availability = availability;
-      state.windows = windows;
-      state.screenSize = screenSize;
+      if (this.backendEngaged) {
+        const [availability, windows, screenSize] = await Promise.all([
+          this.backend.availability(),
+          this.backend.listWindows(),
+          this.backend.getScreenSize(),
+        ]);
+        if (this.disposed || this.threads.get(threadId) !== state) return undefined;
+        state.availability = availability;
+        state.windows = windows;
+        state.screenSize = screenSize;
+      } else {
+        // Nothing has asked for the desktop yet, so nothing here may reach for
+        // it: the probe answers whether the feature could work, and the windows
+        // and screen size stay at whatever the last pass cached — empty and a
+        // placeholder on a backend that has never connected. A panel showing no
+        // windows before anyone opened it is right; provisioning a compositor
+        // plugin to fill that list in would not be.
+        const availability = await this.backend.probeAvailability();
+        if (this.disposed || this.threads.get(threadId) !== state) return undefined;
+        state.availability = availability;
+      }
       state.lastError = null;
     } catch (error) {
       state.lastError = errorMessage(error);
@@ -1293,6 +1416,11 @@ export class ComputerManager {
    * one thing the user can act on behind a badge that says to give up.
    */
   private correctedAvailability(availability: ComputerAvailability): ComputerAvailability {
+    // A backend nobody has asked to connect is not disconnected, it is idle, and
+    // health says "unavailable" for both. Correcting against it before the first
+    // real use would report every KDE desktop as broken until someone clicked
+    // something — the exact opposite of what the probe is there to say.
+    if (!this.backendEngaged) return availability;
     if (
       this.backendHealth.status === "connected" ||
       this.backendHealth.status === "awaiting-consent" ||

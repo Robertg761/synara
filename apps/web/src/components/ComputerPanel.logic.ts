@@ -126,6 +126,13 @@ export function resolveComputerHealthBadge(
 ): ComputerHealthBadge | null {
   if (!health || health.status === "connected") return null;
   const reconnecting = health.status === "reconnecting";
+  // A backend that has never connected AND never failed is not broken — it is
+  // lazy. The server no longer connects at boot, so the first snapshot a pane
+  // sees carries non-connected health with a clean record; opening the pane is
+  // itself what engages the backend, and a real failure arrives with a
+  // lastFailure to show. Badging the lazy state would flash "Desktop
+  // unavailable" at every pane open on a perfectly healthy desktop.
+  if (!reconnecting && health.consecutiveFailures === 0 && !health.lastFailure) return null;
   return {
     label: reconnecting ? "Reconnecting to desktop" : "Desktop unavailable",
     title: computerHealthDetail(health),

@@ -57,7 +57,13 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
       yield* Effect.addFinalizer(() => Effect.promise(() => manager.dispose()));
       let availability: ComputerAvailability;
       if (options.supported === undefined) {
-        availability = yield* Effect.promise(() => backend.availability());
+        // The passive probe, never the establishing read. Boot runs for every
+        // user of every build, and `availability()` on KWin connects, installs
+        // the plugin — compiling it from source on a cold machine — and loads
+        // it into the live compositor. Nobody has asked for a desktop yet at
+        // this point, so nothing may be done to theirs; the first real use is
+        // what provisions, and it reports its own failure if it cannot.
+        availability = yield* Effect.promise(() => backend.probeAvailability());
       } else if (options.supported) {
         availability = { kind: "available", backend: "test-override" };
       } else {
@@ -68,7 +74,8 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
       }
       return {
         // The backend performs the complete Linux gate: Linux, Wayland, a
-        // reachable KWin user bus, and a loaded or installed plugin.
+        // reachable KWin user bus, and a plugin that is loaded, installed,
+        // shipped for this KWin, or buildable here.
         supported: options.supported ?? availability?.kind === "available",
         availability,
         manager,

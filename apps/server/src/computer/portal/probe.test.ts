@@ -1,3 +1,7 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -31,6 +35,7 @@ function desktop(
     readonly helper?: boolean;
     readonly commands?: readonly string[];
     readonly busError?: string;
+    readonly prebuiltRoot?: string;
   } = {},
 ): PortalProbeDependencies {
   const names = new Set(options.names ?? []);
@@ -53,6 +58,9 @@ function desktop(
         : Promise.resolve(options.globals ?? []),
     executableExists: () => Promise.resolve(options.helper === true),
     commandExists: (command) => Promise.resolve(commands.has(command)),
+    // Pinned at a directory that cannot exist, so no test here depends on
+    // whether the checkout it runs in happens to have prebuilt helpers in it.
+    prebuiltRoot: options.prebuiltRoot ?? join(tmpdir(), "synara-no-prebuilt-helpers"),
   };
 }
 
@@ -130,6 +138,43 @@ describe("probeDesktop", () => {
     expect(messages.portal).toContain("xdg-desktop-portal");
     expect(messages["wl-clipboard"]).toContain("wl-clipboard");
     expect(messages["desktop-helper"]).toContain("SYNARA_COMPUTER_HELPER");
+  });
+
+  it("keeps the build.sh refusal word for word and adds why no shipped binary was used", async () => {
+    const probe = await probeDesktop(desktop({ env: { XDG_SESSION_TYPE: "wayland" } }));
+    const message = probe.gaps.find((gap) => gap.step === "desktop-helper")?.message ?? "";
+
+    // The sentence a user acts on has not moved: the note is an addition to it,
+    // never a replacement for it.
+    expect(message).toContain("The native desktop helper is not built at");
+    expect(message).toContain(
+      "Build it with the computer-desktop-helper target, or point SYNARA_COMPUTER_HELPER at an existing build.",
+    );
+    expect(message).toContain("No prebuilt helpers ship with this build");
+  });
+
+  it("says which system a shipped binary would have had to be built for", async () => {
+    const root = await mkdtemp(join(tmpdir(), "synara-helper-prebuilt-"));
+    await writeFile(
+      join(root, "manifest.json"),
+      JSON.stringify({
+        builds: [
+          {
+            osId: "a-distribution-nobody-runs",
+            osVersionId: "1",
+            arch: "x64",
+            file: "synara-computer-desktop-helper-a-distribution-nobody-runs-1-x64",
+            sha256: "00",
+          },
+        ],
+      }),
+    );
+
+    const probe = await probeDesktop(desktop({ prebuiltRoot: root }));
+    const message = probe.gaps.find((gap) => gap.step === "desktop-helper")?.message ?? "";
+
+    expect(message).toContain("for this system");
+    expect(probe.helperBinary).toBeUndefined();
   });
 
   it("reports an X11 session as the wrong session type, with the nested escape hatch", async () => {

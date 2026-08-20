@@ -10,6 +10,7 @@ import type {
 
 import { ComputerTargetError } from "../computer/uiTreeTargeting.ts";
 import {
+  COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   MAX_COMPUTER_CAPTURE_MAX_DIMENSION,
   MAX_COMPUTER_CLIPBOARD_BYTES,
@@ -130,8 +131,13 @@ const POINTER_COORDINATE_NOTE =
  * Every mutating action carries its own after-screenshot so the model can act
  * on the result directly instead of spending a separate perception round trip
  * — the see-act loop is one model turn per action, not two.
+ *
+ * It says the observation is downscaled, and where to get more detail, because
+ * an action screenshot spends a smaller pixel budget than a perception one: an
+ * agent that cannot read a label in it must know the answer is one
+ * `computer_screenshot` away rather than that the label is unreadable.
  */
-const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected (or the whole workspace when no window has focus); ${SCREENSHOT_MAPPING_NOTE}. Read the next state from that screenshot instead of making a separate screenshot call. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
+const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected (or the whole workspace when no window has focus) and downscaled to at most ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side; ${SCREENSHOT_MAPPING_NOTE}. Read the next state from that screenshot instead of making a separate screenshot call, and call computer_screenshot only when this one is too small to read the detail you need. When the new capture is identical to the one the previous action returned, the result reports screenshotUnchanged instead of repeating the image: the screen has not changed since your previous screenshot, so keep reading that one. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
 
 const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
   include_screenshot: {
@@ -489,6 +495,13 @@ export function makeAgentGatewayComputerTools(
         ...result,
         targetWindowClosed: true,
         note: "The window this action targeted no longer exists — the action likely closed it, so no post-action screenshot was taken. Use computer_list_windows or computer_get_state to see the desktop now.",
+      };
+    }
+    if ("screenshotUnchanged" in capture) {
+      return {
+        ...result,
+        screenshotUnchanged: true,
+        note: "The screen has not changed since your previous screenshot, pixel for pixel, so the identical image was not sent again. Keep reading the previous one. If you expected this action to change something, it did not land — check the window is focused and not covered, or that the control is where you aimed.",
       };
     }
     const { bytesBase64, ...metadata } = capture.screenshot;

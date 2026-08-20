@@ -156,8 +156,17 @@ describe("computer panel state helpers", () => {
     expect(reconnecting?.title).toContain("3");
     expect(reconnecting?.title).toContain("Reconnects since startup: 1.");
 
+    // Non-connected with a clean record is the lazy backend that has simply
+    // never been engaged — the server no longer connects at boot — and must
+    // not flash "unavailable" at every pane open on a healthy desktop.
+    expect(resolveComputerHealthBadge({ ...connectedHealth(), status: "unavailable" })).toBeNull();
     expect(
-      resolveComputerHealthBadge({ ...connectedHealth(), status: "unavailable" }),
+      resolveComputerHealthBadge({
+        ...connectedHealth(),
+        status: "unavailable",
+        consecutiveFailures: 1,
+        lastFailure: { message: "plugin load refused", at: "2026-08-20T10:00:00.000Z" },
+      }),
     ).toMatchObject({ label: "Desktop unavailable", tone: "danger", pulse: false });
   });
 

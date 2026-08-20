@@ -10,6 +10,7 @@ import type { ComputerHealth, ComputerWindow } from "@synara/contracts";
 
 import {
   KWinComputerBackend,
+  localBuildToolingPresent,
   newestPluginId,
   prebuiltPluginRoot,
   resolveInstallScriptPath,
@@ -18,7 +19,12 @@ import {
 import { MAX_COMPUTER_CLIPBOARD_BYTES, type ComputerResolvedTarget } from "./ComputerBackend.ts";
 import type { ClipboardCommandResult, ClipboardCommandSpec } from "./wlClipboard.ts";
 import type { AtspiTextWrite, AtspiTreeReader } from "./atspiClient.ts";
-import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
+import {
+  COMPUTER_SERVICE,
+  KWIN_SERVICE,
+  type KWinComputerDbus,
+  type KWinComputerPluginApi,
+} from "./kwinDbus.ts";
 import { GLIDE_FRAME_INTERVAL_MS } from "./pointerSequencing.ts";
 
 const PNG_1X1 = Uint8Array.from(
@@ -238,8 +244,10 @@ function makeBackend(
     ...options,
     dbus,
     atspi: options.atspi ?? atspi,
-    platform: "linux",
-    sessionType: "wayland",
+    // Linux and Wayland unless a test is specifically about the platform gate,
+    // so the suite runs identically on a developer's machine and in CI.
+    platform: options.platform ?? "linux",
+    sessionType: options.sessionType ?? "wayland",
     installedPluginIds:
       options.installedPluginIds ??
       (async () => ["SynaraComputerUsePluginV2", "SynaraComputerUsePluginV10"]),
@@ -250,6 +258,12 @@ function makeBackend(
     // Never let a test read the real installer stamp or spawn kwin_wayland.
     installStampPath: options.installStampPath ?? join(tmpdir(), "synara-absent-install.stamp"),
     runningKwinVersion: options.runningKwinVersion ?? (async () => undefined),
+    // The passive probe's three host reads, all stubbed by default: a test must
+    // never ask the developer's own session bus, find the repository's shipped
+    // binaries, or answer differently on a machine that has cmake installed.
+    busNameHasOwner: options.busNameHasOwner ?? (async () => false),
+    prebuiltRoot: options.prebuiltRoot ?? (() => undefined),
+    buildToolingPresent: options.buildToolingPresent ?? (() => false),
     // Provisioning compiles a KWin plugin and writes it into the developer's own
     // home directory, so no test gets the real one by omission.
     provisionPlugin:
@@ -375,6 +389,169 @@ describe("newestPluginId", () => {
       "SynaraComputerUsePluginV10",
     );
     expect(newestPluginId(["OtherPlugin"])).toBeUndefined();
+  });
+});
+
+describe("localBuildToolingPresent", () => {
+  it("needs both KWin's cmake config and a cmake on the path", () => {
+    const present = new Set(["/usr/lib64/cmake/KWin/KWinConfig.cmake", "/usr/bin/cmake"]);
+    const exists = (path: string) => present.has(path);
+    const env = { PATH: "/usr/local/bin:/usr/bin" };
+
+    expect(localBuildToolingPresent(exists, env)).toBe(true);
+    // The headers without a compiler, and the compiler without the headers,
+    // are both machines where a source build would fail — and reporting one as
+    // buildable would trade a truthful "not available" for a broken toggle.
+    expect(localBuildToolingPresent(exists, { PATH: "/opt/bin" })).toBe(false);
+    expect(localBuildToolingPresent((path) => path === "/usr/bin/cmake", env)).toBe(false);
+  });
+});
+
+/**
+ * Boot and every rendered chat run this, so its whole contract is that it costs
+ * the user's desktop nothing: the compositor is not connected to, no plugin is
+ * installed, and nothing is loaded. `dbus.calls` staying empty is that contract.
+ */
+describe("KWinComputerBackend passive probe", () => {
+  const prebuiltManifest = async (kwinVersion: string): Promise<string> => {
+    const directory = await mkdtemp(join(tmpdir(), "synara-prebuilt-"));
+    await writeFile(
+      join(directory, "manifest.json"),
+      JSON.stringify({
+        builds: [{ kwinVersion, arch: process.arch, file: "plugin.so", sha256: "0".repeat(64) }],
+      }),
+    );
+    return directory;
+  };
+
+  it("is available when the plugin is already answering, and touches nothing", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, {
+      busNameHasOwner: async (name) => name === KWIN_SERVICE || name === COMPUTER_SERVICE,
+      installedPluginIds: async () => [],
+    });
+
+    await expect(backend.probeAvailability()).resolves.toEqual({
+      kind: "available",
+      backend: "kwin",
+    });
+    expect(dbus.calls).toEqual([]);
+    expect(dbus.plugin.calls).toEqual([]);
+    await backend.dispose();
+  });
+
+  it("is available from an installed plugin file alone", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, {
+      busNameHasOwner: async (name) => name === KWIN_SERVICE,
+      installedPluginIds: async () => ["SynaraComputerUsePluginV10"],
+    });
+
+    await expect(backend.probeAvailability()).resolves.toMatchObject({ kind: "available" });
+    expect(dbus.calls).toEqual([]);
+    await backend.dispose();
+  });
+
+  it("is available when a shipped build matches the running KWin exactly", async () => {
+    const root = await prebuiltManifest("6.7.3");
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, {
+      busNameHasOwner: async (name) => name === KWIN_SERVICE,
+      installedPluginIds: async () => [],
+      prebuiltRoot: () => root,
+      runningKwinVersion: async () => "6.7.3",
+    });
+
+    await expect(backend.probeAvailability()).resolves.toMatchObject({ kind: "available" });
+
+    // A near miss is a miss, here as everywhere else: KWin refuses a binary
+    // built for another version, so promising one would be a broken toggle.
+    const mismatched = makeBackend(new FakeDbus(), {
+      busNameHasOwner: async (name) => name === KWIN_SERVICE,
+      installedPluginIds: async () => [],
+      prebuiltRoot: () => root,
+      runningKwinVersion: async () => "6.8.0",
+    });
+    await expect(mismatched.probeAvailability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+    });
+
+    await backend.dispose();
+    await mismatched.dispose();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("is available when this machine could build the plugin itself", async () => {
+    const backend = makeBackend(new FakeDbus(), {
+      busNameHasOwner: async (name) => name === KWIN_SERVICE,
+      installedPluginIds: async () => [],
+      buildToolingPresent: () => true,
+    });
+
+    await expect(backend.probeAvailability()).resolves.toMatchObject({ kind: "available" });
+    await backend.dispose();
+  });
+
+  it("reports the platform, the session, and a missing compositor without asking further", async () => {
+    const notLinux = makeBackend(new FakeDbus(), { platform: "darwin" });
+    await expect(notLinux.probeAvailability()).resolves.toEqual({
+      kind: "unsupported-platform",
+      platform: "darwin",
+    });
+
+    const notWayland = makeBackend(new FakeDbus(), { sessionType: "x11" });
+    await expect(notWayland.probeAvailability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("Wayland session"),
+    });
+
+    const noKwin = makeBackend(new FakeDbus(), {
+      busNameHasOwner: async () => false,
+      installedPluginIds: async () => {
+        throw new Error("the plugin scan must not run without a compositor");
+      },
+    });
+    await expect(noKwin.probeAvailability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("No KWin compositor"),
+    });
+
+    await Promise.all([notLinux.dispose(), notWayland.dispose(), noKwin.dispose()]);
+  });
+
+  it("refuses rather than provisioning when no plugin exists and none could be made", async () => {
+    const dbus = new FakeDbus();
+    const provisionPlugin = vi.fn(async () => {
+      throw new Error("provisioning must never run from a probe");
+    });
+    const backend = makeBackend(dbus, {
+      busNameHasOwner: async (name) => name === KWIN_SERVICE,
+      installedPluginIds: async () => [],
+      provisionPlugin,
+    });
+
+    await expect(backend.probeAvailability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("Synara computer-use plugin"),
+    });
+    expect(provisionPlugin).not.toHaveBeenCalled();
+    expect(dbus.calls).toEqual([]);
+    await backend.dispose();
+  });
+
+  it("survives a session bus that cannot be reached at all", async () => {
+    const backend = makeBackend(new FakeDbus(), {
+      busNameHasOwner: async () => {
+        throw new Error("no session bus");
+      },
+    });
+
+    // A probe answers the question or answers "no"; it never fails the boot
+    // that is waiting on it.
+    await expect(backend.probeAvailability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+    });
+    await backend.dispose();
   });
 });
 

@@ -2,15 +2,19 @@
  * What this desktop can be driven with, established without touching it.
  *
  * The probe is the first thing Tier 2 does and the only thing it is allowed to
- * do unasked, so it is held to two rules. It is **side-effect free**: it reads
- * environment variables, asks the session bus which names are owned, reads two
- * properties, enumerates Wayland globals on a throwaway connection, and stats a
- * file. It never opens a portal session — a `RemoteDesktop.CreateSession` puts
- * a consent dialog on the user's screen, and a dialog nobody asked for at
- * server boot is exactly the behavior the "never at boot, never at probe" rule
- * exists to prevent. And it **never throws**: every step that fails becomes a
- * recorded gap, because a probe that rejects turns one missing package into a
- * backend that cannot explain itself.
+ * do unasked, so it is held to two rules. It **touches nothing the user can
+ * see**: it reads environment variables, asks the session bus which names are
+ * owned, reads two properties, enumerates Wayland globals on a throwaway
+ * connection, and stats a file. It never opens a portal session — a
+ * `RemoteDesktop.CreateSession` puts a consent dialog on the user's screen, and
+ * a dialog nobody asked for at server boot is exactly the behavior the "never
+ * at boot, never at probe" rule exists to prevent. The single write it may
+ * perform is installing a helper binary that shipped with this build into the
+ * user's own data directory, which puts nothing on screen, contacts no
+ * compositor, and is what turns "run this build script" into a working desktop
+ * — see `desktopHelperInstall.ts`. And it **never throws**: every step that
+ * fails becomes a recorded gap, because a probe that rejects turns one missing
+ * package into a backend that cannot explain itself.
  *
  * The output is a decision table, not a backend. `planPortalProviders` turns it
  * into a provider choice per capability, and that pair is what the unit tests
@@ -24,7 +28,18 @@ import { KWIN_SERVICE } from "../kwinDbus.ts";
 import { readSessionBusProperty, sessionBusNameHasOwner } from "../sessionBusNames.ts";
 import { unwrapDbusValue } from "../computerGeometry.ts";
 import { readWaylandGlobals } from "./desktopHelperClient.ts";
+import {
+  desktopHelperPath,
+  resolveDesktopHelper,
+  type DesktopHelperResolution,
+} from "./desktopHelperInstall.ts";
 import type { PortalCapabilitySlot, PortalProviderId } from "./providers.ts";
+
+/**
+ * Re-exported because the helper's location is the probe's answer to every
+ * caller that asks, and one definition of it is the point.
+ */
+export { desktopHelperPath } from "./desktopHelperInstall.ts";
 
 /** Bus name of the portal front-end every portal backend registers behind. */
 export const PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop";
@@ -121,6 +136,12 @@ export interface PortalProbeDependencies {
   readonly executableExists?: (path: string) => Promise<boolean>;
   /** Whether a bare command name resolves on `PATH`. */
   readonly commandExists?: (command: string) => Promise<boolean>;
+  /**
+   * Where the helper binaries shipped with this build live. Given explicitly it
+   * is the only place looked at, which is how a test stays off whatever the
+   * machine running it happens to have packaged.
+   */
+  readonly prebuiltRoot?: string | undefined;
 }
 
 /**
@@ -222,10 +243,35 @@ export async function probeDesktop(
     );
   }
 
+  // Resolved before the globals are read, not after: the resolution is what may
+  // install a shipped binary, and a global list read without one is an empty
+  // list that would plan every wlroots capability away until the next boot.
+  const helperPath = desktopHelperPath(env);
+  const helper = await resolveDesktopHelper({
+    env,
+    ...(dependencies.executableExists ? { executableExists: dependencies.executableExists } : {}),
+    ...("prebuiltRoot" in dependencies ? { prebuiltRoot: dependencies.prebuiltRoot } : {}),
+  }).catch(
+    (error: unknown): DesktopHelperResolution => ({
+      note: `A binary shipped with this build could not be checked (${describe(error)}).`,
+    }),
+  );
+  const helperBinary = helper.path;
+  if (!helperBinary) {
+    record(
+      "desktop-helper",
+      `The native desktop helper is not built at ${helperPath}, so libei input, PipeWire capture, and the wlroots protocols have no transport. ` +
+        "Build it with the computer-desktop-helper target, or point SYNARA_COMPUTER_HELPER at an existing build." +
+        (helper.note ? ` ${helper.note}` : ""),
+    );
+  }
+
   let waylandGlobals: readonly string[] | undefined;
   if (sessionType === "wayland") {
     try {
-      waylandGlobals = await (dependencies.waylandGlobals ?? (() => defaultWaylandGlobals(env)))();
+      waylandGlobals = await (
+        dependencies.waylandGlobals ?? (() => defaultWaylandGlobals(helperBinary, env))
+      )();
     } catch (error) {
       record(
         "wayland-globals",
@@ -233,17 +279,6 @@ export async function probeDesktop(
           "This is expected when the native desktop helper is not built; see apps/server/native/computer-desktop-helper.",
       );
     }
-  }
-
-  const executableExists = dependencies.executableExists ?? defaultExecutableExists;
-  const helperPath = desktopHelperPath(env);
-  const helperBinary = (await executableExists(helperPath)) ? helperPath : undefined;
-  if (!helperBinary) {
-    record(
-      "desktop-helper",
-      `The native desktop helper is not built at ${helperPath}, so libei input, PipeWire capture, and the wlroots protocols have no transport. ` +
-        "Build it with the computer-desktop-helper target, or point SYNARA_COMPUTER_HELPER at an existing build.",
-    );
   }
 
   const commandExists = dependencies.commandExists ?? defaultCommandExists;
@@ -519,21 +554,6 @@ export function readSessionType(env: NodeJS.ProcessEnv): string {
   return env.WAYLAND_DISPLAY ? "wayland" : "";
 }
 
-/**
- * Where the native desktop helper lives. `SYNARA_COMPUTER_HELPER` overrides it
- * so a developer build and a packaged one are the same code path.
- */
-export function desktopHelperPath(env: NodeJS.ProcessEnv = process.env): string {
-  const override = env.SYNARA_COMPUTER_HELPER?.trim();
-  if (override) return override;
-  return join(
-    env.XDG_DATA_HOME?.trim() || join(env.HOME ?? "", ".local", "share"),
-    "synara",
-    "computer",
-    "synara-computer-desktop-helper",
-  );
-}
-
 function defaultReadPortalProperty(interfaceName: string, propertyName: string): Promise<unknown> {
   return readSessionBusProperty({
     busName: PORTAL_BUS_NAME,
@@ -554,11 +574,14 @@ function defaultReadPortalProperty(interfaceName: string, propertyName: string):
  * the helper is not built is the honest answer — it is what makes every wlroots
  * capability report "not built" rather than "your desktop cannot do this".
  */
-async function defaultWaylandGlobals(env: NodeJS.ProcessEnv): Promise<readonly string[]> {
-  const command = desktopHelperPath(env);
-  if (!(await defaultExecutableExists(command))) {
+async function defaultWaylandGlobals(
+  command: string | undefined,
+  env: NodeJS.ProcessEnv,
+): Promise<readonly string[]> {
+  if (command === undefined) {
     throw new Error(
-      `the native desktop helper, which owns the Wayland connection, is not built at ${command}`,
+      "the native desktop helper, which owns the Wayland connection, is not built at " +
+        desktopHelperPath(env),
     );
   }
   return await readWaylandGlobals({ command, env });

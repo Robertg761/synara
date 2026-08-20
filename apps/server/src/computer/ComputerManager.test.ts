@@ -71,7 +71,11 @@ describe("ComputerManager and FakeComputerBackend", () => {
     const initial = await manager.getThreadState("thread-1");
     expect(initial.threadId).toBe("thread-1");
     expect(initial.version).toBe(0);
-    expect(initial.windows.map((window) => window.title)).toEqual(["Terminal", "Calculator"]);
+    // Seeding a panel is not a use of the desktop, so it costs the desktop
+    // nothing: the passive probe answers whether the feature works, and the
+    // window list stays empty until something really asks for the backend.
+    expect(initial.windows).toEqual([]);
+    expect(backend.calls.map((call) => call.method)).toEqual(["probeAvailability"]);
     expect(initial.availability).toEqual({ kind: "available", backend: "fake" });
 
     const result = await manager.withAgentActivity("thread-1", async () => {
@@ -111,6 +115,9 @@ describe("ComputerManager and FakeComputerBackend", () => {
     manager.onEvent((event) => {
       if (event.type === "computer.thread-state") states.push(event.state);
     });
+    // Health only corrects the availability of a backend something has actually
+    // asked for; before that there is nothing to be disconnected from.
+    await manager.listWindows();
     const seeded = await Promise.all([
       manager.getThreadState("thread-a"),
       manager.getThreadState("thread-b"),
@@ -167,8 +174,16 @@ describe("ComputerManager and FakeComputerBackend", () => {
     expect(status.availability).toEqual({ kind: "available", backend: "fake" });
     expect(status.health.status).toBe("connected");
     expect(status.capabilities.input).toBe(true);
-    // No thread state was created as a side effect of asking.
+    // No thread state was created as a side effect of asking, and merely
+    // opening settings must not be the thing that establishes (and on a cold
+    // KDE machine, provisions) the backend: pre-engagement it is the probe.
     expect(backend.calls.map((call) => call.method)).not.toContain("getState");
+    expect(backend.calls.map((call) => call.method)).toContain("probeAvailability");
+    expect(backend.calls.map((call) => call.method)).not.toContain("availability");
+
+    // Health corrections only apply once something real engaged the backend —
+    // supervision cannot report on connections that were never made.
+    await manager.listWindows();
 
     backend.emitHealthChanged({
       status: "reconnecting",
@@ -191,11 +206,21 @@ describe("ComputerManager and FakeComputerBackend", () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });
 
-    backend.failNext("availability", new Error("probe exploded"));
+    // Both reads degrade the same way: the pre-engagement probe and the
+    // establishing read a live backend answers with.
+    backend.failNext("probeAvailability", new Error("probe exploded"));
     const status = await manager.getStatus();
     expect(status.availability).toMatchObject({
       kind: "backend-unavailable",
       message: expect.stringContaining("probe exploded"),
+    });
+
+    await manager.listWindows();
+    backend.failNext("availability", new Error("live read exploded"));
+    const engaged = await manager.getStatus();
+    expect(engaged.availability).toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("live read exploded"),
     });
 
     await manager.dispose();
@@ -762,6 +787,10 @@ describe("ComputerManager and FakeComputerBackend", () => {
   it("coalesces a burst of window changes into a single publish pass", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend, windowsPublishDebounceMs: 5 });
+    // The churn this coalesces comes from a live backend, which by definition
+    // something has already used. Engaging before either thread exists keeps the
+    // republish that engagement triggers out of the count below.
+    await manager.listWindows();
     await manager.getThreadState("thread-a");
     await manager.getThreadState("thread-b");
 
@@ -1077,6 +1106,167 @@ describe("ComputerManager and FakeComputerBackend", () => {
 
     expect(await manager.captureActionScreenshot("fake-terminal")).toBeUndefined();
     expect(backend.callsFor("captureScreenshot")).toHaveLength(0);
+
+    await manager.dispose();
+  });
+
+  /**
+   * On KWin the first backend call installs a compositor plugin — compiling it
+   * on a machine that has never had one — and loads it into the live session.
+   * Panels are seeded for every chat the web app renders, so the seeding path
+   * must stay passive, and the first real use is what pays.
+   */
+  it("seeds panels from the passive probe, and goes live from the first real use", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    const states: ThreadComputerState[] = [];
+    manager.onEvent((event) => {
+      if (event.type === "computer.thread-state") states.push(event.state);
+    });
+
+    const seeded = await manager.getThreadState("thread-1");
+    expect(seeded.availability).toEqual({ kind: "available", backend: "fake" });
+    expect(seeded.windows).toEqual([]);
+    expect(seeded.screenSize).toEqual({ width: 1, height: 1 });
+    expect(backend.calls.map((call) => call.method)).toEqual(["probeAvailability"]);
+
+    // The panel is asked again and again while the chat is open; none of that
+    // reaches the desktop either.
+    await manager.getThreadState("thread-1");
+    await manager.getThreadState("thread-2");
+    expect(backend.calls.map((call) => call.method)).toEqual([
+      "probeAvailability",
+      "probeAvailability",
+      "probeAvailability",
+    ]);
+
+    // One agent tool call, and every panel gets the real desktop.
+    await manager.withAgentActivity("thread-1", () => manager.listWindows());
+    const live = await manager.getThreadState("thread-1");
+    expect(live.windows.map((window) => window.title)).toEqual(["Terminal", "Calculator"]);
+    expect(live.screenSize).toEqual({ width: 1_920, height: 1_080, scale: 1 });
+    expect(backend.callsFor("availability").length).toBeGreaterThan(0);
+    // The engagement republish reaches the thread nobody acted in, too.
+    expect(states.findLast((state) => state.threadId === "thread-2")?.windows).toHaveLength(2);
+
+    await manager.dispose();
+  });
+
+  it("engages the backend when the pane attaches or the human drives it", async () => {
+    const paneBackend = new FakeComputerBackend();
+    const paneManager = new ComputerManager({ backend: paneBackend });
+    const sink = new RecordingSink();
+    const detach = paneManager.subscribeFrames(sink);
+    await paneManager.flushStreamTransitions();
+    expect(paneBackend.callsFor("attachStream")).toHaveLength(1);
+    expect((await paneManager.getThreadState("thread-pane")).windows).toHaveLength(2);
+    detach();
+    await paneManager.dispose();
+
+    // Pane input carries no thread and takes no lease, and is still the human
+    // asking this backend to drive their desktop.
+    const inputBackend = new FakeComputerBackend();
+    const inputManager = new ComputerManager({ backend: inputBackend });
+    await inputManager.click(undefined, { x: 10, y: 10 });
+    expect((await inputManager.getThreadState("thread-pane")).windows).toHaveLength(2);
+    await inputManager.dispose();
+  });
+
+  /**
+   * Image tokens scale with pixel area, and a mutating action attaches a shot
+   * every time, so the observation spends a quarter of the perception budget.
+   * The mapping metadata is what keeps that free: the agent converts pixels to
+   * desktop coordinates through region and scale either way.
+   */
+  it("downscales action observations while keeping the coordinate mapping exact", async () => {
+    const backend = new FakeComputerBackend({
+      screenSize: { width: 2_048, height: 1_536, scale: 1 },
+      windows: [
+        {
+          id: "fake-editor",
+          title: "Editor",
+          bounds: { x: 100, y: 100, width: 1_280, height: 1_396 },
+          focused: true,
+          minimized: false,
+          visible: true,
+        },
+      ],
+    });
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    const observed = await manager.captureActionScreenshot("fake-editor");
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-editor",
+      maxDimension: 1_024,
+    });
+    if (observed === undefined || !("screenshot" in observed)) {
+      throw new Error("the action observation carried no screenshot");
+    }
+    const { region, scale, width, height } = observed.screenshot;
+    // 1396 logical pixels down to 1024 image pixels, and the region still names
+    // the window's own rect, so screenshot (x, y) maps back exactly.
+    expect(scale).toBeCloseTo(1_024 / 1_396, 10);
+    expect(region).toEqual({ x: 100, y: 100, width: 1_280, height: 1_396 });
+    // The middle of the image is still the middle of the window: region.x +
+    // screenshot_x / scale, the mapping every computer tool describes.
+    if (region === undefined || scale === undefined) throw new Error("no coordinate mapping");
+    expect(region.x + width / 2 / scale).toBeCloseTo(region.x + region.width / 2, 0);
+    expect(region.y + height / 2 / scale).toBeCloseTo(region.y + region.height / 2, 0);
+
+    // Perception keeps the full budget: zooming back in is how the agent reads
+    // detail the observation lost.
+    await manager.captureFocusedWindow();
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-editor",
+    });
+
+    await manager.dispose();
+  });
+
+  it("reports an unchanged screen instead of resending identical pixels", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    const first = await manager.captureActionScreenshot("fake-terminal");
+    expect(first !== undefined && "screenshot" in first).toBe(true);
+
+    // The fake returns the same PNG every time, which is exactly the live case
+    // this exists for: an action the desktop did not visibly react to.
+    expect(await manager.captureActionScreenshot("fake-terminal")).toEqual({
+      screenshotUnchanged: true,
+      windowId: "fake-terminal",
+    });
+    // The capture still happens — the only thing skipped is sending the bytes.
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(2);
+
+    // Another window's identical pixels are not a repeat: this is the caller's
+    // first sight of that window.
+    const other = await manager.captureActionScreenshot("fake-calculator");
+    expect(other !== undefined && "screenshot" in other).toBe(true);
+    // And the memory follows the last image handed over, so the terminal is
+    // sent again rather than reported as unchanged against the calculator.
+    const back = await manager.captureActionScreenshot("fake-terminal");
+    expect(back !== undefined && "screenshot" in back).toBe(true);
+
+    await manager.dispose();
+  });
+
+  it("never reports an unchanged screen across different regions", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    // Nothing holds the agent's focus, so observation falls back to the whole
+    // workspace, and the region is what identifies it.
+    backend.emitWindowsChanged([]);
+
+    const first = await manager.captureActionScreenshot();
+    expect(first !== undefined && "screenshot" in first).toBe(true);
+    expect(await manager.captureActionScreenshot()).toEqual({ screenshotUnchanged: true });
+
+    backend.setScreenSize({ width: 1_280, height: 720, scale: 1 });
+    const resized = await manager.captureActionScreenshot();
+    expect(resized !== undefined && "screenshot" in resized).toBe(true);
 
     await manager.dispose();
   });

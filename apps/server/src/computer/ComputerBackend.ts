@@ -18,6 +18,18 @@ import {
 
 /** Longest screenshot side in pixels before a capture is downscaled. */
 export const DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION = 2_048;
+/**
+ * The budget a post-action observation spends, rather than the perception one.
+ *
+ * Image tokens scale with pixel area — roughly `width * height / 750` — so a
+ * full-resolution window shot attached to every mutating action costs about
+ * 2,400 tokens per step of a loop that runs one action per turn. Halving each
+ * side is a quarter of the tokens, and it is still enough to see what the click
+ * did; when it is not, `computer_screenshot` zooms back in at the perception
+ * budget, and the `region`/`scale` mapping is identical either way, so the
+ * agent's coordinate skill transfers between them unchanged.
+ */
+export const COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION = 1_024;
 /** Native per-side image limit enforced by the KWin capture path. */
 export const MAX_COMPUTER_CAPTURE_MAX_DIMENSION = 16_384;
 /**
@@ -117,6 +129,30 @@ export const NO_COMPUTER_CAPABILITIES: ComputerCapabilities = {
 /** Provider-side contract shared by real display backends and the CI fake. */
 export interface ComputerBackend {
   readonly computerId: ComputerId;
+  /**
+   * Whether this host could drive a desktop, answered without doing anything to
+   * it. Side-effect-free by contract: no session is started, nothing is
+   * installed, nothing is loaded into a compositor, and no connection outlives
+   * the call — the most a backend may spend is the cheap questions a desktop
+   * answers for free, such as who owns a bus name and what is on disk.
+   *
+   * This is what boot and the UI's thread-state seeding read, because both run
+   * for every user on every launch, long before anyone has asked for a desktop.
+   * `availability()` is the opposite trade: it establishes the real thing and
+   * reports what actually happened, so it belongs only on paths that were about
+   * to use the desktop anyway.
+   *
+   * Optimism is the intended failure mode. A probe that says "available" and
+   * then cannot provision costs the caller one actionable error card at first
+   * use; a probe that says "unavailable" because it refused to look costs the
+   * user the feature.
+   */
+  probeAvailability(): Promise<ComputerAvailability>;
+  /**
+   * Availability as established, not as guessed: this may connect, install, and
+   * load whatever the backend needs, so it belongs on paths that are about to
+   * use the desktop. See `probeAvailability` for the passive counterpart.
+   */
   availability(): Promise<ComputerAvailability>;
   /**
    * Live supervision health. Synchronous and side-effect free on purpose: it
