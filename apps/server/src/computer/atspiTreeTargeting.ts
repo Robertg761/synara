@@ -1,13 +1,32 @@
-import type {
-  ComputerPoint,
-  ComputerRect,
-  ComputerScreenSize,
-  ComputerUiNode,
-  ComputerWindow,
-  ComputerWindowId,
+import {
+  COMPUTER_TEXT_MAX_LENGTH,
+  type ComputerPoint,
+  type ComputerRect,
+  type ComputerScreenSize,
+  type ComputerUiNode,
+  type ComputerWindow,
+  type ComputerWindowId,
 } from "@synara/contracts";
 
 import { requireWindowBounds } from "./computerGeometry.ts";
+
+/**
+ * The bounds `ComputerUiNode` is encoded against. An accessible name is whatever
+ * the application put there — a toolkit that labels a paragraph widget with its
+ * entire text, or a document title that is a full sentence per line — and
+ * nothing between the toolkit and the schema caps it. Copying one through
+ * verbatim fails the encode of the whole tree, which takes `computer.getState`
+ * down over a single oversized label somewhere on the desktop.
+ *
+ * Mirrored rather than imported because the contracts package exports the text
+ * bound and keeps the label one private; they are checked against each other in
+ * this module's tests.
+ */
+const NODE_ROLE_MAX_LENGTH = 128;
+const NODE_LABEL_MAX_LENGTH = 1_024;
+const NODE_TEXT_MAX_LENGTH = COMPUTER_TEXT_MAX_LENGTH;
+/** Says the text was cut, and is itself counted against the cap. */
+const TRUNCATION_MARKER = "…";
 
 /** The small, serializable subset returned by the AT-SPI helper. */
 export interface AtspiRawNode {
@@ -168,10 +187,10 @@ function fuseNode(
       }
     : null;
   return {
-    role: node.role,
-    label: node.label,
-    value: node.value,
-    description: node.description,
+    role: clampNodeText(node.role, NODE_ROLE_MAX_LENGTH),
+    label: clampNullableNodeText(node.label, NODE_LABEL_MAX_LENGTH),
+    value: clampNullableNodeText(node.value, NODE_TEXT_MAX_LENGTH),
+    description: clampNullableNodeText(node.description, NODE_TEXT_MAX_LENGTH),
     frame,
     activationPoint,
     onScreen: isOnScreen(frame, input.screenSize),
@@ -180,6 +199,26 @@ function fuseNode(
     ...(node.editable === true ? { editable: true } : {}),
     children: node.children.map((child) => fuseNode(child, input)),
   };
+}
+
+/**
+ * `text` cut to `maxLength` characters with a marker in place of the tail, so a
+ * truncated label reads as truncated rather than as a different control.
+ *
+ * The cut never lands between the halves of a surrogate pair: one half on its
+ * own decodes to a replacement character, which would put a symbol in the label
+ * that the application never displayed.
+ */
+export function clampNodeText(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  let cut = maxLength - TRUNCATION_MARKER.length;
+  const code = cut > 0 ? text.charCodeAt(cut - 1) : 0;
+  if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+  return `${text.slice(0, Math.max(0, cut))}${TRUNCATION_MARKER}`;
+}
+
+function clampNullableNodeText(text: string | null | undefined, maxLength: number): string | null {
+  return text === null || text === undefined ? null : clampNodeText(text, maxLength);
 }
 
 function isOnScreen(frame: ComputerRect, screenSize: ComputerScreenSize | undefined): boolean {

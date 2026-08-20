@@ -33,6 +33,26 @@ export interface AtspiTextWrite {
   readonly label?: string | null;
 }
 
+/**
+ * The helper answering "no", as opposed to the helper being gone.
+ *
+ * A JSON-RPC error envelope is a well-formed response from a live process: a
+ * window that closed while its tree was being walked, an unknown method on an
+ * older helper build. Killing the process over one turns every routine
+ * semantic-target miss into a respawn and ratchets the reconnect backoff to five
+ * seconds, so the next few perception requests are slow for no reason. The
+ * portal's desktopHelperClient draws the same line for the same reason.
+ */
+class AtspiHelperMethodError extends Error {
+  readonly code: number | undefined;
+
+  constructor(message: string, code?: number) {
+    super(message);
+    this.name = "AtspiHelperMethodError";
+    this.code = code;
+  }
+}
+
 export interface AtspiTreeReader {
   readonly readTrees: (windows: readonly ComputerWindow[]) => Promise<readonly AtspiWindowTree[]>;
   /** Resolves `false` when the helper refused the write; rejects when it failed. */
@@ -129,6 +149,12 @@ export class AtspiHelperClient implements AtspiTreeReader {
       this.reconnectFailures = 0;
       return result;
     } catch (error) {
+      // The peer answered, so the transport is healthy and the backoff is
+      // cleared exactly as it would be for a success. Only the request failed.
+      if (error instanceof AtspiHelperMethodError) {
+        this.reconnectFailures = 0;
+        throw error;
+      }
       this.resetProcess(error instanceof Error ? error : new Error(String(error)));
       throw error;
     }
@@ -178,9 +204,13 @@ export class AtspiHelperClient implements AtspiTreeReader {
     this.registry = new JsonRpcStdioRequestRegistry({
       requestTimeoutMs: this.requestTimeoutMs,
       includeJsonRpcVersion: true,
+      // Only a well-formed response envelope carrying an error reaches this
+      // hook; timeouts and transport failures come through their own paths. The
+      // distinct type is how `request` tells the two apart.
       responseError: ({ error }) =>
-        new Error(
+        new AtspiHelperMethodError(
           typeof error.message === "string" ? error.message : "AT-SPI helper request failed",
+          typeof error.code === "number" ? error.code : undefined,
         ),
     });
     this.registry.processStarted();

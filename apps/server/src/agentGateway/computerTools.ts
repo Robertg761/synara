@@ -223,6 +223,18 @@ function readTarget(args: Record<string, unknown>): ComputerTarget {
   return readTargetRecord(args);
 }
 
+/**
+ * Whether a target was actually given, decided by what survived reading rather
+ * than by which keys the model happened to emit. Models routinely spell an
+ * omitted optional field as an explicit `null`, and a key-presence test reads
+ * `{"x": null}` as "has a target" and then hands the manager an empty target,
+ * which is refused as `computer_target_invalid` — a hard failure for a request
+ * that plainly meant "no target".
+ */
+function hasTargetFields(target: ComputerTarget): boolean {
+  return Object.keys(target).length > 0;
+}
+
 /** Accepts both spellings, because models emit the camelCase one either way. */
 function readWindowIdArg(args: Record<string, unknown>): string | undefined {
   return readStringArg(args, "window_id") ?? readStringArg(args, "windowId");
@@ -253,6 +265,23 @@ function readDelta(args: Record<string, unknown>, name: string): number {
   const value = readNumberArg(args, name);
   if (value === undefined) throw new ToolInputError(`Missing required argument "${name}".`);
   return value;
+}
+
+const DEFAULT_DRAG_DURATION_MS = 250;
+/**
+ * Longest glide a drag may hold the pointer button for. The bound is repeated in
+ * the JSON Schema for the model's benefit, but it is enforced here because
+ * nothing validates MCP tool arguments against that schema before dispatch: an
+ * unclamped `duration_ms` of 1e9 is a drag that holds the button — and the
+ * exclusive desktop lease — for eleven days.
+ */
+const MAX_DRAG_DURATION_MS = 30_000;
+
+/** Clamped rather than refused: the caller's intent is clear, only the scale is wrong. */
+function readDragDurationMs(args: Record<string, unknown>): number {
+  const value = readNumberArg(args, "duration_ms");
+  if (value === undefined) return DEFAULT_DRAG_DURATION_MS;
+  return Math.min(MAX_DRAG_DURATION_MS, Math.max(0, value));
 }
 
 function readRawRequiredString(args: Record<string, unknown>, name: string): string {
@@ -690,7 +719,7 @@ export function makeAgentGatewayComputerTools(
         properties: {
           from: targetSchema,
           to: targetSchema,
-          duration_ms: { type: "integer", minimum: 0, maximum: 30_000 },
+          duration_ms: { type: "integer", minimum: 0, maximum: MAX_DRAG_DURATION_MS },
         },
         required: ["from", "to"],
         additionalProperties: false,
@@ -700,32 +729,36 @@ export function makeAgentGatewayComputerTools(
           context.callerThreadId,
           readNestedTarget(args, "from"),
           readNestedTarget(args, "to"),
-          readNumberArg(args, "duration_ms") ?? 250,
+          readDragDurationMs(args),
         ),
     ),
     observedActionEntry(
       "computer_scroll",
       "Scroll",
-      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. ${POINTER_COORDINATE_NOTE}`,
+      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in logical pixels, the same unit as coordinates and window bounds — roughly 100 pixels per notch of a physical wheel. ${POINTER_COORDINATE_NOTE}`,
       {
         type: "object",
         properties: {
           ...TARGET_PROPERTIES,
-          delta_x: { type: "number" },
-          delta_y: { type: "number" },
+          delta_x: {
+            type: "number",
+            description:
+              "Horizontal scroll distance in logical pixels; positive scrolls toward the right of the content.",
+          },
+          delta_y: {
+            type: "number",
+            description:
+              "Vertical scroll distance in logical pixels; positive scrolls toward the end of the content, the way a wheel notch pulled downward does.",
+          },
         },
         required: ["delta_x", "delta_y"],
         additionalProperties: false,
       },
       async (args, context) => {
-        const target = Object.keys(args).some((key) =>
-          ["x", "y", "label", "role", "window_id", "windowId"].includes(key),
-        )
-          ? readTarget(args)
-          : null;
+        const target = readTarget(args);
         return manager.scroll(
           context.callerThreadId,
-          target,
+          hasTargetFields(target) ? target : null,
           readDelta(args, "delta_x"),
           readDelta(args, "delta_y"),
         );

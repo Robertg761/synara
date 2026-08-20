@@ -1,9 +1,12 @@
+import { Schema } from "effect";
 import { describe, expect, it } from "vitest";
 
+import { ComputerUiNode as ComputerUiNodeSchema } from "@synara/contracts";
 import type { ComputerUiNode } from "@synara/contracts";
 
 import {
   atspiTextWriteAddress,
+  clampNodeText,
   decorationOffsetForClientSize,
   fuseAtspiWindowTree,
   fuseAtspiTrees,
@@ -126,6 +129,65 @@ describe("AT-SPI coordinate fusion", () => {
     expect(atspiTextWriteAddress({ ...base, windowId: null })).toBeUndefined();
     expect(atspiTextWriteAddress({ ...base, nodePath: [0, -1] })).toBeUndefined();
     expect(atspiTextWriteAddress({ ...base, nodePath: [1.5] })).toBeUndefined();
+  });
+
+  /**
+   * An accessible name is whatever the application put there, and the contract
+   * bounds it. Before this, one application labelling a widget with its own
+   * paragraph of text took every computer.getState on the desktop down with a
+   * schema encode failure.
+   */
+  it("keeps an oversized accessible name inside the contract's bounds", () => {
+    const fused = fuseAtspiWindowTree({
+      window: { id: "verbose" as const, bounds: { x: 0, y: 0, width: 640, height: 480 } },
+      tree: {
+        windowId: "verbose",
+        clientSize: { width: 640, height: 480 },
+        root: {
+          role: "window",
+          label: "w".repeat(4_000),
+          value: null,
+          description: "d".repeat(40_000),
+          frame: { x: 0, y: 0, width: 640, height: 480 },
+          children: [
+            {
+              role: "r".repeat(500),
+              label: null,
+              value: "v".repeat(40_000),
+              description: null,
+              frame: { x: 0, y: 0, width: 10, height: 10 },
+              children: [],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(fused.label).toHaveLength(1_024);
+    expect(fused.label?.endsWith("…")).toBe(true);
+    expect(fused.description).toHaveLength(16 * 1_024);
+    expect(fused.children[0]?.role).toHaveLength(128);
+    expect(fused.children[0]?.value).toHaveLength(16 * 1_024);
+    // The bounds this module mirrors are the contract's own, so the fused node
+    // has to satisfy the schema computer.getState is encoded against — and one
+    // character more than the mirror allows must not.
+    // The contract annotates this as `Schema.Schema<ComputerUiNode>`, which
+    // leaves the decoding-service slot `unknown`, and the validator only takes
+    // schemas that declare they need none. The runtime value is the same schema
+    // the RPC encodes against; the cast restores what the annotation erased.
+    const isContractNode = Schema.is(ComputerUiNodeSchema as Schema.Codec<ComputerUiNode>);
+    expect(isContractNode(fused)).toBe(true);
+    expect(isContractNode({ ...fused, label: "w".repeat(1_025) })).toBe(false);
+  });
+
+  it("never cuts an oversized label between the halves of a surrogate pair", () => {
+    const text = `${"a".repeat(9)}${"🙂".repeat(4)}`;
+    // The cut lands on the low half, so the whole character fits.
+    expect(clampNodeText(text, 12)).toBe("aaaaaaaaa🙂…");
+    // The cut lands on the high half: the character goes rather than half of it.
+    const split = clampNodeText(text, 11);
+    expect(split).toBe("aaaaaaaaa…");
+    expect(split.includes("�")).toBe(false);
   });
 
   it("drops minimized windows from the fused desktop tree", () => {

@@ -26,6 +26,7 @@
  * path is already there.
  */
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -53,12 +54,22 @@ export interface InstallTarget {
  * architecture: it is a distro packaging choice (Fedora and openSUSE use lib64,
  * Debian and Arch use lib), and the answer is already sitting on disk in the
  * form of whichever system plugin root exists.
+ *
+ * Which is why the candidate roots are probed on disk rather than pattern
+ * matched: the caller passes both spellings, so testing the list's text would
+ * answer "lib64" on every machine in existence, including the Debian and Arch
+ * ones that have no /usr/lib64 at all. scripts/install-and-load.sh makes the
+ * same decision with `[[ -d /usr/lib64/qt6/plugins ]]`, and the two have to
+ * agree or a script install and an app install put the plugin in different
+ * directories — only one of which is on the QT_PLUGIN_PATH the env script wrote.
  */
 export function resolveInstallTarget(
   systemQtRoots: readonly string[],
   home: string = homedir(),
+  exists: (path: string) => boolean = existsSync,
 ): InstallTarget {
-  const lib = systemQtRoots.some((root) => root.includes("/lib64/")) ? "lib64" : "lib";
+  const present = systemQtRoots.find((root) => exists(root));
+  const lib = present?.includes("/lib64/") ? "lib64" : "lib";
   const qtPluginRoot = join(home, ".local", lib, "qt6", "plugins");
   return { qtPluginRoot, pluginDirectory: join(qtPluginRoot, KWIN_PLUGIN_SUBPATH) };
 }

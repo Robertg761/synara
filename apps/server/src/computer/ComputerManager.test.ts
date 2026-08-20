@@ -714,6 +714,84 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  /**
+   * The same backstop, on the backend that ships: a visible desktop surfaces no
+   * pane, so nothing ever created a runtime record for an agent thread, and the
+   * in-flight guard read zero from a thread that was mid-drag. The desktop could
+   * then be taken from under it by another conversation.
+   */
+  it("counts an agent's in-flight call even when no panel ever asked about it", async () => {
+    const backend = new FakeComputerBackend({
+      capabilities: { ...new FakeComputerBackend().capabilities(), visibleDesktop: true },
+    });
+    let nowMs = 0;
+    const manager = new ComputerManager({ backend, now: () => nowMs, leaseIdleMs: 1_000 });
+
+    const started = deferred();
+    const finish = deferred();
+    // Nothing here asks for thread state: this is a thread whose only contact
+    // with the manager is the tool calls it makes.
+    const inFlight = manager.withAgentActivity("thread-a", async () => {
+      await manager.click("thread-a", { x: 10, y: 10 });
+      started.resolve();
+      await finish.promise;
+    });
+    await started.promise;
+
+    nowMs = 10_000;
+    await expect(manager.click("thread-b", { x: 20, y: 20 })).rejects.toThrow(
+      /another conversation/,
+    );
+
+    finish.resolve();
+    await inFlight;
+    // Once the call really has finished, the idle lease is up for grabs again.
+    await expect(manager.click("thread-b", { x: 20, y: 20 })).resolves.toMatchObject({
+      action: "computer_click",
+    });
+
+    await manager.dispose();
+  });
+
+  /**
+   * Every publish reads the window list, and every window read can report a
+   * change, so one change used to schedule a pass whose own reads scheduled the
+   * next — multiplied by thread count, on a desktop where nothing more than a
+   * clock title was moving.
+   */
+  it("coalesces a burst of window changes into a single publish pass", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, windowsPublishDebounceMs: 5 });
+    await manager.getThreadState("thread-a");
+    await manager.getThreadState("thread-b");
+
+    const publishes: string[] = [];
+    manager.onEvent((event) => {
+      if (event.type === "computer.thread-state") publishes.push(event.state.threadId);
+    });
+    const readsBefore = backend.callsFor("listWindows").length;
+
+    for (let index = 0; index < 20; index += 1) {
+      backend.emitWindowsChanged([
+        {
+          id: "clock",
+          title: `Clock — 12:00:${index}`,
+          bounds: { x: 0, y: 0, width: 100, height: 40 },
+          focused: false,
+          minimized: false,
+          visible: true,
+        },
+      ]);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    // One pass, one thread state each, one window read each — not twenty.
+    expect(publishes).toEqual(["thread-a", "thread-b"]);
+    expect(backend.callsFor("listWindows").length - readsBefore).toBe(2);
+
+    await manager.dispose();
+  });
+
   it("lets one thread keep driving across a long think, and keeps perception free", async () => {
     const backend = new FakeComputerBackend();
     let nowMs = 0;
@@ -740,6 +818,8 @@ describe("ComputerManager and FakeComputerBackend", () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });
     const sink = new RecordingSink();
+    const eventTypes: string[] = [];
+    manager.onEvent((event) => eventTypes.push(event.type));
     const unsubscribe = manager.subscribeFrames(sink);
     await manager.flushStreamTransitions();
 
@@ -755,6 +835,11 @@ describe("ComputerManager and FakeComputerBackend", () => {
     const count = sink.received.length;
     backend.emitFrame(true, false);
     expect(sink.received).toHaveLength(count);
+
+    // Frames ride the binary transport alone. The JSON event channel used to
+    // carry a `computer.frame` header beside every one of them, which its only
+    // consumer read and dropped.
+    expect(eventTypes).not.toContain("computer.frame");
 
     await manager.dispose();
   });

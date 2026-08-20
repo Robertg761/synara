@@ -128,6 +128,65 @@ describe("AtspiHelperClient", () => {
 
     await client.dispose();
   });
+
+  /**
+   * The helper answering "that window is gone" is routine — it is what a
+   * semantic target that closed mid-walk looks like. Killing the process over
+   * it respawned Python on every miss and pushed the reconnect backoff to five
+   * seconds, so the next perception request paid for a refusal that had nothing
+   * wrong with it.
+   */
+  it("keeps the helper alive when it reports an error instead of dying", async () => {
+    let spawns = 0;
+    const child = new FakeHelperProcess();
+    child.stdin.on("data", (chunk) => {
+      for (const line of chunk.toString().split("\n").filter(Boolean)) {
+        const message = JSON.parse(line) as { id: number | string; method: string };
+        child.stdout.write(
+          `${JSON.stringify(
+            message.method === "read-tree"
+              ? {
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  error: { code: -32000, message: "window closed" },
+                }
+              : { jsonrpc: "2.0", id: message.id, result: { ok: true } },
+          )}\n`,
+        );
+      }
+    });
+    const client = new AtspiHelperClient({
+      spawnProcess: () => {
+        spawns += 1;
+        return child as unknown as ChildProcessWithoutNullStreams;
+      },
+    });
+
+    await expect(client.readTrees([WINDOW])).rejects.toThrow("window closed");
+    expect(child.kill).not.toHaveBeenCalled();
+    // The same process serves the next call, with no reconnect delay in front
+    // of it — the request resolves without any timer being advanced.
+    await expect(client.setText({ window: WINDOW, path: [0], text: "x" })).resolves.toBe(true);
+    expect(spawns).toBe(1);
+
+    await client.dispose();
+  });
+
+  it("still tears down the helper when the transport itself fails", async () => {
+    const child = new FakeHelperProcess();
+    // Never answers: the request times out, which is a dead transport, not a
+    // refusal, and the process must be replaced.
+    child.stdin.on("data", () => {});
+    const client = new AtspiHelperClient({
+      requestTimeoutMs: 5,
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+
+    await expect(client.readTrees([WINDOW])).rejects.toThrow();
+    expect(child.kill).toHaveBeenCalled();
+
+    await client.dispose();
+  });
 });
 
 /** A helper process that records every request and answers with one result. */

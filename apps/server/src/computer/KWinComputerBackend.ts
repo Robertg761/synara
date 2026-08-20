@@ -51,6 +51,7 @@ import {
   parseComputerRect,
   parseJsonPayload,
   parseWindows,
+  readPngDimensions,
   requireWindowBounds,
   screenSizeFromWindows,
   screenshotFromPng,
@@ -433,8 +434,14 @@ export class KWinComputerBackend implements ComputerBackend {
     const plugin = await this.ensurePlugin({ start: false });
     try {
       const state = await this.readPluginState(plugin);
-      const windows = parseWindows(await plugin.windowsJson(), state.targetWindowId);
-      const fingerprint = JSON.stringify(windows);
+      const payload = await plugin.windowsJson();
+      const windows = parseWindows(payload, state.targetWindowId);
+      // The plugin's own document is the change fingerprint. It is already a
+      // string on the wire and it changes whenever any window does, so
+      // re-serializing the parsed list — on a call that runs several times per
+      // action and per publish — buys nothing. The focus target rides along
+      // because it decides `focused` without appearing in that document.
+      const fingerprint = `${state.targetWindowId ?? ""} ${windowsPayloadFingerprint(payload)}`;
       if (fingerprint !== this.previousWindowsFingerprint) {
         this.previousWindowsFingerprint = fingerprint;
         this.emit({ type: "windows-changed", windows });
@@ -445,10 +452,19 @@ export class KWinComputerBackend implements ComputerBackend {
     }
   }
 
+  /**
+   * The workspace rect KWin reported, without a window read.
+   *
+   * Reading every window to derive one screen size put a second full window
+   * enumeration inside every state publish — and each enumeration can report a
+   * window change, which schedules another publish. The size only ever came
+   * from the workspace rect anyway; the window bounding box is the fallback for
+   * a plugin that did not report one, and `workspaceRect` still uses it.
+   */
   async getScreenSize(): Promise<ComputerScreenSize> {
     await this.ensurePlugin({ start: false });
-    const windows = await this.listWindows();
-    return screenSizeFromWindows(windows, this.pluginHealth?.workspace);
+    const rect = await this.workspaceRect();
+    return { width: rect.width, height: rect.height, scale: 1 };
   }
 
   async getState(options: {
@@ -1332,6 +1348,17 @@ export class KWinComputerBackend implements ComputerBackend {
     return workspaceRectFromWindows(await this.listWindows());
   }
 
+  /**
+   * One workspace still, straight out of the plugin and onto the wire.
+   *
+   * Nothing here goes through `captureWorkspaceScreenshot`: that builds a
+   * `ComputerScreenshot`, whose payload is base64, and a frame carries raw
+   * bytes. Round-tripping a multi-megabyte PNG through base64 and back — twice
+   * a second, forever, while anyone is watching the pane — cost two full copies
+   * and an encode per frame to arrive back at the bytes the capture already
+   * returned. The rect comes from the cached workspace geometry for the same
+   * reason: a window enumeration per frame is a window enumeration per frame.
+   */
   private async publishStillFrame(): Promise<void> {
     const listener = this.streamListener;
     if (
@@ -1343,9 +1370,13 @@ export class KWinComputerBackend implements ComputerBackend {
       return;
     this.stillInFlight = true;
     try {
-      const windows = await this.listWindows();
+      const region = await this.workspaceRect();
       if (this.capturePending > 0) return;
-      const screenshot = await this.captureWorkspaceScreenshot(windows);
+      const data = await this.captureRegion(region.x, region.y, region.width, region.height);
+      // Cheap header read, kept for the same reason the screenshot path has it:
+      // a payload that is not a PNG must fail here rather than in a decoder in
+      // the browser, where the only symptom is a blank pane.
+      readPngDimensions(data, { source: CAPTURE_SOURCE });
       if (this.streamListener !== listener) return;
       const frame = {
         sequence: this.nextSequence++,
@@ -1354,7 +1385,7 @@ export class KWinComputerBackend implements ComputerBackend {
         // or delta frame in Tier 1, so the envelope remains keyframe-only.
         keyframe: true,
         codecConfig: false,
-        data: Uint8Array.from(Buffer.from(screenshot.bytesBase64, "base64")),
+        data,
       };
       listener(frame);
       this.emit({ type: "frame", frame });
@@ -1785,6 +1816,15 @@ function parseWorkspaceGeometry(record: Record<string, unknown>): ComputerRect |
   );
 }
 
+/**
+ * The plugin's window document as an opaque change key. It arrives as a string
+ * on the wire, so in the normal case this costs nothing at all.
+ */
+function windowsPayloadFingerprint(payload: unknown): string {
+  const unwrapped = unwrapDbusValue(payload);
+  return typeof unwrapped === "string" ? unwrapped : JSON.stringify(unwrapped);
+}
+
 function readBoolean(value: unknown): boolean {
   const unwrapped = unwrapDbusValue(value);
   return unwrapped === true;
@@ -1796,7 +1836,10 @@ function readByteArray(value: unknown): Uint8Array {
     if (unwrapped.byteLength === 0 || unwrapped.byteLength > MAX_CAPTURE_BYTES) {
       throw new ComputerBackendError("Synara KWin capture exceeded the PNG size limit.");
     }
-    return Uint8Array.from(unwrapped);
+    // A view, not a copy: this is a whole screenshot, the D-Bus message owns the
+    // bytes and is discarded right after, and the only thing this conversion is
+    // for is turning a Node Buffer into a plain Uint8Array.
+    return new Uint8Array(unwrapped.buffer, unwrapped.byteOffset, unwrapped.byteLength);
   }
   if (
     Array.isArray(unwrapped) &&

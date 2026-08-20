@@ -698,4 +698,61 @@ describe("agent gateway computer tools", () => {
       error: { code: "computer_controlled_by_other_thread" },
     });
   });
+
+  /**
+   * Models spell an omitted optional field as an explicit `null` all the time.
+   * Deciding "this scroll has a target" from which keys are present read that
+   * as a target, built an empty one, and had it refused as
+   * computer_target_invalid — a hard failure for a request that meant "scroll
+   * wherever the pointer is".
+   */
+  it("reads an explicitly null scroll target as no target", async () => {
+    const { backend, call } = await setup();
+
+    const result = await call("computer_scroll", {
+      x: null,
+      y: null,
+      label: null,
+      window_id: null,
+      delta_x: 0,
+      delta_y: 120,
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([[null, 0, 120]]);
+  });
+
+  it("still resolves a scroll target when one is actually given", async () => {
+    const { backend, call } = await setup();
+
+    await call("computer_scroll", { x: 12, y: 34, delta_x: 0, delta_y: -50 });
+
+    expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([
+      [{ x: 12, y: 34 }, 0, -50],
+    ]);
+  });
+
+  /**
+   * The JSON Schema bound is advisory: nothing validates MCP tool arguments
+   * against it before dispatch. Unclamped, a duration of 1e9 held the pointer
+   * button — and the exclusive desktop lease — for eleven days.
+   */
+  it("clamps a drag duration to the bound its schema advertises", async () => {
+    const { backend, byName, call } = await setup();
+
+    await call("computer_drag", {
+      from: { x: 1, y: 1 },
+      to: { x: 2, y: 2 },
+      duration_ms: 1e9,
+    });
+    await call("computer_drag", { from: { x: 1, y: 1 }, to: { x: 2, y: 2 }, duration_ms: -5 });
+
+    const durations = backend.callsFor("drag").map((entry) => entry.args[2]);
+    expect(durations).toEqual([30_000, 0]);
+    const schema = byName.get("computer_drag")?.definition.inputSchema as {
+      properties: { duration_ms: { maximum: number; minimum: number } };
+    };
+    // The clamp is the schema's own bound, not a second opinion about it.
+    expect(schema.properties.duration_ms).toMatchObject({ maximum: 30_000, minimum: 0 });
+  });
 });

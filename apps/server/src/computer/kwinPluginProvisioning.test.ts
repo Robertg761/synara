@@ -22,26 +22,58 @@ import {
 
 const temp = () => mkdtemp(join(tmpdir(), "synara-provision-"));
 
+/** The candidate list every caller passes: both spellings, in preference order. */
+const SYSTEM_QT_ROOTS = ["/usr/lib64/qt6/plugins", "/usr/lib/qt6/plugins"];
+const onDisk =
+  (...present: readonly string[]) =>
+  (path: string) =>
+    present.includes(path);
+
 describe("install target", () => {
   it("follows the system Qt's lib64/lib split rather than guessing it", () => {
-    expect(resolveInstallTarget(["/usr/lib64/qt6/plugins"], "/home/x").qtPluginRoot).toBe(
-      "/home/x/.local/lib64/qt6/plugins",
-    );
-    expect(resolveInstallTarget(["/usr/lib/qt6/plugins"], "/home/x").qtPluginRoot).toBe(
+    expect(
+      resolveInstallTarget(SYSTEM_QT_ROOTS, "/home/x", onDisk("/usr/lib64/qt6/plugins"))
+        .qtPluginRoot,
+    ).toBe("/home/x/.local/lib64/qt6/plugins");
+    expect(
+      resolveInstallTarget(SYSTEM_QT_ROOTS, "/home/x", onDisk("/usr/lib/qt6/plugins")).qtPluginRoot,
+    ).toBe("/home/x/.local/lib/qt6/plugins");
+  });
+
+  /**
+   * The regression that mattered: every caller hands over both spellings, so a
+   * decision made by reading the list rather than the disk answered lib64 on
+   * Debian and Arch too, and installed the plugin into a directory the env
+   * script never put on QT_PLUGIN_PATH.
+   */
+  it("reads the split off the disk, not off the candidate list", () => {
+    expect(
+      resolveInstallTarget(SYSTEM_QT_ROOTS, "/home/x", onDisk("/usr/lib/qt6/plugins")).qtPluginRoot,
+    ).toBe("/home/x/.local/lib/qt6/plugins");
+    // Neither present: the script's `else` branch, which is lib.
+    expect(resolveInstallTarget(SYSTEM_QT_ROOTS, "/home/x", onDisk()).qtPluginRoot).toBe(
       "/home/x/.local/lib/qt6/plugins",
     );
   });
 
   it("puts the plugin where KWin scans, under the root it will be told about", () => {
-    const target = resolveInstallTarget(["/usr/lib64/qt6/plugins"], "/home/x");
+    const target = resolveInstallTarget(
+      SYSTEM_QT_ROOTS,
+      "/home/x",
+      onDisk("/usr/lib64/qt6/plugins"),
+    );
     expect(target.pluginDirectory).toBe(`${target.qtPluginRoot}/kwin/plugins`);
   });
 
   it("never leaves the home directory, which is the whole point of not needing sudo", () => {
-    for (const roots of [["/usr/lib64/qt6/plugins"], ["/usr/lib/qt6/plugins"], []]) {
-      expect(resolveInstallTarget(roots, "/home/x").pluginDirectory.startsWith("/home/x/")).toBe(
-        true,
-      );
+    for (const present of [["/usr/lib64/qt6/plugins"], ["/usr/lib/qt6/plugins"], []]) {
+      expect(
+        resolveInstallTarget(
+          SYSTEM_QT_ROOTS,
+          "/home/x",
+          onDisk(...present),
+        ).pluginDirectory.startsWith("/home/x/"),
+      ).toBe(true);
     }
   });
 });

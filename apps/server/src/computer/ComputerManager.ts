@@ -68,11 +68,26 @@ export const COMPUTER_LEASE_IDLE_MS = 300_000;
  */
 export const COMPUTER_ACTION_SETTLE_MS = 300;
 
+/**
+ * Trailing-edge window on the republish that a backend window change triggers.
+ *
+ * A publish costs one availability read, one window read and one screen-size
+ * read per thread, and the window read is itself what reports a change — so a
+ * desktop with a ticking window title (a clock, a download percentage, a video
+ * player's timer) publishes, observes its own read as a change, and publishes
+ * again, once per thread, without ever settling. Coalescing turns that into at
+ * most one pass per window, which is the only rate that is bounded by something
+ * other than how fast D-Bus answers.
+ *
+ * The window list itself is not delayed by this: `computer.windows-changed` is
+ * emitted immediately from the event, with no backend call at all.
+ */
+export const COMPUTER_WINDOWS_PUBLISH_DEBOUNCE_MS = 250;
+
 export type ComputerEventListener = (event: ComputerEvent) => void;
 
 interface ThreadComputerRuntimeState {
   version: number;
-  agentActiveCount: number;
   lastError: string | null;
   windows: readonly ComputerWindow[];
   screenSize: ComputerScreenSize;
@@ -101,6 +116,8 @@ export interface ComputerManagerOptions {
   readonly leaseIdleMs?: number;
   /** Injected for tests, so action-screenshot tests do not sleep for real. */
   readonly actionSettleMs?: number;
+  /** Injected for tests, so window-churn tests do not wait out the real window. */
+  readonly windowsPublishDebounceMs?: number;
 }
 
 /**
@@ -166,12 +183,28 @@ export class ComputerManager {
   private readonly transport: FrameTransport<string, ComputerStreamFrame>;
   private readonly listeners = new Set<ComputerEventListener>();
   private readonly threads = new Map<string, ThreadComputerRuntimeState>();
+  /**
+   * Agent calls in flight, per thread. Deliberately not a field on the thread
+   * runtime record: a thread can drive the desktop without any record existing
+   * — on a visible-desktop backend no pane is ever surfaced, so nothing creates
+   * one until a panel asks for that thread's state, which may be never — and
+   * this count is what stops the desktop lease being taken from a thread whose
+   * drag or keystroke is still running. Entries are deleted as they reach zero,
+   * so nothing accumulates and a removed thread is not resurrected by a late
+   * call.
+   */
+  private readonly agentCallsInFlight = new Map<string, number>();
   /** Display names for the agent cursor badge, keyed by thread id. */
   private readonly threadLabels = new Map<string, string>();
   private readonly backendUnsubscribe?: () => void;
   private readonly now: () => number;
   private readonly leaseIdleMs: number;
   private readonly actionSettleMs: number;
+  private readonly windowsPublishDebounceMs: number;
+  /** Depth rather than a flag: a lease publish can nest inside a window one. */
+  private publishAllDepth = 0;
+  private windowsPublishPending = false;
+  private windowsPublishTimer: ReturnType<typeof setTimeout> | undefined;
   private backendHealth: ComputerHealth;
   /**
    * Read once. A backend's capability set is decided by which providers its
@@ -192,6 +225,8 @@ export class ComputerManager {
     this.now = options.now ?? Date.now;
     this.leaseIdleMs = options.leaseIdleMs ?? COMPUTER_LEASE_IDLE_MS;
     this.actionSettleMs = options.actionSettleMs ?? COMPUTER_ACTION_SETTLE_MS;
+    this.windowsPublishDebounceMs =
+      options.windowsPublishDebounceMs ?? COMPUTER_WINDOWS_PUBLISH_DEBOUNCE_MS;
     this.backendHealth = options.backend.health();
     this.backendCapabilities = options.backend.capabilities();
     this.transport =
@@ -217,7 +252,7 @@ export class ComputerManager {
         if (event.type === "windows-changed") {
           for (const state of this.threads.values()) state.windows = event.windows;
           this.emit({ type: "computer.windows-changed", windows: event.windows });
-          void this.publishAllThreads();
+          this.scheduleWindowsPublish();
         } else if (event.type === "health-changed") {
           this.backendHealth = event.health;
           this.republishAllThreads();
@@ -636,18 +671,31 @@ export class ComputerManager {
     );
   }
 
+  /**
+   * Runs one agent tool call with this thread counted as driving the desktop.
+   *
+   * The count is kept whether or not this thread has a runtime record, because
+   * the lease's in-flight guard reads it: while it was a field on the record,
+   * every thread on a visible-desktop backend counted as idle from the first
+   * call to the last, and the desktop could be taken from a thread in the
+   * middle of a drag. Publishing the badge still requires a record, since a
+   * thread nobody is watching has no panel to update.
+   */
   async withAgentActivity<A>(threadId: string, action: () => Promise<A>): Promise<A> {
-    const state = this.threads.get(threadId);
-    if (state) {
-      state.agentActiveCount += 1;
-      if (state.agentActiveCount === 1) await this.publish(threadId, true).catch(() => undefined);
-    }
+    const owner = agentThreadId(threadId);
+    if (owner === undefined) return await action();
+    const depth = (this.agentCallsInFlight.get(owner) ?? 0) + 1;
+    this.agentCallsInFlight.set(owner, depth);
+    if (depth === 1) await this.publish(owner, true).catch(() => undefined);
     try {
       return await action();
     } finally {
-      if (state && this.threads.get(threadId) === state) {
-        state.agentActiveCount = Math.max(0, state.agentActiveCount - 1);
-        if (state.agentActiveCount === 0) await this.publish(threadId, true).catch(() => undefined);
+      const remaining = Math.max(0, (this.agentCallsInFlight.get(owner) ?? 1) - 1);
+      if (remaining === 0) {
+        this.agentCallsInFlight.delete(owner);
+        await this.publish(owner, true).catch(() => undefined);
+      } else {
+        this.agentCallsInFlight.set(owner, remaining);
       }
     }
   }
@@ -744,7 +792,7 @@ export class ComputerManager {
    */
   private isLeaseStale(lease: DesktopLease, now: number): boolean {
     if (now - lease.lastActivityMs < this.leaseIdleMs) return false;
-    return (this.threads.get(lease.threadId)?.agentActiveCount ?? 0) === 0;
+    return (this.agentCallsInFlight.get(lease.threadId) ?? 0) === 0;
   }
 
   async recordThreadError(threadId: string, message: string): Promise<void> {
@@ -812,6 +860,9 @@ export class ComputerManager {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.windowsPublishTimer !== undefined) clearTimeout(this.windowsPublishTimer);
+    this.windowsPublishTimer = undefined;
+    this.windowsPublishPending = false;
     this.streamDesired = false;
     this.streamEpoch += 1;
     await this.enqueueStreamTransition(async () => {
@@ -853,19 +904,15 @@ export class ComputerManager {
     return next;
   }
 
+  /**
+   * Frames travel on the binary transport and nowhere else. A parallel
+   * `computer.frame` notice on the JSON event channel used to be emitted here
+   * too; its only consumer read the header and did nothing with it, so every
+   * still frame paid for a serialized event that told no one anything.
+   */
   private handleFrame(frame: ComputerStreamFrame): void {
     if (this.disposed || (!this.streamDesired && !this.streamAttached)) return;
     this.transport.publish(this.computerId, frame);
-    this.emit({
-      type: "computer.frame",
-      header: {
-        computerId: this.computerId,
-        sequence: frame.sequence,
-        timestampMs: frame.timestampMs,
-        keyframe: frame.keyframe,
-        codecConfig: frame.codecConfig,
-      },
-    });
   }
 
   /**
@@ -1105,11 +1152,14 @@ export class ComputerManager {
    * rule. On a visible-desktop backend the actions are already happening on the
    * human's own screen, so no pane is requested at all — mirroring their
    * display back at them adds nothing.
+   *
+   * The runtime record is still created in that case, before the decision: it
+   * is what carries this thread's activity count and last error, and a thread
+   * that drives the desktop needs one whether or not a pane is opened for it.
    */
   private surfacePaneForAgent(threadId: string): void {
-    if (this.backendCapabilities.visibleDesktop) return;
     const state = this.threadRuntime(threadId);
-    if (state.paneSurfaced) return;
+    if (this.backendCapabilities.visibleDesktop || state.paneSurfaced) return;
     state.paneSurfaced = true;
     this.emit({
       type: "computer.open-pane-requested",
@@ -1145,7 +1195,37 @@ export class ComputerManager {
   }
 
   private async publishAllThreads(): Promise<void> {
-    for (const threadId of this.threads.keys()) await this.publish(threadId, true);
+    this.publishAllDepth += 1;
+    try {
+      for (const threadId of this.threads.keys()) await this.publish(threadId, true);
+    } finally {
+      this.publishAllDepth -= 1;
+      if (this.publishAllDepth === 0 && this.windowsPublishPending) {
+        this.windowsPublishPending = false;
+        this.scheduleWindowsPublish();
+      }
+    }
+  }
+
+  /**
+   * Queue one republish for a window change, coalescing everything that arrives
+   * before it runs — including the changes this pass's own window reads report,
+   * which is the loop that made this necessary. A pass already running never
+   * starts a second one on top of itself; it re-arms the timer on the way out.
+   */
+  private scheduleWindowsPublish(): void {
+    if (this.disposed) return;
+    if (this.publishAllDepth > 0) {
+      this.windowsPublishPending = true;
+      return;
+    }
+    if (this.windowsPublishTimer !== undefined) return;
+    this.windowsPublishTimer = setTimeout(() => {
+      this.windowsPublishTimer = undefined;
+      if (this.disposed) return;
+      void this.publishAllThreads().catch(() => undefined);
+    }, this.windowsPublishDebounceMs);
+    this.windowsPublishTimer.unref?.();
   }
 
   /**
@@ -1168,7 +1248,6 @@ export class ComputerManager {
     if (!state) {
       state = {
         version: 0,
-        agentActiveCount: 0,
         lastError: null,
         windows: [],
         screenSize: { width: 1, height: 1 },
@@ -1191,7 +1270,7 @@ export class ComputerManager {
       windows: state.windows,
       screenSize: state.screenSize,
       ...(state.cursor ? { cursor: state.cursor } : {}),
-      agentActive: state.agentActiveCount > 0,
+      agentActive: (this.agentCallsInFlight.get(threadId) ?? 0) > 0,
       controlledByOtherThread: this.lease !== null && this.lease.threadId !== threadId,
       availability: this.correctedAvailability(state.availability),
       health: this.backendHealth,

@@ -86,10 +86,12 @@ class FakePlugin implements KWinComputerPluginApi {
         readonly ownsCompositor?: boolean;
       }
     | undefined;
+  /** Which window the plugin says the agent seat is aimed at. */
+  targetWindowId: string | null = "window-1";
   stateJson = async () =>
     JSON.stringify({
       position: this.position,
-      targetWindowId: "window-1",
+      targetWindowId: this.targetWindowId,
       ...(this.humanState ?? {}),
     });
   windowsJson = async () => JSON.stringify(this.windows);
@@ -256,6 +258,17 @@ function makeBackend(
         throw new Error("provisionPlugin was not stubbed in this test");
       }),
   });
+}
+
+/** Counts window enumerations from here on; the plugin does not record them. */
+function countWindowReads(plugin: FakePlugin): () => number {
+  let reads = 0;
+  const original = plugin.windowsJson;
+  plugin.windowsJson = async () => {
+    reads += 1;
+    return await original();
+  };
+  return () => reads;
 }
 
 /** A semantic target resolved against the fake plugin's only window. */
@@ -1188,6 +1201,96 @@ describe("KWinComputerBackend", () => {
       args: [0, 0, 5_120, 2_520, 2_048],
     });
     expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
+    await backend.dispose();
+  });
+
+  /**
+   * A still every half-second is the frame budget, and a window enumeration per
+   * still is two D-Bus round trips that also make every title change look like
+   * a desktop change to the manager subscribed above.
+   */
+  it("streams stills from the cached workspace rect, with the capture's own bytes", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    dbus.plugin.captureBytes = pngOfSize(64, 32);
+    const backend = makeBackend(dbus);
+    await backend.availability();
+    const windowReads = countWindowReads(dbus.plugin);
+
+    const frames: Array<{ readonly data: Uint8Array }> = [];
+    await backend.attachStream((frame) => frames.push(frame));
+
+    expect(windowReads()).toBe(0);
+    // The bytes reach the socket as the plugin returned them: the frame path
+    // used to base64 them into a ComputerScreenshot and decode them straight
+    // back, which is two copies of a multi-megabyte PNG per frame.
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.data).toEqual(dbus.plugin.captureBytes);
+    expect(frames[0]?.data.buffer).toBe(dbus.plugin.captureBytes.buffer);
+    await backend.dispose();
+  });
+
+  /**
+   * The change key is the plugin's own window document rather than a
+   * re-serialization of the parsed list, so this pins what that document does
+   * not contain: which window the agent seat is aimed at, which is what decides
+   * `focused` on every window in the list.
+   */
+  it("reports a window change once per change, including a bare focus move", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.windows = [
+      ...dbus.plugin.windows,
+      {
+        id: "window-2",
+        title: "Editor",
+        bounds: { x: 0, y: 0, width: 640, height: 480 },
+        focused: false,
+        minimized: false,
+        visible: true,
+      },
+    ];
+    const backend = makeBackend(dbus);
+    const changes: Array<readonly ComputerWindow[]> = [];
+    backend.onEvent((event) => {
+      if (event.type === "windows-changed") changes.push(event.windows);
+    });
+    await backend.availability();
+
+    await backend.listWindows();
+    expect(changes).toHaveLength(1);
+    // Nothing moved: reading again must not look like a change, or every
+    // publish would schedule the next one.
+    await backend.listWindows();
+    expect(changes).toHaveLength(1);
+
+    dbus.plugin.targetWindowId = "window-2";
+    await backend.listWindows();
+    expect(changes).toHaveLength(2);
+    expect(changes[1]?.find((window) => window.id === "window-2")?.focused).toBe(true);
+
+    const [terminal, editor] = dbus.plugin.windows;
+    dbus.plugin.windows = [terminal!, { ...editor!, title: "Editor — saved" }];
+    await backend.listWindows();
+    expect(changes).toHaveLength(3);
+
+    await backend.dispose();
+  });
+
+  it("answers the screen size from workspace geometry without enumerating windows", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: 0, y: 0, width: 3_840, height: 2_160 };
+    const backend = makeBackend(dbus);
+    await backend.availability();
+    const windowReads = countWindowReads(dbus.plugin);
+
+    await expect(backend.getScreenSize()).resolves.toEqual({
+      width: 3_840,
+      height: 2_160,
+      scale: 1,
+    });
+    // Every state publish calls this, and the window read it used to make could
+    // itself report a change and trigger the next publish.
+    expect(windowReads()).toBe(0);
     await backend.dispose();
   });
 

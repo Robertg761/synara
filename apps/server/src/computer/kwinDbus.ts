@@ -50,6 +50,13 @@ export interface KWinComputerPluginApi {
   readonly clearFocusWindow: () => Promise<unknown>;
   readonly movePointer: (x: number, y: number) => Promise<unknown>;
   readonly button: (code: number, pressed: boolean) => Promise<unknown>;
+  /**
+   * Scroll distance in logical pixels on each axis, the same unit as pointer
+   * coordinates and window bounds — not wheel notches or lines. One unit is one
+   * pixel of content, so a wheel notch is on the order of a hundred. The plugin
+   * consumes the same unit, and the agent tool surface documents it, so a delta
+   * means the same thing at every hop.
+   */
   readonly axis: (horizontal: number, vertical: number) => Promise<unknown>;
   readonly key: (code: number, pressed: boolean) => Promise<unknown>;
   readonly captureWindow: (windowId: string, maxDimension: number) => Promise<unknown>;
