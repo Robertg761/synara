@@ -185,7 +185,10 @@ private:
     // that never bound it still has its surfaces delivered to by the seat, and
     // the events are dropped on the floor with no error anywhere - the failure
     // mode that makes a click look like it simply did not work.
-    bool clientBoundAgentSeat(const SurfaceInterface *surface) const;
+    // Whether the client created a wl_pointer object on the agent seat (not just
+    // bound the seat). This, not seat binding, decides whether agent-seat
+    // delivery can reach the client; see useDirectInjection.
+    bool clientHasAgentSeatPointer(const SurfaceInterface *surface) const;
     // Whether this window has to be driven by writing straight to its own input
     // resources rather than through the agent seat, which is true exactly of the
     // clients that never bound that seat.

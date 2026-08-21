@@ -28,6 +28,7 @@
 #include "wayland/clientconnection.h"
 #include "wayland/display.h"
 #include "wayland/keyboard.h"
+#include "wayland/pointer.h"
 #include "wayland/seat.h"
 #include "wayland/surface.h"
 #include "wayland_server.h"
@@ -2129,23 +2130,30 @@ struct AgentSeatProbe
     bool bound;
 };
 
-// wl_seat is the resource to look for, not wl_pointer or wl_keyboard: a client
-// that bound the seat but has not yet asked it for a pointer is still reachable,
-// it just has not gotten around to it. A client that never bound the seat cannot
-// become reachable at all.
-wl_iterator_result probeAgentSeatResource(wl_resource *resource, void *data)
+// Whether the client created an actual wl_pointer *object* on the agent seat -
+// not merely bound the seat's wl_seat global. Binding the global and creating
+// the pointer are separate requests, and a toolkit can do the first without the
+// second: Gecko binds every seat advertised to it but calls get_pointer only on
+// the one seat it treats as "the" seat (seat0), so it binds the agent seat and
+// has no pointer on it. Delivering through the agent seat to such a client
+// reaches nothing and the event is dropped with no error - the "returns true,
+// nothing lands" failure. The pointer's own seat is authoritative, via
+// PointerInterface::get.
+wl_iterator_result probeAgentSeatPointer(wl_resource *resource, void *data)
 {
     auto *probe = static_cast<AgentSeatProbe *>(data);
     const char *klass = wl_resource_get_class(resource);
-    if (klass && std::strcmp(klass, "wl_seat") == 0 && SeatInterface::get(resource) == probe->seat) {
-        probe->bound = true;
-        return WL_ITERATOR_STOP;
+    if (klass && std::strcmp(klass, "wl_pointer") == 0) {
+        if (PointerInterface *pointer = PointerInterface::get(resource); pointer && pointer->seat() == probe->seat) {
+            probe->bound = true;
+            return WL_ITERATOR_STOP;
+        }
     }
     return WL_ITERATOR_CONTINUE;
 }
 }
 
-bool SynaraComputerUsePlugin::clientBoundAgentSeat(const SurfaceInterface *surface) const
+bool SynaraComputerUsePlugin::clientHasAgentSeatPointer(const SurfaceInterface *surface) const
 {
     if (!m_seat || !surface) {
         return false;
@@ -2159,7 +2167,7 @@ bool SynaraComputerUsePlugin::clientBoundAgentSeat(const SurfaceInterface *surfa
         return false;
     }
     AgentSeatProbe probe{m_seat, false};
-    wl_client_for_each_resource(client, probeAgentSeatResource, &probe);
+    wl_client_for_each_resource(client, probeAgentSeatPointer, &probe);
     return probe.bound;
 }
 
@@ -2352,7 +2360,20 @@ bool SynaraComputerUsePlugin::useDirectInjection(const Window *window) const
     if (m_ownsCompositor || !window) {
         return false;
     }
-    return !clientBoundAgentSeat(window->surface());
+    // The choice is made by where the client's pointer *object* lives, not by
+    // whether it bound the agent seat's global. The agent-seat delivery path can
+    // only reach a client that created a wl_pointer on the agent seat; a client
+    // that bound the seat but put its pointer on seat0 (Gecko does this) would be
+    // delivered nothing and never know. So the agent seat is used only when the
+    // client is provably reachable through it, and every other client - Chromium,
+    // Electron, Xwayland, and Gecko alike - is driven by writing to its own
+    // pointer/keyboard resources directly, which is the universal path and is
+    // exactly the macOS "post to the target" mechanism. A wrong guess can only
+    // ever route a client to direct injection, which works for any conformant
+    // client, so it never costs reach. The reachability refusal
+    // (requireReachableClient) is separate and turns on whether any input
+    // resource exists at all.
+    return !clientHasAgentSeatPointer(window->surface());
 }
 
 void SynaraComputerUsePlugin::directPointerEnter(Window *window)
