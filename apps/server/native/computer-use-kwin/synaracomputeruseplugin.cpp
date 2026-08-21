@@ -2186,15 +2186,29 @@ wl_iterator_result collectResource(wl_resource *resource, void *data)
     const char *klass = wl_resource_get_class(resource);
     if (klass && std::strcmp(klass, collector->klass) == 0) {
         collector->out->append(resource);
+        // Exactly one: a client can hold an input object of this class on more
+        // than one seat — its own seat0 plus the agent seat it bound — and a
+        // wl_keyboard/wl_pointer event written to every one of them is delivered
+        // to the client that many times, so it types each character or fires
+        // each click two-or-more times over. The client processes an event from
+        // any one of its resources, so one delivery is both sufficient and
+        // correct; more is a multiplier, never extra reach. Enter, key,
+        // modifiers, button, axis, and leave all resolve to this same first
+        // resource because resource iteration order is stable for the life of
+        // the client, so the whole sequence lands on one coherent object.
+        return WL_ITERATOR_STOP;
     }
     return WL_ITERATOR_CONTINUE;
 }
 
 /**
- * Every input resource of one class this client holds.
+ * The single input resource of one class this client holds that the agent
+ * injects into — the first the compositor iterates, deterministically.
  *
- * Safe to treat as seat0's because this is only ever called for a client that
- * did not bind the agent seat, and seat0 is then the only seat it has.
+ * Injecting into every resource of the class instead delivers each event once
+ * per resource, which is how driving a client that holds this object on both
+ * seat0 and the bound agent seat produced quadrupled keystrokes. One is correct;
+ * see collectResource.
  */
 QList<wl_resource *> clientInputResources(const SurfaceInterface *surface, const char *klass)
 {
