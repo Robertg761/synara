@@ -524,9 +524,7 @@ describe("agent gateway computer tools", () => {
     const { byName } = await setup();
     const description = byName.get("computer_click")?.definition.description ?? "";
 
-    expect(description).toContain(
-      `downscaled to at most ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION}`,
-    );
+    expect(description).toContain(`capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels`);
     // Knowing where the detail went is the difference between zooming in and
     // concluding the label is unreadable.
     expect(description).toContain("computer_screenshot");

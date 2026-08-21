@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 import type { ComputerWindow, ThreadComputerState } from "@synara/contracts";
 import { decodeComputerFrame } from "@synara/shared/computerFrame";
 
-import { ComputerBackendError } from "./ComputerBackend.ts";
+import {
+  COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+  ComputerBackendError,
+} from "./ComputerBackend.ts";
 import { ComputerManager } from "./ComputerManager.ts";
 import { FakeComputerBackend } from "./FakeComputerBackend.ts";
 import type { FrameSink } from "@synara/shared/frameTransport";
@@ -1178,14 +1181,15 @@ describe("ComputerManager and FakeComputerBackend", () => {
    * The mapping metadata is what keeps that free: the agent converts pixels to
    * desktop coordinates through region and scale either way.
    */
-  it("downscales action observations while keeping the coordinate mapping exact", async () => {
+  it("downscales large action observations while keeping the coordinate mapping exact", async () => {
+    const tall = COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION + 1_000;
     const backend = new FakeComputerBackend({
-      screenSize: { width: 2_048, height: 1_536, scale: 1 },
+      screenSize: { width: 3_000, height: tall + 400, scale: 1 },
       windows: [
         {
           id: "fake-editor",
           title: "Editor",
-          bounds: { x: 100, y: 100, width: 1_280, height: 1_396 },
+          bounds: { x: 100, y: 100, width: 1_280, height: tall },
           focused: true,
           minimized: false,
           visible: true,
@@ -1198,16 +1202,16 @@ describe("ComputerManager and FakeComputerBackend", () => {
     expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
       kind: "window",
       windowId: "fake-editor",
-      maxDimension: 1_024,
+      maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
     });
     if (observed === undefined || !("screenshot" in observed)) {
       throw new Error("the action observation carried no screenshot");
     }
     const { region, scale, width, height } = observed.screenshot;
-    // 1396 logical pixels down to 1024 image pixels, and the region still names
-    // the window's own rect, so screenshot (x, y) maps back exactly.
-    expect(scale).toBeCloseTo(1_024 / 1_396, 10);
-    expect(region).toEqual({ x: 100, y: 100, width: 1_280, height: 1_396 });
+    // A window taller than the budget scales down to it, and the region still
+    // names the window's own rect, so screenshot (x, y) maps back exactly.
+    expect(scale).toBeCloseTo(COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION / tall, 10);
+    expect(region).toEqual({ x: 100, y: 100, width: 1_280, height: tall });
     // The middle of the image is still the middle of the window: region.x +
     // screenshot_x / scale, the mapping every computer tool describes.
     if (region === undefined || scale === undefined) throw new Error("no coordinate mapping");

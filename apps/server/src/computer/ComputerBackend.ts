@@ -21,15 +21,20 @@ export const DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION = 2_048;
 /**
  * The budget a post-action observation spends, rather than the perception one.
  *
- * Image tokens scale with pixel area — roughly `width * height / 750` — so a
- * full-resolution window shot attached to every mutating action costs about
- * 2,400 tokens per step of a loop that runs one action per turn. Halving each
- * side is a quarter of the tokens, and it is still enough to see what the click
- * did; when it is not, `computer_screenshot` zooms back in at the perception
- * budget, and the `region`/`scale` mapping is identical either way, so the
- * agent's coordinate skill transfers between them unchanged.
+ * Image tokens scale with pixel area — roughly `width * height / 750` — so the
+ * temptation is to shrink every after-action shot hard. A tighter 1024 budget
+ * did save tokens, but it lost the precision the agent needs to read a dense
+ * form or aim at a small field, and the cost came back as mis-aimed clicks and
+ * extra re-screenshots that were both slower and more expensive than the shot
+ * they replaced. So this matches the height of a typical application window:
+ * a browser or editor at ~1400 px tall is captured at full resolution, only a
+ * genuinely large capture is scaled, and the real savings comes from the
+ * byte-identical dedupe (`screenshotUnchanged`) that never resends a frame that
+ * did not change — a token win with no quality cost at all. When still more
+ * detail is needed, `computer_screenshot` zooms in at the perception budget with
+ * the identical `region`/`scale` mapping.
  */
-export const COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION = 1_024;
+export const COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION = 1_536;
 /** Native per-side image limit enforced by the KWin capture path. */
 export const MAX_COMPUTER_CAPTURE_MAX_DIMENSION = 16_384;
 /**
