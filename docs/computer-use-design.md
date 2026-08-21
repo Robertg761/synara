@@ -6,6 +6,15 @@ Target: Linux desktop. Primary reference machine is Fedora, KDE Plasma 6.7.3, Wa
 Companion files: `docs/computer-use-phase0-results.md` records the spike (build, load, verify, findings). `docs/computer-use-macos-reference.md` holds the Codex/macOS reverse-engineering research, reference only. This file is the build target.
 Working plugin: `apps/server/native/computer-use-kwin/`. Seeded from the author's sibling `Androdex-Desktop` project, which is the concrete reference implementation for later phases.
 
+## Current capabilities (authoritative — everything below this section is a build log, not a list of current limits)
+
+Read this before reasoning from any dated entry further down. The entries below record how the feature was built, including earlier models that were later superseded ("an earlier draft said X, that was wrong" appears often). Do not reconstruct a limitation from them; the current truth is here.
+
+- **Reach: every visible application on the human's real desktop, no restart ever required.** Qt/GTK/Gecko are driven on the dedicated `synara-agent` seat; Chromium/Electron and everything behind Xwayland are driven by direct per-client injection (writing to the client's own `wl_pointer`/`wl_keyboard` resources). An app that started before the agent seat existed is reachable too — that is exactly what direct injection handles. `stateJson` reports `directInjection: true`. The plugin refuses only a client with no pointer/keyboard on any seat.
+- **The human is never disturbed:** the agent has its own seat and cursor; the real pointer, keyboard focus, and active window are untouched, and the human can work at the same time.
+- **Genuine known gaps (only these):** an Xwayland client's own override-redirect menus (unmanaged `X11Window`s the hit test skips; Wayland-native menus including Chromium's are fine); protocol-level drag-and-drop and client-side-titlebar window moves (refused by design — see the drag-and-drop entry); GNOME pixel capture (PipeWire provider unbuilt, live spike owed). "Chromium/Electron/Xwayland are refused, use the nested session" is **superseded** — that was the pre-direct-injection (pre-V15) model.
+- **If an agent reports "clicks return true but nothing lands":** it is almost always the agent driving through a hand-rolled script instead of the native `computer_*` tools (which happens when it has no tools), or mis-targeting. Verify with a native `computer_click` before concluding a reach bug. Never answer a reach gap by restarting the app or touching the human's seat.
+
 ## What you asked for
 
 A second cursor, independent of yours, that does things on your real desktop while you keep working, with no fighting over the pointer, and you can see the agent's cursor. Just like the macOS version.
