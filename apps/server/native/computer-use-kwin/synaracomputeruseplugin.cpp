@@ -1369,7 +1369,7 @@ bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
     // typed into it.
     // Probed here rather than reused: this window has not been arrived on yet, so
     // no path decision has been taken for it.
-    if (!requireReachableClient(window, useDirectInjection(window))) {
+    if (!requireReachableClient(window, usePointerDirectInjection(window))) {
         return false;
     }
     m_targetWindow = window;
@@ -1590,6 +1590,14 @@ void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
 {
     if (!inputReady()) {
         return;
+    }
+    // Re-stamp the agent's keyboard target before every key on the direct path,
+    // using the held-key state as it is *before* this event mutates it, so the
+    // human moving seat0's focus to another window mid-type cannot carry the
+    // agent's remaining keystrokes with it. Only the direct path shares a
+    // keyboard object with the human; the agent-seat path has its own focus.
+    if (!m_ownsCompositor && m_directKeyboardSurface) {
+        reassertDirectKeyboardFocus();
     }
     if (pressed) {
         if (!m_pressedKeys.contains(keyCode)) {
@@ -2369,24 +2377,20 @@ qint64 SynaraComputerUsePlugin::humanInputAgeMilliseconds() const
  * exactly as a macOS app does - and it is bounded by never sending a leave to a
  * surface the human's seat has focused.
  */
-bool SynaraComputerUsePlugin::useDirectInjection(const Window *window) const
+bool SynaraComputerUsePlugin::usePointerDirectInjection(const Window *window) const
 {
     if (m_ownsCompositor || !window) {
         return false;
     }
-    // The choice is made by where the client's pointer *object* lives, not by
-    // whether it bound the agent seat's global. The agent-seat delivery path can
-    // only reach a client that created a wl_pointer on the agent seat; a client
-    // that bound the seat but put its pointer on seat0 (Gecko does this) would be
-    // delivered nothing and never know. So the agent seat is used only when the
-    // client is provably reachable through it, and every other client - Chromium,
-    // Electron, Xwayland, and Gecko alike - is driven by writing to its own
-    // pointer/keyboard resources directly, which is the universal path and is
-    // exactly the macOS "post to the target" mechanism. A wrong guess can only
-    // ever route a client to direct injection, which works for any conformant
-    // client, so it never costs reach. The reachability refusal
-    // (requireReachableClient) is separate and turns on whether any input
-    // resource exists at all.
+    // Pointer path by where the pointer *object* lives, not by seat binding. The
+    // agent-seat pointer path can only reach a client that created a wl_pointer
+    // on the agent seat; a client that bound the seat but put its pointer on
+    // seat0 (Gecko does this) would be delivered nothing and never know. So the
+    // agent seat is used only when the client is provably reachable through it,
+    // and everything else - Chromium, Electron, Xwayland, and Gecko's pointer -
+    // is driven by writing to its own pointer resource directly. A wrong guess
+    // can only route a client to direct injection, which works for any
+    // conformant client, so it never costs reach.
     return !clientHasAgentSeatPointer(window->surface());
 }
 
@@ -2539,6 +2543,36 @@ void SynaraComputerUsePlugin::directKeyboardEnter(Window *window)
     // No keymap is sent with this enter, and none is needed: the client bound
     // seat0 and already has that seat's keymap, which is the same physical
     // layout the agent's xkb state mirrors.
+    wl_array keys;
+    wl_array_init(&keys);
+    for (quint32 key : std::as_const(m_pressedKeys)) {
+        if (auto *slot = static_cast<quint32 *>(wl_array_add(&keys, sizeof(quint32)))) {
+            *slot = key;
+        }
+    }
+    const quint32 serial = nextDirectSerial();
+    for (wl_resource *resource : clientInputResources(surface, "wl_keyboard")) {
+        wl_keyboard_send_enter(resource, serial, surface->resource(), &keys);
+    }
+    wl_array_release(&keys);
+    directKeyboardModifiers();
+}
+
+void SynaraComputerUsePlugin::reassertDirectKeyboardFocus()
+{
+    SurfaceInterface *surface = m_directKeyboardSurface;
+    if (!surface) {
+        return;
+    }
+    // A wl_keyboard.key event names no surface: the client routes it to whatever
+    // surface its keyboard was last told to enter. That keyboard object lives on
+    // the client's seat0 - the human's seat - so the human clicking another
+    // window mid-type moves its focus and the agent's remaining keystrokes follow
+    // the human. Re-stamping the enter on the agent's target before every key is
+    // the Wayland twin of macOS posting each event to the target: the agent
+    // reclaims focus for its own key, whatever the human just did. The keys array
+    // carries the held state as it is now, before this event mutates it, so a
+    // chord's modifiers survive the re-stamp.
     wl_array keys;
     wl_array_init(&keys);
     for (quint32 key : std::as_const(m_pressedKeys)) {
@@ -2889,7 +2923,7 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
         releasePressedButtons();
         clearPointerDelivery();
         m_pointerWindow = window;
-        m_pointerDirect = useDirectInjection(window);
+        m_pointerDirect = usePointerDirectInjection(window);
         if (!m_pointerDirect) {
             m_seat->notifyPointerEnter(window->surface(), m_pos, window->inputTransformation());
             return true;
@@ -2971,7 +3005,7 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
         releasePressedKeys();
         clearKeyboardDelivery();
         m_keyboardWindow = window;
-        m_keyboardDirect = useDirectInjection(window);
+        m_keyboardDirect = usePointerDirectInjection(window);
         if (!m_keyboardDirect) {
             if (!m_seat) {
                 return false;

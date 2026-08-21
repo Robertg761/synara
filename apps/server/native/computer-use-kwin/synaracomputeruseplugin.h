@@ -181,18 +181,17 @@ private:
     // Refuses a mutating action aimed at the window the human is working in,
     // sending the D-Bus error the server turns into a retryable refusal.
     bool refuseIfHumanActive(const Window *window);
-    // Whether this window's application bound the agent seat at all. A client
-    // that never bound it still has its surfaces delivered to by the seat, and
-    // the events are dropped on the floor with no error anywhere - the failure
-    // mode that makes a click look like it simply did not work.
     // Whether the client created a wl_pointer object on the agent seat (not just
-    // bound the seat). This, not seat binding, decides whether agent-seat
-    // delivery can reach the client; see useDirectInjection.
+    // bound the seat). This, not seat binding, decides whether the agent-seat
+    // pointer path can reach the client; see usePointerDirectInjection.
     bool clientHasAgentSeatPointer(const SurfaceInterface *surface) const;
-    // Whether this window has to be driven by writing straight to its own input
-    // resources rather than through the agent seat, which is true exactly of the
-    // clients that never bound that seat.
-    bool useDirectInjection(const Window *window) const;
+    // Whether this client's pointer and keyboard are driven by writing to their
+    // own resources rather than through the agent seat: true when the client did
+    // not create a pointer object on the agent seat. Keyboard uses the same
+    // decision as the pointer; a client whose pointer is on seat0 has its
+    // keyboard there too. Crossover on the direct keyboard path is prevented by
+    // re-stamping focus per key (reassertDirectKeyboardFocus), not by routing.
+    bool usePointerDirectInjection(const Window *window) const;
     bool requireReachableClient(const Window *window, bool directInjection);
     void directPointerEnter(Window *window);
     void directPointerMotion(Window *window);
@@ -200,6 +199,10 @@ private:
     void directPointerButton(quint32 code, bool pressed);
     void directPointerAxis(double horizontal, double vertical);
     void directKeyboardEnter(Window *window);
+    // Re-sends the target's keyboard enter before each key, so a key never
+    // follows the human's focus off the agent's target on the shared seat0
+    // keyboard object.
+    void reassertDirectKeyboardFocus();
     void directKeyboardLeave();
     void directKeyboardKey(quint32 keyCode, bool pressed);
     void directKeyboardModifiers();
