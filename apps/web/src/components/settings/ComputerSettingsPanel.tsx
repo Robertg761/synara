@@ -196,18 +196,17 @@ export function ComputerSettingsPanel({
         />
       </SettingsSection>
 
-      <SettingsSection title="Per-chat control">
+      <SettingsSection title="Computer control">
         <SettingsRow
-          title="Start new chats with computer control"
-          description="New chats follow your last choice: flipping Computer control in a chat's mode menu also updates this default. Each chat can still be switched individually."
+          title="Allow agents to control the desktop in new chats"
+          description="When the desktop backend is available, any agent in a new chat can act on the desktop when asked — computer control behaves like a skill, on by default. Turn this off to opt the whole machine out; individual chats can still be switched either way from the composer's mode menu, and doing so never changes this setting."
           resetAction={
-            settings.enableComputerControlForNewChats !==
-            defaults.enableComputerControlForNewChats ? (
+            settings.allowComputerControlInNewChats !== defaults.allowComputerControlInNewChats ? (
               <SettingResetButton
-                label="start new chats with computer control"
+                label="allow agents to control the desktop in new chats"
                 onClick={() =>
                   updateSettings({
-                    enableComputerControlForNewChats: defaults.enableComputerControlForNewChats,
+                    allowComputerControlInNewChats: defaults.allowComputerControlInNewChats,
                   })
                 }
               />
@@ -215,17 +214,17 @@ export function ComputerSettingsPanel({
           }
           control={
             <Switch
-              checked={settings.enableComputerControlForNewChats}
+              checked={settings.allowComputerControlInNewChats}
               onCheckedChange={(checked) =>
-                updateSettings({ enableComputerControlForNewChats: Boolean(checked) })
+                updateSettings({ allowComputerControlInNewChats: Boolean(checked) })
               }
-              aria-label="Start new chats with computer control enabled"
+              aria-label="Allow agents to control the desktop in new chats"
             />
           }
         />
         <SettingsRow
-          title="Enabling computer control"
-          description="Switch computer control per chat from the composer's mode menu (the Full access picker); the mode button shows a monitor icon while it is on. Desktop actions then ask for approval as they run, and clipboard reads always ask."
+          title="Per-chat control"
+          description="Switch computer control for a single chat from the composer's mode menu (the Full access picker); the mode button shows a monitor icon while it is on. Desktop actions then ask for approval as they run, and clipboard reads always ask."
         />
       </SettingsSection>
     </div>

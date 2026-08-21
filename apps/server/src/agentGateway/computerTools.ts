@@ -17,12 +17,7 @@ import {
   type ComputerCaptureRequest,
 } from "../computer/ComputerBackend.ts";
 import { ComputerLeaseError, ComputerManager } from "../computer/ComputerManager.ts";
-import {
-  mcpToolResultError,
-  mcpToolResultJson,
-  type McpToolCallResult,
-  type McpToolMeta,
-} from "./protocol.ts";
+import { mcpToolResultError, mcpToolResultJson, type McpToolCallResult } from "./protocol.ts";
 import {
   ToolInputError,
   errorText,
@@ -69,42 +64,22 @@ export function computerToolRequiresApproval(name: string): boolean {
 }
 
 /**
- * The see-act loop: the tools an agent driving the desktop reaches for on
- * nearly every step. Perception first, then the pointer and keyboard actions
- * that make up the overwhelming majority of desktop work.
+ * Every computer tool is deferred — none carries `anthropic/alwaysLoad`.
  *
- * Claude's harness defers MCP tool schemas behind a tool-search indirection, so
- * without this marker the model spends a round trip discovering these before it
- * can act, and more of them whenever the loop reaches a tool it has not loaded
- * yet — pure latency in the middle of a control loop that is already round-trip
- * bound. The long tail below stays deferred so a thread that never touches the
- * desktop pays no prompt tokens for it.
+ * Computer control is now available to any chat the desktop backend is available
+ * for (see `docs/computer-use-design.md`), so preloading even the act-loop
+ * schemas would tax every chat's prompt, including the pure-coding chats that
+ * never touch the desktop. Deferring all of them is skill semantics: a chat pays
+ * ~0 tokens until an agent first reaches for the desktop, at which point Claude's
+ * tool search pulls the whole family in on one query (they share the `computer`
+ * name segment, so one search retrieves them all). The tools stay in the
+ * capability-gated deferred list, so an agent can always find them on request —
+ * they are just not resident until then.
  *
- * Deliberately no `anthropic/searchHint` on the deferred remainder: the
- * harness's tool search scores a query term matching a name segment far higher
- * than one matching a hint, and every tool here already shares the `computer`
- * segment, so one search retrieves the whole set regardless. A hint would also
- * *replace* the description the harness advertises for a deferred tool, which
- * for one shared string would make the long tail indistinguishable.
+ * The small round-trip cost of that first discovery is the deliberate trade for
+ * charging idle chats nothing: an agent that reaches the desktop pays one search;
+ * an agent that never does pays nothing.
  */
-const COMPUTER_ACT_LOOP_TOOLS = new Set([
-  "computer_get_state",
-  "computer_screenshot",
-  "computer_list_windows",
-  "computer_click",
-  "computer_type_text",
-  "computer_press_key",
-  "computer_hotkey",
-  "computer_scroll",
-]);
-
-/**
- * Spread into a definition rather than set on it: `_meta` must be absent, not
- * present-and-empty, for the deferred tools.
- */
-function computerToolMeta(name: string): { readonly _meta?: McpToolMeta } {
-  return COMPUTER_ACT_LOOP_TOOLS.has(name) ? { _meta: { "anthropic/alwaysLoad": true } } : {};
-}
 
 export interface AgentGatewayComputerToolsOptions {
   readonly manager: ComputerManager;
@@ -472,7 +447,6 @@ export function makeAgentGatewayComputerTools(
       description,
       inputSchema,
       annotations: { title, ...WRITE_TOOL_ANNOTATIONS },
-      ...computerToolMeta(name),
     },
     handler: handle(name, run),
   });
@@ -555,7 +529,6 @@ export function makeAgentGatewayComputerTools(
           "List visible desktop windows and their bounds without touching the pointer. Windows come back topmost-first: stackingIndex is 0 for the topmost window and grows downward, and occludedBy names the overlapping windows stacked above each one. A plain x/y click lands on whatever is topmost at that point, so when the window you want is occluded, pass its id as window_id alongside x/y to scope the click to it. When present, active reports which window the desktop considers activated; apps may silently drop keyboard shortcuts sent to a window that is not active, so if a hotkey had no effect, check this field.",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         annotations: { title: "List computer windows", ...READ_ONLY_TOOL_ANNOTATIONS },
-        ...computerToolMeta("computer_list_windows"),
       },
       handler: handle("computer_list_windows", async () => manager.listWindows()),
     },
@@ -574,7 +547,6 @@ export function makeAgentGatewayComputerTools(
           additionalProperties: false,
         },
         annotations: { title: "Get computer state", ...READ_ONLY_TOOL_ANNOTATIONS },
-        ...computerToolMeta("computer_get_state"),
       },
       handler: handle("computer_get_state", async (args) =>
         imageStateResult(
@@ -616,7 +588,6 @@ export function makeAgentGatewayComputerTools(
           additionalProperties: false,
         },
         annotations: { title: "Capture computer screenshot", ...READ_ONLY_TOOL_ANNOTATIONS },
-        ...computerToolMeta("computer_screenshot"),
       },
       handler: handle("computer_screenshot", async (args) => {
         const request = readCaptureRequest(args);
@@ -647,7 +618,6 @@ export function makeAgentGatewayComputerTools(
         description: "Read the logical screen dimensions used for coordinate targeting.",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         annotations: { title: "Get screen size", ...READ_ONLY_TOOL_ANNOTATIONS },
-        ...computerToolMeta("computer_get_screen_size"),
       },
       handler: handle("computer_get_screen_size", async () => manager.getScreenSize()),
     },
@@ -669,7 +639,6 @@ export function makeAgentGatewayComputerTools(
           idempotentHint: true,
           openWorldHint: false,
         },
-        ...computerToolMeta("computer_read_clipboard"),
       },
       handler: handle("computer_read_clipboard", async (_args, context) =>
         manager.readClipboard(context.callerThreadId),

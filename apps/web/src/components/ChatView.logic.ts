@@ -1525,6 +1525,28 @@ export function deriveComposerSendState(options: {
 }
 
 /**
+ * The effective per-chat computer-control flag.
+ *
+ * Computer control behaves like a skill: the moment the desktop backend is
+ * available for a thread, any agent in it may reach for the desktop, so the flag
+ * defaults on. A chat's own override always wins — a user can turn it off (or
+ * back on) for one chat without touching anything global. When the backend is
+ * unavailable the flag is forced off regardless of the machine default, because
+ * there is nothing to grant. The machine default (`allowInNewChats`) is a plain
+ * opt-out, never rewritten by a per-chat choice.
+ */
+export function resolveEffectiveComputerControl(input: {
+  readonly draftOverride: boolean | undefined;
+  readonly backendAvailable: boolean;
+  readonly allowInNewChats: boolean;
+}): boolean {
+  if (input.draftOverride !== undefined) {
+    return input.draftOverride;
+  }
+  return input.backendAvailable ? input.allowInNewChats : false;
+}
+
+/**
  * Everything a dispatched turn carries besides its message: the composer's model
  * choice, the provider start options, and the per-turn mode flags.
  *

@@ -145,33 +145,28 @@ describe("agent gateway computer tools", () => {
     }
   });
 
-  it("preloads only the act-loop schemas into the Claude prompt", async () => {
+  it("defers every computer tool: none preloaded, none carrying _meta", async () => {
     const { tools, byName } = await setup();
-    const preloaded = tools
-      .filter((tool) => tool.definition._meta?.["anthropic/alwaysLoad"] === true)
-      .map((tool) => tool.definition.name);
-    expect(preloaded).toEqual([
-      "computer_list_windows",
-      "computer_get_state",
-      "computer_screenshot",
-      "computer_click",
-      "computer_scroll",
-      "computer_type_text",
-      "computer_press_key",
-      "computer_hotkey",
-    ]);
-    // The long tail stays behind tool search, and carries no search hint: a
-    // hint replaces the description a deferred tool advertises, and the shared
-    // `computer` name segment already retrieves the whole set in one search.
+    // Computer control is available to any chat the backend serves, so preloading
+    // even the act-loop schemas would tax every chat's prompt. All of them are
+    // deferred instead — skill semantics: a chat pays ~0 tokens until an agent
+    // reaches for the desktop, at which point one tool search pulls the family in.
+    const preloaded = tools.filter(
+      (tool) => tool.definition._meta?.["anthropic/alwaysLoad"] === true,
+    );
+    expect(preloaded).toEqual([]);
+    // No `_meta` at all: no alwaysLoad marker, and no search hint (a hint would
+    // replace the description a deferred tool advertises, and the shared
+    // `computer` name segment already retrieves the whole set in one search).
     for (const tool of tools) {
-      expect(tool.definition._meta?.["anthropic/searchHint"]).toBeUndefined();
-      if (preloaded.includes(tool.definition.name)) continue;
       expect(tool.definition._meta).toBeUndefined();
     }
-    // `_meta` is additive: it must not disturb what the tool already declares.
+    // Deferring must not disturb what a tool already declares, nor its gate: the
+    // whole family stays behind the computer:control capability and is present.
     expect(byName.get("computer_click")?.definition.annotations).toMatchObject({
       readOnlyHint: false,
     });
+    expect(tools.every((tool) => tool.requiredCapability === "computer:control")).toBe(true);
   });
 
   it("returns perception payloads and preserves screenshot image content", async () => {

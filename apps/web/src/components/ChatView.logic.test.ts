@@ -40,6 +40,7 @@ import {
   editAndResendDispatchFields,
   queuedChatTurnDispatchFields,
   queuedPlanFollowUpDispatchFields,
+  resolveEffectiveComputerControl,
   resolveQueuedTurnDispatchSettings,
   threadSettingsDispatchFields,
   turnStartDispatchFields,
@@ -3095,5 +3096,70 @@ describe("turn dispatch settings", () => {
     expect(resolved.envMode).toBe("worktree");
     expect(resolved.runtimeMode).toBe("approval-required");
     expect(resolved.enableComputerControl).toBe(true);
+  });
+});
+
+describe("resolveEffectiveComputerControl", () => {
+  it("defaults on for a new chat when the backend is available", () => {
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: undefined,
+        backendAvailable: true,
+        allowInNewChats: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("stays off when the backend is unavailable, whatever the machine default", () => {
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: undefined,
+        backendAvailable: false,
+        allowInNewChats: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("honors the machine-wide opt-out for an untouched chat", () => {
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: undefined,
+        backendAvailable: true,
+        allowInNewChats: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("lets a per-chat override win in both directions, even against the default", () => {
+    // Override on while the machine opted out.
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: true,
+        backendAvailable: true,
+        allowInNewChats: false,
+      }),
+    ).toBe(true);
+    // Override off while the machine (and availability) would default it on.
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: false,
+        backendAvailable: true,
+        allowInNewChats: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("returns an explicit override verbatim, per the draft ?? (available ? default : false) rule", () => {
+    // Only the default branch is availability-gated. An explicit override is the
+    // draft's own choice and is returned as-is; the composer toggle that sets it
+    // is hidden when the backend is unavailable, so this branch is not reachable
+    // through the UI in that state.
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: true,
+        backendAvailable: false,
+        allowInNewChats: false,
+      }),
+    ).toBe(true);
   });
 });

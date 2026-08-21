@@ -603,6 +603,7 @@ import {
   queuedChatTurnDispatchFields,
   queuedPlanFollowUpDispatchFields,
   type QueuedSteerGate,
+  resolveEffectiveComputerControl,
   resolveQueuedSteerGateTransition,
   resolveQueuedTurnDispatchSettings,
   turnStartDispatchFields,
@@ -1270,14 +1271,19 @@ export default function ChatView({
   const composerPastedTexts = composerDraft.pastedTexts;
   const composerSkills = composerDraft.skills;
   const composerMentions = composerDraft.mentions;
-  // Per-chat choice wins; an untouched chat follows the sticky new-chat default.
-  const enableComputerControl =
-    composerDraft.enableComputerControl ?? settings.enableComputerControlForNewChats;
   // The computer-control toggle needs availability before the Computer pane has
   // ever been opened, so the composer seeds the snapshot itself.
   useThreadComputerStateSeed(threadId);
   const computerThreadState = useComputerStateStore(selectThreadComputerState(threadId));
   const computerControlAvailable = computerThreadState?.availability.kind === "available";
+  // Skill semantics: an untouched chat gets computer control whenever the backend
+  // is available (governed by the machine-wide opt-out), and a per-chat override
+  // wins over both. Availability is required first, so this reads after it.
+  const enableComputerControl = resolveEffectiveComputerControl({
+    draftOverride: composerDraft.enableComputerControl,
+    backendAvailable: computerControlAvailable,
+    allowInNewChats: settings.allowComputerControlInNewChats,
+  });
   const computerControlDisabledReason = computerThreadState
     ? computerThreadState.availability.kind === "unsupported-platform"
       ? `Computer control needs a Wayland desktop on Linux (KDE, GNOME, or wlroots). This server is ${computerThreadState.availability.platform}.`
@@ -5058,17 +5064,18 @@ export default function ChatView({
   );
   const handleComputerControlChange = useCallback(
     (enabled: boolean) => {
+      // A per-chat override only. It never rewrites the machine-wide default —
+      // that sticky write is what silently disabled computer control for every
+      // later chat after a single per-chat "off".
       setComposerDraftComputerControl(threadId, enabled);
-      // Last-used stickiness: the flip also becomes the default for new chats.
-      updateSettings({ enableComputerControlForNewChats: enabled });
       scheduleComposerFocus();
     },
-    [scheduleComposerFocus, setComposerDraftComputerControl, threadId, updateSettings],
+    [scheduleComposerFocus, setComposerDraftComputerControl, threadId],
   );
-  // "Enable" on a computer-control denial card: switch control on (which also
-  // updates the new-chat default) and suggest a retry message when the composer
-  // is empty, so the user can just hit send. Deliberately not auto-sent: the
-  // user should see and approve what goes back to the agent.
+  // "Enable" on a computer-control denial card: switch control on for this chat
+  // and suggest a retry message when the composer is empty, so the user can just
+  // hit send. Deliberately not auto-sent: the user should see and approve what
+  // goes back to the agent.
   const handleEnableComputerControlFromDenial = useCallback(() => {
     handleComputerControlChange(true);
     if (prompt.trim().length === 0) {
