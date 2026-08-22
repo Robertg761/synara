@@ -355,9 +355,18 @@ if (( FORCE == 0 )) && [[ "$installed_signature" == "$current_signature" ]] && v
     log "signature is unchanged; reusing installed $plugin_id"
 fi
 
+expected_build_id=""
 if (( needs_install )); then
     build_plugin
     built_plugin="$BUILD_DIR/$BUILT_PLUGIN_RELATIVE"
+    # The compiled-in build id, read from the same generated header the build
+    # just compiled. The health check below compares the running plugin's
+    # reported id against it, which is the only proof the compositor is serving
+    # the binary this run produced rather than an older generation that still
+    # holds the service name. Only a fresh build carries this guarantee - a
+    # reused install may legitimately predate the checkout's HEAD.
+    expected_build_id="$(sed -n 's/^#define SYNARA_COMPUTER_USE_BUILD_ID "\(.*\)"$/\1/p' \
+        "$BUILD_DIR/synaracomputerusebuildinfo.h" 2>/dev/null || true)"
 
     plugin_id="$(next_plugin_id)"
     destination="$PLUGIN_DIR/$plugin_id.so"
@@ -440,6 +449,18 @@ if ! health_response="$(busctl --user call org.synara.ComputerUse /org/synara/Co
     die "plugin $plugin_id loaded, but healthJson failed: $health_response"
 fi
 printf '%s\n' "$health_response"
+
+if [[ -n "$expected_build_id" ]]; then
+    # busctl prints the JSON as an escaped string, so the quotes arrive as \".
+    reported_build_id="$(printf '%s' "$health_response" | sed -n 's/.*\\"build\\":\\"\([^\\]*\)\\".*/\1/p')"
+    if [[ -z "$reported_build_id" ]]; then
+        log "healthJson reports no build id (older plugin interface); skipping the build identity check"
+    elif [[ "$reported_build_id" != "$expected_build_id" ]]; then
+        die "the compositor is serving build $reported_build_id, not the $expected_build_id this run just installed as $plugin_id - another plugin generation still owns $SERVICE_NAME"
+    else
+        log "the running plugin is the build this run installed ($reported_build_id)"
+    fi
+fi
 
 # Superseded builds are deleted, not merely unloaded. KWin auto-loads any plugin
 # in this directory whose metadata does not opt out, so an old build silently

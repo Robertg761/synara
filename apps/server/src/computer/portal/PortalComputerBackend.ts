@@ -821,8 +821,7 @@ export class PortalComputerBackend implements ComputerBackend {
     // agent space, and a mid-glide workspace change must not bend the path.
     const origin = this.lastAgentOrigin;
     const reported = (await input.pointerPosition?.()) ?? null;
-    const from =
-      this.currentPoint ?? (reported ? shiftPoint(reported, -origin.x, -origin.y) : to);
+    const from = this.currentPoint ?? (reported ? shiftPoint(reported, -origin.x, -origin.y) : to);
     await glidePointerToDeadline({
       sink: {
         movePointer: (x, y, operation) =>
