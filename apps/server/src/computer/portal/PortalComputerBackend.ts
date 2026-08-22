@@ -61,6 +61,9 @@ import {
   formatRect,
   requireWindowBounds,
   screenshotFromPng,
+  shiftPoint,
+  shiftRect,
+  windowInAgentSpace,
 } from "../computerGeometry.ts";
 import { ComputerHealthState } from "../computerHealthState.ts";
 import { EVDEV_BUTTON_CODES, keyStrokeForKey, qwertyTextKeyStrokes } from "../evdevInput.ts";
@@ -189,6 +192,15 @@ export class PortalComputerBackend implements ComputerBackend {
   private seatPrimed = false;
   private disposed = false;
   private currentPoint: ComputerPoint | null = null;
+  /**
+   * The global-space origin agent coordinates are translated by. The providers
+   * all speak the desktop's layout space, whose top-left sits at negative
+   * globals when a monitor is left of or above the primary; everything crossing
+   * this backend's boundary speaks agent space — 0..screenSize — instead, the
+   * same contract `KWinComputerBackend` keeps. Refreshed on every workspace
+   * read; (0, 0) until one happens, which is exact on single-monitor layouts.
+   */
+  private lastAgentOrigin: ComputerPoint = { x: 0, y: 0 };
   private streamListener: ComputerFrameListener | undefined;
   private streamTimer: ReturnType<typeof setInterval> | undefined;
   private stillInFlight = false;
@@ -411,8 +423,23 @@ export class PortalComputerBackend implements ComputerBackend {
   async listWindows(): Promise<readonly ComputerWindow[]> {
     this.throwIfDisposed();
     this.primeSeatArbiterOnce();
+    return await this.readWindows(await this.agentOrigin());
+  }
+
+  private async readWindows(origin: ComputerPoint): Promise<readonly ComputerWindow[]> {
     const provider = requireProvider(this.providers.windows, "Listing windows");
-    return await provider.listWindows();
+    return (await provider.listWindows()).map((window) => windowInAgentSpace(window, origin));
+  }
+
+  /**
+   * The origin agent coordinates translate by, refreshed from the capture
+   * provider's workspace when there is one. Window bounds share the capture
+   * provider's layout space, so its workspace top-left is the one true origin;
+   * without a capture provider the cached value is the best there is.
+   */
+  private async agentOrigin(): Promise<ComputerPoint> {
+    if (this.providers.capture.available) await this.workspaceRect();
+    return this.lastAgentOrigin;
   }
 
   async getScreenSize(): Promise<ComputerScreenSize> {
@@ -435,10 +462,14 @@ export class PortalComputerBackend implements ComputerBackend {
     readonly includeText?: boolean;
   }): Promise<ComputerState> {
     this.throwIfDisposed();
-    const windows = await this.listWindows();
+    this.primeSeatArbiterOnce();
     const rect = await this.workspaceRect();
+    const windows = await this.readWindows(this.lastAgentOrigin);
     const screenshot = options.includeScreenshot
-      ? await this.captureRect(rect, this.captureMaxDimension)
+      ? await this.captureRect(
+          { x: 0, y: 0, width: rect.width, height: rect.height },
+          this.captureMaxDimension,
+        )
       : undefined;
     return {
       computerId: this.computerId,
@@ -785,9 +816,18 @@ export class PortalComputerBackend implements ComputerBackend {
    */
   private async glidePointer(to: ComputerPoint, durationMs: number): Promise<void> {
     const input = this.requireInput("Moving the pointer");
-    const from = this.currentPoint ?? (await input.pointerPosition?.()) ?? to;
+    // One origin per gesture, read from the freshest workspace this backend
+    // has seen: the sink speaks global layout coordinates, the glide plans in
+    // agent space, and a mid-glide workspace change must not bend the path.
+    const origin = this.lastAgentOrigin;
+    const reported = (await input.pointerPosition?.()) ?? null;
+    const from =
+      this.currentPoint ?? (reported ? shiftPoint(reported, -origin.x, -origin.y) : to);
     await glidePointerToDeadline({
-      sink: input.sink,
+      sink: {
+        movePointer: (x, y, operation) =>
+          input.sink.movePointer(x + origin.x, y + origin.y, operation),
+      },
       from,
       to,
       durationMs,
@@ -803,26 +843,36 @@ export class PortalComputerBackend implements ComputerBackend {
 
   private async workspaceRect(): Promise<ComputerRect> {
     const provider = requireProvider(this.providers.capture, "Reading the screen size");
-    return alignRect(await provider.workspaceRect());
+    const rect = alignRect(await provider.workspaceRect());
+    this.lastAgentOrigin = { x: rect.x, y: rect.y };
+    return rect;
   }
 
+  /**
+   * Captures an agent-space region. The provider speaks the desktop's global
+   * layout space, so the request shifts by the workspace origin on the way in
+   * and the captured region shifts back on the way out; the refusal message
+   * stays in agent space because that is the only space the caller ever sees.
+   */
   private async captureRect(
     region: ComputerRect,
     maxDimension: number,
   ): Promise<ComputerScreenshot> {
     const provider = requireProvider(this.providers.capture, "Capturing the screen");
     const workspace = alignRect(await provider.workspaceRect());
+    const origin = { x: workspace.x, y: workspace.y };
+    this.lastAgentOrigin = origin;
     const requested = alignRect(region);
-    const clipped = intersectComputerRects(requested, workspace);
+    const clipped = intersectComputerRects(shiftRect(requested, origin.x, origin.y), workspace);
     if (!clipped) {
       throw new ComputerBackendError(
-        `The requested capture region ${formatRect(requested)} lies outside the desktop ${formatRect(workspace)}.`,
+        `The requested capture region ${formatRect(requested)} lies outside the desktop ${formatRect(shiftRect(workspace, -origin.x, -origin.y))}.`,
       );
     }
     const captured = await provider.captureRegion(clipped, maxDimension);
     return screenshotFromPng({
       bytes: captured.bytes,
-      region: captured.region,
+      region: shiftRect(captured.region, -origin.x, -origin.y),
       capturedAt: new Date(this.now()).toISOString(),
       source: CAPTURE_SOURCE,
     });
@@ -834,7 +884,10 @@ export class PortalComputerBackend implements ComputerBackend {
     this.stillInFlight = true;
     try {
       const rect = await this.workspaceRect();
-      const screenshot = await this.captureRect(rect, this.captureMaxDimension);
+      const screenshot = await this.captureRect(
+        { x: 0, y: 0, width: rect.width, height: rect.height },
+        this.captureMaxDimension,
+      );
       if (this.streamListener !== listener) return;
       const frame = {
         sequence: this.nextSequence++,

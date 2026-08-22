@@ -57,7 +57,10 @@ import {
   requireWindowBounds,
   screenSizeFromWindows,
   screenshotFromPng,
+  shiftPoint,
+  shiftRect,
   unwrapDbusValue,
+  windowInAgentSpace,
   workspaceRectFromWindows,
 } from "./computerGeometry.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
@@ -164,21 +167,6 @@ const INSTALLED_PLUGIN_FILE = /^(SynaraComputerUsePluginV(\d+))\.so$/;
 const CAPTURE_SOURCE = "Synara KWin capture";
 /** What an empty availability or health message degrades to. */
 const FAILURE_FALLBACK_MESSAGE = "The Synara KWin backend failed without a message.";
-
-/** Shifts a rect between the plugin's global space and the agent's 0-based one. */
-function shiftRect(rect: ComputerRect, dx: number, dy: number): ComputerRect {
-  return { x: rect.x + dx, y: rect.y + dy, width: rect.width, height: rect.height };
-}
-
-function shiftPoint(point: ComputerPoint, dx: number, dy: number): ComputerPoint {
-  return { x: point.x + dx, y: point.y + dy };
-}
-
-/** One window's bounds moved into agent space; identity and flags ride along. */
-function windowInAgentSpace(window: ComputerWindow, origin: ComputerPoint): ComputerWindow {
-  if (window.bounds === undefined) return window;
-  return { ...window, bounds: shiftRect(window.bounds, -origin.x, -origin.y) };
-}
 
 /** Shifts every coordinate in an AT-SPI tree, preserving shape and identity. */
 function shiftTree(tree: AtspiWindowTree, dx: number, dy: number): AtspiWindowTree {

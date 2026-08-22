@@ -88,12 +88,14 @@ function fakeInput(): PortalInputProvider & { readonly calls: string[] } {
   };
 }
 
-function fakeCapture(): PortalCaptureProvider & { readonly requests: ComputerRect[] } {
+function fakeCapture(
+  workspace: ComputerRect = WORKSPACE,
+): PortalCaptureProvider & { readonly requests: ComputerRect[] } {
   const requests: ComputerRect[] = [];
   return {
     requests,
     id: "wlr-screencopy",
-    workspaceRect: () => Promise.resolve(WORKSPACE),
+    workspaceRect: () => Promise.resolve(workspace),
     captureRegion: (region) => {
       requests.push(region);
       return Promise.resolve({ bytes: pngOfSize(region.width, region.height), region });
@@ -809,6 +811,93 @@ describe("PortalComputerBackend perception", () => {
       windows: [WINDOW_WITHOUT_BOUNDS],
       screenSize: { width: 1920, height: 1080 },
     });
+  });
+});
+
+describe("PortalComputerBackend negative-origin layouts", () => {
+  // A monitor left of or above the primary puts the desktop's top-left at
+  // negative layout coordinates. The providers speak that space; the agent
+  // speaks 0..screenSize. These pin the translation at the backend boundary —
+  // the same contract the KWin backend keeps — because a screenshot that shows
+  // pixels the agent cannot click is exactly the bug this exists to prevent.
+  const SHIFTED: ComputerRect = { x: -1920, y: -1080, width: 3840, height: 2160 };
+
+  it("clicks in agent space and drives the sink in layout space", async () => {
+    const input = fakeInput();
+    const backend = backendWith(
+      providersOf({
+        input: resolvedProvider(input),
+        capture: resolvedProvider(fakeCapture(SHIFTED)),
+      }),
+    );
+    // Perception first, as in a real turn: the origin comes from the freshest
+    // workspace read, and before one exists the backend can only assume (0,0).
+    await backend.getScreenSize();
+    await backend.click({ x: 200, y: 100 });
+
+    expect(input.calls.filter((call) => call.startsWith("movePointer")).at(-1)).toBe(
+      "movePointer -1720,-980",
+    );
+  });
+
+  it("reports window bounds in agent space", async () => {
+    const backend = backendWith(
+      providersOf({
+        capture: resolvedProvider(fakeCapture(SHIFTED)),
+        windows: resolvedProvider(
+          fakeWindows(
+            [
+              {
+                ...WINDOW_WITHOUT_BOUNDS,
+                bounds: { x: -1800, y: -1000, width: 640, height: 480 },
+              },
+            ],
+            { providesBounds: true },
+          ),
+        ),
+      }),
+    );
+
+    const windows = await backend.listWindows();
+    expect(windows[0]?.bounds).toEqual({ x: 120, y: 80, width: 640, height: 480 });
+  });
+
+  it("captures an agent-space region against the layout-space desktop and answers in agent space", async () => {
+    const capture = fakeCapture(SHIFTED);
+    const backend = backendWith(providersOf({ capture: resolvedProvider(capture) }));
+
+    const screenshot = await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 100, y: 50, width: 400, height: 300 },
+    });
+
+    expect(capture.requests.at(-1)).toEqual({ x: -1820, y: -1030, width: 400, height: 300 });
+    expect(screenshot.region).toEqual({ x: 100, y: 50, width: 400, height: 300 });
+  });
+
+  it("keeps the whole desktop addressable: agent space spans 0..screenSize", async () => {
+    const capture = fakeCapture(SHIFTED);
+    const backend = backendWith(providersOf({ capture: resolvedProvider(capture) }));
+
+    await expect(backend.getScreenSize()).resolves.toEqual({
+      width: 3840,
+      height: 2160,
+      scale: 1,
+    });
+    // The far corner of the bottom-right monitor is reachable...
+    const corner = await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 3800, y: 2100, width: 40, height: 60 },
+    });
+    expect(capture.requests.at(-1)).toEqual({ x: 1880, y: 1020, width: 40, height: 60 });
+    expect(corner.region).toEqual({ x: 3800, y: 2100, width: 40, height: 60 });
+    // ...and a request outside it refuses in agent space, not layout space.
+    await expect(
+      backend.captureScreenshot({
+        kind: "region",
+        region: { x: 4000, y: 2200, width: 10, height: 10 },
+      }),
+    ).rejects.toThrow(/lies outside the desktop 0,0 3840×2160|lies outside the desktop/);
   });
 });
 

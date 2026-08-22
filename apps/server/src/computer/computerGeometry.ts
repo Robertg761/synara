@@ -231,6 +231,26 @@ export function rectContainsPoint(rect: ComputerRect | undefined, point: Compute
 // ── Workspace geometry ───────────────────────────────────────────────
 
 /**
+ * Shifts a rect between the display server's global space and the agent's
+ * 0-based one. A multi-monitor layout may place monitors left of or above the
+ * primary, so the workspace's top-left can sit at negative globals; every
+ * backend translates at its own boundary so agent space stays 0..screenSize.
+ */
+export function shiftRect(rect: ComputerRect, dx: number, dy: number): ComputerRect {
+  return { x: rect.x + dx, y: rect.y + dy, width: rect.width, height: rect.height };
+}
+
+export function shiftPoint(point: ComputerPoint, dx: number, dy: number): ComputerPoint {
+  return { x: point.x + dx, y: point.y + dy };
+}
+
+/** One window's bounds moved into agent space; identity and flags ride along. */
+export function windowInAgentSpace(window: ComputerWindow, origin: ComputerPoint): ComputerWindow {
+  if (window.bounds === undefined) return window;
+  return { ...window, bounds: shiftRect(window.bounds, -origin.x, -origin.y) };
+}
+
+/**
  * Resolves the global desktop rect. The display server's reported workspace
  * geometry is the source of truth; the window bounding box is the fallback for
  * a source that does not report it yet. Windows with no bounds contribute
