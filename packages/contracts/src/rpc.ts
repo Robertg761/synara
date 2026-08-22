@@ -676,8 +676,11 @@ export const WsDeviceRpcGroup = RpcGroup.make(
 );
 
 // ── Computer control ────────────────────────────────────────────────
-// The group is kept separate so AgentGateway can admit it only for sessions
-// that explicitly hold `computer:control` and only when a backend is supported.
+// Two callers, two gates. The agent reaches these methods through the MCP
+// gateway only, gated on the session's `computer:control` capability lease;
+// the human pane reaches them through its own authenticated WebSocket with no
+// turn attached and no gateway in between. The group is kept separate so both
+// admission rules stay visible next to the contract they guard.
 
 export const WsComputerGetStatusRpc = Rpc.make(COMPUTER_WS_METHODS.getStatus, {
   payload: ComputerGetStatusInput,

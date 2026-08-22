@@ -76,6 +76,14 @@ export interface KWinComputerDbus {
   readonly loadPlugin: (pluginId: string) => Promise<boolean>;
   /** `false` only when KWin reports the id was not loaded to begin with. */
   readonly unloadPlugin: (pluginId: string) => Promise<boolean>;
+  /**
+   * The unique bus name of whoever owns `name`, or `undefined` when nothing
+   * does. This is how a well-known name is pinned to the process that answered
+   * it *now*: talking to whichever process holds `org.synara.ComputerUse`
+   * without checking means a stale duplicate instance silently receives every
+   * pointer, key, and capture call.
+   */
+  readonly nameOwner: (name: string) => Promise<string | undefined>;
   readonly connectPlugin: () => Promise<KWinComputerPluginApi>;
   readonly onDisconnect: (listener: () => void) => () => void;
   readonly close: () => Promise<void>;
@@ -132,7 +140,26 @@ export async function createSessionKWinComputerDbus(
     } catch {
       properties = undefined;
     }
+    const busDaemon = await withTimeout(
+      Promise.resolve(bus.getProxyObject(DBUS_SERVICE, DBUS_OBJECT_PATH)),
+      KWIN_DBUS_DEFAULT_TIMEOUT_MS,
+      "getProxyObject",
+    );
+    const daemon = busDaemon.getInterface(DBUS_INTERFACE);
     return {
+      nameOwner: async (name) => {
+        try {
+          const owner = await invoke(daemon, "GetNameOwner", name);
+          return typeof unwrapDbusValue(owner) === "string"
+            ? (unwrapDbusValue(owner) as string)
+            : undefined;
+        } catch (error) {
+          // "Nobody owns it" is an answer, not a failure: the caller is the
+          // one deciding whether an owner was required.
+          if (isUnownedNameError(error)) return undefined;
+          throw error;
+        }
+      },
       listLoadedPluginIds: async () => {
         const result = properties
           ? await invoke(properties, "Get", KWIN_PLUGINS_INTERFACE, "LoadedPlugins")
@@ -228,6 +255,11 @@ export async function waitForSessionBusName(options: {
     eventBus.off("disconnect", onError);
     bus.disconnect();
   }
+}
+
+function isUnownedNameError(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.includes("NameHasNoOwner") || text.includes("ServiceUnknown");
 }
 
 function makePluginApi(iface: unknown): KWinComputerPluginApi {

@@ -1,7 +1,7 @@
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 
-import type { ProviderKind } from "@synara/contracts";
+import { COMPUTER_TEXT_MAX_LENGTH, type ProviderKind } from "@synara/contracts";
 
 import {
   COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
@@ -13,6 +13,7 @@ import {
   COMPUTER_APPROVAL_REQUIRED_TOOLS,
   computerToolRequiresApproval,
   makeAgentGatewayComputerTools,
+  PROVIDERS_WITHOUT_APPROVAL_GATE,
 } from "./computerTools.ts";
 import type { McpToolCallResult } from "./protocol.ts";
 import type { ToolContext } from "./toolRuntime.ts";
@@ -187,6 +188,68 @@ describe("agent gateway computer tools", () => {
     expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
       screenshot: { region: { x: 0, y: 0, width: 1_920, height: 1_080 }, scale: 1 },
     });
+  });
+
+  /**
+   * The elements digest is the parity lever with macOS visual understanding:
+   * without it the model's only grounding is pixel estimation from a
+   * downscaled screenshot, which is how forms turned into scroll-hunting.
+   */
+  it("lists actionable elements on every get_state without needing include_text", async () => {
+    const { call } = await setup();
+    const state = await call("computer_get_state", {});
+    const payload = resultJson(state) as {
+      elements: { role: string; label: string; windowId: string | null }[];
+      text?: string;
+    };
+
+    expect(Array.isArray(payload.elements)).toBe(true);
+    const roles = payload.elements.map((element: { role: string }) => element.role);
+    expect(roles).toContain("button"); // Calculate
+    expect(roles).toContain("text-field"); // Display
+    for (const element of payload.elements) {
+      expect(typeof element.label).toBe("string");
+      expect(element.label.length).toBeGreaterThan(0);
+      expect(element.windowId).not.toBeNull();
+    }
+    // The full text rendering stays opt-in; the digest always rides.
+    expect(payload.text).toBeUndefined();
+
+    const withText = await call("computer_get_state", { include_text: true });
+    const textPayload = resultJson(withText) as { text?: string };
+    expect(textPayload.text).toEqual(expect.stringContaining("button"));
+  });
+
+  it("reports an elements digest that omits nothing silently when truncated", async () => {
+    const bigTree = {
+      role: "desktop" as const,
+      label: null,
+      value: null,
+      description: null,
+      frame: { x: 0, y: 0, width: 1_920, height: 1_080 },
+      activationPoint: null,
+      onScreen: true,
+      windowId: null,
+      children: Array.from({ length: 90 }, (_unused, index) => ({
+        role: "push button" as const,
+        label: `Button ${index}`,
+        value: null,
+        description: null,
+        frame: { x: 0, y: 0, width: 80, height: 30 },
+        activationPoint: null,
+        onScreen: true,
+        windowId: "w1",
+        children: [],
+      })),
+    };
+    const { call } = await setup(new FakeComputerBackend({ root: bigTree }));
+
+    const payload = resultJson(await call("computer_get_state", {})) as {
+      elements: unknown[];
+      elementsTruncated?: boolean;
+    };
+    expect(payload.elements).toHaveLength(60);
+    expect(payload.elementsTruncated).toBe(true);
   });
 
   it("describes the screenshot-to-desktop coordinate mapping for the model", async () => {
@@ -481,6 +544,26 @@ describe("agent gateway computer tools", () => {
     expect(backend.callsFor("pressKey")).toHaveLength(0);
   });
 
+  it("zooms the post-action screenshot to the window under an untargeted action's point", async () => {
+    const { backend, call } = await setup();
+
+    // The regression this pins: an untargeted scroll used to come back with a
+    // workspace-wide downscale too small to read, and the model scroll-hunted
+    // blind. The window under the scroll's own coordinates is the picture.
+    const result = await call("computer_scroll", { x: 1_100, y: 200, delta_x: 0, delta_y: 300 });
+    expect(result.isError).not.toBe(true);
+    expect(result.content.map((entry) => entry.type)).toEqual(["text", "image"]);
+    expect(resultJson(result)).toMatchObject({
+      action: "computer_scroll",
+      screenshot: { windowId: "fake-calculator" },
+    });
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-calculator",
+      maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+    });
+  });
+
   it("tells the model where keyboard input lands and when not to skip a screenshot", async () => {
     const { byName } = await setup();
     for (const name of ["computer_type_text", "computer_press_key", "computer_hotkey"]) {
@@ -662,6 +745,60 @@ describe("agent gateway computer tools", () => {
     expect(backend.callsFor("writeClipboard")).toHaveLength(0);
   });
 
+  /**
+   * MCP tool arguments are never validated against their JSON Schemas, so
+   * these bounds are enforced at the tool layer: an oversized set_value that
+   * fell back to typed keystrokes would hold the exclusive desktop lease and
+   * the turn for hours, and thousands of hotkey keys would hold the seat
+   * indefinitely as press/release pairs.
+   */
+  it("refuses a set_value past the text bound before it reaches the backend", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_set_value", {
+      label: "Display",
+      role: "text-field",
+      value: "x".repeat(COMPUTER_TEXT_MAX_LENGTH + 1),
+    });
+    expect(result.isError).toBe(true);
+    expect(backend.callsFor("setValue")).toHaveLength(0);
+
+    const within = await call("computer_set_value", {
+      label: "Display",
+      role: "text-field",
+      value: "x".repeat(COMPUTER_TEXT_MAX_LENGTH),
+    });
+    expect(within.isError).not.toBe(true);
+    expect(backend.callsFor("setValue")).toHaveLength(1);
+  });
+
+  it("refuses a hotkey chord past the contract's shape before dispatch", async () => {
+    const { backend, call } = await setup();
+
+    const tooMany = await call("computer_hotkey", {
+      keys: Array.from({ length: 17 }, (_, index) => `Key${index}`),
+    });
+    expect(tooMany.isError).toBe(true);
+    expect(backend.callsFor("hotkey")).toHaveLength(0);
+
+    const longKey = await call("computer_hotkey", { keys: ["k".repeat(129)] });
+    expect(longKey.isError).toBe(true);
+    expect(backend.callsFor("hotkey")).toHaveLength(0);
+
+    const within = await call("computer_hotkey", { keys: ["Control", "L"] });
+    expect(within.isError).not.toBe(true);
+    expect(backend.callsFor("hotkey")).toHaveLength(1);
+  });
+
+  it("refuses a semantic action name past the contract's bound", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_perform_action", {
+      label: "Display",
+      action: "a".repeat(257),
+    });
+    expect(result.isError).toBe(true);
+    expect(backend.callsFor("performAction")).toHaveLength(0);
+  });
+
   it("reports clipboard tools as unsupported on a backend without them", async () => {
     const { call } = await setup(withoutClipboard(new FakeComputerBackend()));
 
@@ -681,6 +818,15 @@ describe("agent gateway computer tools", () => {
     const result = await call("computer_click", { x: 10, y: 10 }, "antigravity");
     expect(result.isError).toBe(true);
     expect(backend.callsFor("click")).toHaveLength(0);
+  });
+
+  /**
+   * A provider added to this set skips the approval card entirely, so a name
+   * drifting in silently would ship an unreviewable input path. Pinned so the
+   * set only ever changes deliberately.
+   */
+  it("pins the gate-less provider set", async () => {
+    expect(PROVIDERS_WITHOUT_APPROVAL_GATE).toEqual(new Set(["antigravity"]));
   });
 
   it("keeps the clipboard read behind approval instead of the perception set", async () => {
@@ -759,7 +905,65 @@ describe("agent gateway computer tools", () => {
     });
 
     expect(result.isError).not.toBe(true);
-    expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([[null, 0, 120]]);
+    // Probe plus remainder, both untargeted: the null target survives into
+    // every leg rather than becoming an empty target object.
+    expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([
+      [null, 0, 48],
+      [null, 0, 72],
+    ]);
+  });
+
+  it("reports scroll travel and spends no extra capture doing it", async () => {
+    const { backend, call } = await setup();
+
+    const result = await call("computer_scroll", { x: 1_100, y: 200, delta_x: 0, delta_y: 300 });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content.map((entry) => entry.type)).toEqual(["text", "image"]);
+    expect(resultJson(result)).toMatchObject({
+      action: "computer_scroll",
+      scroll: {
+        requested: { deltaX: 0, deltaY: 300 },
+        injected: { deltaX: 0, deltaY: 300 },
+        gearing: 1,
+      },
+    });
+    // Exactly three on a first, probing scroll: before, after the probe leg,
+    // and after the remainder — the last of which is also the screenshot the
+    // result carries. A fourth would mean the generic observation path had
+    // photographed the window again.
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(3);
+  });
+
+  it("opts out of the captures with the screenshot, keeping the request telemetry", async () => {
+    const { backend, call } = await setup();
+
+    const result = await call("computer_scroll", {
+      x: 1_100,
+      y: 200,
+      delta_x: 0,
+      delta_y: 300,
+      include_screenshot: false,
+    });
+
+    expect(result.content.map((entry) => entry.type)).toEqual(["text"]);
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(0);
+    const payload = resultJson(result) as {
+      scroll?: { requested?: unknown; injected?: unknown; traveledY?: number };
+    };
+    expect(payload.scroll?.requested).toEqual({ deltaX: 0, deltaY: 300 });
+    expect(payload.scroll?.injected).toEqual({ deltaX: 0, deltaY: 300 });
+    expect(payload.scroll?.traveledY).toBeUndefined();
+  });
+
+  it("tells the model that scroll distance is verified rather than assumed", async () => {
+    const { byName } = await setup();
+    const description = byName.get("computer_scroll")?.definition.description ?? "";
+
+    expect(description).toContain("scroll.traveledY");
+    expect(description).toContain("corrected automatically");
+    // The advice that replaced scroll-hunting stays.
+    expect(description).toContain("computer_get_state");
   });
 
   it("still resolves a scroll target when one is actually given", async () => {
@@ -767,8 +971,10 @@ describe("agent gateway computer tools", () => {
 
     await call("computer_scroll", { x: 12, y: 34, delta_x: 0, delta_y: -50 });
 
+    // Probe plus remainder — the resolved point rides into both legs.
     expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([
-      [{ x: 12, y: 34 }, 0, -50],
+      [{ x: 12, y: 34 }, 0, -48],
+      [{ x: 12, y: 34 }, 0, -2],
     ]);
   });
 

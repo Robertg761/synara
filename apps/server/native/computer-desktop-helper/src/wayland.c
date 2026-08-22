@@ -1217,23 +1217,25 @@ static int32_t take_discrete_steps(double *remainder, double delta) {
 	return (int32_t)steps;
 }
 
+/*
+ * Wheel source with both halves, matching SynaraComputerUsePlugin::axis(): a
+ * finger-source variant was tried on 2026-08-22 and Gecko ignored those
+ * events entirely while Qt geared them up, so wheel is the one scroll every
+ * toolkit acts on. The per-toolkit distance it travels is measured and
+ * corrected server-side (scrollCalibration.ts), not here.
+ *
+ * The protocol says `axis_discrete` "allows the client to extend data
+ * normally sent using the axis event with discrete value" — it is an
+ * annotation on an axis event, not a substitute for one, so the continuous
+ * half goes out first and the discrete half extends it. A compositor that
+ * takes the pixel delta only from `axis` sees nothing at all otherwise.
+ * They are not additive: both carry the same delta, and the discrete
+ * request names the notch count that delta amounts to.
+ */
 static void send_axis(helper_wayland *state, uint32_t axis, double delta, double *remainder) {
 	if (delta == 0) return;
 	int32_t steps = take_discrete_steps(remainder, delta);
 	zwlr_virtual_pointer_v1_axis_source(state->pointer, WL_POINTER_AXIS_SOURCE_WHEEL);
-	/*
-	 * Both halves of a wheel event: GTK reads the discrete steps, and anything
-	 * that scrolls by pixels reads the value. Sending one without the other
-	 * makes a toolkit either ignore the scroll or jump a whole page.
-	 *
-	 * The protocol says `axis_discrete` "allows the client to extend data
-	 * normally sent using the axis event with discrete value" — it is an
-	 * annotation on an axis event, not a substitute for one, so the continuous
-	 * half goes out first and the discrete half extends it. A compositor that
-	 * takes the pixel delta only from `axis` sees nothing at all otherwise.
-	 * They are not additive: both carry the same delta, and the discrete
-	 * request names the notch count that delta amounts to.
-	 */
 	zwlr_virtual_pointer_v1_axis(state->pointer, now_ms(state), axis,
 	                             wl_fixed_from_double(delta));
 	if (steps != 0) {

@@ -28,11 +28,7 @@ import { KWIN_SERVICE } from "../kwinDbus.ts";
 import { readSessionBusProperty, sessionBusNameHasOwner } from "../sessionBusNames.ts";
 import { unwrapDbusValue } from "../computerGeometry.ts";
 import { readWaylandGlobals } from "./desktopHelperClient.ts";
-import {
-  desktopHelperPath,
-  resolveDesktopHelper,
-  type DesktopHelperResolution,
-} from "./desktopHelperInstall.ts";
+import { desktopHelperPath } from "./desktopHelperInstall.ts";
 import type { PortalCapabilitySlot, PortalProviderId } from "./providers.ts";
 
 /**
@@ -243,26 +239,22 @@ export async function probeDesktop(
     );
   }
 
-  // Resolved before the globals are read, not after: the resolution is what may
-  // install a shipped binary, and a global list read without one is an empty
-  // list that would plan every wlroots capability away until the next boot.
+  // Checked for presence only — not resolved. Resolving installs a shipped
+  // binary, and the boot-time probe runs for every user of every build, so an
+  // install here would contradict "install nothing until someone uses the
+  // desktop". Resolution is deferred to the first real use; until then a
+  // missing helper plans the wlroots capabilities away in this probe, and the
+  // backend's re-probe brings them back once one exists.
   const helperPath = desktopHelperPath(env);
-  const helper = await resolveDesktopHelper({
-    env,
-    ...(dependencies.executableExists ? { executableExists: dependencies.executableExists } : {}),
-    ...("prebuiltRoot" in dependencies ? { prebuiltRoot: dependencies.prebuiltRoot } : {}),
-  }).catch(
-    (error: unknown): DesktopHelperResolution => ({
-      note: `A binary shipped with this build could not be checked (${describe(error)}).`,
-    }),
+  const helperPresent = await (dependencies.executableExists ?? defaultExecutableExists)(
+    helperPath,
   );
-  const helperBinary = helper.path;
+  const helperBinary = helperPresent ? helperPath : undefined;
   if (!helperBinary) {
     record(
       "desktop-helper",
       `The native desktop helper is not built at ${helperPath}, so libei input, PipeWire capture, and the wlroots protocols have no transport. ` +
-        "Build it with the computer-desktop-helper target, or point SYNARA_COMPUTER_HELPER at an existing build." +
-        (helper.note ? ` ${helper.note}` : ""),
+        "Build it with the computer-desktop-helper target, or point SYNARA_COMPUTER_HELPER at an existing build.",
     );
   }
 

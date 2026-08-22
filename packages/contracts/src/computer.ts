@@ -39,21 +39,39 @@ export const COMPUTER_WS_CHANNELS = {
   event: "computer.event",
 } as const;
 
-const COMPUTER_ID_MAX_LENGTH = 128;
+/**
+ * Caps a window or computer identifier, which a compositor-side enumerator
+ * copies off the desktop and must clamp to this.
+ */
+export const COMPUTER_ID_MAX_LENGTH = 128;
 /**
  * Exported because it bounds `ComputerActionResult.value`, and the clipboard
  * read path must enforce it before putting clipboard text on that field.
  */
 export const COMPUTER_TEXT_MAX_LENGTH = 16 * 1024;
-const COMPUTER_LABEL_MAX_LENGTH = 1_024;
+/**
+ * Exported because backend window enumerators copy titles and app names
+ * verbatim off the desktop, and must clamp them to this before constructing
+ * `ComputerWindow` objects.
+ */
+export const COMPUTER_LABEL_MAX_LENGTH = 1_024;
 /**
  * Exported because the backend composes health and availability messages from
  * error text it does not control, and must clamp them to this before they reach
  * a state payload.
  */
 export const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
-/** Caps both a reported window list and one window's occluder list. */
-const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
+/**
+ * Caps both a reported window list and one window's occluder list. Exported
+ * because a backend enumerator must clamp its own list to this.
+ */
+export const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
+/**
+ * A sane ceiling on one window's `occludedBy` entries, far below the list
+ * maximum: stacking metadata is an N² hint in the worst case, and no caller
+ * needs hundreds of occluders. Exported for the same reason as above.
+ */
+export const COMPUTER_OCCLUDERS_MAX_LENGTH = 32;
 
 /**
  * Thread-activity kind appended by the agent gateway when a computer tool call
@@ -616,6 +634,22 @@ export const ComputerActionResult = Schema.Struct({
   clampedTo: Schema.optional(ComputerPoint),
   windowId: Schema.optional(ComputerWindowId),
   value: Schema.optional(Schema.String.check(Schema.isMaxLength(COMPUTER_TEXT_MAX_LENGTH))),
+  /**
+   * Scroll telemetry: what was asked, what was injected after gearing
+   * correction, and what the window content measurably did. `traveledY` is in
+   * logical pixels with the same sign convention as `deltaY` (positive = toward
+   * the end of the content); absent when the travel could not be measured.
+   * `gearing` is the learned travel-per-requested-pixel for this window — 1
+   * means pixel-true.
+   */
+  scroll: Schema.optional(
+    Schema.Struct({
+      requested: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
+      injected: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
+      traveledY: Schema.optional(Schema.Number),
+      gearing: Schema.optional(Schema.Number),
+    }),
+  ),
 });
 export type ComputerActionResult = typeof ComputerActionResult.Type;
 

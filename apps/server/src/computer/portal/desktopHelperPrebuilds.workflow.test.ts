@@ -80,3 +80,38 @@ describe.skipIf(!hasPyYaml)("desktop-helper-prebuilds.yml", () => {
     expect(text).toContain('"file": "$name"');
   });
 });
+
+/**
+ * These binaries execute with session-compositor authority (the helper) or load
+ * into the user's own compositor process (the plugin), so what they are built
+ * from is part of the product's supply chain. A mutable container tag drifts
+ * under a monthly schedule, and a tag-pinned action can be repointed at any
+ * commit its name touches; both are pinned here so a regression cannot land by
+ * accident.
+ */
+describe.skipIf(!hasPyYaml)("prebuild supply chain", () => {
+  it("pins every container image by digest and every action by commit SHA", async () => {
+    const [helperText, pluginText] = await Promise.all([
+      readFile(HELPER_WORKFLOW, "utf8"),
+      readFile(PLUGIN_WORKFLOW, "utf8"),
+    ]);
+
+    for (const [name, text] of [
+      ["desktop-helper-prebuilds.yml", helperText],
+      ["kwin-plugin-prebuilds.yml", pluginText],
+    ] as const) {
+      // Formatting-independent extraction: oxfmt reflows YAML flow mappings
+      // across lines, so nothing here may assume one entry per line.
+      const images = [...text.matchAll(/image:\s*"([^"]+)"/g)].map((match) => match[1]!);
+      expect(images.length).toBeGreaterThan(0);
+      for (const image of images) {
+        expect(image, `${name}: ${image} is not digest-pinned`).toMatch(/@sha256:[0-9a-f]{64}$/);
+      }
+      const uses = [...text.matchAll(/uses:\s*(\S+)/g)].map((match) => match[1]!);
+      expect(uses.length).toBeGreaterThan(0);
+      for (const action of uses) {
+        expect(action, `${name}: ${action} is not SHA-pinned`).toMatch(/^[\w./-]+@[0-9a-f]{40}$/);
+      }
+    }
+  });
+});

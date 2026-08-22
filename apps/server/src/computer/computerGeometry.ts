@@ -15,16 +15,21 @@
  * geometry, and re-exported here because this is the import every parser
  * already reaches for.
  */
-import type {
-  ComputerPoint,
-  ComputerRect,
-  ComputerScreenshot,
-  ComputerScreenSize,
-  ComputerWindow,
+import {
+  COMPUTER_ID_MAX_LENGTH,
+  COMPUTER_LABEL_MAX_LENGTH,
+  COMPUTER_OCCLUDERS_MAX_LENGTH,
+  COMPUTER_WINDOW_LIST_MAX_LENGTH,
+  type ComputerPoint,
+  type ComputerRect,
+  type ComputerScreenshot,
+  type ComputerScreenSize,
+  type ComputerWindow,
 } from "@synara/contracts";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { unwrapDbusValue } from "./dbusPlumbing.ts";
+import { clampTextToLength } from "./utf8Truncation.ts";
 
 const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
 const PNG_IHDR = Uint8Array.of(0x49, 0x48, 0x44, 0x52);
@@ -94,11 +99,16 @@ export function parseComputerPoint(value: unknown): ComputerPoint | null {
  * individual entries degrade to absent rather than failing the whole window
  * list, because stacking metadata is an optional hint and an older loaded
  * plugin omits it entirely. An empty list is dropped: "nothing above this
- * window" is what an absent field already means.
+ * window" is what an absent field already means. The list is clamped well
+ * below the contract's ceiling because the plugin's occluder enumeration is
+ * N² in the worst case, and no caller can use hundreds of entries.
  */
 function asWindowIds(value: unknown): readonly ComputerWindow["id"][] | undefined {
   if (!Array.isArray(value)) return undefined;
-  const ids = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+  const ids = value
+    .filter((item): item is string => typeof item === "string" && item.length > 0)
+    .slice(0, COMPUTER_OCCLUDERS_MAX_LENGTH)
+    .map((id) => clampTextToLength(id, COMPUTER_ID_MAX_LENGTH));
   return ids.length > 0 ? (ids as ComputerWindow["id"][]) : undefined;
 }
 
@@ -114,29 +124,37 @@ function asWindowIds(value: unknown): readonly ComputerWindow["id"][] | undefine
  * single malformed entry from a source that does report geometry is a bug in
  * that entry, and admitting it would put an unlocatable window in front of a
  * model that has no way to tell the two cases apart.
+ *
+ * Every free-form string — id, title, app name — is clamped to its contract
+ * bound before an object is constructed: one application with a paragraph-long
+ * window title (browsers and SPAs do this) must cost that title's tail, not
+ * fail the schema encode of every state payload and push event for the whole
+ * session. The list itself is clamped to the same ceiling the contract checks.
  */
 export function parseWindows(value: unknown, focusedWindowId: string | null): ComputerWindow[] {
   const parsed = parseJsonPayload(value);
   const items = Array.isArray(parsed) ? parsed : [];
   const windows: ComputerWindow[] = [];
-  for (const item of items) {
+  for (const item of items.slice(0, COMPUTER_WINDOW_LIST_MAX_LENGTH)) {
     const record = asRecord(item);
-    const id = asString(record.id) ?? asString(record.windowId);
+    const rawId = asString(record.id) ?? asString(record.windowId);
     const bounds = parseComputerRect(record.bounds);
-    if (!id || !bounds) continue;
-    const title = asString(record.title) ?? "";
-    const appName = asString(record.appId) ?? asString(record.resourceClass);
-    const pid =
-      typeof record.pid === "number" && record.pid > 0 ? Math.trunc(record.pid) : undefined;
+    if (!rawId || !bounds) continue;
+    // An oversized id cannot be addressed through the schema either way, so
+    // the tail is cut rather than the whole window dropped.
+    const id = clampTextToLength(rawId, COMPUTER_ID_MAX_LENGTH);
+    const appNameSource = asString(record.appId) ?? asString(record.resourceClass);
     const stackingIndex = asNonNegativeInt(record.stackingIndex);
     const occludedBy = asWindowIds(record.occludedBy);
     windows.push({
       id: id as ComputerWindow["id"],
-      title,
-      ...(appName ? { appName } : {}),
-      ...(pid ? { pid } : {}),
+      title: clampTextToLength(asString(record.title) ?? "", COMPUTER_LABEL_MAX_LENGTH),
+      ...(appNameSource
+        ? { appName: clampTextToLength(appNameSource, COMPUTER_LABEL_MAX_LENGTH) }
+        : {}),
+      ...(typeof record.pid === "number" && record.pid > 0 ? { pid: Math.trunc(record.pid) } : {}),
       bounds,
-      focused: record.focused === true || id === focusedWindowId,
+      focused: record.focused === true || rawId === focusedWindowId,
       ...(typeof record.active === "boolean" ? { active: record.active } : {}),
       minimized: record.minimized === true,
       visible: record.visible !== false,
@@ -173,6 +191,30 @@ export function windowsCoveringPoint(
       window.stackingIndex !== undefined &&
       window.stackingIndex < depth &&
       rectContainsPoint(window.bounds, point),
+  );
+}
+
+/**
+ * The window a bare coordinate action at `point` was delivered to: the topmost
+ * visible, unminimized window whose frame contains the point — the same
+ * stacking rule the compositor applies to an unscoped click.
+ *
+ * With one candidate the stacking order is irrelevant. With several, every
+ * candidate must report a stacking index: ranking only the windows that have
+ * one could crown a window that an unranked one actually covers, and a wrong
+ * answer here photographs a window the action never touched.
+ */
+export function topmostWindowAtPoint(
+  windows: readonly ComputerWindow[],
+  point: ComputerPoint,
+): ComputerWindow | undefined {
+  const candidates = windows.filter(
+    (window) => window.visible && !window.minimized && rectContainsPoint(window.bounds, point),
+  );
+  if (candidates.length <= 1) return candidates[0];
+  if (candidates.some((window) => window.stackingIndex === undefined)) return undefined;
+  return candidates.reduce((top, window) =>
+    (window.stackingIndex as number) < (top.stackingIndex as number) ? window : top,
   );
 }
 

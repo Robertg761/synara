@@ -33,6 +33,7 @@
 import type { ComputerPoint, ComputerRect } from "@synara/contracts";
 
 import { ComputerBackendError } from "../ComputerBackend.ts";
+import { takeDiscreteSteps } from "../scrollUnits.ts";
 import {
   connectSessionPortalBus,
   portalBoolean,
@@ -184,6 +185,12 @@ export class PortalSession {
    */
   private closedGeneration = 0;
   private disposed = false;
+  /**
+   * Sub-notch scroll dust, carried per axis across calls so repeated small
+   * pixel deltas still add up to a whole notch. See `scrollUnits.ts`.
+   */
+  private scrollRemainderX = 0;
+  private scrollRemainderY = 0;
   private readonly subscriptions: (() => void)[] = [];
   private readonly closeListeners = new Set<(reason: string) => void>();
   private readonly selectionTransferListeners = new Set<
@@ -326,6 +333,27 @@ export class PortalSession {
       ),
     );
 
+    // From here to the grant being published, every step can *throw* — a
+    // timeout on SelectSources or CreateSession's reply, a bus error between
+    // Start and the token write — and the failure-code paths below are not the
+    // only way out. A thrown error that left the handle alive would make every
+    // retry open a second portal-side session while the first lives until the
+    // bus drops, so the handle is closed behind any exit this method does not
+    // return from. Closing an already-closed handle is swallowed by design.
+    try {
+      return await this.finishOpen(bus, sessionHandle, generation);
+    } catch (error) {
+      await this.closeSession(bus, sessionHandle);
+      throw error;
+    }
+  }
+
+  /** Everything after the session exists: selection, clipboard, Start, publish. */
+  private async finishOpen(
+    bus: PortalBus,
+    sessionHandle: string,
+    generation: number,
+  ): Promise<PortalSessionState> {
     const restoreToken = await this.restoreTokens.read(this.restoreKey);
     const persistence: PortalOptions = {
       persist_mode: portalUint32(PORTAL_PERSIST_MODE_PERSISTENT),
@@ -605,29 +633,46 @@ export class PortalSession {
   }
 
   /**
+   * Scroll by logical pixels, like every other backend.
+   *
+   * `NotifyPointerAxisDiscrete` speaks whole wheel notches, not pixels — the
+   * unit mismatch that once sent a `deltaY: -600` forty screens down. The
+   * pixel→notch conversion with its carried sub-notch remainder lives in
+   * `scrollUnits.ts`, shared deliberately with the wlroots helper's C math so
+   * one scroll means one thing on every desktop.
+   *
    * Discrete steps only, unlike the wlroots provider's paired axis events.
    * There the pair rides one `wl_pointer.frame`; the portal has no frame
    * grouping, so `NotifyPointerAxis` alongside this would arrive as a second,
    * separate scroll and double every wheel step. Discrete is the form every
-   * toolkit understands on its own.
+   * toolkit understands on its own. A delta that has not yet accumulated a
+   * whole notch sends nothing: the remainder waits for the next call.
    */
   async scroll(deltaX: number, deltaY: number): Promise<void> {
     const state = await this.ensureOpen();
     if (deltaY !== 0) {
-      await this.notify("NotifyPointerAxisDiscrete", "oa{sv}ui", [
-        state.sessionHandle,
-        {},
-        POINTER_AXIS_VERTICAL,
-        Math.trunc(deltaY),
-      ]);
+      const vertical = takeDiscreteSteps(this.scrollRemainderY, deltaY);
+      this.scrollRemainderY = vertical.remainder;
+      if (vertical.steps !== 0) {
+        await this.notify("NotifyPointerAxisDiscrete", "oa{sv}ui", [
+          state.sessionHandle,
+          {},
+          POINTER_AXIS_VERTICAL,
+          vertical.steps,
+        ]);
+      }
     }
     if (deltaX !== 0) {
-      await this.notify("NotifyPointerAxisDiscrete", "oa{sv}ui", [
-        state.sessionHandle,
-        {},
-        POINTER_AXIS_HORIZONTAL,
-        Math.trunc(deltaX),
-      ]);
+      const horizontal = takeDiscreteSteps(this.scrollRemainderX, deltaX);
+      this.scrollRemainderX = horizontal.remainder;
+      if (horizontal.steps !== 0) {
+        await this.notify("NotifyPointerAxisDiscrete", "oa{sv}ui", [
+          state.sessionHandle,
+          {},
+          POINTER_AXIS_HORIZONTAL,
+          horizontal.steps,
+        ]);
+      }
     }
   }
 

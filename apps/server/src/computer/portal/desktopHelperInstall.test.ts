@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,12 +11,14 @@ import {
   glibcIsAvailable,
   parseOsRelease,
   readDesktopHelperManifest,
+  readDesktopHelperStamp,
   resolveDesktopHelper,
   runtimeGlibcVersion,
   selectDesktopHelperPrebuild,
   type DesktopHelperPrebuild,
   type DesktopHelperResolutionDependencies,
 } from "./desktopHelperInstall.ts";
+import { DESKTOP_HELPER_PROTOCOL_VERSION } from "./desktopHelperClient.ts";
 
 const temp = (): Promise<string> => mkdtemp(join(tmpdir(), "synara-helper-"));
 
@@ -224,15 +227,122 @@ describe("resolveDesktopHelper", () => {
     expect(resolution.note).toContain("SYNARA_COMPUTER_HELPER points at this path");
   });
 
-  it("uses a helper build.sh already installed without reading the manifest at all", async () => {
+  it("uses a helper build.sh already installed when nothing ships to verify it against", async () => {
     const deps = await fedoraHost({
       executableExists: () => Promise.resolve(true),
       prebuiltRoot: join(await temp(), "does-not-exist"),
     });
     const resolution = await resolveDesktopHelper(deps);
 
+    // No stamp (build.sh wrote no record) and no shipped manifest to check it
+    // against: executed as-is, because refusing it would break the documented
+    // build-it-yourself path.
     expect(resolution.source).toBe("installed");
     expect(resolution.path).toBe(desktopHelperPath(deps.env));
+  });
+
+  it("re-verifies an unstamped install against the shipped manifest instead of executing it blindly", async () => {
+    const root = await prebuiltRoot([build()]);
+    const deps = await fedoraHost({
+      executableExists: () => Promise.resolve(true),
+      prebuiltRoot: root,
+    });
+    const destination = desktopHelperPath(deps.env);
+    // A binary from an older Synara, before installs were stamped. Its bytes
+    // are not trusted; the shipped bundle is installed over it, stamped.
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, "#!/bin/sh\nold build\n");
+
+    const resolution = await resolveDesktopHelper(deps);
+
+    expect(resolution).toEqual({ path: destination, source: "prebuilt" });
+    expect(await readFile(destination, "utf8")).toBe("#!/bin/sh\nexit 0\n");
+    expect(await readDesktopHelperStamp(destination)).toMatchObject({ arch: "x64" });
+  });
+
+  it("replaces an installed helper whose bytes contradict their stamp", async () => {
+    const root = await prebuiltRoot([build()]);
+    const deps = await fedoraHost({ prebuiltRoot: root });
+    const destination = desktopHelperPath(deps.env);
+    // Install properly, then corrupt what it left behind — the truncated or
+    // tampered case the stamp exists to catch.
+    expect(await resolveDesktopHelper(deps)).toEqual({ path: destination, source: "prebuilt" });
+    await writeFile(destination, "corrupted");
+
+    const resolution = await resolveDesktopHelper(deps);
+
+    expect(resolution).toEqual({ path: destination, source: "prebuilt" });
+    expect(await readFile(destination, "utf8")).toBe("#!/bin/sh\nexit 0\n");
+  });
+
+  it("refuses a stamped helper whose bytes went bad when nothing ships to replace it", async () => {
+    const deps = await fedoraHost({
+      executableExists: () => Promise.resolve(true),
+      prebuiltRoot: join(await temp(), "absent"),
+    });
+    const destination = desktopHelperPath(deps.env);
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, "tampered");
+    await writeFile(
+      `${destination}.stamp`,
+      [
+        `sha256=${createHash("sha256").update("original bytes").digest("hex")}`,
+        "os_id=fedora",
+        "os_version_id=44",
+        "arch=x64",
+        `protocol_version=${DESKTOP_HELPER_PROTOCOL_VERSION}`,
+        "installed_at=2026-01-01T00:00:00.000Z",
+        "",
+      ].join("\n"),
+    );
+
+    const resolution = await resolveDesktopHelper(deps);
+
+    // Executing bytes that contradict their own stamp is exactly what the
+    // stamp exists to prevent, bundle or no bundle.
+    expect(resolution.path).toBeUndefined();
+    expect(resolution.note).toContain("no longer matches the record of what was installed");
+  });
+
+  it("upgrades an installed helper in place when a newer build ships for this system", async () => {
+    const root = await prebuiltRoot([build()]);
+    const deps = await fedoraHost({ prebuiltRoot: root });
+    const destination = desktopHelperPath(deps.env);
+    expect(await resolveDesktopHelper(deps)).toEqual({ path: destination, source: "prebuilt" });
+
+    // The app updated: same system key, different bytes.
+    const updated = await prebuiltRoot([build()], "#!/bin/sh\nupgraded\n");
+    const resolution = await resolveDesktopHelper({ ...deps, prebuiltRoot: updated });
+
+    expect(resolution).toEqual({ path: destination, source: "prebuilt" });
+    expect(await readFile(destination, "utf8")).toBe("#!/bin/sh\nupgraded\n");
+    expect(await readDesktopHelperStamp(destination)).toMatchObject({
+      sha256: createHash("sha256").update("#!/bin/sh\nupgraded\n").digest("hex"),
+    });
+  });
+
+  it("treats a stamp from an older helper protocol as a reinstall trigger", async () => {
+    const root = await prebuiltRoot([build()]);
+    const deps = await fedoraHost({ prebuiltRoot: root });
+    const destination = desktopHelperPath(deps.env);
+    expect(await resolveDesktopHelper(deps)).toEqual({ path: destination, source: "prebuilt" });
+
+    // Roll the stamp back as if an older server had written it.
+    const stamp = await readDesktopHelperStamp(destination);
+    await writeFile(
+      `${destination}.stamp`,
+      (await readFile(`${destination}.stamp`, "utf8")).replace(
+        `protocol_version=${stamp?.protocolVersion}`,
+        `protocol_version=${stamp!.protocolVersion - 1}`,
+      ),
+    );
+
+    const resolution = await resolveDesktopHelper(deps);
+
+    expect(resolution.source).toBe("prebuilt");
+    expect((await readDesktopHelperStamp(destination))?.protocolVersion).toBe(
+      DESKTOP_HELPER_PROTOCOL_VERSION,
+    );
   });
 
   it("installs a matching shipped binary, executable, where the probe looks", async () => {

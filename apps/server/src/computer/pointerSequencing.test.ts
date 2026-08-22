@@ -163,6 +163,17 @@ describe("pressKeyStroke", () => {
       `${POINTER_SEQUENCE_OPERATIONS.shiftRelease} ${EVDEV_KEY_CODES.LeftShift} false`,
     );
   });
+
+  it("reports the stroke failure when the shift release refuses on top of it", async () => {
+    const { sink } = recordingSink({
+      failOn: (call) =>
+        call === `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.A} true` ||
+        call === `${POINTER_SEQUENCE_OPERATIONS.shiftRelease} ${EVDEV_KEY_CODES.LeftShift} false`,
+    });
+    await expect(pressKeyStroke({ sink, stroke: keyStrokeForKey("A") })).rejects.toThrow(
+      `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.A}`,
+    );
+  });
 });
 
 describe("pressHotkeyStrokes", () => {
@@ -194,6 +205,37 @@ describe("pressHotkeyStrokes", () => {
       `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.T} true`,
       `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.LeftControl} false`,
     ]);
+  });
+
+  /**
+   * Each release is one D-Bus notify that can fail transiently while the
+   * session survives; aborting the loop on the first refusal would leave every
+   * modifier behind it latched on the human's keyboard until disposal.
+   */
+  it("runs every chord release even after one refuses, and surfaces the first refusal", async () => {
+    const refusedRelease = `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.LeftShift} false`;
+    const { sink, calls } = recordingSink({ failOn: (call) => call === refusedRelease });
+    await expect(
+      pressHotkeyStrokes({ sink, strokes: ["ctrl", "shift", "t"].map(keyStrokeForKey) }),
+    ).rejects.toThrow(`refused ${refusedRelease}`);
+
+    // Shift's release refused, but T's and Ctrl's still happened.
+    expect(calls.slice(-3)).toEqual([
+      `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.T} false`,
+      refusedRelease,
+      `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.LeftControl} false`,
+    ]);
+  });
+
+  it("keeps reporting the press failure when a chord release also refuses", async () => {
+    const { sink } = recordingSink({
+      failOn: (call) =>
+        call === `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.T} true` ||
+        call === `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.LeftControl} false`,
+    });
+    await expect(
+      pressHotkeyStrokes({ sink, strokes: ["ctrl", "t"].map(keyStrokeForKey) }),
+    ).rejects.toThrow(`${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.T}`);
   });
 });
 
@@ -231,5 +273,19 @@ describe("pressButtonOnce", () => {
     expect(calls.at(-1)).toBe(
       `${POINTER_SEQUENCE_OPERATIONS.buttonRelease} ${EVDEV_BUTTON_CODES.left} false`,
     );
+  });
+
+  it("reports an interrupted hold rather than a refused release on top of it", async () => {
+    // Both halves failed; the hold's abort is the cause worth acting on.
+    const { sink } = recordingSink({
+      failOn: (call) => call.includes(POINTER_SEQUENCE_OPERATIONS.buttonRelease),
+    });
+    await expect(
+      pressButtonOnce({
+        sink,
+        code: EVDEV_BUTTON_CODES.left,
+        sleep: () => Promise.reject(new Error("aborted")),
+      }),
+    ).rejects.toThrow("aborted");
   });
 });

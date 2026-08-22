@@ -229,6 +229,33 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  /**
+   * `lastError` and availability messages are schema-bounded at 2048
+   * characters, and both are composed from backend error text nothing here
+   * controls. One oversized D-Bus diagnostic used to fail the encode of the
+   * whole getThreadState payload — breaking thread-state pushes for that
+   * thread until the message changed.
+   */
+  it("clamps an oversized backend error before it reaches a state payload", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+
+    const oversized = "E".repeat(100_000);
+    backend.failNext("probeAvailability", new Error(oversized));
+    const state = await manager.getThreadState("thread-oversize");
+
+    expect(state.lastError).toBeDefined();
+    expect(state.lastError!.length).toBeLessThanOrEqual(2_048);
+    // The availability verdict on the same payload is clamped the same way,
+    // so encoding the state succeeds end to end.
+    expect(state.availability.kind).toBe("backend-unavailable");
+    if (state.availability.kind === "backend-unavailable") {
+      expect(state.availability.message.length).toBeLessThanOrEqual(2_048);
+    }
+
+    await manager.dispose();
+  });
+
   it("performs semantic writes only against a fresh, unambiguous snapshot", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });
@@ -1098,6 +1125,94 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("photographs the window under an untargeted action's point instead of the workspace", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    // The scroll-hunting run this fixes: an unscoped pointer action cleared
+    // the agent's explicit target, and the old fallback answered with a
+    // workspace-wide downscale too small to read. The action's own
+    // coordinates name the window it touched, so that window is the picture.
+    const observed = await manager.captureActionScreenshot(undefined, { x: 1_100, y: 200 });
+    expect(observed !== undefined && "windowId" in observed ? observed.windowId : undefined).toBe(
+      "fake-calculator",
+    );
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "window",
+      windowId: "fake-calculator",
+      maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+    });
+
+    // A point over bare desktop identifies no window; the agent-focus step
+    // still answers (the fake terminal holds the agent's focus by default).
+    const desktop = await manager.captureActionScreenshot(undefined, { x: 1_800, y: 1_000 });
+    expect(desktop !== undefined && "windowId" in desktop ? desktop.windowId : undefined).toBe(
+      "fake-terminal",
+    );
+
+    await manager.dispose();
+  });
+
+  it("resolves overlapping point candidates by stacking order and refuses to guess without one", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    const overlapping = (stacked: boolean): ComputerWindow[] => [
+      {
+        id: "under",
+        title: "Under",
+        bounds: { x: 100, y: 100, width: 800, height: 600 },
+        focused: false,
+        minimized: false,
+        visible: true,
+        ...(stacked ? { stackingIndex: 1 } : {}),
+      },
+      {
+        id: "over",
+        title: "Over",
+        bounds: { x: 300, y: 200, width: 400, height: 300 },
+        focused: false,
+        minimized: false,
+        visible: true,
+        ...(stacked ? { stackingIndex: 0 } : {}),
+      },
+    ];
+
+    backend.emitWindowsChanged(overlapping(true));
+    const observed = await manager.captureActionScreenshot(undefined, { x: 400, y: 300 });
+    expect(observed !== undefined && "windowId" in observed ? observed.windowId : undefined).toBe(
+      "over",
+    );
+
+    // The same overlap with no stacking order: a guess could photograph a
+    // window the action never touched, so the workspace fallback answers.
+    backend.emitWindowsChanged(overlapping(false));
+    const widened = await manager.captureActionScreenshot(undefined, { x: 400, y: 300 });
+    expect(widened !== undefined && "windowId" in widened ? widened.windowId : undefined).toBe(
+      undefined,
+    );
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toMatchObject({
+      kind: "region",
+    });
+
+    await manager.dispose();
+  });
+
+  it("falls back to the focus path when the point window vanishes before its capture", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    // The point resolved to the calculator, but its capture fails — the
+    // window closed in the race. The caller never named it, so the answer is
+    // the ordinary focus fallback, not targetWindowClosed and not an error.
+    backend.failNext("captureScreenshot");
+    const observed = await manager.captureActionScreenshot(undefined, { x: 1_100, y: 200 });
+    expect(observed !== undefined && "windowId" in observed ? observed.windowId : undefined).toBe(
+      "fake-terminal",
+    );
+
+    await manager.dispose();
+  });
+
   it("skips the post-action capture entirely on a backend that cannot capture", async () => {
     const backend = new FakeComputerBackend({
       capabilities: {
@@ -1271,6 +1386,213 @@ describe("ComputerManager and FakeComputerBackend", () => {
     backend.setScreenSize({ width: 1_280, height: 720, scale: 1 });
     const resized = await manager.captureActionScreenshot();
     expect(resized !== undefined && "screenshot" in resized).toBe(true);
+
+    await manager.dispose();
+  });
+
+  /**
+   * A manager whose travel measurement is scripted, so the tests exercise the
+   * closed loop rather than the correlator (which has its own unit tests). Each
+   * queued screenshot makes one capture's bytes differ from the last, because
+   * byte-identical captures short-circuit to "did not move" before measuring.
+   */
+  function calibratedScrollFixture(
+    travels: readonly (number | undefined)[],
+    backend = new FakeComputerBackend(),
+  ) {
+    const measured: number[] = [];
+    const manager = new ComputerManager({
+      backend,
+      actionSettleMs: 0,
+      measureScrollTravel: () => travels[measured.push(0) - 1],
+    });
+    backend.queueScreenshots(Array.from({ length: 12 }, (_unused, index) => `capture-${index}`));
+    return { backend, manager, measurements: measured };
+  }
+
+  it("probes an unmeasured window, then delivers the remainder pre-corrected", async () => {
+    // A GTK-hosted browser gears a pixel delta up by ~7x, and nothing in the
+    // protocol says so. Sending the whole request first would travel beyond
+    // what the correlator can measure, so the first large scroll goes out as a
+    // 48px probe (which travels 336 at 7x — measurable), and the remainder —
+    // the request minus what the probe already covered — is divided by the
+    // gearing the probe just taught. The first scroll lands on target.
+    const { backend, manager } = calibratedScrollFixture([336, 64, 400]);
+
+    const first = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, {
+      observe: true,
+    });
+    expect(first.result.scroll).toEqual({
+      requested: { deltaX: 0, deltaY: 400 },
+      // Reported to two decimals; the backend gets the unrounded deltas.
+      injected: { deltaX: 0, deltaY: 57.14 },
+      traveledY: 400,
+      gearing: 7,
+    });
+    const legs = backend.callsFor("scroll").map((entry) => entry.args[2]);
+    expect(legs[0]).toBe(48);
+    expect(legs[1]).toBeCloseTo(64 / 7, 6);
+    expect(first.observation !== undefined && "screenshot" in first.observation).toBe(true);
+
+    // A measured window is trusted in one delivery: no probe, one injection.
+    const second = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, {
+      observe: true,
+    });
+    expect(second.result.scroll?.injected.deltaY).toBe(57.14);
+    expect(second.result.scroll?.traveledY).toBe(400);
+    expect(second.result.scroll?.gearing).toBe(7);
+    expect(backend.callsFor("scroll")).toHaveLength(3);
+    expect(backend.callsFor("scroll").at(-1)?.args[2]).toBeCloseTo(400 / 7, 6);
+
+    await manager.dispose();
+  });
+
+  it("falls back to the full request when the probe cannot be measured", async () => {
+    const { backend, manager } = calibratedScrollFixture([undefined, undefined]);
+
+    const result = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, {
+      observe: true,
+    });
+
+    // The unmeasured probe deducts only its own request: 48 went out, so the
+    // remaining 352 follows at gearing 1, and the client got the 400 it would
+    // have gotten without the probe.
+    expect(result.result.scroll?.injected).toEqual({ deltaX: 0, deltaY: 400 });
+    expect(result.result.scroll?.traveledY).toBeUndefined();
+    expect(result.result.scroll?.gearing).toBe(1);
+    expect(backend.callsFor("scroll").map((entry) => entry.args[2])).toEqual([48, 352]);
+
+    await manager.dispose();
+  });
+
+  it("converts measured travel out of capture pixels before reporting or learning it", async () => {
+    // A window wider than the observation budget is captured downscaled, so the
+    // correlator's answer is in capture pixels and means less travel than it
+    // says. Reporting it unconverted would teach the store a gearing that is
+    // really the zoom factor.
+    const backend = new FakeComputerBackend({
+      windows: [
+        {
+          id: "fake-browser",
+          title: "Browser",
+          bounds: { x: 0, y: 0, width: 1_920, height: 1_080 },
+          focused: true,
+          minimized: false,
+          visible: true,
+          stackingIndex: 0,
+        },
+      ],
+    });
+    const { manager } = calibratedScrollFixture([800], backend);
+
+    // Probe-sized on purpose, so the request goes out in one measured leg.
+    const result = await manager.scrollCalibrated("thread-1", { x: 900, y: 500 }, 0, 40, {
+      observe: true,
+    });
+
+    // 1536/1920 = 0.8, so 800 capture pixels of travel are 1000 logical ones.
+    expect(result.result.scroll?.traveledY).toBe(1_000);
+    expect(result.result.scroll?.gearing).toBe(25);
+
+    await manager.dispose();
+  });
+
+  it("suppresses a wrong-way measurement instead of reporting or learning it", async () => {
+    // The live footer-alias case: the correlator locked onto repetitive
+    // content and answered with travel opposing the injection. That number
+    // must reach neither the caller nor the store.
+    const { backend, manager } = calibratedScrollFixture([-752, undefined]);
+
+    const result = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 100, {
+      observe: true,
+    });
+
+    expect(result.result.scroll?.traveledY).toBeUndefined();
+    expect(result.result.scroll?.gearing).toBe(1);
+    expect(backend.callsFor("scroll").map((entry) => entry.args[2])).toEqual([48, 52]);
+
+    await manager.dispose();
+  });
+
+  it("reads byte-identical captures as no movement, and learns nothing from it", async () => {
+    const backend = new FakeComputerBackend();
+    const measurements: number[] = [];
+    const manager = new ComputerManager({
+      backend,
+      actionSettleMs: 0,
+      measureScrollTravel: () => measurements.push(0) && undefined,
+    });
+
+    // No queued captures: the fake returns the same fixture every time, which is
+    // what the end of a page looks like — pixels that did not change did not
+    // move, and no correlation is needed to know it.
+    const first = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, {
+      observe: true,
+    });
+    expect(first.result.scroll?.traveledY).toBe(0);
+    expect(first.result.scroll?.gearing).toBe(1);
+    expect(measurements).toEqual([]);
+
+    const second = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, {
+      observe: true,
+    });
+    expect(second.result.scroll?.injected).toEqual({ deltaX: 0, deltaY: 400 });
+    expect(second.result.scroll?.traveledY).toBe(0);
+    // The after-capture is still the caller's observation, so a screen that did
+    // not change comes back as the repeat it is rather than the same image.
+    expect(second.observation).toEqual({ screenshotUnchanged: true, windowId: "fake-calculator" });
+    expect(measurements).toEqual([]);
+
+    await manager.dispose();
+  });
+
+  it("keeps the correction but takes no captures when the caller wants no observation", async () => {
+    const { backend, manager } = calibratedScrollFixture([336, 64]);
+
+    await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, { observe: true });
+    // Three on the probing first scroll: before, after the probe, after the rest.
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(3);
+
+    const unobserved = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, {
+      observe: false,
+    });
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(3);
+    expect(unobserved.observation).toBeUndefined();
+    expect(unobserved.result.scroll?.traveledY).toBeUndefined();
+    expect(unobserved.result.scroll?.injected.deltaY).toBe(57.14);
+    expect(backend.callsFor("scroll").at(-1)?.args[2]).toBeCloseTo(400 / 7, 6);
+
+    await manager.dispose();
+  });
+
+  it("never re-gears the pane's own scroll, whatever the agent learned", async () => {
+    const { backend, manager } = calibratedScrollFixture([336, 64]);
+    await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, { observe: true });
+    const capturesAfterLearning = backend.callsFor("captureScreenshot").length;
+
+    // The human is watching the result and closing the loop themselves; a
+    // correction applied under their hand would fight them.
+    await manager.scroll(undefined, { x: 1_100, y: 200 }, 0, 400);
+    expect(backend.callsFor("scroll").at(-1)?.args).toEqual([{ x: 1_100, y: 200 }, 0, 400]);
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(capturesAfterLearning);
+
+    await manager.dispose();
+  });
+
+  it("delivers the scroll unmeasured when the capture fails", async () => {
+    const { backend, manager } = calibratedScrollFixture([336]);
+    backend.failNext("captureScreenshot");
+
+    const result = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 400, {
+      observe: true,
+    });
+
+    expect(result.result).toMatchObject({ action: "computer_scroll" });
+    expect(result.result.scroll?.traveledY).toBeUndefined();
+    expect(result.observation).toBeUndefined();
+    expect(backend.callsFor("scroll")).toHaveLength(1);
+    // The before-capture failed, so nothing to compare an after-capture against.
+    expect(backend.callsFor("captureScreenshot")).toHaveLength(1);
 
     await manager.dispose();
   });

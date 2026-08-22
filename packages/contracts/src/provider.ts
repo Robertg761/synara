@@ -91,6 +91,12 @@ export const ProviderForkThreadInput = Schema.Struct({
   cwd: Schema.optional(TrimmedNonEmptyString),
   modelSelection: Schema.optional(ModelSelection),
   providerOptions: Schema.optional(ProviderStartOptions),
+  /**
+   * The computer-control fact a start would carry, so a fork leases the same
+   * gateway capabilities as its source instead of silently losing
+   * `computer:control` at the fork boundary.
+   */
+  enableComputerControl: Schema.optional(Schema.Boolean),
   runtimeMode: RuntimeMode,
 });
 export type ProviderForkThreadInput = typeof ProviderForkThreadInput.Type;

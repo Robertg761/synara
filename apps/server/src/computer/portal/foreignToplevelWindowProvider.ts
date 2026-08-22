@@ -26,10 +26,12 @@ function toComputerWindow(toplevel: DesktopHelperWindow): ComputerWindow {
     id: toplevel.id as ComputerWindow["id"],
     title: toplevel.title,
     ...(toplevel.appId ? { appName: toplevel.appId } : {}),
-    // Activation is the only focus signal the protocol carries, and it is the
-    // one that matters for input: a toolkit dispatches keyboard shortcuts only
-    // to the activated window.
-    focused: toplevel.activated,
+    // `focused` is the agent's input target and stays false until this backend
+    // actually aims at the window; activation — which is what the protocol
+    // carries, and what decides toolkit shortcut dispatch — rides on `active`,
+    // matching the GNOME provider's convention. Conflating the two would make
+    // every window claim to be where the agent is typing.
+    focused: false,
     active: toplevel.activated,
     minimized: toplevel.minimized,
     // "Not minimized" is the strongest visibility claim available. Occlusion is

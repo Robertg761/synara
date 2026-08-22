@@ -538,6 +538,8 @@ public:
     }
     void sendAxis(PointerAxis axis, qreal delta, qint32 delta120)
     {
+        // Wheel source with a value120 half, deliberately: see the delivery
+        // contract above SynaraComputerUsePlugin::axis().
         Q_EMIT pointerAxisChanged(axis, delta, delta120, PointerAxisSource::Wheel, false, timestamp(), this);
         Q_EMIT pointerFrame(this);
     }
@@ -1064,6 +1066,13 @@ QString SynaraComputerUsePlugin::stateJson() const
         {QStringLiteral("agentName"), m_agentName.isEmpty() ? s_agentFallbackName : m_agentName},
         {QStringLiteral("pressedButtonCount"), m_pressedButtons.size()},
         {QStringLiteral("pressedKeyCount"), m_pressedKeys.size()},
+        // Whether CapsLock is latched on the keyboard this plugin drives. The
+        // server's QWERTY synthesis is Shift-only, so a latched CapsLock would
+        // turn "Hello" into "hELLO"; reporting it lets the backend invert its
+        // Shift decisions for letters. Absent on builds older than this field.
+        {QStringLiteral("capsLockOn"),
+         m_xkbState != nullptr &&
+             xkb_state_mod_name_is_active(m_xkbState, XKB_MOD_NAME_CAPS, XKB_STATE_MODS_LOCKED) == 1},
         {QStringLiteral("idleTimeoutMs"), double(m_idleTimeoutMs)},
         {QStringLiteral("idleMs"), double(idleMilliseconds())},
         {QStringLiteral("releasedByUser"), m_releasedByUser},
@@ -1415,6 +1424,12 @@ bool SynaraComputerUsePlugin::movePointer(double x, double y)
     if (!inputReady()) {
         return false;
     }
+    // NaN survives every downstream clamp (comparisons are all false), and
+    // wl_fixed_from_double would encode it into the compositor's pointer
+    // position, so non-finite input is refused at the door.
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        return false;
+    }
 
     m_pos = confinedPoint(QPointF(x, y));
     if (m_ownsCompositor) {
@@ -1490,6 +1505,20 @@ static int scrollValue120(double pixels)
  * Scrolls by @p horizontal and @p vertical desktop pixels, not wheel notches.
  *
  * Positive is right and down, matching wl_pointer's axis directions.
+ *
+ * Wheel source with both halves — the pixel axis and its value120 notch count
+ * — because it is the only scroll every toolkit acts on, measured live on
+ * 2026-08-22: V22 sent finger-source continuous deltas instead, hoping their
+ * pixels would be taken at face value, and Gecko ignored them completely (a
+ * single 300 px burst and a touchpad-cadence stream of 6x50 px both moved a
+ * form page zero pixels) while KWrite geared them ~5x. Wheel events always
+ * deliver; what varies by toolkit is the distance — Qt honors the pixel half
+ * exactly, browsers multiply the notch count by their own per-notch line
+ * distance (~7x in Gecko). That per-window gearing is deliberately NOT
+ * corrected here: the server measures real travel from before/after captures
+ * and pre-divides each window's requests (scrollCalibration.ts), which is the
+ * only place the correction can live, because no compositor-side unit is read
+ * the same way by every client.
  */
 bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 {
@@ -1497,6 +1526,11 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
         return false;
     }
     if (!inputReady()) {
+        return false;
+    }
+    // Same hazard as movePointer: a non-finite delta poisons the value120
+    // conversion and any accumulator it touches.
+    if (!std::isfinite(horizontal) || !std::isfinite(vertical)) {
         return false;
     }
     if (!updatePointerFocus()) {

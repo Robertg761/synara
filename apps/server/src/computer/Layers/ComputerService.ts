@@ -2,7 +2,6 @@ import { Effect, Layer } from "effect";
 import type { ComputerAvailability } from "@synara/contracts";
 
 import { ComputerManager } from "../ComputerManager.ts";
-import { FakeComputerBackend } from "../FakeComputerBackend.ts";
 import { KWinComputerBackend } from "../KWinComputerBackend.ts";
 import { UnavailableComputerBackend } from "../UnavailableComputerBackend.ts";
 import {
@@ -30,6 +29,8 @@ export interface ComputerServiceLiveOptions {
   readonly backend?: ComputerBackend;
   /** Test/embedding override for the final availability decision. */
   readonly supported?: boolean;
+  /** Test override for the host platform; defaults to `process.platform`. */
+  readonly platform?: NodeJS.Platform;
 }
 
 interface LinuxBackend {
@@ -41,11 +42,23 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
   return Layer.effect(
     ComputerService,
     Effect.gen(function* () {
+      const platform = options.platform ?? process.platform;
       const linux =
-        options.backend === undefined && process.platform === "linux"
+        options.backend === undefined && platform === "linux"
           ? yield* Effect.promise(() => makeLinuxBackend())
           : undefined;
-      const backend = options.backend ?? linux?.backend ?? new FakeComputerBackend();
+      // Off Linux there is no backend to fall back to — and the fake would be
+      // worse than none: it answers "available" and every tool call succeeds
+      // against a phantom desktop, so an agent could report success at clicks
+      // that never happened. The unavailable backend refuses instead, with the
+      // verdict kind the pane's blocked state is keyed off.
+      const backend =
+        options.backend ??
+        linux?.backend ??
+        new UnavailableComputerBackend(
+          `Computer control requires a Linux host; this server runs on ${platform}.`,
+          { availability: { kind: "unsupported-platform", platform } },
+        );
       // Registered before the manager's finalizer because a scope runs
       // finalizers in reverse: the backend is disposed first, so nothing is
       // still talking to the nested compositor when it is killed.

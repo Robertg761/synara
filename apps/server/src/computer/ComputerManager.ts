@@ -35,7 +35,12 @@ import {
   type ComputerStreamFrame,
   type ComputerResolvedTarget,
 } from "./ComputerBackend.ts";
-import { rectContainsPoint, windowsCoveringPoint } from "./computerGeometry.ts";
+import {
+  rectContainsPoint,
+  topmostWindowAtPoint,
+  windowsCoveringPoint,
+} from "./computerGeometry.ts";
+import { decodePngLuma, estimateVerticalTravel, ScrollGearingStore } from "./scrollCalibration.ts";
 import {
   ComputerTargetError,
   computerTargetCandidates,
@@ -87,6 +92,29 @@ export const COMPUTER_ACTION_SETTLE_MS = 300;
  */
 export const COMPUTER_WINDOWS_PUBLISH_DEBOUNCE_MS = 250;
 
+/**
+ * The first vertical scroll into a window whose gearing is unknown is split:
+ * this many requested pixels go first as a probe whose travel is measured and
+ * learned, and the remainder is delivered pre-corrected. Sized so that even a
+ * client gearing pixels up by the largest believable ratio keeps the probe's
+ * travel inside the correlator's measurable band, while staying above the
+ * store's minimum learnable injection.
+ */
+export const SCROLL_PROBE_PX = 48;
+/**
+ * Requests at or below this skip the probe: they are already probe-sized, and
+ * even a heavily geared client keeps their travel measurable. Anything larger
+ * into an unmeasured window is split — a 90 px request at 7x already travels
+ * past what a window-height capture pair can correlate.
+ */
+export const SCROLL_PROBE_TRIGGER_PX = SCROLL_PROBE_PX;
+
+/**
+ * How long recordError waits before republishing the threads it touched, so an
+ * outage that fails ten calls in a burst costs one publish, not ten.
+ */
+export const COMPUTER_ERROR_REPUBLISH_DEBOUNCE_MS = 250;
+
 export type ComputerEventListener = (event: ComputerEvent) => void;
 
 interface ThreadComputerRuntimeState {
@@ -121,6 +149,8 @@ export interface ComputerManagerOptions {
   readonly actionSettleMs?: number;
   /** Injected for tests, so window-churn tests do not wait out the real window. */
   readonly windowsPublishDebounceMs?: number;
+  /** Injected for tests; decodes and correlates two PNG captures. */
+  readonly measureScrollTravel?: (before: Uint8Array, after: Uint8Array) => number | undefined;
 }
 
 /**
@@ -195,6 +225,9 @@ export class ComputerManager {
   private readonly backend: ComputerBackend;
   private readonly transport: FrameTransport<string, ComputerStreamFrame>;
   private readonly listeners = new Set<ComputerEventListener>();
+  /** Per-thread publish serialization; see `publish`. */
+  private readonly publishChains = new Map<string, Promise<unknown>>();
+  private errorRepublishTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly threads = new Map<string, ThreadComputerRuntimeState>();
   /**
    * Agent calls in flight, per thread. Deliberately not a field on the thread
@@ -214,6 +247,12 @@ export class ComputerManager {
   private readonly leaseIdleMs: number;
   private readonly actionSettleMs: number;
   private readonly windowsPublishDebounceMs: number;
+  private readonly measureScrollTravel: (
+    before: Uint8Array,
+    after: Uint8Array,
+  ) => number | undefined;
+  /** Learned per window and kept for the manager's life; see ScrollGearingStore. */
+  private readonly scrollGearing = new ScrollGearingStore();
   /** Depth rather than a flag: a lease publish can nest inside a window one. */
   private publishAllDepth = 0;
   private windowsPublishPending = false;
@@ -253,6 +292,7 @@ export class ComputerManager {
     this.actionSettleMs = options.actionSettleMs ?? COMPUTER_ACTION_SETTLE_MS;
     this.windowsPublishDebounceMs =
       options.windowsPublishDebounceMs ?? COMPUTER_WINDOWS_PUBLISH_DEBOUNCE_MS;
+    this.measureScrollTravel = options.measureScrollTravel ?? measureScrollTravelFromPng;
     this.backendHealth = options.backend.health();
     this.backendCapabilities = options.backend.capabilities();
     this.transport =
@@ -334,7 +374,10 @@ export class ComputerManager {
         ? await this.backend.availability()
         : await this.backend.probeAvailability();
     } catch (error) {
-      availability = { kind: "backend-unavailable", message: errorMessage(error) };
+      availability = {
+        kind: "backend-unavailable",
+        message: clampComputerMessage(errorMessage(error), "The computer backend failed."),
+      };
     }
     return {
       computerId: this.computerId,
@@ -406,9 +449,10 @@ export class ComputerManager {
   /**
    * Best-effort perception for an action that already happened: wait for the
    * UI to settle, then capture the window the action affected — the caller's
-   * hint when it named one, otherwise the agent's own focus target. Failures
-   * return no screenshot instead of throwing, because the action itself
-   * succeeded and a capture problem must not turn that success into an error.
+   * hint when it named one, otherwise the window under the action's own point,
+   * otherwise the agent's own focus target. Failures return no screenshot
+   * instead of throwing, because the action itself succeeded and a capture
+   * problem must not turn that success into an error.
    *
    * A hinted window that has vanished is reported as `targetWindowClosed`,
    * never replaced by another window. The E2E run that forced this rule ended
@@ -416,11 +460,18 @@ export class ComputerManager {
    * the human's own browser — the focused window is the human's whenever the
    * agent's target is gone — which both leaked their screen and convinced the
    * agent its click had landed there. For the same reason the untargeted path
-   * only ever observes the agent's focus target or the whole workspace,
-   * never the compositor-active (human's) window.
+   * never observes the compositor-active (human's) window as such. The
+   * action-point step honors the same rule from the other direction: the
+   * compositor routes an unscoped pointer action to the topmost window at its
+   * coordinates, so that window is the one the action touched — photographing
+   * it is reporting the action's own outcome, not drifting to someone's focus.
+   * Without it, every untargeted scroll came back as a workspace-wide
+   * downscale too small to read, and the agent scroll-hunted blind (the Codex
+   * OSS form run, 2026-08-22).
    */
   async captureActionScreenshot(
     windowIdHint?: string,
+    actionPoint?: ComputerPoint,
   ): Promise<ComputerActionObservation | undefined> {
     if (!this.backendCapabilities.capture) return undefined;
     this.engageBackend();
@@ -447,6 +498,25 @@ export class ComputerManager {
           // The listing failed too; report nothing rather than guessing.
         }
         return undefined;
+      }
+    }
+    if (actionPoint) {
+      const pointWindowId = await this.windowIdAtActionPoint(actionPoint);
+      if (pointWindowId !== undefined) {
+        try {
+          return this.observeCapture({
+            screenshot: await this.backend.captureScreenshot({
+              kind: "window",
+              windowId: pointWindowId,
+              maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+            }),
+            windowId: pointWindowId,
+          });
+        } catch {
+          // The window vanished between the listing and the capture. It was
+          // never named by the caller, so fall through to the focus path
+          // rather than reporting a close the caller did not ask about.
+        }
       }
     }
     try {
@@ -499,6 +569,21 @@ export class ComputerManager {
     // caller actually received, which is the only thing a repeat can repeat.
     this.lastActionObservation = { key, hash };
     return capture;
+  }
+
+  /**
+   * The window an unscoped pointer action at `point` was delivered to, by the
+   * same topmost-at-point rule the compositor routes it with — the server's
+   * frame-rect approximation of that rule, which the occlusion refusals
+   * already rely on. Unresolvable stacking returns nothing rather than a
+   * guess; a listing failure does too, because this only feeds perception.
+   */
+  private async windowIdAtActionPoint(point: ComputerPoint): Promise<string | undefined> {
+    try {
+      return topmostWindowAtPoint(await this.backend.listWindows(), point)?.id;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -648,6 +733,14 @@ export class ComputerManager {
     );
   }
 
+  /**
+   * The raw gesture: the deltas given are the deltas injected.
+   *
+   * This is the pane's path, carrying a human's own wheel events. Their gesture
+   * must never be re-geared — they are watching the result and closing the loop
+   * themselves, and a correction applied under their hand would fight them.
+   * Agent scrolls go through `scrollCalibrated` instead.
+   */
   async scroll(
     threadId: string | undefined,
     target: ComputerTarget | null,
@@ -655,11 +748,8 @@ export class ComputerManager {
     deltaY: number,
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
-    const resolved = target ? await this.resolvePointTarget(target) : null;
-    await this.prepareResolvedTarget(resolved ?? undefined);
-    const result = await this.injectScoped("computer_scroll", resolved ?? {}, () =>
-      this.backend.scroll(resolved?.point ?? null, deltaX, deltaY),
-    );
+    const resolved = await this.prepareScrollTarget(target);
+    const result = await this.injectScroll(resolved, deltaX, deltaY);
     return this.actionResult(
       threadId,
       "computer_scroll",
@@ -667,6 +757,250 @@ export class ComputerManager {
       result,
       resolved?.windowId,
     );
+  }
+
+  /**
+   * Scroll, then check what the window did with it — the agent's path.
+   *
+   * A scroll request is in logical pixels, but no Wayland client is obliged to
+   * treat it that way: Qt honors the pixel deltas exactly while GTK-hosted
+   * browsers convert them to their own scroll units and travel several times as
+   * far. Nothing reports that conversion, so the distance is measured from
+   * before/after captures of the affected window, returned to the caller as
+   * `scroll.traveledY`, and remembered per window so the next request to it is
+   * pre-divided by what was learned.
+   *
+   * Measurement is best-effort throughout: a capture that fails, a window that
+   * cannot be identified, or a correlation that will not commit leaves the
+   * scroll delivered and simply unmeasured. The after-capture doubles as the
+   * caller's observation, so the closed loop costs no extra screenshot.
+   *
+   * A large request into a window nobody has measured is split: a small probe
+   * goes first, its travel is measured and learned, and the remainder — the
+   * request minus what the probe already covered — is delivered pre-divided by
+   * the fresh gearing. Without the split, the first scroll into a 7x browser
+   * travels so far that the before and after captures share no content, the
+   * correlation refuses, and nothing is ever learned — the run that exposed
+   * this scrolled to the page bottom, clicked coordinates from a layout that
+   * no longer existed, and typed into nothing (2026-08-22, run 23556dc6). The
+   * probe is sized so that even a heavily geared client keeps its travel
+   * inside the measurable band.
+   */
+  async scrollCalibrated(
+    threadId: string | undefined,
+    target: ComputerTarget | null,
+    deltaX: number,
+    deltaY: number,
+    options: { readonly observe: boolean },
+  ): Promise<{
+    readonly result: ComputerActionResult;
+    readonly observation?: ComputerActionObservation;
+  }> {
+    await this.claimDesktopControl(threadId);
+    const resolved = await this.prepareScrollTarget(target);
+    // The window the gesture lands in, by the ladder `captureActionScreenshot`
+    // already climbs: the one targeting named, else the one the compositor
+    // routes an unscoped pointer action to, else the agent's own focus target.
+    // A scroll that lands somewhere else measures no travel and so teaches this
+    // window nothing, which is the right outcome for a guess.
+    const observedWindowId =
+      resolved?.windowId ??
+      (resolved?.point ? await this.windowIdAtActionPoint(resolved.point) : undefined) ??
+      (await this.agentFocusWindowId());
+    const before = options.observe ? await this.captureForMeasurement(observedWindowId) : undefined;
+
+    let injectedX = 0;
+    let injectedY = 0;
+    let after: ComputerCapturedWindow | undefined;
+    let traveledY: number | undefined;
+    let result: ComputerBackendActionResult | void;
+
+    if (
+      before !== undefined &&
+      observedWindowId !== undefined &&
+      !this.scrollGearing.has(observedWindowId) &&
+      Math.abs(deltaY) > SCROLL_PROBE_TRIGGER_PX
+    ) {
+      const probe = Math.sign(deltaY) * SCROLL_PROBE_PX;
+      result = await this.injectScroll(resolved, 0, probe);
+      injectedY += probe;
+      const probeLeg = await this.settleAndMeasure(observedWindowId, before, probe);
+      after = probeLeg.capture;
+      // What the probe already delivered comes off the ask. An unmeasured or
+      // wrong-way measurement deducts only the probe's own request, which is
+      // the strongest claim it can still make.
+      const covered =
+        probeLeg.traveled !== undefined && Math.sign(probeLeg.traveled) === Math.sign(deltaY)
+          ? probeLeg.traveled
+          : probe;
+      const remainder = Math.abs(covered) >= Math.abs(deltaY) ? 0 : deltaY - covered;
+      // One gearing per window drives both axes: a toolkit's unit conversion is
+      // a property of how it reads scroll events, not of which axis they carry,
+      // and only the vertical travel is measurable from a row correlation.
+      const legX = this.scrollGearing.plan(observedWindowId, deltaX);
+      const legY = this.scrollGearing.plan(observedWindowId, remainder);
+      if (legX !== 0 || legY !== 0) {
+        result = await this.injectScroll(resolved, legX, legY);
+        injectedX += legX;
+        injectedY += legY;
+        if (after) {
+          const remainderLeg = await this.settleAndMeasure(observedWindowId, after, legY);
+          after = remainderLeg.capture ?? after;
+          traveledY =
+            probeLeg.traveled !== undefined && remainderLeg.traveled !== undefined
+              ? probeLeg.traveled + remainderLeg.traveled
+              : undefined;
+        }
+      } else {
+        traveledY = probeLeg.traveled;
+      }
+    } else {
+      injectedX = this.scrollGearing.plan(observedWindowId, deltaX);
+      injectedY = this.scrollGearing.plan(observedWindowId, deltaY);
+      result = await this.injectScroll(resolved, injectedX, injectedY);
+      if (before) {
+        const leg = await this.settleAndMeasure(observedWindowId, before, injectedY);
+        after = leg.capture;
+        traveledY = leg.traveled;
+      }
+    }
+
+    const base = this.actionResult(
+      threadId,
+      "computer_scroll",
+      resolved?.point,
+      result,
+      resolved?.windowId,
+    );
+    return {
+      result: {
+        ...base,
+        scroll: {
+          requested: { deltaX, deltaY },
+          injected: { deltaX: round2(injectedX), deltaY: round2(injectedY) },
+          ...(traveledY === undefined ? {} : { traveledY: round2(traveledY) }),
+          ...(observedWindowId === undefined
+            ? {}
+            : { gearing: round2(this.scrollGearing.gearing(observedWindowId)) }),
+        },
+      },
+      ...(after ? { observation: this.observeCapture(after) } : {}),
+    };
+  }
+
+  private async prepareScrollTarget(
+    target: ComputerTarget | null,
+  ): Promise<ResolvedPointTarget | null> {
+    const resolved = target ? await this.resolvePointTarget(target) : null;
+    await this.prepareResolvedTarget(resolved ?? undefined);
+    return resolved;
+  }
+
+  private async injectScroll(
+    resolved: ResolvedPointTarget | null,
+    deltaX: number,
+    deltaY: number,
+  ): Promise<ComputerBackendActionResult | void> {
+    return this.injectScoped("computer_scroll", resolved ?? {}, () =>
+      this.backend.scroll(resolved?.point ?? null, deltaX, deltaY),
+    );
+  }
+
+  /**
+   * One injected leg's perception: settle, recapture, measure against `from`,
+   * and teach the store what the window did with the injection. A capture or
+   * correlation that fails leaves the leg unmeasured, never undelivered.
+   */
+  private async settleAndMeasure(
+    windowId: string | undefined,
+    from: ComputerCapturedWindow,
+    injectedY: number,
+  ): Promise<{ readonly capture?: ComputerCapturedWindow; readonly traveled?: number }> {
+    if (this.actionSettleMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.actionSettleMs));
+    }
+    const capture = await this.captureForMeasurement(windowId);
+    if (!capture) return {};
+    const measured = this.measureTravel(from.screenshot, capture.screenshot);
+    // A travel opposing the injection is the correlator locking onto the wrong
+    // feature — repetitive content aliases — not a page that scrolled
+    // backwards. The store would refuse the sample anyway; suppressing it here
+    // keeps the caller's traveledY from asserting a direction nothing moved in.
+    const traveled =
+      measured !== undefined &&
+      measured !== 0 &&
+      injectedY !== 0 &&
+      Math.sign(measured) !== Math.sign(injectedY)
+        ? undefined
+        : measured;
+    if (traveled !== undefined && injectedY !== 0) {
+      this.scrollGearing.learn(windowId, injectedY, traveled);
+    }
+    return { capture, ...(traveled === undefined ? {} : { traveled }) };
+  }
+
+  /** The agent seat's focus target, when it has one; never the human's. */
+  private async agentFocusWindowId(): Promise<string | undefined> {
+    try {
+      return (await this.focusedCapturableWindow(true))?.id;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * A capture taken to be measured against another one, and then handed to the
+   * caller as the action's observation. It deliberately bypasses
+   * `observeCapture`: the before-capture is never shown to anyone, so recording
+   * it as the last thing the caller saw would make the after-capture vanish as a
+   * repeat of an image that was never sent.
+   *
+   * With no window to name — no target, no window under the point, no agent
+   * focus — it widens to the same workspace capture the observation path would
+   * take, which is still comparable to itself even though nothing can be
+   * learned from a region that is not one window.
+   */
+  private async captureForMeasurement(
+    windowId: string | undefined,
+  ): Promise<ComputerCapturedWindow | undefined> {
+    if (!this.backendCapabilities.capture) return undefined;
+    this.engageBackend();
+    try {
+      if (windowId === undefined) {
+        return await this.captureFocusedWindow(COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION, {
+          agentFocusOnly: true,
+        });
+      }
+      return {
+        screenshot: await this.backend.captureScreenshot({
+          kind: "window",
+          windowId,
+          maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+        }),
+        windowId,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Vertical travel in logical pixels, or nothing when the two captures cannot
+   * be compared. Byte equality answers first and for free: pixels that did not
+   * change did not move, which is what the end of a page looks like.
+   */
+  private measureTravel(before: ComputerScreenshot, after: ComputerScreenshot): number | undefined {
+    if (before.bytesBase64 === after.bytesBase64) return 0;
+    // Without a scale on both captures there is no conversion from capture
+    // pixels to the logical pixels the request was made in, and two different
+    // scales are two different pictures of the window.
+    const scale = before.scale;
+    if (scale === undefined || scale !== after.scale || scale <= 0) return undefined;
+    const traveled = this.measureScrollTravel(
+      Buffer.from(before.bytesBase64, "base64"),
+      Buffer.from(after.bytesBase64, "base64"),
+    );
+    return traveled === undefined ? undefined : traveled / scale;
   }
 
   async typeText(
@@ -906,7 +1240,10 @@ export class ComputerManager {
   async recordThreadError(threadId: string, message: string): Promise<void> {
     const state = this.threads.get(threadId);
     if (!state) return;
-    state.lastError = message;
+    state.lastError = clampComputerMessage(
+      message,
+      "The computer backend reported an error without a message.",
+    );
     await this.publish(threadId, true).catch(() => undefined);
   }
 
@@ -974,6 +1311,8 @@ export class ComputerManager {
     if (this.windowsPublishTimer !== undefined) clearTimeout(this.windowsPublishTimer);
     this.windowsPublishTimer = undefined;
     this.windowsPublishPending = false;
+    if (this.errorRepublishTimer !== undefined) clearTimeout(this.errorRepublishTimer);
+    this.errorRepublishTimer = undefined;
     this.streamDesired = false;
     this.streamEpoch += 1;
     await this.enqueueStreamTransition(async () => {
@@ -1232,11 +1571,21 @@ export class ComputerManager {
     windowId?: string,
   ): ComputerActionResult {
     this.emitAction(threadId, action);
-    return computerBackendActionResult(this.computerId, action, {
+    const merged = computerBackendActionResult(this.computerId, action, {
       ...(point ? { point } : {}),
       ...(windowId !== undefined ? { windowId } : {}),
-      ...(result ?? {}),
+      ...(result === undefined ? {} : result),
     });
+    // The pane's agent-cursor dot is fed from here, the one funnel every
+    // pointer action passes through: without it the field stayed declared but
+    // never assigned, and the overlay never rendered.
+    const attributed = agentThreadId(threadId);
+    const state = attributed ? this.threads.get(attributed) : undefined;
+    if (attributed && state && merged.point) {
+      state.cursor = merged.point;
+      this.publish(attributed, true).catch(() => undefined);
+    }
+    return merged;
   }
 
   /**
@@ -1278,7 +1627,27 @@ export class ComputerManager {
     });
   }
 
+  /**
+   * Serializes publishes per thread. Two overlapping publishes read the same
+   * state, each bump `version`, and both emit — the second overwriting the
+   * first with a *newer* version number but identical or older content, which
+   * is how duplicate versions leaked to the pane. Chaining makes each publish
+   * see its predecessor's state.
+   */
   private async publish(
+    threadId: string,
+    increment: boolean,
+  ): Promise<ThreadComputerState | undefined> {
+    const previous = this.publishChains.get(threadId) ?? Promise.resolve();
+    const next = previous.then(() => this.publishNow(threadId, increment));
+    this.publishChains.set(
+      threadId,
+      next.catch(() => undefined),
+    );
+    return await next;
+  }
+
+  private async publishNow(
     threadId: string,
     increment: boolean,
   ): Promise<ThreadComputerState | undefined> {
@@ -1309,7 +1678,12 @@ export class ComputerManager {
       }
       state.lastError = null;
     } catch (error) {
-      state.lastError = errorMessage(error);
+      // Error text the backend does not control, so it meets the contract's
+      // bound here rather than failing the state payload that carries it.
+      state.lastError = clampComputerMessage(
+        errorMessage(error),
+        "The computer backend reported an error without a message.",
+      );
     }
     if (this.disposed || this.threads.get(threadId) !== state) return undefined;
     const snapshot = this.threadSnapshot(threadId, state);
@@ -1441,8 +1815,22 @@ export class ComputerManager {
   }
 
   private recordError(error: unknown): void {
-    const message = errorMessage(error);
+    const message = clampComputerMessage(
+      errorMessage(error),
+      "The computer backend reported an error without a message.",
+    );
     for (const state of this.threads.values()) state.lastError = message;
+    // Written without a publish, a stream attach failure never reached the
+    // panel it explains. Debounced, because this can fire per frame or per
+    // call during an outage.
+    if (this.threads.size === 0) return;
+    this.errorRepublishTimer ??= setTimeout(() => {
+      this.errorRepublishTimer = undefined;
+      for (const threadId of this.threads.keys()) {
+        void this.publish(threadId, true).catch(() => undefined);
+      }
+    }, COMPUTER_ERROR_REPUBLISH_DEBOUNCE_MS);
+    this.errorRepublishTimer.unref?.();
   }
 
   private emit(event: ComputerEvent): void {
@@ -1454,6 +1842,24 @@ export class ComputerManager {
       }
     }
   }
+}
+
+/**
+ * The default travel measurement: decode both captures and correlate them. Both
+ * halves already answer with undefined for anything they cannot handle, so a
+ * capture in a format this does not decode costs the measurement, not the
+ * scroll.
+ */
+function measureScrollTravelFromPng(before: Uint8Array, after: Uint8Array): number | undefined {
+  const decodedBefore = decodePngLuma(before);
+  const decodedAfter = decodePngLuma(after);
+  if (!decodedBefore || !decodedAfter) return undefined;
+  return estimateVerticalTravel(decodedBefore, decodedAfter);
+}
+
+/** Scroll telemetry is a reading, not a measurement instrument: two decimals is all it means. */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 /**

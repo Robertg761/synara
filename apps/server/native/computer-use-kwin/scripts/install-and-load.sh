@@ -25,6 +25,9 @@ BUILD_DIR="${SYNARA_KWIN_BUILD_DIR:-$CACHE_ROOT/build}"
 STAMP_FILE="$STATE_ROOT/install.stamp"
 LOCK_FILE="$STATE_ROOT/install.lock"
 BUILD_LOCK_FILE="$STATE_ROOT/build.lock"
+# Must match s_service in synaracomputeruseplugin.cpp and COMPUTER_SERVICE in
+# the server's kwinDbus.ts: it is the name the health check pins an owner for.
+SERVICE_NAME="org.synara.ComputerUse"
 
 FORCE=0
 NONINTERACTIVE=0
@@ -399,12 +402,37 @@ if [[ -n "$old_plugin_ids" ]]; then
     done <<< "$old_plugin_ids"
 fi
 
+# Whoever owns the well-known service name owns healthJson and every later
+# call, so the unique owner is pinned across the LoadPlugin boundary: a load
+# that left the previous registration in place - an unload race, or another
+# process holding the name - would make this script's own health check run
+# against the wrong build.
+service_owner_before=""
+if owner_response="$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s "$SERVICE_NAME" 2>/dev/null)"; then
+    service_owner_before="$owner_response"
+fi
+
 load_response=""
 if ! load_response="$(busctl --user call org.kde.KWin /Plugins org.kde.KWin.Plugins LoadPlugin s "$plugin_id" 2>&1)"; then
     die "KWin D-Bus LoadPlugin failed for $plugin_id: $load_response"
 fi
 if [[ "$load_response" != *"b true"* ]]; then
     die "KWin refused $plugin_id: $load_response. This usually means the plugin has a mismatching plugin version. Rebuild on this host against its installed kwin-devel package and inspect: journalctl --user -b -g 'mismatching plugin version'"
+fi
+
+service_owner_now=""
+for _ in 1 2 3; do
+    if owner_response="$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s "$SERVICE_NAME" 2>/dev/null)"; then
+        service_owner_now="$owner_response"
+        break
+    fi
+    sleep 0.1
+done
+if [[ -z "$service_owner_now" ]]; then
+    die "$plugin_id loaded, but nothing owns $SERVICE_NAME on the session bus, so the plugin did not register its service."
+fi
+if [[ -n "$service_owner_before" && "$service_owner_before" == "$service_owner_now" ]]; then
+    die "$SERVICE_NAME is still owned by $service_owner_now from before $plugin_id was loaded, so the health check below would answer from the wrong process."
 fi
 
 health_response=""

@@ -85,9 +85,13 @@ async function withSessionBus<T>(
   } catch (error) {
     throw asError(connectionError ?? error);
   } finally {
+    // Disconnecting can itself surface as an 'error' event on the bus
+    // (ECONNRESET during close is routine), so the handlers stay attached
+    // through it — removing them first would turn that into an unhandled
+    // 'error' on a bare EventEmitter, which crashes the process.
+    bus.disconnect();
     eventBus.off("error", onError);
     eventBus.off("disconnect", onError);
-    bus.disconnect();
   }
 }
 

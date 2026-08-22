@@ -84,6 +84,7 @@ import {
 } from "./portalSessionProviders.ts";
 import {
   planPortalProviders,
+  probeDesktop,
   usesProvider,
   type PortalProbe,
   type PortalProviderPlan,
@@ -124,13 +125,22 @@ export interface PortalComputerBackendOptions {
   readonly providers: PortalProviders;
   readonly platform?: string;
   readonly now?: () => number;
-  readonly sleep?: (milliseconds: number) => Promise<void>;
+  readonly sleep?: () => Promise<void>;
   readonly spawnProcess?: (app: string, args: readonly string[]) => ChildProcess;
   /** Name-to-executable resolution, replaced in tests to avoid host lookups. */
   readonly resolveApp?: AppLaunchResolver;
   readonly glideDurationMs?: number;
   readonly stillIntervalMs?: number;
   readonly captureMaxDimension?: number;
+  /**
+   * Re-runs the desktop probe, so capabilities the first probe planned away —
+   * a helper that was not built yet, wl-clipboard installed since — can come
+   * back without a server restart. Production wires `probeDesktop`; tests omit
+   * it and nothing is ever re-probed.
+   */
+  readonly recomputeProbe?: () => Promise<PortalProbe>;
+  /** Rebuilds the provider set from a fresh probe; see `recomputeProbe`. */
+  readonly buildProviders?: (probe: PortalProbe) => PortalProviders;
   /**
    * Whether this desktop needs a consent dialog at all. wlroots grants nothing
    * and prompts for nothing, so its consent state starts and stays
@@ -142,9 +152,9 @@ export interface PortalComputerBackendOptions {
 export class PortalComputerBackend implements ComputerBackend {
   readonly computerId: ComputerId;
 
-  private readonly probe: PortalProbe;
-  private readonly plan: PortalProviderPlan;
-  private readonly providers: PortalProviders;
+  private probe: PortalProbe;
+  private plan: PortalProviderPlan;
+  private providers: PortalProviders;
   private readonly platform: string;
   private readonly now: () => number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
@@ -153,6 +163,16 @@ export class PortalComputerBackend implements ComputerBackend {
   private readonly glideDurationMs: number;
   private readonly stillIntervalMs: number;
   private readonly captureMaxDimension: number;
+  private readonly recomputeProbe: (() => Promise<PortalProbe>) | undefined;
+  private readonly buildProviders: ((probe: PortalProbe) => PortalProviders) | undefined;
+  /**
+   * The desktop probe is a snapshot, and the desktop moves: wl-clipboard gets
+   * installed, the helper binary appears. This is how the snapshot catches up —
+   * at most once per interval, and only while some capability is missing.
+   */
+  private static readonly REPROBE_MIN_INTERVAL_MS = 30_000;
+  private lastReprobeAt = Number.NEGATIVE_INFINITY;
+  private reprobing: Promise<void> | undefined;
   private readonly healthState: ComputerHealthState;
   private readonly capabilitySet: ComputerCapabilities;
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
@@ -179,6 +199,8 @@ export class PortalComputerBackend implements ComputerBackend {
     this.probe = options.probe;
     this.plan = planPortalProviders(options.probe);
     this.providers = options.providers;
+    this.recomputeProbe = options.recomputeProbe;
+    this.buildProviders = options.buildProviders;
     this.platform = options.platform ?? process.platform;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? ((milliseconds) => delay(milliseconds));
@@ -250,7 +272,60 @@ export class PortalComputerBackend implements ComputerBackend {
     return this.availability();
   }
 
+  /**
+   * Catches the snapshot up with the desktop, at most once per interval and
+   * only while a capability is missing — so a panel refresh is what lets an
+   * installed wl-clipboard or a newly built helper appear without a server
+   * restart, and nothing re-probes on a desktop where everything resolved.
+   */
+  private async refreshCapabilitiesIfStale(): Promise<void> {
+    const allResolved =
+      this.providers.input.available &&
+      this.providers.capture.available &&
+      this.providers.windows.available &&
+      this.providers.clipboard.available;
+    if (
+      this.disposed ||
+      this.recomputeProbe === undefined ||
+      allResolved ||
+      this.now() - this.lastReprobeAt < PortalComputerBackend.REPROBE_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.reprobing ??= this.reprobeOnce().finally(() => {
+      this.reprobing = undefined;
+    });
+    await this.reprobing.catch(() => undefined);
+  }
+
+  private async reprobeOnce(): Promise<void> {
+    this.lastReprobeAt = this.now();
+    if (this.recomputeProbe === undefined) return;
+    const fresh = await this.recomputeProbe().catch(() => undefined);
+    if (fresh === undefined || this.disposed) return;
+    const freshPlan = planPortalProviders(fresh);
+    // Only an upgrade swaps the plan in: providers hold live sessions and
+    // consent state, and rebuilding them would throw that away for nothing.
+    const upgrades = (slot: "input" | "capture" | "windows" | "clipboard"): boolean =>
+      freshPlan[slot].blockedBy === undefined && this.plan[slot].blockedBy !== undefined;
+    if (
+      !upgrades("input") &&
+      !upgrades("capture") &&
+      !upgrades("windows") &&
+      !upgrades("clipboard")
+    ) {
+      return;
+    }
+    if (this.buildProviders === undefined) return;
+    this.probe = fresh;
+    this.plan = freshPlan;
+    this.providers = this.buildProviders(fresh);
+  }
+
   async availability(): Promise<ComputerAvailability> {
+    // The panel reads this on every render of a thread state, which makes it
+    // the natural place for a throttled catch-up with the desktop.
+    await this.refreshCapabilitiesIfStale();
     if (this.platform !== "linux") {
       return { kind: "unsupported-platform", platform: this.platform };
     }
@@ -951,9 +1026,8 @@ export function createPortalComputerBackend(
 ): PortalComputerBackend {
   const { providers, providerOptions, ...rest } = options;
   let backend: PortalComputerBackend | undefined;
-  const resolved =
-    providers ??
-    resolvePortalProviders(probe, {
+  const buildProviders = (probeForProviders: PortalProbe): PortalProviders =>
+    resolvePortalProviders(probeForProviders, {
       ...providerOptions,
       onConsentChanged: (state, reason) => {
         backend?.setConsentState(state, reason);
@@ -963,7 +1037,14 @@ export function createPortalComputerBackend(
         providerOptions?.onSessionClosed?.(reason);
       },
     });
-  backend = new PortalComputerBackend({ ...rest, probe, providers: resolved });
+  const resolved = providers ?? buildProviders(probe);
+  backend = new PortalComputerBackend({
+    ...rest,
+    probe,
+    providers: resolved,
+    recomputeProbe: rest.recomputeProbe ?? (() => probeDesktop()),
+    buildProviders,
+  });
   return backend;
 }
 

@@ -62,4 +62,28 @@ describe("ComputerServiceLive", () => {
       ),
     );
   });
+
+  /**
+   * Off Linux there is no backend to build, and the pre-fix fallback was the
+   * fake — which answers "available" and succeeds at every action against a
+   * phantom desktop. An agent on macOS must see a refused surface, not a
+   * fabricated one, so the platform verdict has to reach the pane's blocked
+   * state untouched.
+   */
+  it("reports an unsupported platform instead of a fake desktop off Linux", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const service = yield* ComputerService;
+          expect(service.supported).toBe(false);
+          expect(service.availability).toEqual({
+            kind: "unsupported-platform",
+            platform: "darwin",
+          });
+          const state = yield* Effect.promise(() => service.manager.getThreadState("thread-macos"));
+          expect(state.availability).toEqual({ kind: "unsupported-platform", platform: "darwin" });
+        }).pipe(Effect.provide(makeComputerServiceLayer({ platform: "darwin" }))),
+      ),
+    );
+  });
 });

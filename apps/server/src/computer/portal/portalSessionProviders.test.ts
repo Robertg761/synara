@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { ComputerBackendError } from "../ComputerBackend.ts";
 import { FakePortalService } from "./fakePortalService.ts";
 import { createPortalComputerBackend } from "./PortalComputerBackend.ts";
 import { PortalSession } from "./portalSession.ts";
@@ -195,6 +196,45 @@ describe("PortalSelectionClipboardProvider", () => {
     await expect(provider.read()).rejects.toThrow(
       /clipboard holds nothing Synara can read as text.*Copy text rather than an image/s,
     );
+    await provider.dispose();
+  });
+
+  /**
+   * A paste target that never writes must not hang `computer_read_clipboard`
+   * forever — the bus timeout covers only the descriptor handout, so the read
+   * carries a deadline of its own.
+   */
+  it("abandons a stalled transfer with a structured error instead of waiting forever", async () => {
+    const portal = new FakePortalService({ screenCastVersion: 5 });
+    const { session } = clipboardFor(portal);
+    const provider = new PortalSelectionClipboardProvider(session, () => session.dispose(), {
+      // A descriptor whose writer never closes: the real shape of a stalled
+      // transfer, short-circuited at the seam so the test measures the
+      // deadline rather than the pipe.
+      readFd: () => new Promise<Buffer>(() => undefined),
+      writeFd: () => Promise.resolve(),
+      transferTimeoutMs: 50,
+    });
+    const startedAt = Date.now();
+
+    await expect(provider.read()).rejects.toThrow(
+      /clipboard transfer but sent nothing within 50 ms/,
+    );
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    await provider.dispose();
+  });
+
+  it("propagates a structured read failure instead of negotiating mime types over it", async () => {
+    const portal = new FakePortalService({ screenCastVersion: 5 });
+    const { session } = clipboardFor(portal);
+    const provider = new PortalSelectionClipboardProvider(session, () => session.dispose(), {
+      readFd: () =>
+        Promise.reject(new ComputerBackendError("the transfer timed out", { retryable: true })),
+      writeFd: () => Promise.resolve(),
+    });
+
+    // Retrying under the next mime name would stall the same way again.
+    await expect(provider.read()).rejects.toThrow(/transfer timed out/);
     await provider.dispose();
   });
 });

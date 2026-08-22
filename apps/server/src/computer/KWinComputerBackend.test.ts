@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import type { ChildProcess } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ComputerHealth, ComputerWindow } from "@synara/contracts";
 
 import {
+  installStampIsCurrent,
   KWinComputerBackend,
   localBuildToolingPresent,
   newestPluginId,
@@ -26,6 +28,10 @@ import {
   type KWinComputerPluginApi,
 } from "./kwinDbus.ts";
 import { GLIDE_FRAME_INTERVAL_MS } from "./pointerSequencing.ts";
+import { resolveInstallTarget } from "./kwinPluginProvisioning.ts";
+
+/** The same roots KWinComputerBackend feeds resolveInstallTarget. */
+const SYSTEM_QT_PLUGIN_ROOTS_FOR_TEST = ["/usr/lib64/qt6/plugins", "/usr/lib/qt6/plugins"] as const;
 
 const PNG_1X1 = Uint8Array.from(
   Buffer.from(
@@ -193,12 +199,23 @@ class FakeDbus implements KWinComputerDbus {
   readonly calls: Array<{ readonly method: string; readonly args: readonly unknown[] }> = [];
   readonly plugin: FakePlugin;
   loaded: readonly string[] = [];
+  /**
+   * The unique bus name currently owning org.synara.ComputerUse, mimicking how
+   * every freshly loaded generation registers under a new unique name.
+   */
+  serviceOwner: string | undefined;
+  private ownerCounter = 42;
   private disconnectListener: (() => void) | undefined;
 
   constructor(plugin = new FakePlugin()) {
     this.plugin = plugin;
   }
 
+  nameOwner = async (name: string) => {
+    this.calls.push({ method: "GetNameOwner", args: [name] });
+    if (this.serviceOwner !== undefined) return this.serviceOwner;
+    return this.loaded.some((id) => id.startsWith("SynaraComputerUsePlugin")) ? ":1.42" : undefined;
+  };
   listLoadedPluginIds = async () => {
     this.calls.push({ method: "loadedPlugins", args: [] });
     return this.loaded;
@@ -206,6 +223,11 @@ class FakeDbus implements KWinComputerDbus {
   loadPlugin = async (pluginId: string) => {
     this.calls.push({ method: "LoadPlugin", args: [pluginId] });
     this.loaded = [pluginId];
+    if (pluginId.startsWith("SynaraComputerUsePlugin")) {
+      // A new registration takes a new unique name; that change across the
+      // LoadPlugin boundary is exactly what the backend asserts on.
+      this.serviceOwner = `:1.${(this.ownerCounter += 1)}`;
+    }
     return true;
   };
   unloadPlugin = async (pluginId: string) => {
@@ -271,6 +293,101 @@ function makeBackend(
       (async () => {
         throw new Error("provisionPlugin was not stubbed in this test");
       }),
+  });
+}
+
+/**
+ * Redirects every path the real provisioning wiring derives from the
+ * environment into a temp home, restores the old ones afterwards. Used by the
+ * tests that exercise the backend's own `provisionKWinPlugin` wiring rather
+ * than a stub: without this they would write an env script and plugin into
+ * the developer's actual home directory.
+ */
+async function withProvisionHome(body: (home: string) => Promise<void>): Promise<void> {
+  const home = await mkdtemp(join(tmpdir(), "synara-kwin-home-"));
+  const saved = new Map<string, string | undefined>();
+  const keys = [
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "SYNARA_KWIN_PLUGIN_DIR",
+    "SYNARA_KWIN_STATE_ROOT",
+    "SYNARA_KWIN_PREBUILT_DIR",
+    "SYNARA_KWIN_SOURCE_DIR",
+  ] as const;
+  for (const key of keys) saved.set(key, process.env[key]);
+  process.env.HOME = home;
+  process.env.XDG_CONFIG_HOME = join(home, "config");
+  process.env.XDG_STATE_HOME = join(home, "state");
+  for (const key of keys.slice(3)) delete process.env[key];
+  try {
+    await body(home);
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(home, { recursive: true, force: true });
+  }
+}
+
+/** A shipped-binary bundle whose single build matches `kwinVersion`. */
+async function writePrebuiltBundle(
+  home: string,
+  kwinVersion: string,
+  bytes: string,
+): Promise<string> {
+  const prebuiltRoot = join(home, "prebuilt");
+  await mkdir(prebuiltRoot, { recursive: true });
+  await writeFile(join(prebuiltRoot, "p.so"), bytes);
+  await writeFile(
+    join(prebuiltRoot, "manifest.json"),
+    JSON.stringify({
+      builds: [
+        {
+          kwinVersion,
+          arch: process.arch,
+          file: "p.so",
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+        },
+      ],
+    }),
+  );
+  return prebuiltRoot;
+}
+
+/**
+ * A backend running the real default provisioning wiring — no provisionPlugin
+ * stub — against temp directories, mirroring makeBackend's other stand-ins.
+ * `pluginDirectories` is pinned to the resolved user-owned target so version
+ * numbering never reads the developer's real system plugin directories.
+ */
+function provisionWiringBackend(options: {
+  readonly dbus: FakeDbus;
+  readonly pluginDirectory: string;
+  readonly prebuiltRoot: string;
+  readonly runningKwinVersion: () => Promise<string | undefined>;
+  readonly installedPluginIds?: () => Promise<readonly string[]>;
+}): KWinComputerBackend {
+  return new KWinComputerBackend({
+    dbus: options.dbus,
+    atspi,
+    platform: "linux",
+    sessionType: "wayland",
+    sleep: async () => undefined,
+    resolveApp: (app, args) => ({ command: app, args: [...args], via: "path" }),
+    pluginDirectories: [options.pluginDirectory],
+    installStampPath: join(
+      process.env.XDG_STATE_HOME ?? join(tmpdir(), "state"),
+      "synara",
+      "kwin-computer-use-plugin",
+      "install.stamp",
+    ),
+    runningKwinVersion: options.runningKwinVersion,
+    busNameHasOwner: async () => false,
+    prebuiltRoot: () => options.prebuiltRoot,
+    buildToolingPresent: () => false,
+    ...(options.installedPluginIds ? { installedPluginIds: options.installedPluginIds } : {}),
   });
 }
 
@@ -404,6 +521,70 @@ describe("localBuildToolingPresent", () => {
     // buildable would trade a truthful "not available" for a broken toggle.
     expect(localBuildToolingPresent(exists, { PATH: "/opt/bin" })).toBe(false);
     expect(localBuildToolingPresent((path) => path === "/usr/bin/cmake", env)).toBe(false);
+  });
+});
+
+/**
+ * The stamp check is what keeps repeat provisioning calls cheap once failures
+ * and successes stop being memoized, so its four verdicts are pinned here.
+ */
+describe("installStampIsCurrent", () => {
+  const stamp = (pluginId: string, kwinVersion: string): string =>
+    [
+      `plugin_id=${pluginId}`,
+      "installed_at=2026-01-01T00:00:00.000Z",
+      `plugin_path=/somewhere/${pluginId}.so`,
+      `kwin_version=${kwinVersion}`,
+      "",
+    ].join("\n");
+
+  it("is current when the stamped file exists for the running KWin", () => {
+    expect(
+      installStampIsCurrent(
+        stamp("SynaraComputerUsePluginV3", "6.7.3"),
+        ["SynaraComputerUsePluginV3.so"],
+        "6.7.3",
+      ),
+    ).toBe(true);
+  });
+
+  it("is not current when the stamped file is gone", () => {
+    expect(installStampIsCurrent(stamp("SynaraComputerUsePluginV3", "6.7.3"), [], "6.7.3")).toBe(
+      false,
+    );
+  });
+
+  it("is not current when the running KWin is newer than the build", () => {
+    // This verdict is what turns a KWin upgrade into a fresh install instead
+    // of an eternal "already current" about a binary the compositor refuses.
+    expect(
+      installStampIsCurrent(
+        stamp("SynaraComputerUsePluginV3", "6.7.3"),
+        ["SynaraComputerUsePluginV3.so"],
+        "6.8.0",
+      ),
+    ).toBe(false);
+  });
+
+  it("stays current when either version is unreadable", () => {
+    expect(
+      installStampIsCurrent(
+        stamp("SynaraComputerUsePluginV3", ""),
+        ["SynaraComputerUsePluginV3.so"],
+        undefined,
+      ),
+    ).toBe(true);
+    expect(
+      installStampIsCurrent(
+        stamp("SynaraComputerUsePluginV3", "6.7.3"),
+        ["SynaraComputerUsePluginV3.so"],
+        undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it("is not current without a stamp at all", () => {
+    expect(installStampIsCurrent(undefined, ["SynaraComputerUsePluginV3.so"], "6.7.3")).toBe(false);
   });
 });
 
@@ -558,6 +739,86 @@ describe("KWinComputerBackend passive probe", () => {
 describe("KWinComputerBackend", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  /**
+   * A monitor arranged left of and above the primary puts the workspace's
+   * top-left at negative global coordinates. Before the agent↔global
+   * translation existed, its windows reported bounds no coordinate could
+   * address: resolveComputerPoint refuses negatives, so screenshots showed
+   * pixels the pointer could never reach. Here everything above the backend —
+   * window bounds, screen size, click coordinates, capture regions, clamped
+   * results — agrees on one 0-based space while the plugin sees globals.
+   */
+  it("addresses a negative-origin multi-monitor layout in agent space", async () => {
+    const dbus = new FakeDbus();
+    const plugin = new FakePlugin();
+    plugin.workspace = { x: -1920, y: -1080, width: 3840, height: 2160 };
+    plugin.windows = [
+      {
+        id: "window-1",
+        title: "Terminal",
+        appName: "org.kde.konsole",
+        pid: 123,
+        // Global bounds on the left-hand monitor.
+        bounds: { x: -1800, y: -900, width: 648, height: 518 },
+        focused: true,
+        minimized: false,
+        visible: true,
+      },
+    ];
+    dbus.serviceOwner = ":1.42";
+    (dbus as { plugin: FakePlugin }).plugin = plugin;
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    // The window list speaks agent space: shifted by the workspace origin.
+    await expect(backend.listWindows()).resolves.toEqual([
+      expect.objectContaining({
+        id: "window-1",
+        bounds: { x: 120, y: 180, width: 648, height: 518 },
+      }),
+    ]);
+    await expect(backend.getScreenSize()).resolves.toEqual({
+      width: 3840,
+      height: 2160,
+      scale: 1,
+    });
+
+    // A bare coordinate inside the left monitor is deliverable: the sink
+    // translates it back into the global space the plugin drives.
+    await backend.click({ x: 200, y: 100 });
+    const move = plugin.calls.findLast((call) => call.method === "movePointer");
+    expect(move?.args).toEqual([200 - 1920, 100 - 1080]);
+
+    // Capture regions go the other way: requested in agent space, captured in
+    // globals, reported in agent space.
+    await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 120, y: 180, width: 648, height: 518 },
+    });
+    const region = plugin.calls.findLast((call) => call.method === "captureRegion");
+    expect(region?.args.slice(0, 4)).toEqual([-1800, -900, 648, 518]);
+
+    await backend.dispose();
+  });
+
+  it("reports a clamp result in agent space on a negative-origin layout", async () => {
+    const dbus = new FakeDbus();
+    const plugin = new FakePlugin();
+    plugin.workspace = { x: -1920, y: -1080, width: 3840, height: 2160 };
+    // KWin lands the move somewhere other than requested; the caller learns
+    // where in the same space it asked in.
+    plugin.clampPointer = () => ({ x: -1900, y: -1000 });
+    (dbus as { plugin: FakePlugin }).plugin = plugin;
+    const backend = makeBackend(dbus);
+    await backend.availability();
+
+    const result = await backend.moveCursor({ x: 500, y: 500 });
+    expect(result.point).toEqual({ x: 500, y: 500 });
+    expect(result.clampedTo).toEqual({ x: 20, y: 80 });
+
+    await backend.dispose();
   });
 
   it("reports Tier 1's whole capability set, without a dedicated seat being shared", () => {
@@ -987,10 +1248,53 @@ describe("KWinComputerBackend", () => {
     dbus.listLoadedPluginIds = async () => {
       throw new Error("org.freedesktop.DBus.Error.UnknownMethod");
     };
+    // The "existing service" the fallback connects to: something must own the
+    // well-known name for it to be trusted.
+    dbus.serviceOwner = ":1.42";
     const backend = makeBackend(dbus);
 
     await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
     expect(dbus.calls.some((call) => call.method === "LoadPlugin")).toBe(false);
+    await backend.dispose();
+  });
+
+  /**
+   * The plugin is addressed by the well-known org.synara.ComputerUse name, so
+   * a stale duplicate Synara instance (or any same-session squatter) that kept
+   * the name through an unload race would otherwise receive every input and
+   * capture call — and could serve forged state the agent acts on. A load that
+   * did not move the name to a new registration is refused, not driven.
+   */
+  it("refuses to connect when a fresh load left the previous owner holding the name", async () => {
+    const dbus = new FakeDbus();
+    // A stale duplicate already owns the well-known name before we connect.
+    dbus.serviceOwner = ":1.42";
+    dbus.loadPlugin = async (pluginId: string) => {
+      // The pathological case: KWin reports the load succeeded, but the old
+      // registration never gave up the well-known name.
+      dbus.calls.push({ method: "LoadPlugin", args: [pluginId] });
+      dbus.loaded = [pluginId];
+      return true;
+    };
+    const backend = makeBackend(dbus);
+
+    const availability = await backend.availability();
+    expect(availability.kind).toBe("backend-unavailable");
+    const message = availability.kind === "backend-unavailable" ? availability.message : "";
+    expect(message).toContain("still owned by");
+    expect(message).toContain("rather than the one just loaded");
+    await backend.dispose();
+  });
+
+  it("refuses to connect when nothing owns the service after a load", async () => {
+    const dbus = new FakeDbus();
+    dbus.nameOwner = async () => undefined;
+    const backend = makeBackend(dbus);
+
+    const availability = await backend.availability();
+    expect(availability.kind).toBe("backend-unavailable");
+    const message = availability.kind === "backend-unavailable" ? availability.message : "";
+    expect(message).toContain("no computer-use plugin is answering");
     await backend.dispose();
   });
 
@@ -1057,7 +1361,11 @@ describe("KWinComputerBackend", () => {
     let installed = ["SynaraComputerUsePluginV2"];
     // Only the locally built one loads: the shipped binary matches this KWin
     // version but was compiled against a different distribution's Qt.
-    dbus.loadPlugin = async (pluginId: string) => pluginId === "SynaraComputerUsePluginV4";
+    dbus.loadPlugin = async (pluginId: string) => {
+      const accepted = pluginId === "SynaraComputerUsePluginV4";
+      if (accepted) dbus.serviceOwner = ":1.43";
+      return accepted;
+    };
     const attempts: boolean[] = [];
     const backend = makeBackend(dbus, {
       installedPluginIds: async () => installed,
@@ -1081,7 +1389,11 @@ describe("KWinComputerBackend", () => {
   it("reinstalls once when KWin refuses the installed plugin, then loads the new id", async () => {
     const dbus = new FakeDbus();
     let installed = ["SynaraComputerUsePluginV2"];
-    dbus.loadPlugin = async (pluginId: string) => pluginId === "SynaraComputerUsePluginV3";
+    dbus.loadPlugin = async (pluginId: string) => {
+      const accepted = pluginId === "SynaraComputerUsePluginV3";
+      if (accepted) dbus.serviceOwner = ":1.43";
+      return accepted;
+    };
     const backend = makeBackend(dbus, {
       installedPluginIds: async () => installed,
       provisionPlugin: async () => {
@@ -1097,6 +1409,135 @@ describe("KWinComputerBackend", () => {
 
     await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
     await backend.dispose();
+  });
+
+  /**
+   * The pre-fix memo replayed a failed provision forever: one transient
+   * failure (an OOM-killed compiler, a full disk) and every future connect
+   * answered with the identical stale error until the server restarted.
+   */
+  it("retries provisioning on the next connect after a failed attempt", async () => {
+    const dbus = new FakeDbus();
+    let installed: readonly string[] = [];
+    let fail = true;
+    const attempts: number[] = [];
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => installed,
+      provisionPlugin: async () => {
+        attempts.push(attempts.length + 1);
+        if (fail) throw new Error("the compiler was OOM-killed");
+        installed = ["SynaraComputerUsePluginV1"];
+        return {
+          action: "installed-prebuilt",
+          pluginId: "SynaraComputerUsePluginV1",
+          requiresRelogin: false,
+          summary: "The computer-use plugin is installed and ready.",
+        };
+      },
+    });
+
+    const first = await backend.availability();
+    expect(first.kind).toBe("backend-unavailable");
+    fail = false;
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    // The second connect really provisioned again; a background reconnect may
+    // also have joined by dispose time, hence the floor rather than equality.
+    expect(attempts.length).toBeGreaterThanOrEqual(2);
+    await backend.dispose();
+  });
+
+  it("answers a repeat provision from the current-install stamp without reinstalling", async () => {
+    await withProvisionHome(async (home) => {
+      const pluginDirectory = resolveInstallTarget(
+        SYSTEM_QT_PLUGIN_ROOTS_FOR_TEST,
+        home,
+      ).pluginDirectory;
+      const prebuiltRoot = await writePrebuiltBundle(home, "6.7.3", "shipped bytes");
+      // The default wiring discovers the shipped bundle through this variable,
+      // not through the backend option.
+      process.env.SYNARA_KWIN_PREBUILT_DIR = prebuiltRoot;
+      const backend = provisionWiringBackend({
+        dbus: new FakeDbus(),
+        pluginDirectory,
+        prebuiltRoot,
+        runningKwinVersion: async () => "6.7.3",
+        // The install landed in a directory this session was never told about,
+        // which is exactly the first-login case that must re-ask provisioning
+        // on every connect without reinstalling each time.
+        installedPluginIds: async () => [],
+      });
+
+      const first = await backend.availability();
+      // Either the login-needed summary or, if connectWithBackoff's retries
+      // reached the second provision within this call, the current answer —
+      // both prove an install happened exactly once.
+      expect(first.kind).toBe("backend-unavailable");
+      expect(first.kind === "backend-unavailable" ? first.message : "").toMatch(
+        /plugin is installed/,
+      );
+      expect(await readdir(pluginDirectory)).toEqual(["SynaraComputerUsePluginV1.so"]);
+
+      const second = await backend.availability();
+      expect(second.kind === "backend-unavailable" ? second.message : "").toContain(
+        "installed and current",
+      );
+      // The fast path answered from the stamp: no second version suffix was
+      // created, which is what a rebuild or reinstall would have done.
+      expect(await readdir(pluginDirectory)).toEqual(["SynaraComputerUsePluginV1.so"]);
+      await backend.dispose();
+    });
+  });
+
+  it("installs a fresh candidate when the stamped install predates a KWin upgrade", async () => {
+    await withProvisionHome(async (home) => {
+      const pluginDirectory = resolveInstallTarget(
+        SYSTEM_QT_PLUGIN_ROOTS_FOR_TEST,
+        home,
+      ).pluginDirectory;
+      const prebuiltRoot = await writePrebuiltBundle(home, "6.8.0", "upgraded bytes");
+      process.env.SYNARA_KWIN_PREBUILT_DIR = prebuiltRoot;
+      await mkdir(pluginDirectory, { recursive: true });
+      await writeFile(join(pluginDirectory, "SynaraComputerUsePluginV1.so"), "old build");
+      const stampDirectory = join(home, "state", "synara", "kwin-computer-use-plugin");
+      await mkdir(stampDirectory, { recursive: true });
+      await writeFile(
+        join(stampDirectory, "install.stamp"),
+        [
+          "plugin_id=SynaraComputerUsePluginV1",
+          "installed_at=2026-01-01T00:00:00.000Z",
+          `plugin_path=${join(pluginDirectory, "SynaraComputerUsePluginV1.so")}`,
+          "kwin_version=6.7.3",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const dbus = new FakeDbus();
+      // Only the freshly installed build loads, as an upgraded compositor
+      // refuses the binary built for its predecessor.
+      dbus.loadPlugin = async (pluginId: string) => {
+        dbus.calls.push({ method: "LoadPlugin", args: [pluginId] });
+        const accepted = pluginId === "SynaraComputerUsePluginV2";
+        if (accepted) dbus.serviceOwner = ":1.43";
+        return accepted;
+      };
+      const backend = provisionWiringBackend({
+        dbus,
+        pluginDirectory,
+        prebuiltRoot,
+        runningKwinVersion: async () => "6.8.0",
+      });
+
+      await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+      expect(await readFile(join(pluginDirectory, "SynaraComputerUsePluginV2.so"), "utf8")).toBe(
+        "upgraded bytes",
+      );
+      expect(
+        dbus.calls.some(
+          (call) => call.method === "LoadPlugin" && call.args[0] === "SynaraComputerUsePluginV2",
+        ),
+      ).toBe(true);
+      await backend.dispose();
+    });
   });
 
   it("names the KWin version mismatch when LoadPlugin is refused", async () => {

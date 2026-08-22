@@ -124,6 +124,10 @@ export default function ComputerPanel(props: {
     () =>
       createComputerInputQueue({
         onError: (error) => setInputError(inputErrorMessage(error)),
+        onDrop: () =>
+          setInputError(
+            "The desktop is busy, so that input was dropped. Wait for it to catch up and try again.",
+          ),
       }),
     [],
   );
