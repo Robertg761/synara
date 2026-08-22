@@ -3526,7 +3526,13 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     context.nextRequestId += 1;
 
     const result = await this.requestRegistry(context)
-      .requestWithId(id, method, params, (message) => this.writeMessage(context, message), timeoutMs)
+      .requestWithId(
+        id,
+        method,
+        params,
+        (message) => this.writeMessage(context, message),
+        timeoutMs,
+      )
       .finally(() => {
         this.restartDiscoverySessionIdleTimer(context);
       });
