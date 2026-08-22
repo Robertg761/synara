@@ -3,11 +3,12 @@
  * and learn what a pixel of scroll request is worth to it.
  *
  * Wayland has no cross-toolkit pixel-true scroll unit. The stack injects
- * finger-source continuous pixel deltas, which Qt clients honor exactly, while
- * GTK-hosted browsers convert them into their own scroll units and travel
- * several times the request. Nothing in the protocol reports that conversion
- * back, so the only way to know the distance is to look at the window before
- * and after and correlate the two pictures.
+ * wheel-source events whose pixel half Qt clients honor exactly, while
+ * browsers act on the notch half and travel several times the request (and
+ * the finger-source alternative is worse: Gecko ignores it outright — see
+ * SynaraComputerUsePlugin::axis()). Nothing in the protocol reports a
+ * client's conversion back, so the only way to know the distance is to look
+ * at the window before and after and correlate the two pictures.
  *
  * Everything here is pure: PNG in, numbers out. The manager owns the captures
  * and the injection; this module owns the arithmetic.
@@ -312,10 +313,11 @@ const GEARING_SMOOTHING = 0.5;
  * Per-window scroll gearing: how many pixels of content travel one requested
  * pixel buys.
  *
- * Gearing is defined end to end, against the *request*, so that planning
- * converges: inject `requested / gearing` and the content travels `requested`.
- * A window nobody has measured is assumed pixel-true (gearing 1), which is what
- * every Qt client actually does.
+ * Gearing is the client's own ratio — travel per *injected* pixel, learned in
+ * `learn` — and planning divides the request by it, so the loop converges in
+ * one measurement: inject `requested / gearing` and the content travels
+ * `requested`. A window nobody has measured is assumed pixel-true (gearing 1),
+ * which is what every Qt client actually does.
  *
  * Keyed by window id. Windows come and go, so the map is bounded and evicts in
  * insertion order — which relies on `Map` preserving it, and on `set` of an

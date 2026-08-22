@@ -6,7 +6,6 @@ import {
   type ComputerActionResult,
   type ComputerScreenshot,
   type ComputerTarget,
-  type ComputerState,
 } from "@synara/contracts";
 
 import { actionableElements, ComputerTargetError } from "../computer/uiTreeTargeting.ts";

@@ -1,5 +1,12 @@
-// Dispatches a computer-use E2E turn to the DEV server over its feature socket.
-// Usage: bun cu-e2e-dispatch.mjs "<prompt text>" [title]
+// Dispatches a computer-use E2E turn to the DEV server over its feature socket,
+// so computer-use changes can be exercised end to end without driving the UI.
+// Must live under apps/web: bun resolves the effect/unstable subpath imports
+// from the script's own directory. The project id is this machine's dev
+// project; the token is the dev server's SYNARA_AUTH_TOKEN (read it from
+// /proc/<dev server pid>/environ — untruncated).
+//
+// Usage:
+//   cd apps/web && SYNARA_DEV_TOKEN=<token> bun scripts/cu-e2e-dispatch.mjs "<prompt>" [title]
 import { Effect, Layer } from "effect";
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
