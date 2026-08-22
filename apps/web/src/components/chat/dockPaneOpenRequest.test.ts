@@ -6,8 +6,8 @@ import { routeSingleDockPaneOpenRequest } from "./dockPaneOpenRequest";
 const CURRENT_THREAD_ID = ThreadId.makeUnsafe("thread-current");
 const REQUESTED_THREAD_ID = ThreadId.makeUnsafe("thread-requested");
 
-describe("routeSingleDockPaneOpenRequest with the browser pane's refuse policy", () => {
-  it("opens the current thread browser immediately without navigating", () => {
+describe("routeSingleDockPaneOpenRequest with the browser panel's remember policy", () => {
+  it("shows the current thread browser immediately without navigating", () => {
     const calls: string[] = [];
 
     routeSingleDockPaneOpenRequest({
@@ -15,13 +15,13 @@ describe("routeSingleDockPaneOpenRequest with the browser pane's refuse policy",
       requestedThreadId: CURRENT_THREAD_ID,
       requestImmediateHydration: () => calls.push("hydrate"),
       openPane: (threadId) => calls.push(`open:${threadId}`),
-      crossThread: { kind: "refuse" },
+      crossThread: { kind: "remember", remember: (threadId) => calls.push(`remember:${threadId}`) },
     });
 
     expect(calls).toEqual(["hydrate", `open:${CURRENT_THREAD_ID}`]);
   });
 
-  it("leaves the current chat untouched for a background thread request", () => {
+  it("remembers a background thread request without touching the current chat", () => {
     const calls: string[] = [];
 
     routeSingleDockPaneOpenRequest({
@@ -29,10 +29,10 @@ describe("routeSingleDockPaneOpenRequest with the browser pane's refuse policy",
       requestedThreadId: REQUESTED_THREAD_ID,
       requestImmediateHydration: () => calls.push("hydrate"),
       openPane: (threadId) => calls.push(`open:${threadId}`),
-      crossThread: { kind: "refuse" },
+      crossThread: { kind: "remember", remember: (threadId) => calls.push(`remember:${threadId}`) },
     });
 
-    expect(calls).toEqual([]);
+    expect(calls).toEqual([`remember:${REQUESTED_THREAD_ID}`]);
   });
 });
 
@@ -90,20 +90,24 @@ describe("routeSingleDockPaneOpenRequest with the device/computer navigate polic
 });
 
 describe("cross-thread policy divergence", () => {
-  // The browser pane refuses cross-thread opens on purpose: its runtime stays
-  // alive without the route mounted, so following the request would steal the
-  // user's chat for nothing. Device and computer panes have no such runtime, so
-  // they follow the request. Both halves are behaviour, not an oversight.
-  it("refuses everything for a background thread while navigate seeds and routes", () => {
-    const refuseCalls: string[] = [];
+  // The browser panel remembers cross-thread opens instead of following them:
+  // its native runtime stays on the requested thread, so returning to that chat
+  // restores the panel, but the user's current chat is never stolen. Device and
+  // computer panes have no such runtime, so they follow the request. Both
+  // halves are behaviour, not an oversight.
+  it("remembers quietly for a background thread while navigate seeds and routes", () => {
+    const rememberCalls: string[] = [];
     const navigateCalls: string[] = [];
 
     routeSingleDockPaneOpenRequest({
       currentThreadId: CURRENT_THREAD_ID,
       requestedThreadId: REQUESTED_THREAD_ID,
-      requestImmediateHydration: () => refuseCalls.push("hydrate"),
-      openPane: (threadId) => refuseCalls.push(`open:${threadId}`),
-      crossThread: { kind: "refuse" },
+      requestImmediateHydration: () => rememberCalls.push("hydrate"),
+      openPane: (threadId) => rememberCalls.push(`open:${threadId}`),
+      crossThread: {
+        kind: "remember",
+        remember: (threadId) => rememberCalls.push(`remember:${threadId}`),
+      },
     });
     routeSingleDockPaneOpenRequest({
       currentThreadId: CURRENT_THREAD_ID,
@@ -116,8 +120,8 @@ describe("cross-thread policy divergence", () => {
       },
     });
 
-    // Refuse skips hydration too — a refused request must leave no trace.
-    expect(refuseCalls).toEqual([]);
+    // Remember skips hydration and the pane — the current chat sees no change.
+    expect(rememberCalls).toEqual([`remember:${REQUESTED_THREAD_ID}`]);
     expect(navigateCalls).toEqual([
       "hydrate",
       `open:${REQUESTED_THREAD_ID}`,
@@ -126,15 +130,18 @@ describe("cross-thread policy divergence", () => {
   });
 
   it("is identical for a same-thread request under either policy", () => {
-    const refuseCalls: string[] = [];
+    const rememberCalls: string[] = [];
     const navigateCalls: string[] = [];
 
     routeSingleDockPaneOpenRequest({
       currentThreadId: CURRENT_THREAD_ID,
       requestedThreadId: CURRENT_THREAD_ID,
-      requestImmediateHydration: () => refuseCalls.push("hydrate"),
-      openPane: (threadId) => refuseCalls.push(`open:${threadId}`),
-      crossThread: { kind: "refuse" },
+      requestImmediateHydration: () => rememberCalls.push("hydrate"),
+      openPane: (threadId) => rememberCalls.push(`open:${threadId}`),
+      crossThread: {
+        kind: "remember",
+        remember: (threadId) => rememberCalls.push(`remember:${threadId}`),
+      },
     });
     routeSingleDockPaneOpenRequest({
       currentThreadId: CURRENT_THREAD_ID,
@@ -147,6 +154,6 @@ describe("cross-thread policy divergence", () => {
       },
     });
 
-    expect(refuseCalls).toEqual(navigateCalls);
+    expect(rememberCalls).toEqual(navigateCalls);
   });
 });

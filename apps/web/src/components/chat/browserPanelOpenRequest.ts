@@ -4,20 +4,22 @@ import { findLeafPaneById } from "../../splitView.logic";
 import type { PaneId, SplitView } from "../../splitViewStore";
 
 // The single-pane browser open request routes through
-// `routeSingleDockPaneOpenRequest` (dockPaneOpenRequest.ts) with the `refuse`
+// `routeSingleDockPaneOpenRequest` (dockPaneOpenRequest.ts) with the `remember`
 // cross-thread policy; only the split-view variant is browser-specific.
 
 interface SplitBrowserPanelOpenRequestInput {
   readonly splitView: SplitView;
   readonly requestedThreadId: ThreadId;
-  readonly openBrowserPanel: (paneId: PaneId) => void;
+  readonly rememberFloatingBrowser: (threadId: ThreadId) => void;
+  readonly showFloatingBrowser: (paneId: PaneId) => void;
 }
 
 export function routeSplitBrowserPanelOpenRequest(input: SplitBrowserPanelOpenRequestInput): void {
+  input.rememberFloatingBrowser(input.requestedThreadId);
   const focusedPane = findLeafPaneById(input.splitView.root, input.splitView.focusedPaneId);
   if (!focusedPane || focusedPane.threadId !== input.requestedThreadId) {
     return;
   }
 
-  input.openBrowserPanel(focusedPane.id);
+  input.showFloatingBrowser(focusedPane.id);
 }

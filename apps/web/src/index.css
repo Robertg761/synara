@@ -4,6 +4,15 @@
 
 @theme inline {
   --animate-skeleton: skeleton 2s -1s infinite linear;
+  /* Always-on status spinners (sidebar running-thread glyph) rotate in discrete
+     steps (~18 fps) instead of a continuous 60 fps spin. The desktop shell is a
+     transparent window over macOS vibrancy and the sidebar surface carries a
+     backdrop-filter, so EVERY presented frame re-blurs the whole sidebar in the
+     GPU process and re-composites the vibrancy in WindowServer — a 12px spinner
+     at 60 fps kept the GPU process at ~18% CPU / +100MB and the renderer at ~9%.
+     Fewer frames is the only lever that cuts all of that; at this size the 15°
+     steps are visually indistinguishable from a smooth spin. */
+  --animate-spin-stepped: spin-stepped 1.3s steps(24, end) infinite;
   --font-sans: var(--font-ui-family);
   --font-display: var(--font-display-family);
   --font-mono: var(--font-mono-family);
@@ -61,6 +70,11 @@
   @keyframes skeleton {
     to {
       background-position: -200% 0;
+    }
+  }
+  @keyframes spin-stepped {
+    to {
+      transform: rotate(360deg);
     }
   }
 }
@@ -2191,6 +2205,8 @@ label:has(> select#reasoning-effort) select {
    "Working for …" status line via the `shimmer` class. Provides `shimmer`,
    `shimmer-duration-*`, `shimmer-spread-*`, `shimmer-angle-*`,
    `shimmer-color-*`, `shimmer-once`, `shimmer-reverse`, and `shimmer-none`.
+   One deliberate deviation: the animation is duty-cycled via `--shimmer-timing`
+   (see the note inside `@utility shimmer`).
    Docs: https://ui.shadcn.com/docs/utils/shimmer */
 @property --shimmer-angle {
   syntax: "<angle>";
@@ -2239,7 +2255,15 @@ label:has(> select#reasoning-effort) select {
   background-clip: text;
   -webkit-background-clip: text;
   -webkit-text-fill-color: var(--shimmer-text-fill, transparent);
-  animation: tw-shimmer var(--shimmer-duration, 2s) linear infinite;
+  /* Local deviation from the vendored utility: the sweep is duty-cycled with a stepped
+     timing function instead of `linear`. A `background-position` animation on a
+     `background-clip: text` element cannot run on the compositor, so every animation
+     frame re-rasterizes the label and — because the "Working…" line sits under the
+     composer's backdrop blur — re-blurs the glass. At 120 Hz that is ~240 repaints per
+     2 s cycle; 60 steps keep 30 hops/s (video-smooth on a label this small) and measured
+     ~-6 CPU points (renderer + GPU process) on the transcript perf harness while
+     streaming. `--shimmer-timing` lets a caller restore `linear` where the hop would show. */
+  animation: tw-shimmer var(--shimmer-duration, 2s) var(--shimmer-timing, steps(60)) infinite;
 
   @variant dark {
     --_highlight: var(
