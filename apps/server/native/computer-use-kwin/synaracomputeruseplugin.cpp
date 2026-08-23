@@ -1713,6 +1713,15 @@ QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint 
     if (!calledFromDBus()) {
         return {};
     }
+    // The release shortcut revokes the agent's view as well as its hands:
+    // a latched release refuses capture until the user resumes, matching
+    // start() and the input path.
+    if (m_releasedByUser) {
+        sendErrorReply(s_releasedErrorName,
+                       QStringLiteral("computer control was released with %1")
+                           .arg(releaseShortcut().toString(QKeySequence::NativeText)));
+        return {};
+    }
     setDelayedReply(true);
     if (m_running) {
         noteActivity();
@@ -1729,6 +1738,14 @@ QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint 
 QByteArray SynaraComputerUsePlugin::captureRegion(int x, int y, uint width, uint height, uint maxDimension)
 {
     if (!calledFromDBus()) {
+        return {};
+    }
+    // Same privacy rule as captureWindow: a latched user release blanks the
+    // agent's view of the desktop, not just its input.
+    if (m_releasedByUser) {
+        sendErrorReply(s_releasedErrorName,
+                       QStringLiteral("computer control was released with %1")
+                           .arg(releaseShortcut().toString(QKeySequence::NativeText)));
         return {};
     }
     setDelayedReply(true);
