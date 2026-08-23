@@ -575,13 +575,18 @@ export function makeAgentGatewayComputerTools(
   const observeAfterAction = async (
     args: Record<string, unknown>,
     result: ComputerActionResult,
+    context: ToolContext,
   ): Promise<unknown> => {
     if (readBooleanArg(args, "include_screenshot") === false) return result;
     // The clamped point when the display server moved the pointer, because the
     // window under where the action actually landed is the one it affected.
     return withObservation(
       result,
-      await manager.captureActionScreenshot(result.windowId, result.clampedTo ?? result.point),
+      await manager.captureActionScreenshot(
+        result.windowId,
+        result.clampedTo ?? result.point,
+        context.callerThreadId,
+      ),
     );
   };
 
@@ -613,7 +618,7 @@ export function makeAgentGatewayComputerTools(
         const outcome = await run(args, context);
         return "result" in outcome
           ? withObservation(outcome.result, outcome.observation)
-          : observeAfterAction(args, outcome);
+          : observeAfterAction(args, outcome, context);
       },
     );
 

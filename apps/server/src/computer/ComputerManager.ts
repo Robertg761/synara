@@ -472,6 +472,7 @@ export class ComputerManager {
   async captureActionScreenshot(
     windowIdHint?: string,
     actionPoint?: ComputerPoint,
+    threadId?: string,
   ): Promise<ComputerActionObservation | undefined> {
     if (!this.backendCapabilities.capture) return undefined;
     this.engageBackend();
@@ -480,14 +481,17 @@ export class ComputerManager {
     }
     if (windowIdHint !== undefined) {
       try {
-        return this.observeCapture({
-          screenshot: await this.backend.captureScreenshot({
-            kind: "window",
+        return this.observeCapture(
+          {
+            screenshot: await this.backend.captureScreenshot({
+              kind: "window",
+              windowId: windowIdHint,
+              maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+            }),
             windowId: windowIdHint,
-            maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
-          }),
-          windowId: windowIdHint,
-        });
+          },
+          threadId,
+        );
       } catch {
         try {
           const stillListed = (await this.backend.listWindows()).some(
@@ -504,14 +508,17 @@ export class ComputerManager {
       const pointWindowId = await this.windowIdAtActionPoint(actionPoint);
       if (pointWindowId !== undefined) {
         try {
-          return this.observeCapture({
-            screenshot: await this.backend.captureScreenshot({
-              kind: "window",
+          return this.observeCapture(
+            {
+              screenshot: await this.backend.captureScreenshot({
+                kind: "window",
+                windowId: pointWindowId,
+                maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+              }),
               windowId: pointWindowId,
-              maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
-            }),
-            windowId: pointWindowId,
-          });
+            },
+            threadId,
+          );
         } catch {
           // The window vanished between the listing and the capture. It was
           // never named by the caller, so fall through to the focus path
@@ -524,6 +531,7 @@ export class ComputerManager {
         await this.captureFocusedWindow(COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION, {
           agentFocusOnly: true,
         }),
+        threadId,
       );
     } catch {
       return undefined;
@@ -543,13 +551,21 @@ export class ComputerManager {
    * region is never compared against them — two windows can be equally blank,
    * and reporting the second as unchanged would hide the first sight of it.
    */
-  private observeCapture(capture: ComputerCapturedWindow): ComputerActionObservation {
+  private observeCapture(
+    capture: ComputerCapturedWindow,
+    threadId?: string,
+  ): ComputerActionObservation {
     const region = capture.screenshot.region;
+    // Scoped to the observing thread as well: "unchanged" tells the caller to
+    // keep reading its previous screenshot, which only makes sense against an
+    // image that same thread actually received. Without the scope, thread A's
+    // delivered capture suppressed thread B's first sight of the same window.
+    const scope = threadId ?? "";
     const key =
       capture.windowId !== undefined
-        ? `window:${capture.windowId}`
+        ? `${scope}|window:${capture.windowId}`
         : region
-          ? `region:${region.x},${region.y},${region.width}x${region.height}`
+          ? `${scope}|region:${region.x},${region.y},${region.width}x${region.height}`
           : undefined;
     if (key === undefined) {
       // Pixels that say nothing about what they cover cannot be compared: two
@@ -884,7 +900,7 @@ export class ComputerManager {
             : { gearing: round2(this.scrollGearing.gearing(observedWindowId)) }),
         },
       },
-      ...(after ? { observation: this.observeCapture(after) } : {}),
+      ...(after ? { observation: this.observeCapture(after, threadId) } : {}),
     };
   }
 

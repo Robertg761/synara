@@ -1372,6 +1372,27 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("never reports an unchanged screen to a thread that has not seen it", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+
+    const seenByA = await manager.captureActionScreenshot("fake-terminal", undefined, "thread-a");
+    expect(seenByA !== undefined && "screenshot" in seenByA).toBe(true);
+
+    // Identical pixels, different thread: thread B has no previous screenshot
+    // to keep reading, so the bytes must be sent, not suppressed.
+    const firstForB = await manager.captureActionScreenshot("fake-terminal", undefined, "thread-b");
+    expect(firstForB !== undefined && "screenshot" in firstForB).toBe(true);
+
+    // The same thread repeating its own view is still a repeat.
+    expect(await manager.captureActionScreenshot("fake-terminal", undefined, "thread-b")).toEqual({
+      screenshotUnchanged: true,
+      windowId: "fake-terminal",
+    });
+
+    await manager.dispose();
+  });
+
   it("never reports an unchanged screen across different regions", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend, actionSettleMs: 0 });
