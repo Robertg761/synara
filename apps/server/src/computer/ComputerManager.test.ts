@@ -275,6 +275,19 @@ describe("ComputerManager and FakeComputerBackend", () => {
       code: "computer_target_invalid",
     });
 
+    // A target that names no control refuses up front with what is missing,
+    // instead of matching every node in scope and dumping the whole tree as
+    // an ambiguity refusal.
+    await expect(
+      manager.scroll("thread-1", { windowId: "fake-calculator" }, 0, 300),
+    ).rejects.toMatchObject({ code: "computer_target_invalid" });
+    await expect(manager.setValue("thread-1", {}, "468")).rejects.toMatchObject({
+      code: "computer_target_invalid",
+    });
+    await expect(manager.performAction("thread-1", {}, "activate")).rejects.toMatchObject({
+      code: "computer_target_invalid",
+    });
+
     await manager.dispose();
   });
 

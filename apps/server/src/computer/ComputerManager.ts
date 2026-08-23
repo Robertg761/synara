@@ -1574,6 +1574,19 @@ export class ComputerManager {
   }
 
   private async resolveSemanticTarget(target: ComputerTarget): Promise<ComputerResolvedTarget> {
+    // Without a label or role the query matches every control in scope, and
+    // the ambiguity refusal that follows would dump the whole tree at the
+    // caller. Refuse up front, before paying for the accessibility walk, with
+    // what is actually missing.
+    if (target.label === undefined && target.role === undefined) {
+      throw new ComputerTargetError({
+        code: "computer_target_invalid",
+        message:
+          "This target does not name a control: window_id or coordinates alone match everything in scope. " +
+          "Pass label (optionally with role and window_id) to pick a control, or use x/y coordinates " +
+          "with the pointer tools.",
+      });
+    }
     const state = await this.backend.getState({ includeText: true });
     if (!state.root) {
       throw new ComputerTargetError({
