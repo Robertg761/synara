@@ -139,6 +139,17 @@ jobs:
           # than to discover on a release tag.
           command -v cc >/dev/null 2>&1 || ln -s "$(command -v gcc)" /usr/local/bin/cc
 
+      - name: Report the dependency gap
+        if: steps.deps.outcome != 'success'
+        shell: bash
+        env:
+          DISTRO_ID: ${{ matrix.distro.id }}
+        # continue-on-error leaves the job green, so without this annotation a
+        # failed leg ships a release silently missing its prebuilt. The warning
+        # is the "reported" half of the reported-and-skipped contract above.
+        run: |
+          echo "::warning title=No prebuilt for $DISTRO_ID::Dependency install failed; this release ships no desktop-helper prebuilt for $DISTRO_ID and its users fall back to a local build."
+
       - name: Checkout
         if: steps.deps.outcome == 'success'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
