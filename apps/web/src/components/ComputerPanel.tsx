@@ -397,14 +397,27 @@ export default function ComputerPanel(props: {
               </div>
             ) : null}
             {cursorPosition ? (
-              <span
+              // The same look as the on-desktop ghost cursor the KWin plugin
+              // draws: an ordinary pointer glyph whose violet halo is what says
+              // it is the agent's. The path tip sits at the SVG origin, so the
+              // element is positioned by the hotspot with no centering shift.
+              <svg
                 aria-label="Agent cursor"
+                viewBox="0 0 14 16"
                 className={cn(
-                  "pointer-events-none absolute size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-blue-500 shadow-[0_0_0_1px_rgba(0,0,0,0.7)]",
+                  "pointer-events-none absolute h-4 w-3.5 overflow-visible [filter:drop-shadow(0_0_3px_rgba(124,58,237,0.9))_drop-shadow(0_0_7px_rgba(124,58,237,0.65))]",
                   threadState?.agentActive ? "opacity-100" : "opacity-65",
                 )}
                 style={{ left: cursorPosition.left, top: cursorPosition.top }}
-              />
+              >
+                <path
+                  d="M0 0 L0 10.64 L2.66 8.12 L4.2 12.32 L6.16 11.48 L4.48 7.56 L7.84 7.56 Z"
+                  fill="#ffffff"
+                  stroke="rgba(20,10,46,0.85)"
+                  strokeWidth="1.2"
+                  strokeLinejoin="round"
+                />
+              </svg>
             ) : null}
           </>
         )}
