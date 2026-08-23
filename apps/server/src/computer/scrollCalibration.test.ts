@@ -175,8 +175,12 @@ describe("decodePngLuma", () => {
   it("declines what it does not decode instead of throwing", async () => {
     const luma = noise(4, 4, 7);
     // Interlaced, 16-bit, and palette are all legal PNG and all unsupported.
-    await expect(decodePngLuma(encodePng(4, 4, 0, luma, { interlace: 1 }))).resolves.toBeUndefined();
-    await expect(decodePngLuma(encodePng(4, 4, 0, luma, { bitDepth: 16 }))).resolves.toBeUndefined();
+    await expect(
+      decodePngLuma(encodePng(4, 4, 0, luma, { interlace: 1 })),
+    ).resolves.toBeUndefined();
+    await expect(
+      decodePngLuma(encodePng(4, 4, 0, luma, { bitDepth: 16 })),
+    ).resolves.toBeUndefined();
     const palette = Buffer.concat([
       PNG_SIGNATURE,
       ihdr(4, 4, 8, 3),
