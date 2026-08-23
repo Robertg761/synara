@@ -433,16 +433,19 @@ describe("agent gateway computer tools", () => {
 
   it("attaches a post-action screenshot of the focused window to action results", async () => {
     const { backend, call } = await setup();
-    const result = await call("computer_click", { x: 10, y: 10 });
+    const result = await call("computer_click", { x: 100, y: 100 });
 
     expect(result.isError).not.toBe(true);
     expect(result.content.map((entry) => entry.type)).toEqual(["text", "image"]);
-    // A bare coordinate names no window, so the capture falls to the focused
-    // one, and the metadata says which window the pixels cover.
+    // A bare coordinate names no window, so the capture goes to the window the
+    // compositor routed the click to — the topmost one at the point — and the
+    // metadata says which window the pixels cover. (An untargeted action also
+    // clears the pinned focus, so the focused-window fallback cannot answer
+    // here; the action point is what identifies the window.)
     const text = result.content.find((entry) => entry.type === "text");
     expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
       action: "computer_click",
-      point: { x: 10, y: 10 },
+      point: { x: 100, y: 100 },
       screenshot: {
         windowId: "fake-terminal",
         region: { x: 40, y: 40, width: 960, height: 720 },
@@ -969,12 +972,14 @@ describe("agent gateway computer tools", () => {
   it("still resolves a scroll target when one is actually given", async () => {
     const { backend, call } = await setup();
 
-    await call("computer_scroll", { x: 12, y: 34, delta_x: 0, delta_y: -50 });
+    await call("computer_scroll", { x: 100, y: 100, delta_x: 0, delta_y: -50 });
 
-    // Probe plus remainder — the resolved point rides into both legs.
+    // Probe plus remainder — the resolved point rides into both legs. The
+    // point sits inside a window so the probe has something to measure against;
+    // a point over bare desktop would skip calibration and send one leg.
     expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([
-      [{ x: 12, y: 34 }, 0, -48],
-      [{ x: 12, y: 34 }, 0, -2],
+      [{ x: 100, y: 100 }, 0, -48],
+      [{ x: 100, y: 100 }, 0, -2],
     ]);
   });
 

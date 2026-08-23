@@ -1486,6 +1486,25 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("still identifies the window for an untargeted scroll after the clear", async () => {
+    // Preparing an untargeted action clears the pinned focus, and the focus
+    // fallback used to be read only afterwards — so a bare delta scroll could
+    // never name its window, observed an unreadable workspace downscale, and
+    // calibrated nothing. The cursor the thread last drove to fills the gap.
+    const { backend, manager } = calibratedScrollFixture([336, 64]);
+
+    await manager.click("thread-1", { x: 1_100, y: 200 });
+    const result = await manager.scrollCalibrated("thread-1", null, 0, 400, { observe: true });
+
+    // The focus really was cleared; the window came from the cursor position.
+    expect(backend.callsFor("clearFocusWindow").length).toBeGreaterThan(0);
+    expect(result.result.scroll?.gearing).toBe(7);
+    expect(result.result.scroll?.traveledY).toBe(400);
+    expect(result.observation !== undefined && "screenshot" in result.observation).toBe(true);
+
+    await manager.dispose();
+  });
+
   it("converts measured travel out of capture pixels before reporting or learning it", async () => {
     // A window wider than the observation budget is captured downscaled, so the
     // correlator's answer is in capture pixels and means less travel than it

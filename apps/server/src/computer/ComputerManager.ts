@@ -813,6 +813,15 @@ export class ComputerManager {
     readonly observation?: ComputerActionObservation;
   }> {
     await this.claimDesktopControl(threadId);
+    // An untargeted scroll routes to whatever sits under the agent's cursor
+    // once the pinned focus is cleared — but preparing the target clears that
+    // focus, and it was the only fallback naming the observed window. Read the
+    // candidates that will not survive the clear first: the cursor position
+    // this thread last drove to, and the focus about to be dropped.
+    const attributed = agentThreadId(threadId);
+    const cursorPoint =
+      target !== null ? undefined : attributed ? this.threads.get(attributed)?.cursor : undefined;
+    const preClearFocusId = target !== null ? undefined : await this.agentFocusWindowId();
     const resolved = await this.prepareScrollTarget(target);
     // The window the gesture lands in, by the ladder `captureActionScreenshot`
     // already climbs: the one targeting named, else the one the compositor
@@ -822,6 +831,8 @@ export class ComputerManager {
     const observedWindowId =
       resolved?.windowId ??
       (resolved?.point ? await this.windowIdAtActionPoint(resolved.point) : undefined) ??
+      (cursorPoint ? await this.windowIdAtActionPoint(cursorPoint) : undefined) ??
+      preClearFocusId ??
       (await this.agentFocusWindowId());
     const before = options.observe ? await this.captureForMeasurement(observedWindowId) : undefined;
 
