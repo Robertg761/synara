@@ -20,6 +20,7 @@ import {
   type NestedSessionMode,
 } from "../nestedKWinSession.ts";
 import { createPortalComputerBackend } from "../portal/PortalComputerBackend.ts";
+import { fileRestoreTokenStore } from "../portal/restoreTokenStore.ts";
 import { probeDesktop } from "../portal/probe.ts";
 import { ComputerService, type ComputerServiceShape } from "../Services/ComputerService.ts";
 import type { ComputerBackend } from "../ComputerBackend.ts";
@@ -124,7 +125,14 @@ async function makeLinuxBackend(): Promise<LinuxBackend> {
     case "nested-window":
       return await makeNestedBackend(nestedModeForChoice(selection.choice) ?? "virtual");
     case "portal":
-      return { backend: createPortalComputerBackend(await probeDesktop()) };
+      // The file-backed token store is what turns a crash-restart loop into a
+      // remembered grant instead of a consent-dialog loop; only tests and
+      // nested sessions want the in-memory default.
+      return {
+        backend: createPortalComputerBackend(await probeDesktop(), {
+          providerOptions: { restoreTokens: fileRestoreTokenStore() },
+        }),
+      };
   }
 }
 
