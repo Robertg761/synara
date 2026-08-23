@@ -150,7 +150,10 @@ export interface ComputerManagerOptions {
   /** Injected for tests, so window-churn tests do not wait out the real window. */
   readonly windowsPublishDebounceMs?: number;
   /** Injected for tests; decodes and correlates two PNG captures. */
-  readonly measureScrollTravel?: (before: Uint8Array, after: Uint8Array) => number | undefined;
+  readonly measureScrollTravel?: (
+    before: Uint8Array,
+    after: Uint8Array,
+  ) => number | undefined | Promise<number | undefined>;
 }
 
 /**
@@ -250,7 +253,7 @@ export class ComputerManager {
   private readonly measureScrollTravel: (
     before: Uint8Array,
     after: Uint8Array,
-  ) => number | undefined;
+  ) => number | undefined | Promise<number | undefined>;
   /** Learned per window and kept for the manager's life; see ScrollGearingStore. */
   private readonly scrollGearing = new ScrollGearingStore();
   /** Depth rather than a flag: a lease publish can nest inside a window one. */
@@ -948,7 +951,7 @@ export class ComputerManager {
     }
     const capture = await this.captureForMeasurement(windowId);
     if (!capture) return {};
-    const measured = this.measureTravel(from.screenshot, capture.screenshot);
+    const measured = await this.measureTravel(from.screenshot, capture.screenshot);
     // A travel opposing the injection is the correlator locking onto the wrong
     // feature — repetitive content aliases — not a page that scrolled
     // backwards. The store would refuse the sample anyway; suppressing it here
@@ -1016,14 +1019,17 @@ export class ComputerManager {
    * be compared. Byte equality answers first and for free: pixels that did not
    * change did not move, which is what the end of a page looks like.
    */
-  private measureTravel(before: ComputerScreenshot, after: ComputerScreenshot): number | undefined {
+  private async measureTravel(
+    before: ComputerScreenshot,
+    after: ComputerScreenshot,
+  ): Promise<number | undefined> {
     if (before.bytesBase64 === after.bytesBase64) return 0;
     // Without a scale on both captures there is no conversion from capture
     // pixels to the logical pixels the request was made in, and two different
     // scales are two different pictures of the window.
     const scale = before.scale;
     if (scale === undefined || scale !== after.scale || scale <= 0) return undefined;
-    const traveled = this.measureScrollTravel(
+    const traveled = await this.measureScrollTravel(
       Buffer.from(before.bytesBase64, "base64"),
       Buffer.from(after.bytesBase64, "base64"),
     );
@@ -1890,9 +1896,12 @@ export class ComputerManager {
  * capture in a format this does not decode costs the measurement, not the
  * scroll.
  */
-function measureScrollTravelFromPng(before: Uint8Array, after: Uint8Array): number | undefined {
-  const decodedBefore = decodePngLuma(before);
-  const decodedAfter = decodePngLuma(after);
+async function measureScrollTravelFromPng(
+  before: Uint8Array,
+  after: Uint8Array,
+): Promise<number | undefined> {
+  const decodedBefore = await decodePngLuma(before);
+  const decodedAfter = await decodePngLuma(after);
   if (!decodedBefore || !decodedAfter) return undefined;
   return estimateVerticalTravel(decodedBefore, decodedAfter);
 }

@@ -96,37 +96,37 @@ function noise(width: number, height: number, seed: number): Uint8Array {
  * A window onto a taller page, so a shift shows content that really exists
  * rather than blank filler — which is what a scroll does.
  */
-function pageWindow(
+async function pageWindow(
   page: Uint8Array,
   width: number,
   height: number,
   topRow: number,
-): LumaImage | undefined {
+): Promise<LumaImage | undefined> {
   const bytes = grayPng(width, height, page.subarray(topRow * width, (topRow + height) * width));
   return decodePngLuma(bytes);
 }
 
 describe("decodePngLuma", () => {
-  it("round-trips an 8-bit grayscale image", () => {
+  it("round-trips an 8-bit grayscale image", async () => {
     const width = 8;
     const height = 4;
     const luma = new Uint8Array(width * height);
     for (let index = 0; index < luma.length; index += 1) luma[index] = (index * 7) % 256;
 
-    const decoded = decodePngLuma(grayPng(width, height, luma));
+    const decoded = await decodePngLuma(grayPng(width, height, luma));
     expect(decoded?.width).toBe(width);
     expect(decoded?.height).toBe(height);
     expect(Array.from(decoded?.luma ?? [])).toEqual(Array.from(luma));
   });
 
-  it("converts RGB samples to luma", () => {
+  it("converts RGB samples to luma", async () => {
     // Pure red, green, blue, then white: the coefficients are visible directly.
     const samples = Uint8Array.of(255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255);
-    const decoded = decodePngLuma(encodePng(4, 1, 2, samples));
+    const decoded = await decodePngLuma(encodePng(4, 1, 2, samples));
     expect(Array.from(decoded?.luma ?? [])).toEqual([76, 149, 29, 255]);
   });
 
-  it("survives every scanline filter", () => {
+  it("survives every scanline filter", async () => {
     // Filters are chosen per row by the encoder in the wild; the decoder has to
     // undo all five, and Paeth is the one with a spec-exact tie rule.
     const width = 6;
@@ -166,29 +166,29 @@ describe("decodePngLuma", () => {
       chunk("IEND", Buffer.alloc(0)),
     ]);
 
-    const decoded = decodePngLuma(bytes);
+    const decoded = await decodePngLuma(bytes);
     expect(decoded?.width).toBe(width);
-    const expected = decodePngLuma(encodePng(width, height, 2, samples));
+    const expected = await decodePngLuma(encodePng(width, height, 2, samples));
     expect(Array.from(decoded?.luma ?? [])).toEqual(Array.from(expected?.luma ?? [1]));
   });
 
-  it("declines what it does not decode instead of throwing", () => {
+  it("declines what it does not decode instead of throwing", async () => {
     const luma = noise(4, 4, 7);
     // Interlaced, 16-bit, and palette are all legal PNG and all unsupported.
-    expect(decodePngLuma(encodePng(4, 4, 0, luma, { interlace: 1 }))).toBeUndefined();
-    expect(decodePngLuma(encodePng(4, 4, 0, luma, { bitDepth: 16 }))).toBeUndefined();
+    await expect(decodePngLuma(encodePng(4, 4, 0, luma, { interlace: 1 }))).resolves.toBeUndefined();
+    await expect(decodePngLuma(encodePng(4, 4, 0, luma, { bitDepth: 16 }))).resolves.toBeUndefined();
     const palette = Buffer.concat([
       PNG_SIGNATURE,
       ihdr(4, 4, 8, 3),
       chunk("IDAT", deflateSync(Buffer.alloc(20))),
       chunk("IEND", Buffer.alloc(0)),
     ]);
-    expect(decodePngLuma(palette)).toBeUndefined();
+    await expect(decodePngLuma(palette)).resolves.toBeUndefined();
   });
 
-  it("declines malformed bytes instead of throwing", () => {
-    expect(decodePngLuma(new Uint8Array(0))).toBeUndefined();
-    expect(decodePngLuma(Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8, 9))).toBeUndefined();
+  it("declines malformed bytes instead of throwing", async () => {
+    await expect(decodePngLuma(new Uint8Array(0))).resolves.toBeUndefined();
+    await expect(decodePngLuma(Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8, 9))).resolves.toBeUndefined();
     // A valid header whose pixel data is not deflate: inflate throws, and the
     // measurement has to degrade rather than fail the scroll that already ran.
     const badIdat = Buffer.concat([
@@ -197,9 +197,9 @@ describe("decodePngLuma", () => {
       chunk("IDAT", Buffer.from("not compressed", "utf8")),
       chunk("IEND", Buffer.alloc(0)),
     ]);
-    expect(decodePngLuma(badIdat)).toBeUndefined();
+    await expect(decodePngLuma(badIdat)).resolves.toBeUndefined();
     // Truncated mid-chunk.
-    expect(decodePngLuma(badIdat.subarray(0, 20))).toBeUndefined();
+    await expect(decodePngLuma(badIdat.subarray(0, 20))).resolves.toBeUndefined();
   });
 });
 
@@ -217,31 +217,31 @@ describe("estimateVerticalTravel", () => {
   const height = 400;
   const page = noise(width, height + 300, 20_260_822);
 
-  it("recovers a downward scroll as positive travel", () => {
+  it("recovers a downward scroll as positive travel", async () => {
     // Positive delta_y moves content up the screen: the after capture shows what
     // was 37 rows further down the page, so after[i] === before[i + 37].
-    const before = pageWindow(page, width, height, 150)!;
-    const after = pageWindow(page, width, height, 187)!;
+    const before = (await pageWindow(page, width, height, 150))!;
+    const after = (await pageWindow(page, width, height, 187))!;
     expect(estimateVerticalTravel(before, after)).toBe(37);
   });
 
-  it("recovers an upward scroll as negative travel", () => {
-    const before = pageWindow(page, width, height, 150)!;
-    const after = pageWindow(page, width, height, 67)!;
+  it("recovers an upward scroll as negative travel", async () => {
+    const before = (await pageWindow(page, width, height, 150))!;
+    const after = (await pageWindow(page, width, height, 67))!;
     expect(estimateVerticalTravel(before, after)).toBe(-83);
   });
 
-  it("reports zero for a window that did not move", () => {
-    const before = pageWindow(page, width, height, 150)!;
+  it("reports zero for a window that did not move", async () => {
+    const before = (await pageWindow(page, width, height, 150))!;
     expect(estimateVerticalTravel(before, before)).toBe(0);
   });
 
-  it("refuses a shifted pair whose best alignment is still a poor match", () => {
+  it("refuses a shifted pair whose best alignment is still a poor match", async () => {
     // The live footer-alias case: when the true shift lies outside the search
     // range, repetitive content can still produce a relative winner. A real
     // alignment of lossless captures is near-exact, so a winner that differs
     // this much from its counterpart rows is a coincidence, not a match.
-    const before = pageWindow(page, width, height, 150)!;
+    const before = (await pageWindow(page, width, height, 150))!;
     const after = {
       ...before,
       luma: before.luma.map((value, index) => (value + ((index * 2_654_435_761) % 41)) & 0xff),
@@ -249,7 +249,7 @@ describe("estimateVerticalTravel", () => {
     expect(estimateVerticalTravel(before, after)).toBeUndefined();
   });
 
-  it("refuses a blank window, where any shift matches", () => {
+  it("refuses a blank window, where any shift matches", async () => {
     const blank: LumaImage = {
       width,
       height,
@@ -258,26 +258,26 @@ describe("estimateVerticalTravel", () => {
     expect(estimateVerticalTravel(blank, blank)).toBeUndefined();
   });
 
-  it("refuses captures of different sizes", () => {
-    const before = pageWindow(page, width, height, 150)!;
-    const after = pageWindow(page, width, height - 40, 150)!;
+  it("refuses captures of different sizes", async () => {
+    const before = (await pageWindow(page, width, height, 150))!;
+    const after = (await pageWindow(page, width, height - 40, 150))!;
     expect(estimateVerticalTravel(before, after)).toBeUndefined();
   });
 
-  it("refuses a capture too short to correlate", () => {
-    const short = decodePngLuma(grayPng(width, 40, noise(width, 40, 3)))!;
+  it("refuses a capture too short to correlate", async () => {
+    const short = (await decodePngLuma(grayPng(width, 40, noise(width, 40, 3))))!;
     expect(estimateVerticalTravel(short, short)).toBeUndefined();
   });
 
-  it("honors a caller-supplied shift ceiling", () => {
-    const before = pageWindow(page, width, height, 150)!;
-    const after = pageWindow(page, width, height, 187)!;
+  it("honors a caller-supplied shift ceiling", async () => {
+    const before = (await pageWindow(page, width, height, 150))!;
+    const after = (await pageWindow(page, width, height, 187))!;
     expect(estimateVerticalTravel(before, after, { maxShift: 10 })).toBeUndefined();
   });
 });
 
 describe("ScrollGearingStore", () => {
-  it("assumes pixel-true until it has measured otherwise", () => {
+  it("assumes pixel-true until it has measured otherwise", async () => {
     const store = new ScrollGearingStore();
     expect(store.gearing("w1")).toBe(1);
     expect(store.plan("w1", 400)).toBe(400);
@@ -292,7 +292,7 @@ describe("ScrollGearingStore", () => {
     expect(store.gearing("w1")).toBe(1);
   });
 
-  it("converges on a 7x browser in one measurement", () => {
+  it("converges on a 7x browser in one measurement", async () => {
     const store = new ScrollGearingStore();
     const device = 7;
 
@@ -312,7 +312,7 @@ describe("ScrollGearingStore", () => {
     expect(store.gearing("browser")).toBeCloseTo(7, 6);
   });
 
-  it("smooths later observations rather than chasing one of them", () => {
+  it("smooths later observations rather than chasing one of them", async () => {
     const store = new ScrollGearingStore();
     store.learn("w1", 400, 1_600);
     expect(store.gearing("w1")).toBe(4);
@@ -320,7 +320,7 @@ describe("ScrollGearingStore", () => {
     expect(store.gearing("w1")).toBe(6);
   });
 
-  it("drops samples that cannot mean anything", () => {
+  it("drops samples that cannot mean anything", async () => {
     const store = new ScrollGearingStore();
     // The page hit its edge.
     store.learn("w1", 400, 0);
@@ -337,7 +337,7 @@ describe("ScrollGearingStore", () => {
     expect(store.plan("w1", 400)).toBe(400);
   });
 
-  it("never plans a nonzero request down to nothing", () => {
+  it("never plans a nonzero request down to nothing", async () => {
     const store = new ScrollGearingStore();
     store.learn("w1", 400, 400 * 50);
     expect(store.gearing("w1")).toBe(50);
@@ -345,7 +345,7 @@ describe("ScrollGearingStore", () => {
     expect(store.plan("w1", -10)).toBe(-1);
   });
 
-  it("forgets the oldest window rather than growing without bound", () => {
+  it("forgets the oldest window rather than growing without bound", async () => {
     const store = new ScrollGearingStore();
     for (let index = 0; index < 64; index += 1) {
       store.learn(`w${index}`, 400, 2_800);

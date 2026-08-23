@@ -13,7 +13,13 @@
  * Everything here is pure: PNG in, numbers out. The manager owns the captures
  * and the injection; this module owns the arithmetic.
  */
-import { inflateSync } from "node:zlib";
+import { inflate } from "node:zlib";
+import { promisify } from "node:util";
+
+// The async form dispatches to the libuv threadpool: a multi-megapixel
+// capture's inflate must not stall the event loop the frame publisher and
+// every RPC response share.
+const inflateAsync = promisify(inflate);
 
 /** Row-major single-channel image, one byte per pixel, in capture pixels. */
 export interface LumaImage {
@@ -41,15 +47,15 @@ const CHANNELS_BY_COLOR_TYPE = new Map<number, number>([
  * already been delivered, so a decode surprise must degrade to "distance
  * unknown" rather than turn a scroll that happened into a failed tool call.
  */
-export function decodePngLuma(bytes: Uint8Array): LumaImage | undefined {
+export async function decodePngLuma(bytes: Uint8Array): Promise<LumaImage | undefined> {
   try {
-    return decodePng(bytes);
+    return await decodePng(bytes);
   } catch {
     return undefined;
   }
 }
 
-function decodePng(bytes: Uint8Array): LumaImage | undefined {
+async function decodePng(bytes: Uint8Array): Promise<LumaImage | undefined> {
   if (bytes.length < PNG_SIGNATURE.length) return undefined;
   for (const [index, byte] of PNG_SIGNATURE.entries()) {
     if (bytes[index] !== byte) return undefined;
@@ -94,7 +100,7 @@ function decodePng(bytes: Uint8Array): LumaImage | undefined {
 
   if (!header || idatBytes === 0) return undefined;
   const compressed = concat(idatParts, idatBytes);
-  const raw = inflateSync(compressed);
+  const raw = await inflateAsync(compressed);
   return unfilterToLuma(raw, header.width, header.height, header.channels);
 }
 
