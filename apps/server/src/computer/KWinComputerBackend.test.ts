@@ -800,6 +800,24 @@ describe("KWinComputerBackend", () => {
     const region = plugin.calls.findLast((call) => call.method === "captureRegion");
     expect(region?.args.slice(0, 4)).toEqual([-1800, -900, 648, 518]);
 
+    // A region on the right-hand monitor is just as capturable. The clip rect
+    // is the global workspace itself; shifting it by the origin again would
+    // reject everything right of or below the primary.
+    await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 2000, y: 1200, width: 400, height: 300 },
+    });
+    const rightRegion = plugin.calls.findLast((call) => call.method === "captureRegion");
+    expect(rightRegion?.args.slice(0, 4)).toEqual([80, 120, 400, 300]);
+
+    // A region straddling the monitor seam survives untruncated.
+    await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 1800, y: 1000, width: 400, height: 300 },
+    });
+    const seamRegion = plugin.calls.findLast((call) => call.method === "captureRegion");
+    expect(seamRegion?.args.slice(0, 4)).toEqual([-120, -80, 400, 300]);
+
     await backend.dispose();
   });
 

@@ -1060,8 +1060,10 @@ export class KWinComputerBackend implements ComputerBackend {
       );
     }
     // The request arrives in agent space; the plugin captures in globals.
+    // workspaceRect() is already global — shifting it again would double the
+    // origin offset and reject on-screen regions on negative-origin layouts.
     const origin = this.currentOrigin();
-    const globalWorkspace = shiftRect(await this.workspaceRect(), origin.x, origin.y);
+    const globalWorkspace = await this.workspaceRect();
     const global = intersectComputerRects(
       shiftRect(alignRect(requested), origin.x, origin.y),
       globalWorkspace,
