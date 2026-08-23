@@ -1465,6 +1465,14 @@ static bool capture_one(helper_wayland *state, struct helper_output *output, hel
                         helper_error *error) {
 	struct capture_frame capture = {0};
 	capture.state = state;
+	/* A previous piece's wait_for dispatches events, and a global_remove can
+	 * destroy the manager between pieces; re-validate rather than marshal
+	 * through a NULL proxy. */
+	if (state->screencopy_manager == NULL) {
+		helper_error_set(error, HELPER_REFUSAL_TRANSIENT,
+		                 "the compositor withdrew zwlr_screencopy_manager_v1 mid-capture");
+		return false;
+	}
 	struct zwlr_screencopy_frame_v1 *frame = zwlr_screencopy_manager_v1_capture_output_region(
 		state->screencopy_manager, overlay_cursor ? 1 : 0, output->output, local.x, local.y,
 		local.width, local.height);

@@ -56,6 +56,10 @@ log() {
     printf '[synara-kwin-plugin] %s\n' "$*"
 }
 
+warn() {
+    printf '[synara-kwin-plugin] WARNING: %s\n' "$*" >&2
+}
+
 die() {
     printf '[synara-kwin-plugin] ERROR: %s\n' "$*" >&2
     exit 1
@@ -469,7 +473,7 @@ fi
 # build that was just installed and makes an explicit LoadPlugin answer false.
 # Only the id that just passed its health check may stay on disk.
 prune_old_plugins() {
-    local path name removed=0
+    local path name removed=0 failed=0
     local plugin_files=()
 
     shopt -s nullglob
@@ -485,10 +489,19 @@ prune_old_plugins() {
         unload_plugin "$name"
         if remove_plugin "$path"; then
             removed=$((removed + 1))
+        else
+            # A stale .so left behind wins the bus name on the next compositor
+            # start (oldest registrant), shadowing the build this run installed
+            # — never report that silently.
+            warn "could not remove superseded plugin build $path; it will shadow $plugin_id on the next KWin start. Remove it manually."
+            failed=$((failed + 1))
         fi
     done
     if (( removed )); then
         log "removed $removed superseded plugin build(s)"
+    fi
+    if (( failed )); then
+        warn "$failed superseded plugin build(s) are still on disk"
     fi
 }
 

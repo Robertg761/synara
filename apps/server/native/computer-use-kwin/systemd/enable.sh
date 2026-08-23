@@ -56,6 +56,9 @@ path_unit="$SYSTEMD_USER_DIR/synara-kwin-computer-use-rebuild.path"
         echo "PathChanged=$watched"
     done
     echo "Unit=synara-kwin-computer-use-rebuild.service"
+    echo ""
+    echo "[Install]"
+    echo "WantedBy=paths.target"
 } >"$path_unit"
 
 service_unit="$SYSTEMD_USER_DIR/synara-kwin-computer-use-rebuild.service"
@@ -70,6 +73,11 @@ service_unit="$SYSTEMD_USER_DIR/synara-kwin-computer-use-rebuild.service"
     echo "Type=oneshot"
     echo "ExecStart=$SCRIPT_PATH --noninteractive"
 } >"$service_unit"
+
+# The timer is machine-independent and ships checked in; systemctl enable is
+# all-or-nothing, so it must exist in the unit directory alongside the
+# generated units before either can be enabled.
+cp -- "$SOURCE_DIR/systemd/synara-kwin-computer-use-rebuild.timer" "$SYSTEMD_USER_DIR/"
 
 systemctl --user daemon-reload
 systemctl --user enable \
