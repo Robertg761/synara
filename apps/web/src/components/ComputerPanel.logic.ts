@@ -62,6 +62,13 @@ export type ComputerAvailabilityView =
       readonly kind: "blocked";
       readonly title: string;
       readonly description: string;
+      /**
+       * A recovery the viewport should offer. `ask-consent-again` is a denied
+       * permission dialog: the one blocker whose remedy is a user decision, so
+       * the panel shows a button (`computer.resetConsent`) instead of leaving
+       * the description to promise an affordance that does not exist.
+       */
+      readonly action?: "ask-consent-again";
     };
 
 export function resolveComputerAvailabilityView(
@@ -102,8 +109,12 @@ export function resolveComputerAvailabilityView(
   }
   return {
     kind: "blocked",
-    title: "Computer control is unavailable",
+    title:
+      health?.status === "consent-denied"
+        ? "Desktop permission was declined"
+        : "Computer control is unavailable",
     description: availability.message,
+    ...(health?.status === "consent-denied" ? { action: "ask-consent-again" as const } : {}),
   };
 }
 
@@ -125,6 +136,16 @@ export function resolveComputerHealthBadge(
   health: ComputerHealth | undefined,
 ): ComputerHealthBadge | null {
   if (!health || health.status === "connected") return null;
+  // A declined dialog is a decision, not an outage: warn, name it, and let the
+  // viewport's "ask again" affordance carry the remedy.
+  if (health.status === "consent-denied") {
+    return {
+      label: "Desktop permission declined",
+      title: computerHealthDetail(health),
+      tone: "warning",
+      pulse: false,
+    };
+  }
   const reconnecting = health.status === "reconnecting";
   // A backend that has never connected AND never failed is not broken — it is
   // lazy. The server no longer connects at boot, so the first snapshot a pane
@@ -146,7 +167,9 @@ function computerHealthDetail(health: ComputerHealth): string {
   const parts = [
     health.status === "reconnecting"
       ? "The desktop backend dropped out and is being reconnected."
-      : "The desktop backend is not connected.",
+      : health.status === "consent-denied"
+        ? "The desktop's permission dialog was declined, so the agent has no remote-control grant."
+        : "The desktop backend is not connected.",
   ];
   if (health.lastFailure) parts.push(`Last failure: ${health.lastFailure.message}`);
   if (health.consecutiveFailures > 0) {

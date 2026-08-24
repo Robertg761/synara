@@ -262,12 +262,6 @@ export class ComputerManager {
   private windowsPublishPending = false;
   private windowsPublishTimer: ReturnType<typeof setTimeout> | undefined;
   private backendHealth: ComputerHealth;
-  /**
-   * Read once. A backend's capability set is decided by which providers its
-   * probe resolved at construction, so it cannot change under a live backend,
-   * and re-reading it per snapshot would put a call on every state publish.
-   */
-  private readonly backendCapabilities: ComputerCapabilities;
   private lease: DesktopLease | null = null;
   /**
    * Whether anything has yet asked this backend for the desktop itself.
@@ -281,6 +275,16 @@ export class ComputerManager {
    * until a real use flips this, and behave exactly as they always did after.
    */
   private backendEngaged = false;
+
+  /**
+   * Read live rather than cached at construction: a backend that re-probes may
+   * upgrade a capability when its missing piece appears (a helper installed, an
+   * extension enabled), and the call is synchronous and cheap by the backend
+   * contract, so freshness costs a state publish nothing.
+   */
+  private get backendCapabilities(): ComputerCapabilities {
+    return this.backend.capabilities();
+  }
   private lastActionObservation: ActionObservationMemory | undefined;
   private streamAttached = false;
   private streamDesired = false;
@@ -298,7 +302,6 @@ export class ComputerManager {
       options.windowsPublishDebounceMs ?? COMPUTER_WINDOWS_PUBLISH_DEBOUNCE_MS;
     this.measureScrollTravel = options.measureScrollTravel ?? measureScrollTravelFromPng;
     this.backendHealth = options.backend.health();
-    this.backendCapabilities = options.backend.capabilities();
     this.transport =
       options.transport ??
       new FrameTransport<string, ComputerStreamFrame>({
@@ -389,6 +392,18 @@ export class ComputerManager {
       health: this.backendHealth,
       capabilities: this.backendCapabilities,
     };
+  }
+
+  /**
+   * Human-driven recovery from a dismissed permission dialog: clears the
+   * backend's denied-consent latch, when it has one, and answers with fresh
+   * status so the caller's panel shows the recovered state without a second
+   * round trip. Counted as engagement — the user just asked for the desktop.
+   */
+  async resetConsent(): Promise<ComputerStatusResult> {
+    this.engageBackend();
+    this.backend.resetConsent?.();
+    return await this.getStatus();
   }
 
   async listWindows(): Promise<ComputerListWindowsResult> {
@@ -1969,7 +1984,10 @@ function healthUnavailableMessage(health: ComputerHealth): string {
   const reason =
     health.status === "reconnecting"
       ? "Reconnecting to the desktop."
-      : "The desktop backend is not connected.";
+      : health.status === "consent-denied"
+        ? "The desktop's permission dialog was dismissed, so Synara has no remote-control grant. " +
+          'Use "Ask for permission again" in the Computer panel to be asked once more.'
+        : "The desktop backend is not connected.";
   return clampComputerMessage(
     health.lastFailure ? `${reason} Last failure: ${health.lastFailure.message}` : reason,
     reason,

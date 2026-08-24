@@ -82,6 +82,10 @@ export class PortalRemoteDesktopInputProvider implements PortalInputProvider {
    * only answer there is — which is what omitting this method tells it.
    */
 
+  resetDeniedConsent(): void {
+    this.session.resetDeniedConsent();
+  }
+
   async dispose(): Promise<void> {
     // The session may outlive this provider — the clipboard shares it — so the
     // seat is not cleared by the teardown that would otherwise clear it.

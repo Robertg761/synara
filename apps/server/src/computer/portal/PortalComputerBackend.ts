@@ -85,11 +85,13 @@ import {
   resolvePortalSessionProviders,
   type PortalSessionProviderOptions,
 } from "./portalSessionProviders.ts";
+import { resolveDesktopHelper, type DesktopHelperResolution } from "./desktopHelperInstall.ts";
 import {
   planPortalProviders,
   probeDesktop,
   usesProvider,
   type PortalProbe,
+  type PortalProviderChoice,
   type PortalProviderPlan,
 } from "./probe.ts";
 import {
@@ -145,6 +147,13 @@ export interface PortalComputerBackendOptions {
   /** Rebuilds the provider set from a fresh probe; see `recomputeProbe`. */
   readonly buildProviders?: (probe: PortalProbe) => PortalProviders;
   /**
+   * Installs the shipped desktop helper when the probe found none. Run only on
+   * the establishing path — never from the passive probe, which must install
+   * nothing. Production wires `resolveDesktopHelper`; tests omit it and no
+   * install is ever attempted.
+   */
+  readonly resolveHelper?: () => Promise<DesktopHelperResolution>;
+  /**
    * Whether this desktop needs a consent dialog at all. wlroots grants nothing
    * and prompts for nothing, so its consent state starts and stays
    * `not-required`; GNOME's portal starts at `not-requested`.
@@ -176,8 +185,12 @@ export class PortalComputerBackend implements ComputerBackend {
   private static readonly REPROBE_MIN_INTERVAL_MS = 30_000;
   private lastReprobeAt = Number.NEGATIVE_INFINITY;
   private reprobing: Promise<void> | undefined;
+  private readonly resolveHelper: (() => Promise<DesktopHelperResolution>) | undefined;
+  private lastHelperResolveAt = Number.NEGATIVE_INFINITY;
+  private helperResolving: Promise<void> | undefined;
   private readonly healthState: ComputerHealthState;
-  private readonly capabilitySet: ComputerCapabilities;
+  /** Rebuilt when a reprobe upgrades a provider slot; see `reprobeOnce`. */
+  private capabilitySet: ComputerCapabilities;
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
   /**
    * The traffic rule between the agent and the human, on the desktops where
@@ -185,7 +198,7 @@ export class PortalComputerBackend implements ComputerBackend {
    * means there is nobody to yield to, and every mutating action runs straight
    * through.
    */
-  private readonly arbiter: SharedSeatArbiter | undefined;
+  private arbiter: SharedSeatArbiter | undefined;
 
   private consent: PortalConsentState;
   private consentReason: string | undefined;
@@ -213,6 +226,7 @@ export class PortalComputerBackend implements ComputerBackend {
     this.providers = options.providers;
     this.recomputeProbe = options.recomputeProbe;
     this.buildProviders = options.buildProviders;
+    this.resolveHelper = options.resolveHelper;
     this.platform = options.platform ?? process.platform;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? ((milliseconds) => delay(milliseconds));
@@ -274,14 +288,45 @@ export class PortalComputerBackend implements ComputerBackend {
   }
 
   /**
-   * The portal backend's availability is already the passive answer: it reads
-   * the desktop probe taken at construction and the provider plan derived from
-   * it, and starts no session, opens no dialog, and spawns no helper. So the
-   * two are the same call rather than a second implementation that could drift
-   * from the first.
+   * The passive answer: it reads the desktop probe and the provider plan
+   * derived from it, and starts no session, opens no dialog, spawns no helper,
+   * and installs nothing. It shares the verdict with `availability()` rather
+   * than being a second implementation that could drift from it; what the
+   * establishing read adds is the one licensed side effect, installing a
+   * shipped helper the boot probe refused to.
    */
   probeAvailability(): Promise<ComputerAvailability> {
-    return this.availability();
+    return this.currentAvailability();
+  }
+
+  /**
+   * Installs the shipped desktop helper on the establishing path, when the
+   * probe found none. The boot probe must not install by contract, so without
+   * this the prebuilts packaged with the app would never reach disk and the
+   * helper-backed capabilities they carry would stay planned away until
+   * someone ran build.sh by hand. Throttled like the reprobe; a successful
+   * install un-throttles the next refresh so the new binary is seen at once.
+   */
+  private async resolveHelperIfMissing(): Promise<void> {
+    if (this.disposed || this.resolveHelper === undefined) return;
+    if (this.probe.helperBinary !== undefined) return;
+    if (this.helperResolving) {
+      await this.helperResolving;
+      return;
+    }
+    if (this.now() - this.lastHelperResolveAt < PortalComputerBackend.REPROBE_MIN_INTERVAL_MS) {
+      return;
+    }
+    this.lastHelperResolveAt = this.now();
+    this.helperResolving = this.resolveHelper()
+      .then((resolution) => {
+        if (resolution.path !== undefined) this.lastReprobeAt = Number.NEGATIVE_INFINITY;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        this.helperResolving = undefined;
+      });
+    await this.helperResolving;
   }
 
   /**
@@ -316,7 +361,7 @@ export class PortalComputerBackend implements ComputerBackend {
     const fresh = await this.recomputeProbe().catch(() => undefined);
     if (fresh === undefined || this.disposed) return;
     const freshPlan = planPortalProviders(fresh);
-    // Only an upgrade swaps the plan in: providers hold live sessions and
+    // Only an upgrade swaps anything in: providers hold live sessions and
     // consent state, and rebuilding them would throw that away for nothing.
     const upgrades = (slot: "input" | "capture" | "windows" | "clipboard"): boolean =>
       freshPlan[slot].blockedBy === undefined && this.plan[slot].blockedBy !== undefined;
@@ -329,12 +374,86 @@ export class PortalComputerBackend implements ComputerBackend {
       return;
     }
     if (this.buildProviders === undefined) return;
+    // Merge per slot rather than replacing the whole set: a slot that already
+    // resolved keeps its provider — and with it any live session and consent —
+    // while a slot that upgraded takes the freshly built one. The fresh build's
+    // duplicates of kept slots are disposed rather than dropped, because a
+    // constructed provider can hold a share of the helper process or the portal
+    // session from birth.
+    const built = this.buildProviders(fresh);
+    const keepSlot = <T extends { dispose(): Promise<void> }>(
+      current: ProviderSlot<T>,
+      freshSlot: ProviderSlot<T>,
+      currentChoice: PortalProviderChoice,
+      freshChoice: PortalProviderChoice,
+    ): { readonly slot: ProviderSlot<T>; readonly choice: PortalProviderChoice } => {
+      if (!current.available) return { slot: freshSlot, choice: freshChoice };
+      if (freshSlot.available && freshSlot.provider !== current.provider) {
+        void freshSlot.provider.dispose();
+      }
+      return { slot: current, choice: currentChoice };
+    };
+    const input = keepSlot(this.providers.input, built.input, this.plan.input, freshPlan.input);
+    const capture = keepSlot(
+      this.providers.capture,
+      built.capture,
+      this.plan.capture,
+      freshPlan.capture,
+    );
+    const windows = keepSlot(
+      this.providers.windows,
+      built.windows,
+      this.plan.windows,
+      freshPlan.windows,
+    );
+    const clipboard = keepSlot(
+      this.providers.clipboard,
+      built.clipboard,
+      this.plan.clipboard,
+      freshPlan.clipboard,
+    );
+    // The idle source follows the same rule: an existing one keeps watching —
+    // the arbiter holds it — and an unused fresh one is disposed, since it can
+    // hold a helper share of its own.
+    const seatIdle = this.providers.seatIdle ?? built.seatIdle;
+    if (built.seatIdle !== undefined && built.seatIdle !== seatIdle) {
+      void built.seatIdle.dispose();
+    }
     this.probe = fresh;
-    this.plan = freshPlan;
-    this.providers = this.buildProviders(fresh);
+    this.plan = {
+      input: input.choice,
+      capture: capture.choice,
+      windows: windows.choice,
+      clipboard: clipboard.choice,
+    };
+    this.providers = {
+      input: input.slot,
+      capture: capture.slot,
+      windows: windows.slot,
+      clipboard: clipboard.slot,
+      ...(seatIdle !== undefined ? { seatIdle } : {}),
+    };
+    // The derived views must follow the providers they were derived from, or
+    // status and seat arbitration keep describing the set this backend no
+    // longer calls: the exact staleness this merge exists to prevent.
+    this.capabilitySet = capabilitiesFromProviders(this.providers);
+    if (this.arbiter === undefined && seatIdle !== undefined && this.capabilitySet.sharedSeat) {
+      this.arbiter = new SharedSeatArbiter({ source: seatIdle, now: () => this.now() });
+      // A brand-new arbiter has never sampled the seat; the next perception
+      // primes it exactly as the first one primed its predecessor.
+      this.seatPrimed = false;
+    }
+    this.healthState.publish();
   }
 
   async availability(): Promise<ComputerAvailability> {
+    // The establishing read: something is about to use the desktop, which is
+    // the licence to install the shipped helper the passive probe refused to.
+    await this.resolveHelperIfMissing();
+    return this.currentAvailability();
+  }
+
+  private async currentAvailability(): Promise<ComputerAvailability> {
     // The panel reads this on every render of a thread state, which makes it
     // the natural place for a throttled catch-up with the desktop.
     await this.refreshCapabilitiesIfStale();
@@ -361,7 +480,37 @@ export class PortalComputerBackend implements ComputerBackend {
     if (blockers.length > 0) {
       return { kind: "backend-unavailable", message: blockers.join(" ") };
     }
+    // A denied dialog blocks availability with the reason and its remedy — the
+    // one blocker whose fix is a decision rather than a package. `awaiting`
+    // deliberately stays available: the dialog is up and health says so.
+    if (this.consent === "denied") {
+      return {
+        kind: "backend-unavailable",
+        message:
+          this.consentReason ??
+          "The desktop's permission dialog was dismissed, so Synara has no remote-control grant. " +
+            'Use "Ask for permission again" in the Computer panel to be asked once more.',
+      };
+    }
     return { kind: "available", backend: "portal" };
+  }
+
+  /**
+   * The human-driven recovery from a dismissed permission dialog: clears the
+   * denied latch here and on the session behind every consent-bearing
+   * provider, so the next action asks once more. Returns whether anything was
+   * latched — a desktop with no denial has nothing to recover.
+   */
+  resetConsent(): boolean {
+    if (this.disposed || this.consent !== "denied") return false;
+    for (const slot of [this.providers.input, this.providers.capture, this.providers.clipboard]) {
+      if (slot.available) slot.provider.resetDeniedConsent?.();
+    }
+    // The session callback has normally cleared this already; covering the
+    // case where no live provider carries the session keeps the latch from
+    // surviving its own reset.
+    if (this.consent === "denied") this.setConsentState("not-requested");
+    return true;
   }
 
   /**
@@ -732,7 +881,7 @@ export class PortalComputerBackend implements ComputerBackend {
 
   private healthStatus(): ComputerHealth["status"] {
     if (this.consent === "awaiting") return "awaiting-consent";
-    if (this.consent === "denied") return "unavailable";
+    if (this.consent === "denied") return "consent-denied";
     return this.providers.input.available && this.providers.capture.available
       ? "connected"
       : "unavailable";
@@ -1096,6 +1245,7 @@ export function createPortalComputerBackend(
     providers: resolved,
     recomputeProbe: rest.recomputeProbe ?? (() => probeDesktop()),
     buildProviders,
+    resolveHelper: rest.resolveHelper ?? (() => resolveDesktopHelper()),
   });
   return backend;
 }

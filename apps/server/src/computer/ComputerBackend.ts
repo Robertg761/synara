@@ -168,12 +168,20 @@ export interface ComputerBackend {
    */
   health(): ComputerHealth;
   /**
-   * What this backend can do, decided by which providers its probe resolved at
-   * construction. Synchronous and constant for the backend's lifetime: a
-   * capability is a property of the display server this process is talking to,
-   * not a live reading, so it is safe to cache and cheap to publish with state.
+   * What this backend can do, decided by which providers its probe resolved.
+   * Synchronous and cheap by contract, but not constant: a backend that
+   * re-probes may upgrade a capability when the missing piece appears (a
+   * helper installed, an extension enabled), so callers read it rather than
+   * caching the first answer for the backend's lifetime.
    */
   capabilities(): ComputerCapabilities;
+  /**
+   * Clears a denied consent latch so the next action may ask the desktop's
+   * permission dialog once more. Human-driven only — the agent tool surface
+   * never exposes it. Returns whether a denial was actually cleared. Absent on
+   * backends whose transport needs no consent.
+   */
+  resetConsent?(): boolean;
   listWindows(): Promise<readonly ComputerWindow[]>;
   getScreenSize(): Promise<ComputerScreenSize>;
   getState(options: {

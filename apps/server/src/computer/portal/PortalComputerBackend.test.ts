@@ -393,6 +393,74 @@ describe("PortalComputerBackend availability", () => {
   });
 });
 
+describe("PortalComputerBackend reprobe", () => {
+  it("keeps live providers on an upgrade, adopts the new slot, and refreshes capabilities", async () => {
+    const oldInput = fakeInput();
+    const oldInputDispose = vi.spyOn(oldInput, "dispose");
+    const freshInput = { ...fakeInput(), dispose: vi.fn(() => Promise.resolve()) };
+    const freshCapture = { ...fakeCapture(), dispose: vi.fn(() => Promise.resolve()) };
+    const upgraded = probeFor({
+      wlClipboard: true,
+      waylandGlobals: [WLROOTS_GLOBALS.dataControl],
+    });
+    const backend = backendWith(
+      providersOf({ input: resolvedProvider(oldInput) }),
+      {
+        recomputeProbe: () => Promise.resolve(upgraded),
+        buildProviders: () =>
+          providersOf({
+            input: resolvedProvider(freshInput),
+            capture: resolvedProvider(freshCapture),
+            clipboard: resolvedProvider(fakeClipboard()),
+          }),
+      },
+    );
+    expect(backend.capabilities().clipboard).toBe(false);
+
+    await backend.probeAvailability();
+
+    // The upgraded slot arrives, and the capability set follows the providers
+    // it was derived from instead of freezing the boot answer.
+    expect(backend.capabilities().clipboard).toBe(true);
+    // The slots that already resolved keep their live providers — sessions and
+    // consent live there — and the fresh duplicates are disposed, not leaked.
+    expect(oldInputDispose).not.toHaveBeenCalled();
+    expect(freshInput.dispose).toHaveBeenCalledTimes(1);
+    expect(freshCapture.dispose).toHaveBeenCalledTimes(1);
+
+    await backend.click({ x: 10, y: 10 });
+    expect(oldInput.calls.length).toBeGreaterThan(0);
+    expect(freshInput.calls).toEqual([]);
+  });
+
+  it("installs the shipped helper only on the establishing read, then reprobes at once", async () => {
+    const resolveHelper = vi
+      .fn<() => Promise<{ path?: string }>>()
+      .mockResolvedValue({ path: "/tmp/synara-desktop-helper" });
+    const recomputeProbe = vi.fn(() => Promise.resolve(probeFor()));
+    const backend = backendWith(providersOf(), {
+      recomputeProbe,
+      buildProviders: () => providersOf(),
+      resolveHelper,
+    });
+
+    // Boot's passive read installs nothing, by contract.
+    await backend.probeAvailability();
+    expect(resolveHelper).not.toHaveBeenCalled();
+    expect(recomputeProbe).toHaveBeenCalledTimes(1);
+
+    // The establishing read is licensed to install, and a successful install
+    // un-throttles the refresh so the new binary is probed immediately.
+    await backend.availability();
+    expect(resolveHelper).toHaveBeenCalledTimes(1);
+    expect(recomputeProbe).toHaveBeenCalledTimes(2);
+
+    // Throttled thereafter: one establishing read does not hammer the installer.
+    await backend.availability();
+    expect(resolveHelper).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("PortalComputerBackend consent", () => {
   it("stays available while consent is outstanding and says so in health", async () => {
     // A missing grant is a user action, not a fault: an unavailable badge would
@@ -417,7 +485,19 @@ describe("PortalComputerBackend consent", () => {
     backend.setConsentState("granted");
 
     expect(backend.consentState().state).toBe("denied");
-    expect(backend.health().status).toBe("unavailable");
+    expect(backend.health().status).toBe("consent-denied");
+  });
+
+  it("blocks availability while denied, with the reason and its remedy", async () => {
+    const backend = backendWith(providersOf(), {
+      probe: probeFor({ portal: { present: true, remoteDesktopVersion: 2 } }),
+    });
+    backend.setConsentState("denied", "The user cancelled the screen-sharing dialog.");
+
+    await expect(backend.availability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("cancelled the screen-sharing dialog"),
+    });
   });
 
   it("clears a latched denial only through an explicit reset", () => {
@@ -426,6 +506,19 @@ describe("PortalComputerBackend consent", () => {
     backend.setConsentState("not-requested");
 
     expect(backend.consentState().state).toBe("not-requested");
+  });
+
+  it("resetConsent clears a denial exactly once and reports whether it did", () => {
+    const backend = backendWith(providersOf(), {
+      probe: probeFor({ portal: { present: true, remoteDesktopVersion: 2 } }),
+    });
+    backend.setConsentState("denied", "cancelled");
+
+    expect(backend.resetConsent()).toBe(true);
+    expect(backend.consentState().state).toBe("not-requested");
+    expect(backend.health().status).not.toBe("consent-denied");
+    // Nothing is latched any more, so a second reset has nothing to clear.
+    expect(backend.resetConsent()).toBe(false);
   });
 
   it("starts at not-required on a desktop with no portal to prompt from", () => {

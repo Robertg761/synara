@@ -61,6 +61,12 @@ export interface PortalInputProvider {
    */
   readonly sharedSeat: boolean;
   readonly sink: ComputerInputSink;
+  /**
+   * Clears a denied consent latch on the session behind this provider, when
+   * there is one, so the next action may ask again. Only the human-driven
+   * recovery path calls it; providers whose transport needs no consent omit it.
+   */
+  resetDeniedConsent?(): void;
   /** Discrete scroll, which is an axis event rather than a button or key. */
   scroll(deltaX: number, deltaY: number): Promise<void>;
   /** Where the pointer is, when the transport reports it. Absent means unknown. */
@@ -77,6 +83,8 @@ export interface PortalCapturedImage {
 
 export interface PortalCaptureProvider {
   readonly id: PortalProviderId;
+  /** See `PortalInputProvider.resetDeniedConsent`. */
+  resetDeniedConsent?(): void;
   /** The union of every output, which is the coordinate space windows live in. */
   workspaceRect(): Promise<ComputerRect>;
   captureRegion(region: ComputerRect, maxDimension: number): Promise<PortalCapturedImage>;
@@ -104,6 +112,8 @@ export interface PortalWindowProvider {
 
 export interface PortalClipboardProvider {
   readonly id: PortalProviderId;
+  /** See `PortalInputProvider.resetDeniedConsent`. */
+  resetDeniedConsent?(): void;
   read(): Promise<string>;
   write(text: string): Promise<void>;
   dispose(): Promise<void>;

@@ -46,6 +46,27 @@ describe("ComputerServiceLive", () => {
     });
   });
 
+  /**
+   * Supported means the host could ever drive a desktop, not that it can right
+   * now. A backend whose boot probe fails — a helper not yet installed, a
+   * compositor briefly unreachable — must stay routed through the manager, or
+   * the frozen verdict caches "unsupported" in every WS handler and the agent
+   * gateway until the server restarts, and the backend's re-probe can never
+   * report the desktop coming up.
+   */
+  it("stays supported when the boot probe merely reports the backend unavailable", async () => {
+    const backend = new FakeComputerBackend();
+    backend.setAvailability({
+      kind: "backend-unavailable",
+      message: "The native desktop helper is not built yet.",
+    });
+
+    await withComputerService(backend, async (service) => {
+      expect(service.supported).toBe(true);
+      expect(service.availability).toMatchObject({ kind: "backend-unavailable" });
+    });
+  });
+
   it("keeps the configured override ahead of both reads", async () => {
     const backend = new FakeComputerBackend();
 

@@ -108,6 +108,29 @@ describe("PortalSession", () => {
     await session.dispose();
   });
 
+  it("asks once more after an explicit consent reset, and only then", async () => {
+    const portal = new FakePortalService({
+      screenCastVersion: 5,
+      startResponse: PORTAL_RESPONSE_CANCELLED,
+    });
+    const { session, consent } = sessionFor(portal);
+
+    await expect(session.ensureOpen()).rejects.toThrow(/dismissed/);
+    await expect(session.ensureOpen()).rejects.toThrow(/dismissed/);
+    expect(portal.startCount()).toBe(1);
+
+    session.resetDeniedConsent();
+    expect(session.consentState().state).toBe("not-requested");
+    expect(consent.at(-1)?.state).toBe("not-requested");
+
+    // The next action raises a fresh dialog — dismissed again here, which
+    // latches again: one reset buys exactly one more ask.
+    await expect(session.ensureOpen()).rejects.toThrow(/dismissed/);
+    expect(portal.startCount()).toBe(2);
+    expect(session.consentState().state).toBe("denied");
+    await session.dispose();
+  });
+
   it("refuses a denied session without retrying, because a retry is another dialog", async () => {
     const portal = new FakePortalService({
       screenCastVersion: 5,

@@ -280,7 +280,7 @@ export class PortalSession {
       throw refuse(
         this.deniedReason ??
           "The desktop's permission dialog was dismissed, so Synara has no remote-control grant. " +
-            "Nothing will be asked again until you restart computer control from the panel.",
+            'Nothing will be asked again until you use "Ask for permission again" in the Computer panel.',
         false,
       );
     }
@@ -294,6 +294,17 @@ export class PortalSession {
     this.consent = state;
     this.deniedReason = reason;
     this.onConsentChanged?.(state, reason);
+  }
+
+  /**
+   * Clears a denied latch so the next action may ask once more — the recovery
+   * the denial copy promises, driven only by an explicit human request. A no-op
+   * in every other state: an open session, a pending dialog, and an unasked one
+   * all keep their meaning.
+   */
+  resetDeniedConsent(): void {
+    if (this.consent !== "denied") return;
+    this.setConsent("not-requested");
   }
 
   private async open(): Promise<PortalSessionState> {
@@ -442,9 +453,9 @@ export class PortalSession {
       const reason =
         started.code === PORTAL_RESPONSE_CANCELLED
           ? "You dismissed the desktop's screen-sharing dialog, so Synara has no permission to control this desktop. " +
-            "Start computer control again from the panel to be asked once more."
+            'Use "Ask for permission again" in the Computer panel to be asked once more.'
           : "The desktop ended the screen-sharing request before it was answered, so Synara has no permission to control this desktop. " +
-            "Start computer control again from the panel to be asked once more.";
+            'Use "Ask for permission again" in the Computer panel to be asked once more.';
       this.setConsent("denied", reason);
       throw refuse(reason, false);
     }

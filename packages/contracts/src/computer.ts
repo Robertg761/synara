@@ -26,6 +26,10 @@ export const COMPUTER_WS_METHODS = {
   performAction: "computer.performAction",
   getThreadState: "computer.getThreadState",
   subscribeEvents: "computer.subscribeEvents",
+  // Human-only recovery: clears a denied portal-consent latch so the next
+  // action may ask again. Deliberately absent from the agent tool surface — an
+  // agent must never be able to re-open a dialog the user just dismissed.
+  resetConsent: "computer.resetConsent",
   // User-driven input from the computer dock pane. Separate from the tool
   // surface above because it must work with no agent turn in flight, and
   // because a pane only ever sends resolved desktop coordinates — never the
@@ -136,11 +140,18 @@ export type ComputerAvailability = typeof ComputerAvailability.Type;
  * been answered yet. Nothing is broken, nothing is retrying, and the user has to
  * go find a dialog — which is exactly the thing an `unavailable` badge would
  * hide. Availability stays `available` while health reports it.
+ *
+ * `consent-denied` is the dialog's other answer: the user dismissed or refused
+ * the desktop's permission request, and nothing will ask again until they say
+ * so. Distinct from `unavailable` because its remedy is a user decision — the
+ * panel offers to ask again (`computer.resetConsent`) rather than implying
+ * something needs repairing.
  */
 export const ComputerHealthStatus = Schema.Literals([
   "connected",
   "reconnecting",
   "awaiting-consent",
+  "consent-denied",
   "unavailable",
 ]);
 export type ComputerHealthStatus = typeof ComputerHealthStatus.Type;
@@ -430,6 +441,14 @@ export type ThreadComputerState = typeof ThreadComputerState.Type;
 
 export const ComputerGetStatusInput = Schema.Struct({});
 export type ComputerGetStatusInput = typeof ComputerGetStatusInput.Type;
+
+/**
+ * Empty on purpose: consent belongs to the whole desktop backend, not to a
+ * thread, and the reset takes no options — it either clears a denied latch or
+ * finds none to clear. The fresh status in the result says which.
+ */
+export const ComputerResetConsentInput = Schema.Struct({});
+export type ComputerResetConsentInput = typeof ComputerResetConsentInput.Type;
 
 /**
  * `ThreadComputerState` without the thread: the settings screen asks how this

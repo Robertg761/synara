@@ -87,10 +87,17 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
         };
       }
       return {
-        // The backend performs the complete Linux gate: Linux, Wayland, a
-        // reachable KWin user bus, and a plugin that is loaded, installed,
-        // shipped for this KWin, or buildable here.
-        supported: options.supported ?? availability?.kind === "available",
+        // Supported means "this host could ever drive a desktop", not "the
+        // desktop works right now". A real backend keeps every handler and the
+        // agent gateway routed through the manager, whose availability reads
+        // let a helper installed or a plugin loaded after boot appear without
+        // a server restart; freezing the boot probe's verdict here would cache
+        // `unsupported` for the process's lifetime — the exact restart the
+        // backend's re-probe exists to avoid. Only a host that can never
+        // qualify — off Linux, or a configuration the backend selection
+        // refused — stays unsupported, and the boot `availability` beside it
+        // is the frozen answer those handlers serve.
+        supported: options.supported ?? !(backend instanceof UnavailableComputerBackend),
         availability,
         manager,
       } satisfies ComputerServiceShape;

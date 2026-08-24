@@ -171,6 +171,7 @@ import type {
   ComputerGetScreenSizeInput,
   ComputerGetScreenSizeResult,
   ComputerGetStatusInput,
+  ComputerResetConsentInput,
   ComputerInputClickInput,
   ComputerInputKeyInput,
   ComputerInputScrollInput,
@@ -946,6 +947,8 @@ export interface NativeApi {
   computer: {
     /** Thread-independent backend status for surfaces outside any conversation. */
     getStatus: (input: ComputerGetStatusInput) => Promise<ComputerStatusResult>;
+    /** Clears a denied portal-consent latch so the next action may ask again. */
+    resetConsent: (input: ComputerResetConsentInput) => Promise<ComputerStatusResult>;
     getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
     listWindows: (input: ComputerListWindowsInput) => Promise<ComputerListWindowsResult>;
     getScreenSize: (input: ComputerGetScreenSizeInput) => Promise<ComputerGetScreenSizeResult>;

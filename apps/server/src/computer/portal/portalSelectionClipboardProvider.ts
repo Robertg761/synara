@@ -74,6 +74,10 @@ export class PortalSelectionClipboardProvider implements PortalClipboardProvider
     this.transferTimeoutMs = options.transferTimeoutMs ?? CLIPBOARD_TRANSFER_TIMEOUT_MS;
   }
 
+  resetDeniedConsent(): void {
+    this.session.resetDeniedConsent();
+  }
+
   async read(): Promise<string> {
     await this.requireClipboard();
     let lastError: unknown;
