@@ -301,9 +301,9 @@ describe("the GNOME backend's consent projection", () => {
 
     expect(backend.consentState()).toEqual({
       state: "denied",
-      reason: expect.stringMatching(/Start computer control again from the panel/),
+      reason: expect.stringMatching(/Ask for permission again/),
     });
-    expect(backend.health().status).toBe("unavailable");
+    expect(backend.health().status).toBe("consent-denied");
     await backend.dispose();
   });
 
