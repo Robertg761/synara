@@ -463,7 +463,7 @@ export default function ComputerPanel(props: {
 function ComputerAvailabilityMessage(props: {
   title: string;
   description: string;
-  action?: { label: string; onClick: () => void };
+  action?: { label: string; onClick: () => void } | undefined;
 }) {
   return (
     <div className="max-w-sm px-6 text-center text-white/80" role="status">

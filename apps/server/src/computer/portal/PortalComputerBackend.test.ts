@@ -403,18 +403,15 @@ describe("PortalComputerBackend reprobe", () => {
       wlClipboard: true,
       waylandGlobals: [WLROOTS_GLOBALS.dataControl],
     });
-    const backend = backendWith(
-      providersOf({ input: resolvedProvider(oldInput) }),
-      {
-        recomputeProbe: () => Promise.resolve(upgraded),
-        buildProviders: () =>
-          providersOf({
-            input: resolvedProvider(freshInput),
-            capture: resolvedProvider(freshCapture),
-            clipboard: resolvedProvider(fakeClipboard()),
-          }),
-      },
-    );
+    const backend = backendWith(providersOf({ input: resolvedProvider(oldInput) }), {
+      recomputeProbe: () => Promise.resolve(upgraded),
+      buildProviders: () =>
+        providersOf({
+          input: resolvedProvider(freshInput),
+          capture: resolvedProvider(freshCapture),
+          clipboard: resolvedProvider(fakeClipboard()),
+        }),
+    });
     expect(backend.capabilities().clipboard).toBe(false);
 
     await backend.probeAvailability();
