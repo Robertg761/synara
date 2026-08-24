@@ -512,24 +512,26 @@ function helperBacked(implementation: PortalProviderId, probe: PortalProbe): Por
 }
 
 /**
- * The one Tier 2 gap that is a missing *library*, not missing code.
+ * The one Tier 2 gap that is unimplemented code, and must say so.
  *
  * The ScreenCast portal is reachable and its session is already brokered — the
  * granted stream's node id, position, and size come back in the `Start`
  * response, which is what makes absolute pointing work on this desktop today.
  * What is missing is the other half: the frames themselves arrive over
- * PipeWire, and neither Node nor the current native helper can receive them.
- * Saying that precisely is what stops a user concluding GNOME is unsupported.
+ * PipeWire, and Synara has no PipeWire receiver anywhere — not in Node and not
+ * in the native helper, whatever headers it is rebuilt against. The refusal
+ * must not promise a rebuild that changes nothing; the honest answer is that
+ * GNOME screen capture is not implemented yet, plus the nested desktop that
+ * works today.
  */
 function nativeCaptureGap(): PortalProviderChoice {
   return {
     implementation: "pipewire-screencast",
     blockedBy:
-      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara's native " +
-      "desktop helper has no PipeWire support compiled in: it needs the PipeWire development headers present at build " +
-      "time (dnf install pipewire-devel / apt install libpipewire-0.3-dev) and a rebuild with " +
-      "apps/server/native/computer-desktop-helper/build.sh. Until then this desktop's screen cannot be read; " +
-      "SYNARA_COMPUTER_NESTED=window runs an isolated agent desktop that can be captured today.",
+      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara " +
+      "cannot receive PipeWire streams yet — no rebuild or package adds that, so this desktop's screen cannot " +
+      "be read by the agent for now. SYNARA_COMPUTER_NESTED=window runs an isolated agent desktop that can be " +
+      "captured today.",
   };
 }
 

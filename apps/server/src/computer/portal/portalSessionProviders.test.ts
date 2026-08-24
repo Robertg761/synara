@@ -316,7 +316,7 @@ describe("the GNOME backend's consent projection", () => {
         kind: "region",
         region: { x: 0, y: 0, width: 100, height: 100 },
       }),
-    ).rejects.toThrow(/delivers frames over PipeWire.*pipewire-devel.*build\.sh/s);
+    ).rejects.toThrow(/delivers frames over PipeWire.*cannot receive PipeWire streams yet/s);
     await backend.dispose();
   });
 

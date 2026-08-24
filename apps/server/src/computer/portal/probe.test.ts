@@ -283,9 +283,11 @@ describe("planPortalProviders", () => {
     expect(plan.input.implementation).toBe("portal-remote-desktop");
     expect(plan.input.blockedBy).toBeUndefined();
     expect(plan.clipboard.implementation).toBe("portal-selection");
-    // Only the frames need the native seam, and the sentence names it.
+    // Only the frames are missing, and the sentence says so honestly: no
+    // rebuild adds a PipeWire receiver, so none may be promised.
     expect(plan.capture.implementation).toBe("pipewire-screencast");
-    expect(plan.capture.blockedBy).toMatch(/pipewire-devel/);
+    expect(plan.capture.blockedBy).toMatch(/cannot receive PipeWire streams yet/);
+    expect(plan.capture.blockedBy).not.toMatch(/pipewire-devel|build\.sh/);
   });
 
   it("blocks portal input when the desktop has no ScreenCast to anchor motion to", () => {
