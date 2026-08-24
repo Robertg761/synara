@@ -185,7 +185,7 @@ const TARGET_PROPERTIES = {
   window_id: {
     type: "string",
     description:
-      "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the coordinate is outside the window.",
+      "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the coordinate is outside the window. For computer_scroll it is also a target on its own, scrolling the window itself.",
   },
 } as const;
 

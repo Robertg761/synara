@@ -126,6 +126,29 @@ export function resolveComputerSemanticTarget(
 }
 
 /**
+ * A bare window id names the window itself rather than a control in it — the
+ * shape "scroll this window" arrives as. The match is the window's own node:
+ * the first node carrying that id in document order, which is the window's
+ * root. Returns undefined when the tree does not describe the window at all,
+ * so the caller can fall back to the window list's geometry.
+ */
+export function resolveComputerWindowTarget(
+  root: ComputerUiNode,
+  windowId: string,
+): ComputerTargetMatch | undefined {
+  const node = flattenUiTree(root, childrenOf).find((candidate) => candidate.windowId === windowId);
+  if (node === undefined) return undefined;
+  if (!node.onScreen) {
+    throw new ComputerTargetError({
+      code: "computer_target_offscreen",
+      message: `Computer window ${JSON.stringify(windowId)} is off-screen; refusing to guess a scroll point.`,
+      candidates: candidateDescriptions([node]),
+    });
+  }
+  return { node, point: activationPointForNode(node) };
+}
+
+/**
  * The desktop's half of the shared resolver.
  *
  * Three of these deliberately differ from the iOS family rather than having

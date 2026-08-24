@@ -275,12 +275,13 @@ describe("ComputerManager and FakeComputerBackend", () => {
       code: "computer_target_invalid",
     });
 
-    // A target that names no control refuses up front with what is missing,
-    // instead of matching every node in scope and dumping the whole tree as
-    // an ambiguity refusal.
+    // A bare window id is a real scroll target — the window itself, at its
+    // own point — while for the semantic writes below a target that names no
+    // control refuses up front with what is missing, instead of matching
+    // every node in scope and dumping the whole tree as an ambiguity refusal.
     await expect(
       manager.scroll("thread-1", { windowId: "fake-calculator" }, 0, 300),
-    ).rejects.toMatchObject({ code: "computer_target_invalid" });
+    ).resolves.toMatchObject({ action: "computer_scroll", point: { x: 1_260, y: 430 } });
     await expect(manager.setValue("thread-1", {}, "468")).rejects.toMatchObject({
       code: "computer_target_invalid",
     });

@@ -46,6 +46,7 @@ import {
   computerTargetCandidates,
   resolveComputerPoint,
   resolveComputerSemanticTarget,
+  resolveComputerWindowTarget,
 } from "./uiTreeTargeting.ts";
 
 export const COMPUTER_FRAME_QUEUE_LIMIT = 8;
@@ -921,9 +922,47 @@ export class ComputerManager {
   private async prepareScrollTarget(
     target: ComputerTarget | null,
   ): Promise<ResolvedPointTarget | null> {
-    const resolved = target ? await this.resolvePointTarget(target) : null;
+    const resolved = target ? await this.resolveScrollPointTarget(target) : null;
     await this.prepareResolvedTarget(resolved ?? undefined);
     return resolved;
+  }
+
+  /**
+   * Scroll accepts one control-less target the semantic resolver refuses: a
+   * bare window id, meaning "scroll this window". It resolves to the window's
+   * own point — its node in the accessibility tree when it has one, else the
+   * centre of its reported bounds — rather than entering label matching,
+   * where a query naming no control matches everything in scope.
+   */
+  private async resolveScrollPointTarget(target: ComputerTarget): Promise<ResolvedPointTarget> {
+    const windowId = target.windowId;
+    if (
+      windowId === undefined ||
+      target.x !== undefined ||
+      target.y !== undefined ||
+      hasLabelFields(target)
+    ) {
+      return this.resolvePointTarget(target);
+    }
+    const state = await this.backend.getState({ includeText: false });
+    const match = state.root ? resolveComputerWindowTarget(state.root, windowId) : undefined;
+    if (match) return { point: match.point, windowId };
+    const windows = await this.backend.listWindows();
+    const window = windows.find((candidate) => candidate.id === windowId);
+    if (!window) throw windowNotFoundError(windowId);
+    const bounds = window.bounds;
+    if (!bounds) {
+      throw new ComputerTargetError({
+        code: "computer_target_offscreen",
+        message:
+          `This desktop reports no geometry for window ${JSON.stringify(windowId)}, so a scroll ` +
+          "point inside it cannot be chosen. Scroll at x/y coordinates instead.",
+      });
+    }
+    return {
+      point: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 },
+      windowId,
+    };
   }
 
   private async injectScroll(
@@ -1590,7 +1629,7 @@ export class ComputerManager {
         message:
           "This target does not name a control: window_id or coordinates alone match everything in scope. " +
           "Pass label (optionally with role and window_id) to pick a control, or use x/y coordinates " +
-          "with the pointer tools.",
+          "with the pointer tools. Only computer_scroll takes window_id alone, scrolling that window itself.",
       });
     }
     const state = await this.backend.getState({ includeText: true });
