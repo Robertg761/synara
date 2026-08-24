@@ -25,6 +25,10 @@ name: Desktop Helper Prebuilds
 
 on:
   workflow_dispatch:
+  # The release workflow calls this one so its artifacts exist inside the
+  # release's own run — workflow artifacts are per-run, so a standalone tag
+  # run's output is invisible to the release that wants to package it.
+  workflow_call:
   push:
     tags:
       - "v*.*.*"
