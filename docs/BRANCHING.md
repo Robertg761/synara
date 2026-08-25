@@ -4,15 +4,15 @@ This is a fork that does two things at once: it sends focused PRs upstream, and 
 runs a build with all of that work applied together. Those two goals fight unless
 the branches have distinct jobs.
 
-| Branch | Job | May I commit here? |
-| --- | --- | --- |
-| `main` | An exact mirror of `upstream/main`. | **No.** `scripts/branches.sh sync` moves it. |
-| `computer-use-linux` | Linux computer use. → PR #780 | Yes |
-| `android-app` | The Android app and remote access. | Yes |
-| `session-sync` | Importing external agent sessions. | Yes |
-| `desktop-flavor-env` | One-line turbo fix so `SYNARA_DESKTOP_FLAVOR` reaches Electron. | Yes |
-| `workflow` | This script and this document. | Yes |
-| `integration` | Every topic merged onto `upstream/main`. | **No.** It is regenerated. |
+| Branch               | Job                                                             | May I commit here?                           |
+| -------------------- | --------------------------------------------------------------- | -------------------------------------------- |
+| `main`               | An exact mirror of `upstream/main`.                             | **No.** `scripts/branches.sh sync` moves it. |
+| `computer-use-linux` | Linux computer use. → PR #780                                   | Yes                                          |
+| `android-app`        | The Android app and remote access.                              | Yes                                          |
+| `session-sync`       | Importing external agent sessions.                              | Yes                                          |
+| `desktop-flavor-env` | One-line turbo fix so `SYNARA_DESKTOP_FLAVOR` reaches Electron. | Yes                                          |
+| `workflow`           | This script and this document.                                  | Yes                                          |
+| `integration`        | Every topic merged onto `upstream/main`.                        | **No.** It is regenerated.                   |
 
 ## Why integration is derived
 
