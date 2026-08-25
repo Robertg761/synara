@@ -39,13 +39,13 @@ export const COMPUTER_WS_CHANNELS = {
   event: "computer.event",
 } as const;
 
-const COMPUTER_ID_MAX_LENGTH = 128;
+export const COMPUTER_ID_MAX_LENGTH = 128;
 /**
  * Exported because it bounds `ComputerActionResult.value`, and the clipboard
  * read path must enforce it before putting clipboard text on that field.
  */
 export const COMPUTER_TEXT_MAX_LENGTH = 16 * 1024;
-const COMPUTER_LABEL_MAX_LENGTH = 1_024;
+export const COMPUTER_LABEL_MAX_LENGTH = 1_024;
 /**
  * Exported because the backend composes health and availability messages from
  * error text it does not control, and must clamp them to this before they reach
@@ -53,7 +53,7 @@ const COMPUTER_LABEL_MAX_LENGTH = 1_024;
  */
 export const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
 /** Caps both a reported window list and one window's occluder list. */
-const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
+export const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
 
 /**
  * Thread-activity kind appended by the agent gateway when a computer tool call

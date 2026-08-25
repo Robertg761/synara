@@ -15,6 +15,11 @@
  * geometry, and re-exported here because this is the import every parser
  * already reaches for.
  */
+import {
+  COMPUTER_ID_MAX_LENGTH,
+  COMPUTER_LABEL_MAX_LENGTH,
+  COMPUTER_WINDOW_LIST_MAX_LENGTH,
+} from "@synara/contracts";
 import type {
   ComputerPoint,
   ComputerRect,
@@ -90,6 +95,35 @@ export function parseComputerPoint(value: unknown): ComputerPoint | null {
 }
 
 /**
+ * A compositor reports whatever an application set; the contract's schemas cap
+ * it. Nothing downstream reconciles the two, so a single window with a
+ * paragraph-long title used to fail the encode of every state payload and push
+ * event for the rest of the session. Clamping here keeps one bad window from
+ * silencing the whole desktop.
+ */
+function truncateLabel(text: string, max: number): string {
+  if (text.length <= max) return text;
+  // Leave room for the ellipsis so the result is exactly `max`, and never cut
+  // between the halves of an astral character — a lone surrogate is a symbol
+  // that no font draws.
+  let cut = max - 1;
+  const last = text.charCodeAt(cut - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return `${text.slice(0, cut)}…`;
+}
+
+/**
+ * Ids are clamped rather than dropped. A truncated id still names the window
+ * for the compositor calls that follow, whereas dropping the entry hides a real
+ * window from the model entirely.
+ */
+function clampId(id: string): ComputerWindow["id"] {
+  return (
+    id.length <= COMPUTER_ID_MAX_LENGTH ? id : id.slice(0, COMPUTER_ID_MAX_LENGTH)
+  ) as ComputerWindow["id"];
+}
+
+/**
  * Occluder ids from a source that reports them. Both the field and its
  * individual entries degrade to absent rather than failing the whole window
  * list, because stacking metadata is an optional hint and an older loaded
@@ -98,8 +132,11 @@ export function parseComputerPoint(value: unknown): ComputerPoint | null {
  */
 function asWindowIds(value: unknown): readonly ComputerWindow["id"][] | undefined {
   if (!Array.isArray(value)) return undefined;
-  const ids = value.filter((item): item is string => typeof item === "string" && item.length > 0);
-  return ids.length > 0 ? (ids as ComputerWindow["id"][]) : undefined;
+  const ids = value
+    .filter((item): item is string => typeof item === "string" && item.length > 0)
+    .slice(0, COMPUTER_WINDOW_LIST_MAX_LENGTH)
+    .map(clampId);
+  return ids.length > 0 ? ids : undefined;
 }
 
 /**
@@ -120,18 +157,21 @@ export function parseWindows(value: unknown, focusedWindowId: string | null): Co
   const items = Array.isArray(parsed) ? parsed : [];
   const windows: ComputerWindow[] = [];
   for (const item of items) {
+    if (windows.length >= COMPUTER_WINDOW_LIST_MAX_LENGTH) break;
     const record = asRecord(item);
     const id = asString(record.id) ?? asString(record.windowId);
     const bounds = parseComputerRect(record.bounds);
     if (!id || !bounds) continue;
-    const title = asString(record.title) ?? "";
-    const appName = asString(record.appId) ?? asString(record.resourceClass);
+    const title = truncateLabel(asString(record.title) ?? "", COMPUTER_LABEL_MAX_LENGTH);
+    const rawAppName = asString(record.appId) ?? asString(record.resourceClass);
+    const appName =
+      rawAppName === undefined ? undefined : truncateLabel(rawAppName, COMPUTER_LABEL_MAX_LENGTH);
     const pid =
       typeof record.pid === "number" && record.pid > 0 ? Math.trunc(record.pid) : undefined;
     const stackingIndex = asNonNegativeInt(record.stackingIndex);
     const occludedBy = asWindowIds(record.occludedBy);
     windows.push({
-      id: id as ComputerWindow["id"],
+      id: clampId(id),
       title,
       ...(appName ? { appName } : {}),
       ...(pid ? { pid } : {}),

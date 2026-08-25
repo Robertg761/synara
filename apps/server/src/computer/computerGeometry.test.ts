@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import {
   COMPUTER_ID_MAX_LENGTH,
   COMPUTER_LABEL_MAX_LENGTH,
-  COMPUTER_OCCLUDERS_MAX_LENGTH,
   COMPUTER_WINDOW_LIST_MAX_LENGTH,
   ComputerWindow,
 } from "@synara/contracts";
@@ -67,7 +66,7 @@ describe("parseWindows clamps to the contract", () => {
 
   it("caps one window's occluder list and each occluder id", () => {
     const occluders = Array.from(
-      { length: COMPUTER_OCCLUDERS_MAX_LENGTH * 4 },
+      { length: COMPUTER_WINDOW_LIST_MAX_LENGTH * 4 },
       (_, index) => `occluder-${index}`,
     );
     const windows = parseWindows(
@@ -75,7 +74,7 @@ describe("parseWindows clamps to the contract", () => {
       null,
     );
 
-    expect(windows[0]?.occludedBy).toHaveLength(COMPUTER_OCCLUDERS_MAX_LENGTH);
+    expect(windows[0]?.occludedBy).toHaveLength(COMPUTER_WINDOW_LIST_MAX_LENGTH);
     expect(Schema.is(ComputerWindow)(windows[0])).toBe(true);
   });
 
