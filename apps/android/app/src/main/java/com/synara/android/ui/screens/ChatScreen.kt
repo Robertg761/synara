@@ -8,8 +8,17 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.FastForward
 import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.LowPriority
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import androidx.compose.ui.platform.LocalContext
+import com.synara.android.data.MessageAttachment
 import com.synara.android.data.PendingAttachment
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.material.icons.outlined.Edit
@@ -60,6 +69,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
@@ -163,7 +173,17 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
     // Opening a thread should land at the newest message immediately; only later updates animate.
     var messageActionsFor by remember(state.selectedThreadId) { mutableStateOf<MessageItem?>(null) }
     var editing by remember(state.selectedThreadId) { mutableStateOf<MessageItem?>(null) }
+    var lightboxFor by remember { mutableStateOf<MessageAttachment?>(null) }
     var hasLanded by remember(state.selectedThreadId) { mutableStateOf(false) }
+
+    // A failed send hands the words back. The composer is emptied the instant a turn dispatches;
+    // if the server rejected it, this puts the text (and staged attachments, restored in the
+    // view model) where they were instead of leaving the user to retype from memory.
+    LaunchedEffect(state.draftRestoreToken) {
+        val text = state.draftRestoreText ?: return@LaunchedEffect
+        draft = TextFieldValue(text, TextRange(text.length))
+    }
+
     LaunchedEffect(lastMessage?.id, lastMessage?.text?.length, lastMessage?.streaming) {
         if (lastMessage == null) return@LaunchedEffect
         // The first pass runs before the list has been laid out, when totalItemsCount is still 0.
@@ -247,9 +267,12 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                         )
                     }
                 },
+                followUpSteer = if (thread?.isRunning == true) state.followUpSteer else null,
+                onToggleFollowUpSteer = { viewModel.setFollowUpSteer(!state.followUpSteer) },
                 onSend = {
+                    // The draft is deliberately not cleared here: it leaves only when the server
+                    // accepted the turn, and comes back through draftRestore if that failed.
                     viewModel.sendMessage(draft.text)
-                    draft = TextFieldValue()
                     focusManager.clearFocus()
                 },
                 onStop = viewModel::interruptThread,
@@ -297,8 +320,20 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                     if (detail.messages.isEmpty()) {
                         item(key = "empty") { EmptyThreadCard(thread) }
                     } else {
-                        items(detail.messages, key = { it.id }) { message ->
-                            Message(message) { messageActionsFor = message }
+                        itemsIndexed(detail.messages, key = { _, it -> it.id }) { index, message ->
+                            // An agent turn arrives as several messages, and stamping "Agent" plus
+                            // the minute over every one of them turned a single answer into five
+                            // labelled fragments. Only the first of a run introduces the speaker.
+                            val continuesPrevious = index > 0 &&
+                                !message.isUser &&
+                                !detail.messages[index - 1].isUser
+                            Message(
+                                message,
+                                viewModel,
+                                { messageActionsFor = message },
+                                { lightboxFor = it },
+                                continuesPrevious = continuesPrevious,
+                            )
                         }
                     }
 
@@ -328,6 +363,10 @@ fun ChatScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
 
     ThreadActionsSheet(state, viewModel)
     StudioOutputsSheet(state, viewModel)
+
+    lightboxFor?.let { attachment ->
+        AttachmentLightbox(attachment, viewModel) { lightboxFor = null }
+    }
 
     messageActionsFor?.let { message ->
         MessageActionsSheet(
@@ -511,8 +550,117 @@ private fun ThreadStatusStrip(detail: ThreadDetail) {
 // ── Messages ─────────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun Message(message: MessageItem, onLongClick: () -> Unit) {
-    if (message.isUser) UserMessage(message, onLongClick) else AssistantMessage(message, onLongClick)
+private fun Message(
+    message: MessageItem,
+    viewModel: SynaraViewModel,
+    onLongClick: () -> Unit,
+    onOpenImage: (MessageAttachment) -> Unit,
+    continuesPrevious: Boolean = false,
+) {
+    if (message.isUser) UserMessage(message, viewModel, onLongClick, onOpenImage)
+    else AssistantMessage(message, viewModel, onLongClick, onOpenImage, continuesPrevious)
+}
+
+/**
+ * Builds a media-route image request carrying the session credential. Attachments are served
+ * behind the same auth as everything else, and `<img>`-style loaders cannot attach headers on
+ * their own — so every request is assembled here with one.
+ */
+@Composable
+private fun attachmentImageModel(viewModel: SynaraViewModel, attachmentId: String): Any? {
+    val context = LocalContext.current
+    return remember(attachmentId) {
+        viewModel.attachmentUrl(attachmentId)?.let { url ->
+            ImageRequest.Builder(context).data(url).apply {
+                viewModel.mediaAuthHeader()?.let { (name, value) -> addHeader(name, value) }
+            }.crossfade(true).build()
+        }
+    }
+}
+
+/**
+ * Images and non-image files a message carries. Thumbnails open full-screen; files stay chips
+ * because a phone has nothing useful to do with a `.patch` beyond knowing it exists.
+ */
+@Composable
+private fun MessageAttachments(
+    attachments: List<MessageAttachment>,
+    viewModel: SynaraViewModel,
+    onOpenImage: (MessageAttachment) -> Unit,
+) {
+    if (attachments.isEmpty()) return
+    Column(verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs)) {
+        val images = attachments.filter(MessageAttachment::isImage)
+        if (images.isNotEmpty()) {
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
+            ) {
+                items(images, key = { it.id }) { attachment ->
+                    AsyncImage(
+                        model = attachmentImageModel(viewModel, attachment.id),
+                        contentDescription = attachment.name,
+                        modifier = Modifier
+                            .size(148.dp)
+                            .clip(MaterialTheme.shapes.medium)
+                            .clickable { onOpenImage(attachment) },
+                        contentScale = ContentScale.Crop,
+                    )
+                }
+            }
+        }
+        attachments.filterNot(MessageAttachment::isImage).forEach { attachment ->
+            Row(
+                Modifier
+                    .clip(MaterialTheme.shapes.small)
+                    .background(SynaraTheme.accents.mutedSurface, MaterialTheme.shapes.small)
+                    .padding(horizontal = SynaraTheme.spacing.sm, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
+            ) {
+                Icon(
+                    Icons.Outlined.Description,
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    attachment.name,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+/** Full-screen image view; tapping anywhere dismisses. */
+@Composable
+private fun AttachmentLightbox(
+    attachment: MessageAttachment,
+    viewModel: SynaraViewModel,
+    onDismiss: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.92f))
+                .clickable(onClick = onDismiss),
+            contentAlignment = Alignment.Center,
+        ) {
+            AsyncImage(
+                model = attachmentImageModel(viewModel, attachment.id),
+                contentDescription = attachment.name,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit,
+            )
+        }
+    }
 }
 
 /**
@@ -524,7 +672,12 @@ private fun Message(message: MessageItem, onLongClick: () -> Unit) {
  * room its code blocks and lists need.
  */
 @Composable
-private fun UserMessage(message: MessageItem, onLongClick: () -> Unit) {
+private fun UserMessage(
+    message: MessageItem,
+    viewModel: SynaraViewModel,
+    onLongClick: () -> Unit,
+    onOpenImage: (MessageAttachment) -> Unit,
+) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         Column(
             modifier = Modifier
@@ -534,7 +687,9 @@ private fun UserMessage(message: MessageItem, onLongClick: () -> Unit) {
                 .combinedClickable(onClick = {}, onLongClick = onLongClick)
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
         ) {
+            MessageAttachments(message.attachments, viewModel, onOpenImage)
             SelectionContainer {
                 Text(
                     message.text,
@@ -546,7 +701,6 @@ private fun UserMessage(message: MessageItem, onLongClick: () -> Unit) {
             if (time.isNotEmpty()) {
                 Text(
                     time,
-                    modifier = Modifier.padding(top = 3.dp),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -556,7 +710,13 @@ private fun UserMessage(message: MessageItem, onLongClick: () -> Unit) {
 }
 
 @Composable
-private fun AssistantMessage(message: MessageItem, onLongClick: () -> Unit) {
+private fun AssistantMessage(
+    message: MessageItem,
+    viewModel: SynaraViewModel,
+    onLongClick: () -> Unit,
+    onOpenImage: (MessageAttachment) -> Unit,
+    continuesPrevious: Boolean = false,
+) {
     val clipboard = LocalClipboardManager.current
     var copied by remember(message.id) { mutableStateOf(false) }
 
@@ -566,39 +726,41 @@ private fun AssistantMessage(message: MessageItem, onLongClick: () -> Unit) {
             .combinedClickable(onClick = {}, onLongClick = onLongClick),
         verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs),
     ) {
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm),
-        ) {
-            Text(
-                "Agent",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            val time = formatTimeOfDay(message.createdAt)
-            if (time.isNotEmpty()) {
+        if (!continuesPrevious) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm),
+            ) {
                 Text(
-                    time,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
+                    "Agent",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-            }
-            Spacer(Modifier.weight(1f))
-            if (message.text.isNotBlank()) {
-                IconButton(
-                    onClick = {
-                        clipboard.setText(AnnotatedString(message.text))
-                        copied = true
-                    },
-                    modifier = Modifier.size(32.dp),
-                ) {
-                    Icon(
-                        if (copied) Icons.Outlined.Check else Icons.Outlined.ContentCopy,
-                        contentDescription = if (copied) "Copied" else "Copy message",
-                        modifier = Modifier.size(15.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                val time = formatTimeOfDay(message.createdAt)
+                if (time.isNotEmpty()) {
+                    Text(
+                        time,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
                     )
+                }
+                Spacer(Modifier.weight(1f))
+                if (message.text.isNotBlank()) {
+                    IconButton(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(message.text))
+                            copied = true
+                        },
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(
+                            if (copied) Icons.Outlined.Check else Icons.Outlined.ContentCopy,
+                            contentDescription = if (copied) "Copied" else "Copy message",
+                            modifier = Modifier.size(15.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
@@ -608,6 +770,7 @@ private fun AssistantMessage(message: MessageItem, onLongClick: () -> Unit) {
                 MarkdownText(message.text, Modifier.fillMaxWidth())
             }
         }
+        MessageAttachments(message.attachments, viewModel, onOpenImage)
         if (message.streaming) StreamingDots()
     }
 }
@@ -921,14 +1084,24 @@ private fun ProposedPlanCard(plan: String) {
     }
 }
 
+/** How many trailing activity lines the thread screen renders. */
+private const val ACTIVITY_PREVIEW = 8
+
 @Composable
 private fun ActivitySection(activities: List<ActivityItem>) {
     val accents = SynaraTheme.accents
-    val recent = remember(activities) { activities.takeLast(8).asReversed() }
+    val recent = remember(activities) { activities.takeLast(ACTIVITY_PREVIEW).asReversed() }
     SynaraCard(contentSpacing = SynaraTheme.spacing.xs) {
         DisclosureSection(
             title = "Recent activity",
-            trailingSummary = "${activities.size}",
+            // Only the tail is rendered, so the bare total read as a promise the section did not
+            // keep: a reader who saw "500", opened it and counted eight would reasonably think
+            // the rest had failed to load. Say which eight instead.
+            trailingSummary = if (activities.size > ACTIVITY_PREVIEW) {
+                "Last $ACTIVITY_PREVIEW of ${activities.size}"
+            } else {
+                "${activities.size}"
+            },
         ) {
             recent.forEach { activity ->
                 Row(
@@ -976,6 +1149,9 @@ private fun Composer(
     onRemoveAttachment: (String) -> Unit,
     interactionMode: String?,
     onToggleInteractionMode: () -> Unit,
+    /** Non-null only while a turn is running: queue vs steer is then a live decision. */
+    followUpSteer: Boolean?,
+    onToggleFollowUpSteer: () -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
     enabled: Boolean,
@@ -1012,7 +1188,12 @@ private fun Composer(
         ) {
             AttachmentRow(attachments, onRemoveAttachment)
         }
-        PlanModeToggle(interactionMode, enabled, onToggleInteractionMode)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            PlanModeToggle(interactionMode, enabled, onToggleInteractionMode)
+            followUpSteer?.let { steer ->
+                DispatchModeToggle(steer, enabled && !isSending, onToggleFollowUpSteer)
+            }
+        }
         Row(
             Modifier
                 .fillMaxWidth()
@@ -1158,6 +1339,50 @@ private fun PlanModeToggle(interactionMode: String?, enabled: Boolean, onToggle:
                 if (planning) "Plan mode" else "Build mode",
                 style = MaterialTheme.typography.labelMedium,
                 color = if (planning) accents.infoForeground else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/**
+ * Queue vs steer for a follow-up sent while the agent is already running.
+ *
+ * Queued turns wait their turn; a steered message redirects the work in flight. The two differ
+ * enough in consequence that the active mode is always labelled on the chip rather than buried
+ * behind a long-press, and the toggle only exists while there is something to steer.
+ */
+@Composable
+private fun DispatchModeToggle(steer: Boolean, enabled: Boolean, onToggle: () -> Unit) {
+    val accents = SynaraTheme.accents
+    val shape = MaterialTheme.shapes.extraSmall
+    Row(
+        Modifier.padding(start = SynaraTheme.spacing.sm, top = SynaraTheme.spacing.xs),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            Modifier
+                .clip(shape)
+                .background(if (steer) accents.infoSurface else SynaraTheme.accents.mutedSurface, shape)
+                .border(
+                    1.dp,
+                    if (steer) accents.info.copy(alpha = 0.4f) else MaterialTheme.colorScheme.outlineVariant,
+                    shape,
+                )
+                .clickable(enabled = enabled, onClick = onToggle)
+                .padding(horizontal = 9.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Icon(
+                if (steer) Icons.Outlined.FastForward else Icons.Outlined.LowPriority,
+                contentDescription = null,
+                modifier = Modifier.size(13.dp),
+                tint = if (steer) accents.infoForeground else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                if (steer) "Steering" else "Queued",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (steer) accents.infoForeground else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }

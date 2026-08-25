@@ -12,6 +12,9 @@ export interface RemoteAccessInterfaceAddress {
 }
 
 const KIND_DISPLAY_ORDER: Record<DesktopRemoteAccessUrlKind, number> = {
+  // The tunnel sorts first: when it is up it works from any network, so it is
+  // the address pairing links should default to.
+  tunnel: -1,
   tailscale: 0,
   lan: 1,
   other: 2,

@@ -2,6 +2,7 @@
 
 package com.synara.android.ui.screens
 
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -12,6 +13,7 @@ import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.layout.Arrangement
@@ -28,6 +30,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.CloudOff
@@ -47,6 +50,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,6 +66,7 @@ import com.synara.android.data.ProjectItem
 import com.synara.android.data.SynaraUiState
 import com.synara.android.data.SynaraViewModel
 import com.synara.android.data.ThreadItem
+import com.synara.android.data.orderedForPicking
 import com.synara.android.ui.components.ConnectionPill
 import com.synara.android.ui.components.EmptyState
 import com.synara.android.ui.components.ErrorSnackbar
@@ -111,6 +116,20 @@ fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
     val showSkeletons = state.isLoading && state.threads.isEmpty()
     val showEmptyState = !showSkeletons && visible.isEmpty()
 
+    val listState = rememberLazyListState()
+    // A pinned header needs an edge once rows start sliding underneath it — without one, a
+    // half-scrolled thread reads as part of the filter row. Nothing is drawn while the list is
+    // still at rest, so an untouched screen keeps its open look.
+    val headerDetached by remember {
+        derivedStateOf {
+            listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 0
+        }
+    }
+    val headerEdge by animateFloatAsState(
+        targetValue = if (headerDetached) 1f else 0f,
+        label = "workspaceHeaderEdge",
+    )
+
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
@@ -158,7 +177,7 @@ fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
                         if (state.projects.isEmpty()) {
                             viewModel.openCreateProject()
                         } else {
-                            viewModel.openCreateThread(selectedProject ?: state.projects.firstOrNull()?.id)
+                            viewModel.openCreateThread()
                         }
                     },
                     icon = { Icon(Icons.Outlined.Add, contentDescription = null) },
@@ -171,103 +190,108 @@ fun WorkspaceScreen(state: SynaraUiState, viewModel: SynaraViewModel) {
         },
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                // Bottom room for the extended FAB so the final row is never trapped beneath it.
-                contentPadding = PaddingValues(bottom = 96.dp),
-            ) {
+            Column(Modifier.fillMaxSize()) {
+                // Status and filters sit above the scrolling list rather than inside it. Inside,
+                // they were rows one and two of a list hundreds of threads long: they scrolled away
+                // the moment anyone looked past the top, and — because they only appear once the
+                // first workspace snapshot lands — the list would already be anchored past them, so
+                // a freshly launched app showed no filter row at all until the user happened to
+                // scroll up.
                 if (state.connection != ConnectionState.CONNECTED) {
-                    item(key = "offline") {
-                        OfflineNotice(state, viewModel::refreshOrReconnect)
-                    }
+                    OfflineNotice(state, viewModel::refreshOrReconnect)
                 }
 
                 if (state.spaces.isNotEmpty()) {
-                    item(key = "spaces") {
-                        SpaceFilters(
-                            spaces = state.spaces,
-                            selected = state.selectedSpaceId,
-                            onSelect = viewModel::selectSpace,
-                            onLongPress = { spaceId -> viewModel.openSpaceActions(spaceId) },
-                        )
-                    }
+                    SpaceFilters(
+                        spaces = state.spaces,
+                        selected = state.selectedSpaceId,
+                        onSelect = viewModel::selectSpace,
+                        onLongPress = { spaceId -> viewModel.openSpaceActions(spaceId) },
+                    )
                 }
 
                 if (spaceProjects.isNotEmpty()) {
-                    item(key = "filters") {
-                        ProjectFilters(
-                            projects = spaceProjects,
-                            selected = selectedProject,
-                            onSelect = { selectedProject = it },
-                            onLongPress = viewModel::openProjectActions,
-                        )
-                    }
+                    ProjectFilters(
+                        projects = spaceProjects,
+                        selected = selectedProject,
+                        onSelect = { selectedProject = it },
+                        onLongPress = viewModel::openProjectActions,
+                    )
                 }
 
-                if (attention.isNotEmpty()) {
-                    item(key = "attention-label") {
-                        SectionLabel(
-                            "Needs you",
-                            Modifier.padding(
-                                start = SynaraTheme.spacing.screenGutter,
-                                end = SynaraTheme.spacing.screenGutter,
-                                top = SynaraTheme.spacing.lg,
-                                bottom = SynaraTheme.spacing.xs,
-                            ),
-                        )
-                    }
-                    // Dividers separate rows *within* a section only. A trailing divider under the
-                    // last row would stack against the next section heading and read as a double
-                    // rule.
-                    itemsIndexed(attention, key = { _, thread -> "a-${thread.id}" }) { index, thread ->
-                        if (index > 0) SynaraDivider(startIndent = 56.dp)
-                        ThreadRow(
-                            thread = thread,
-                            projectTitle = projectsById[thread.projectId]?.title,
-                            onClick = { viewModel.selectThread(thread.id) },
-                            onLongClick = { viewModel.openThreadActions(thread.id) },
-                        )
-                    }
-                }
+                SynaraDivider(Modifier.alpha(headerEdge))
 
-                // A section heading over nothing is just noise, so it is skipped entirely while
-                // the empty state has the screen to itself.
-                if (!showEmptyState) {
-                    item(key = "threads-label") {
-                        SectionLabel(
-                            text = if (attention.isEmpty()) "Threads" else "Everything else",
-                            modifier = Modifier.padding(
-                                start = SynaraTheme.spacing.screenGutter,
-                                end = SynaraTheme.spacing.screenGutter,
-                                top = SynaraTheme.spacing.xl,
-                                bottom = SynaraTheme.spacing.xs,
-                            ),
-                        )
-                    }
-                }
-
-                when {
-                    showSkeletons -> items(4) { ThreadRowSkeleton() }
-
-                    showEmptyState -> item(key = "empty") {
-                        Box(
-                            // Fills the remaining viewport so the empty state sits optically
-                            // centred instead of clinging to the top of an otherwise blank screen.
-                            Modifier.fillParentMaxHeight().padding(bottom = 64.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            WorkspaceEmptyState(state, viewModel)
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    // Bottom room for the extended FAB so the final row is never trapped beneath it.
+                    contentPadding = PaddingValues(bottom = 96.dp),
+                ) {
+                    if (attention.isNotEmpty()) {
+                        item(key = "attention-label") {
+                            SectionLabel(
+                                "Needs you",
+                                Modifier.padding(
+                                    start = SynaraTheme.spacing.screenGutter,
+                                    end = SynaraTheme.spacing.screenGutter,
+                                    top = SynaraTheme.spacing.lg,
+                                    bottom = SynaraTheme.spacing.xs,
+                                ),
+                            )
+                        }
+                        // Dividers separate rows *within* a section only. A trailing divider under the
+                        // last row would stack against the next section heading and read as a double
+                        // rule.
+                        itemsIndexed(attention, key = { _, thread -> "a-${thread.id}" }) { index, thread ->
+                            if (index > 0) SynaraDivider(startIndent = 56.dp)
+                            ThreadRow(
+                                thread = thread,
+                                projectTitle = projectsById[thread.projectId]?.title,
+                                onClick = { viewModel.selectThread(thread.id) },
+                                onLongClick = { viewModel.openThreadActions(thread.id) },
+                            )
                         }
                     }
 
-                    else -> itemsIndexed(rest, key = { _, thread -> thread.id }) { index, thread ->
-                        if (index > 0) SynaraDivider(startIndent = 56.dp)
-                        ThreadRow(
-                            thread = thread,
-                            projectTitle = projectsById[thread.projectId]?.title,
-                            onClick = { viewModel.selectThread(thread.id) },
-                            onLongClick = { viewModel.openThreadActions(thread.id) },
-                        )
+                    // A section heading over nothing is just noise, so it is skipped entirely while
+                    // the empty state has the screen to itself.
+                    if (!showEmptyState) {
+                        item(key = "threads-label") {
+                            SectionLabel(
+                                text = if (attention.isEmpty()) "Threads" else "Everything else",
+                                modifier = Modifier.padding(
+                                    start = SynaraTheme.spacing.screenGutter,
+                                    end = SynaraTheme.spacing.screenGutter,
+                                    top = SynaraTheme.spacing.xl,
+                                    bottom = SynaraTheme.spacing.xs,
+                                ),
+                            )
+                        }
+                    }
+
+                    when {
+                        showSkeletons -> items(4) { ThreadRowSkeleton() }
+
+                        showEmptyState -> item(key = "empty") {
+                            Box(
+                                // Fills the remaining viewport so the empty state sits optically
+                                // centred instead of clinging to the top of an otherwise blank screen.
+                                Modifier.fillParentMaxHeight().padding(bottom = 64.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                WorkspaceEmptyState(state, viewModel)
+                            }
+                        }
+
+                        else -> itemsIndexed(rest, key = { _, thread -> thread.id }) { index, thread ->
+                            if (index > 0) SynaraDivider(startIndent = 56.dp)
+                            ThreadRow(
+                                thread = thread,
+                                projectTitle = projectsById[thread.projectId]?.title,
+                                onClick = { viewModel.selectThread(thread.id) },
+                                onLongClick = { viewModel.openThreadActions(thread.id) },
+                            )
+                        }
                     }
                 }
             }
@@ -541,6 +565,10 @@ private fun ProjectFilters(
     onSelect: (String?) -> Unit,
     onLongPress: (String) -> Unit,
 ) {
+    // Same order as the project picker: the row is horizontally scrollable, so whatever the server
+    // happens to list first is what the user sees, and that must not be Home and Studio ahead of
+    // their own repositories.
+    val ordered = remember(projects) { projects.orderedForPicking() }
     LazyRow(
         modifier = Modifier.padding(top = SynaraTheme.spacing.sm),
         contentPadding = PaddingValues(horizontal = SynaraTheme.spacing.screenGutter),
@@ -549,7 +577,7 @@ private fun ProjectFilters(
         item {
             ProjectChip("All threads", selected == null, onClick = { onSelect(null) })
         }
-        items(projects, key = { it.id }) { project ->
+        items(ordered, key = { it.id }) { project ->
             ProjectChip(
                 label = project.title,
                 selected = selected == project.id,
@@ -663,6 +691,17 @@ private fun OfflineNotice(state: SynaraUiState, onReconnect: () -> Unit) {
 
 @Composable
 private fun WorkspaceEmptyState(state: SynaraUiState, viewModel: SynaraViewModel) {
+    // A disconnected phone knows nothing about the workspace, so "you have no projects" is a guess
+    // rather than a fact — and the button under it opens a dialog whose submit cannot reach the
+    // server. Reconnecting is the only move that helps, and the notice above already offers it.
+    if (state.connection != ConnectionState.CONNECTED) {
+        EmptyState(
+            icon = Icons.Outlined.CloudOff,
+            title = "Nothing to show yet",
+            body = "Your threads appear here as soon as this phone reaches your Synara server.",
+        )
+        return
+    }
     val noProjects = state.projects.isEmpty()
     Column(Modifier.fillMaxWidth()) {
         EmptyState(

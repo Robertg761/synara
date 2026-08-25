@@ -1,5 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Lets the repository wake reconnect the instant connectivity returns instead of waiting
+         out the backoff; no user data is read. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Posting notifications is a runtime permission from API 33; the app asks only when the
          background watch is switched on, so a user who never enables it is never prompted. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -24,6 +27,15 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Pairing links minted as synara://pair?server=…&token=… land here straight
+                 from a camera-app QR scan or the web app's "Open in app" button, so the
+                 server address and credential arrive prefilled instead of retyped. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="synara" android:host="pair" />
+            </intent-filter>
         </activity>
 
         <!-- dataSync: the service exists to keep a synchronised view of the workspace so an
@@ -32,5 +44,11 @@
             android:name=".notifications.SynaraConnectionService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Approve/Decline actions on approval notifications land here; not exported because
+             only this app's notifications post them. -->
+        <receiver
+            android:name=".notifications.SynaraNotificationReceiver"
+            android:exported="false" />
     </application>
 </manifest>

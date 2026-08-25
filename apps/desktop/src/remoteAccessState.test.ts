@@ -30,22 +30,34 @@ afterEach(() => {
 });
 
 describe("parseDesktopRemoteAccessState", () => {
-  it("accepts a valid persisted state", () => {
-    expect(parseDesktopRemoteAccessState({ version: 1, enabled: true, port: 3773 })).toEqual({
-      version: 1,
+  it("accepts a valid v2 state", () => {
+    expect(
+      parseDesktopRemoteAccessState({ version: 2, enabled: true, port: 3773, tunnel: true }),
+    ).toEqual({
+      version: 2,
       enabled: true,
       port: 3773,
+      tunnel: true,
+    });
+  });
+
+  it("upgrades a v1 file with the tunnel off", () => {
+    expect(parseDesktopRemoteAccessState({ version: 1, enabled: true, port: 3773 })).toEqual({
+      version: 2,
+      enabled: true,
+      port: 3773,
+      tunnel: false,
     });
   });
 
   it.each([
     ["null", null],
-    ["wrong version", { version: 2, enabled: true, port: 3773 }],
-    ["missing enabled", { version: 1, port: 3773 }],
-    ["non-boolean enabled", { version: 1, enabled: "yes", port: 3773 }],
-    ["port zero", { version: 1, enabled: true, port: 0 }],
-    ["port too large", { version: 1, enabled: true, port: 70000 }],
-    ["fractional port", { version: 1, enabled: true, port: 3773.5 }],
+    ["missing enabled", { version: 2, port: 3773, tunnel: false }],
+    ["non-boolean enabled", { version: 2, enabled: "yes", port: 3773, tunnel: false }],
+    ["non-boolean tunnel", { version: 2, enabled: true, port: 3773, tunnel: "yes" }],
+    ["port zero", { version: 2, enabled: true, port: 0, tunnel: false }],
+    ["port too large", { version: 2, enabled: true, port: 70000, tunnel: false }],
+    ["fractional port", { version: 2, enabled: true, port: 3773.5, tunnel: false }],
   ])("rejects %s", (_label, value) => {
     expect(parseDesktopRemoteAccessState(value)).toBeNull();
   });
@@ -62,11 +74,17 @@ describe("readDesktopRemoteAccessState", () => {
 
   it("round-trips written state", () => {
     const statePath = makeTempStatePath();
-    writeDesktopRemoteAccessState(statePath, { version: 1, enabled: true, port: 4881 });
-    expect(readDesktopRemoteAccessState(statePath)).toEqual({
-      version: 1,
+    writeDesktopRemoteAccessState(statePath, {
+      version: 2,
       enabled: true,
       port: 4881,
+      tunnel: true,
+    });
+    expect(readDesktopRemoteAccessState(statePath)).toEqual({
+      version: 2,
+      enabled: true,
+      port: 4881,
+      tunnel: true,
     });
   });
 

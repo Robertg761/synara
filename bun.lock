@@ -64,6 +64,7 @@
         "node-pty": "^1.1.0",
         "open": "^10.1.0",
         "tree-kill": "^1.2.2",
+        "uqr": "^0.1.3",
         "ws": "^8.21.0",
       },
       "devDependencies": {
@@ -79,6 +80,23 @@
         "typescript": "catalog:",
         "vitest": "catalog:",
         "zod": "4.3.6",
+      },
+    },
+    "apps/session-sync": {
+      "name": "@synara/session-sync",
+      "version": "0.1.0",
+      "dependencies": {
+        "@synara/contracts": "workspace:*",
+        "@synara/shared": "workspace:*",
+        "effect": "catalog:",
+      },
+      "devDependencies": {
+        "@effect/vitest": "catalog:",
+        "@synara/contracts": "workspace:*",
+        "@synara/shared": "workspace:*",
+        "@types/bun": "catalog:",
+        "typescript": "catalog:",
+        "vitest": "catalog:",
       },
     },
     "apps/web": {
@@ -968,6 +986,8 @@
     "@synara/marketing": ["@synara/marketing@workspace:apps/marketing"],
 
     "@synara/scripts": ["@synara/scripts@workspace:scripts"],
+
+    "@synara/session-sync": ["@synara/session-sync@workspace:apps/session-sync"],
 
     "@synara/shared": ["@synara/shared@workspace:packages/shared"],
 

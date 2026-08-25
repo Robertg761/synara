@@ -30,6 +30,12 @@ import {
 } from "./config";
 import { fixPath, resolveBaseDir } from "./os-jank";
 import { Open } from "./open";
+import {
+  resolveCloudflaredCommand,
+  startQuickTunnel,
+  type QuickTunnelHandle,
+} from "@synara/shared/cloudflaredQuickTunnel";
+import { renderANSI } from "uqr";
 import { ServerAuth } from "./auth/Services/ServerAuth";
 import * as SqlitePersistence from "./persistence/Layers/Sqlite";
 import { ProviderRuntimeEventRepositoryLive } from "./persistence/Layers/ProviderRuntimeEvents";
@@ -96,6 +102,7 @@ interface CliInput {
   readonly devUrl: Option.Option<URL>;
   readonly publicUrl: Option.Option<URL>;
   readonly allowInsecureRemote: BooleanFlagInput;
+  readonly tunnel: BooleanFlagInput;
   readonly noBrowser: BooleanFlagInput;
   readonly authToken: Option.Option<string>;
   readonly autoBootstrapProjectFromCwd: BooleanFlagInput;
@@ -162,6 +169,7 @@ const CliEnvConfig = Config.all({
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   publicUrl: Config.url("SYNARA_PUBLIC_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   allowInsecureRemote: optionalBooleanEnvironmentConfig("SYNARA_ALLOW_INSECURE_REMOTE"),
+  tunnel: optionalBooleanEnvironmentConfig("SYNARA_TUNNEL"),
   noBrowser: optionalBooleanEnvironmentConfig("SYNARA_NO_BROWSER"),
   authToken: Config.string("SYNARA_AUTH_TOKEN").pipe(
     Config.option,
@@ -374,12 +382,52 @@ const makeServerProgram = (input: CliInput) =>
       config.host && !isWildcardHost(config.host)
         ? `http://${formatHostForUrl(config.host)}:${config.port}`
         : localUrl;
-    const pairingBaseUrl = config.publicUrl?.origin ?? bindUrl;
+
+    // Anywhere access: a cloudflared quick tunnel gives this server a public
+    // HTTPS URL relayed through Cloudflare's edge. The server itself stays on
+    // its normal bind — the tunnel dials it from this machine — so enabling it
+    // changes nothing about the local security posture, and pairing links minted
+    // against the tunnel URL work from any network.
+    const cliEnv = yield* CliEnvConfig.asEffect();
+    const tunnelRequested = resolveBooleanConfig(input.tunnel, cliEnv.tunnel, false);
+    let tunnelHandle: QuickTunnelHandle | null = null;
+    let tunnelOrigin: string | null = null;
+    if (tunnelRequested) {
+      if (!resolveCloudflaredCommand()) {
+        yield* Effect.logWarning("Anywhere access requested but cloudflared is not installed", {
+          hint: "Install cloudflared (https://developers.cloudflare.com/cloudflare/one-page-docs/cloudflare-one/connections/connect-networks/downloads/) and start Synara with --tunnel again.",
+        });
+      } else {
+        // Bound to a const so the closure below keeps the non-null type: the
+        // mutable `tunnelHandle` loses its narrowing once it is captured.
+        const handle = startQuickTunnel({
+          targetUrl: localUrl,
+          log: (line) =>
+            Effect.runFork(Effect.logInfo(`[tunnel] ${line.replace(/\s+/g, " ").slice(0, 160)}`)),
+        });
+        tunnelHandle = handle;
+        const found = yield* Effect.promise(() => handle.waitForUrl(45_000));
+        if (found) {
+          tunnelOrigin = new URL(found).origin;
+          yield* Effect.logInfo("Anywhere access is up", {
+            url: tunnelOrigin,
+            hint: "Pairing links below work from any network. Stop with Ctrl+C; the tunnel closes with the server.",
+          });
+        } else {
+          yield* Effect.logWarning("Anywhere access tunnel did not come up", {
+            detail: handle.detail() ?? "timed out waiting for cloudflared",
+          });
+        }
+      }
+    }
+
+    const pairingBaseUrl = tunnelOrigin ?? config.publicUrl?.origin ?? bindUrl;
     // Desktop mode manages pairing links from the app's Remote access settings
     // instead: an auto-issued owner link would sit unclaimed in that list (and
     // in the logs) on every launch.
     const startupPairingUrl =
-      config.mode !== "desktop" && (config.publicUrl || !isLoopbackHost(config.host))
+      config.mode !== "desktop" &&
+      (config.publicUrl || !isLoopbackHost(config.host) || tunnelOrigin)
         ? yield* serverAuth.issueStartupPairingUrl(pairingBaseUrl).pipe(
             Effect.mapError(
               (cause) =>
@@ -440,6 +488,18 @@ const makeServerProgram = (input: CliInput) =>
       );
     }
 
+    // The QR turns "copy a URL to the phone" into "point the camera at the
+    // screen" — the whole point of anywhere access is that the phone is often
+    // not on this machine or network at all.
+    if (startupPairingUrl && tunnelOrigin) {
+      yield* Effect.sync(() => {
+        process.stdout.write(
+          `\nPair from anywhere — scan or open on the device:\n${startupPairingUrl}\n\n`,
+        );
+        process.stdout.write(`${renderANSI(startupPairingUrl)}\n`);
+      });
+    }
+
     if (!config.noBrowser) {
       const target = startupPairingUrl ?? config.devUrl?.toString() ?? bindUrl;
       yield* openDeps.openBrowser(target).pipe(
@@ -451,7 +511,9 @@ const makeServerProgram = (input: CliInput) =>
       );
     }
 
-    return yield* stopSignal;
+    // The tunnel is a child process; if it outlived the server every restart
+    // would leak one more cloudflared against the same account-less edge.
+    return yield* stopSignal.pipe(Effect.ensuring(Effect.sync(() => void tunnelHandle?.stop())));
   }).pipe(Effect.scoped, Effect.provide(LayerLive(input)));
 
 /**
@@ -490,6 +552,10 @@ const publicUrlFlag = Flag.string("public-url").pipe(
 const allowInsecureRemoteFlag = optionalBooleanFlag("allow-insecure-remote", {
   description:
     "Explicitly allow unencrypted authenticated remote access on a trusted LAN (equivalent to SYNARA_ALLOW_INSECURE_REMOTE).",
+});
+const tunnelFlag = optionalBooleanFlag("tunnel", {
+  description:
+    "Expose this server through a Cloudflare quick tunnel so any device can reach it (equivalent to SYNARA_TUNNEL). Requires the cloudflared binary.",
 });
 const noBrowserFlag = optionalBooleanFlag("no-browser", {
   description: "Disable automatic browser opening.",
@@ -534,6 +600,7 @@ const baseServerCommand = Command.make("synara", {
   devUrl: devUrlFlag,
   publicUrl: publicUrlFlag,
   allowInsecureRemote: allowInsecureRemoteFlag,
+  tunnel: tunnelFlag,
   noBrowser: noBrowserFlag,
   authToken: authTokenFlag,
   autoBootstrapProjectFromCwd: autoBootstrapProjectFromCwdFlag,

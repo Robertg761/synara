@@ -9,15 +9,21 @@ import * as Path from "node:path";
 export const DEFAULT_REMOTE_ACCESS_PORT = 3773;
 
 export interface PersistedDesktopRemoteAccessState {
-  readonly version: 1;
+  /**
+   * v1 was `{ enabled, port }`; v2 adds `tunnel`. v1 files parse with tunnel
+   * off, so a pre-tunnel install upgrades in place without losing its settings.
+   */
+  readonly version: 2;
   readonly enabled: boolean;
   readonly port: number;
+  readonly tunnel: boolean;
 }
 
 export const DISABLED_REMOTE_ACCESS_STATE: PersistedDesktopRemoteAccessState = {
-  version: 1,
+  version: 2,
   enabled: false,
   port: DEFAULT_REMOTE_ACCESS_PORT,
+  tunnel: false,
 };
 
 function isValidPort(value: unknown): value is number {
@@ -31,18 +37,25 @@ export function parseDesktopRemoteAccessState(
     return null;
   }
   const candidate = value as Record<string, unknown>;
-  if (
-    candidate.version !== 1 ||
-    typeof candidate.enabled !== "boolean" ||
-    !isValidPort(candidate.port)
-  ) {
+  if (!isValidPort(candidate.port)) {
     return null;
   }
-  return {
-    version: 1,
-    enabled: candidate.enabled,
-    port: candidate.port,
-  };
+  if (candidate.version === 1 && typeof candidate.enabled === "boolean") {
+    return { version: 2, enabled: candidate.enabled, port: candidate.port, tunnel: false };
+  }
+  if (
+    candidate.version === 2 &&
+    typeof candidate.enabled === "boolean" &&
+    typeof candidate.tunnel === "boolean"
+  ) {
+    return {
+      version: 2,
+      enabled: candidate.enabled,
+      port: candidate.port,
+      tunnel: candidate.tunnel,
+    };
+  }
+  return null;
 }
 
 export function readDesktopRemoteAccessState(filePath: string): PersistedDesktopRemoteAccessState {

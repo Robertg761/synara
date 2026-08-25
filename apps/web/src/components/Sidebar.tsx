@@ -99,7 +99,7 @@ import {
   type SidebarThreadSortOrder,
   useAppSettings,
 } from "../appSettings";
-import { isElectron } from "../env";
+import { appBrandName, isElectron } from "../env";
 import { formatRelativeTime } from "../lib/relativeTime";
 import {
   isMacNavigatorPlatform,
@@ -1238,7 +1238,9 @@ function SidebarActivityBellButton({
 }
 
 const SIDEBAR_SURFACE_PICKER_COPY: Record<SidebarView, { title: string; description: string }> = {
-  threads: { title: "Synara", description: "Build, debug, and ship" },
+  // The threads surface is the product itself, so it carries the build's brand
+  // name: side-by-side flavors show "Canary"/"Dev" here rather than "Synara".
+  threads: { title: appBrandName, description: "Build, debug, and ship" },
   studio: { title: "Studio", description: "Open-ended agent work" },
 };
 

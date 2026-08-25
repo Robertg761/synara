@@ -65,6 +65,14 @@ function parseBrowserAnnotationEvent(payload: unknown): BrowserAnnotationEvent |
 
 contextBridge.exposeInMainWorld("desktopBridge", {
   getWsUrl: getDesktopWsUrl,
+  getFlavor: () => {
+    try {
+      const flavor = ipcRenderer.sendSync(IPC.flavor);
+      return typeof flavor === "string" && flavor.length > 0 ? flavor : null;
+    } catch {
+      return null;
+    }
+  },
   // Absolute path for OS-dropped File objects (folders with spaces/parens, etc.).
   getPathForFile: (file: File) => {
     try {

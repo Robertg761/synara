@@ -47,6 +47,7 @@ import com.synara.android.data.SynaraUiState
 import com.synara.android.data.SynaraViewModel
 import com.synara.android.ui.components.ActionSheetItem
 import com.synara.android.ui.components.ActionSheetSection
+import com.synara.android.ui.components.DisclosureSection
 import com.synara.android.ui.components.EmptyState
 import com.synara.android.ui.components.InlineNotice
 import com.synara.android.ui.components.SectionLabel
@@ -378,6 +379,29 @@ private fun AutomationDetailSheet(
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+
+                // Dedicated-mode automations persist memory across runs; showing it here is the
+                // only way to see what a schedule has learned without opening the desktop.
+                DisclosureSection(title = "Memory", initiallyExpanded = false) {
+                    val memory = state.automations.memoryById[automation.id]
+                    when {
+                        memory == null -> CircularProgressIndicator(
+                            Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        memory.isBlank() -> Text(
+                            "No memory yet.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        else -> Text(
+                            memory,
+                            style = SynaraTheme.textStyles.monoSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
 

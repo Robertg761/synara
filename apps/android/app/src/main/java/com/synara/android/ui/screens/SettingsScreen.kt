@@ -353,22 +353,34 @@ private fun ServerSettingsSections(state: SynaraUiState, viewModel: SynaraViewMo
             enabled = !server.isSaving,
             onChange = viewModel::setProviderUpdateChecks,
         )
-    }
-
-    Column(verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm)) {
-        Text(
-            "New threads run in",
-            style = MaterialTheme.typography.labelLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm)) {
-            listOf("local" to "The checkout", "worktree" to "A worktree").forEach { (wire, label) ->
-                EnvModeOption(
-                    label = label,
-                    selected = settings.defaultThreadEnvMode == wire,
-                    enabled = !server.isSaving,
-                    modifier = Modifier.weight(1f),
-                ) { viewModel.setDefaultThreadEnvMode(wire) }
+        SynaraDivider(startIndent = SynaraTheme.spacing.lg)
+        // A third server setting, not a section of its own. Standing outside the card between
+        // "Server" and "Providers", its label carried the same weight as those headings and read
+        // as a top-level group — when all it decides is where one more server-side default points.
+        Column(
+            Modifier.fillMaxWidth().padding(SynaraTheme.spacing.lg),
+            verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm),
+        ) {
+            Text(
+                "New threads run in",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Text(
+                "A worktree gives each thread its own checkout, so threads working at the same " +
+                    "time never overwrite each other.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm)) {
+                listOf("local" to "The checkout", "worktree" to "A worktree").forEach { (wire, label) ->
+                    EnvModeOption(
+                        label = label,
+                        selected = settings.defaultThreadEnvMode == wire,
+                        enabled = !server.isSaving,
+                        modifier = Modifier.weight(1f),
+                    ) { viewModel.setDefaultThreadEnvMode(wire) }
+                }
             }
         }
     }
@@ -381,6 +393,7 @@ private fun ServerSettingsSections(state: SynaraUiState, viewModel: SynaraViewMo
                 settings = providerSettings,
                 status = server.statuses.firstOrNull { it.provider == providerSettings.provider },
                 enabled = !server.isSaving,
+                checking = server.isLoading,
                 onToggle = { viewModel.setProviderEnabled(providerSettings.provider, it) },
             )
         }
@@ -436,6 +449,7 @@ private fun ProviderRow(
     settings: ProviderSettings,
     status: ProviderStatus?,
     enabled: Boolean,
+    checking: Boolean,
     onToggle: (Boolean) -> Unit,
 ) {
     val accents = SynaraTheme.accents
@@ -466,6 +480,9 @@ private fun ProviderRow(
             // Availability and auth are separate failures: an installed binary that is not signed
             // in needs a different fix from one that is missing, so they are not merged.
             val detail = when {
+                // Nothing has been read back yet. "Status unknown" is the answer once the probe
+                // has run and come back with nothing — before that it is simply premature.
+                status == null && checking -> "Checking…"
                 status == null -> "Status unknown"
                 !status.available -> status.message ?: "Not installed"
                 status.authStatus == "authenticated" -> status.authLabel ?: "Signed in"

@@ -30,11 +30,21 @@ class MainActivity : ComponentActivity() {
         )
         super.onCreate(savedInstanceState)
         openThreadFromIntent(intent)
+        // A scanned QR usually cold-starts the app, so the launch intent carries the
+        // pairing link here rather than through onNewIntent.
+        openPairingFromIntent(intent)
         setContent {
             SynaraTheme {
                 SynaraApp(viewModel)
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Foreground is the moment a half-dead background socket becomes worth fixing now rather
+        // than on the reconnect loop's schedule; the repository throttles repeats.
+        (application as SynaraApplication).repository.wake()
     }
 
     /**
@@ -45,9 +55,24 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         openThreadFromIntent(intent)
+        openPairingFromIntent(intent)
     }
 
     private fun openThreadFromIntent(intent: Intent?) {
-        intent?.getStringExtra(SynaraNotifier.EXTRA_THREAD_ID)?.let(viewModel::selectThread)
+        intent?.getStringExtra(SynaraNotifier.EXTRA_THREAD_ID)?.let(viewModel::openThreadFromNotification)
+    }
+
+    /**
+     * `synara://pair?server=…&token=…` from a scanned QR or the web app's hand-off button.
+     * Prefill only: pairing still takes one deliberate tap, so a stray scan cannot sign the
+     * device in by itself.
+     */
+    private fun openPairingFromIntent(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme != "synara" || data.host != "pair") return
+        val server = data.getQueryParameter("server") ?: return
+        val token = data.getQueryParameter("token") ?: return
+        if (server.isBlank() || token.isBlank()) return
+        viewModel.prefillPairing(server, token)
     }
 }

@@ -244,6 +244,10 @@
       "types": "./src/cli.ts",
       "import": "./src/cli.ts"
     },
+    "./cloudflaredQuickTunnel": {
+      "types": "./src/cloudflaredQuickTunnel.ts",
+      "import": "./src/cloudflaredQuickTunnel.ts"
+    },
     "./migrationRecovery": {
       "types": "./src/migrationRecovery.ts",
       "import": "./src/migrationRecovery.ts"

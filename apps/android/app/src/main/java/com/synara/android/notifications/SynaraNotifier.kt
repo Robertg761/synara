@@ -92,7 +92,7 @@ object SynaraNotifier {
             AttentionKind.INPUT -> ATTENTION_CHANNEL_ID to "The agent asked a question"
             AttentionKind.FINISHED -> ACTIVITY_CHANNEL_ID to "Turn finished"
         }
-        val notification = NotificationCompat.Builder(context, channel)
+        val builder = NotificationCompat.Builder(context, channel)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(attention.title)
@@ -103,7 +103,9 @@ object SynaraNotifier {
                 if (attention.kind == AttentionKind.FINISHED) {
                     NotificationCompat.CATEGORY_STATUS
                 } else {
-                    NotificationCompat.CATEGORY_CALL
+                    // REMINDER, not CALL: a call category makes some devices treat this as an
+                    // incoming call with full-screen intent semantics, which an approval is not.
+                    NotificationCompat.CATEGORY_REMINDER
                 },
             )
             .setPriority(
@@ -113,13 +115,41 @@ object SynaraNotifier {
                     NotificationCompat.PRIORITY_HIGH
                 },
             )
-            .build()
+
+        // Approvals are the one notification worth answering without opening the app: the agent
+        // is blocked either way, and the decision is usually obvious from the title.
+        if (attention.kind == AttentionKind.APPROVAL) {
+            builder.addAction(approvalAction(context, "Approve", SynaraNotificationReceiver.ACTION_APPROVE, attention.threadId))
+            builder.addAction(approvalAction(context, "Decline", SynaraNotificationReceiver.ACTION_DECLINE, attention.threadId))
+        }
+
+        val notification = builder.build()
 
         // Keyed by thread so a second event for the same thread replaces the first rather than
         // stacking; the newest state is the only one worth acting on.
         runCatching {
             NotificationManagerCompat.from(context).notify(attention.threadId, 0, notification)
         }
+    }
+
+    /** A shade-level approve/decline button that answers through [SynaraNotificationReceiver]. */
+    private fun approvalAction(
+        context: Context,
+        label: String,
+        action: String,
+        threadId: String,
+    ): NotificationCompat.Action {
+        val intent = Intent(context, SynaraNotificationReceiver::class.java).apply {
+            this.action = action
+            putExtra(EXTRA_THREAD_ID, threadId)
+        }
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            (threadId + action).hashCode(),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        return NotificationCompat.Action.Builder(R.drawable.ic_notification, label, pendingIntent).build()
     }
 
     /** Withdraws a thread's notification once it no longer needs anything. */

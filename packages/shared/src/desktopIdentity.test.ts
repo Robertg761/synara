@@ -38,6 +38,7 @@ describe("desktopIdentity", () => {
     expect(synaraDesktopIdentity("canary")).toEqual({
       flavor: "canary",
       displayName: "Synara Canary",
+      shortDisplayName: "Canary",
       bundleId: SYNARA_CANARY_BUNDLE_ID,
       scheme: "synara-canary",
       origin: SYNARA_CANARY_DESKTOP_ORIGIN,

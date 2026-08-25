@@ -1,13 +1,22 @@
 package com.synara.android.data
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import com.synara.android.BuildConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.HttpUrl
@@ -25,6 +34,7 @@ import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 sealed interface RepositoryEvent {
@@ -47,8 +57,16 @@ enum class ConnectionState {
 
 class AuthRequiredException(message: String) : IOException(message)
 
+/**
+ * The title the server reads as "not named yet": a thread carrying it is renamed from its first
+ * message, which is how every untitled thread on the desktop gets its name. Must stay in step with
+ * `GENERIC_CHAT_THREAD_TITLE` in `packages/shared/src/chatThreads.ts`.
+ */
+internal const val UNTITLED_THREAD_TITLE = "New thread"
+
 class SynaraRepository(context: Context) {
-    private val store = SecureSessionStore(context.applicationContext)
+    private val appContext = context.applicationContext
+    private val store = SecureSessionStore(appContext)
     private val http = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -59,11 +77,36 @@ class SynaraRepository(context: Context) {
     private val pending = ConcurrentHashMap<String, CompletableDeferred<JSONObject?>>()
     private val streams = ConcurrentHashMap<String, (JSONObject) -> Unit>()
     private val streamCompletions = ConcurrentHashMap<String, () -> Unit>()
+    /** Thread subscription ids mapped back to their thread, so a failed stream can drop its cursor. */
+    private val streamThreads = ConcurrentHashMap<String, String>()
     private val events = kotlinx.coroutines.flow.MutableSharedFlow<RepositoryEvent>(
         extraBufferCapacity = 64,
     )
     private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val shellRefreshInFlight = AtomicBoolean(false)
+
+    /**
+     * Serialises every socket lifecycle: pairing, manual reconnect and the automatic reconnect
+     * loop must never race each other into two live sockets.
+     */
+    private val connectMutex = Mutex()
+
+    private val backoff = ReconnectBackoff()
+    private val reconnectAttempts = AtomicInteger(0)
+    private var reconnectJob: Job? = null
+
+    /** Set when the user (or a revoked token) ended the session; suppresses the reconnect loop. */
+    @Volatile
+    private var intentionallyDisconnected = false
+
+    @Volatile
+    private var currentState: ConnectionState = ConnectionState.DISCONNECTED
+
+    @Volatile
+    private var lastWakeAtMs = 0L
+
+    /** Last orchestration sequence applied per thread; drives gap-free resubscribes. */
+    private val threadCursors = StreamCursors()
 
     @Volatile
     private var socket: WebSocket? = null
@@ -74,38 +117,195 @@ class SynaraRepository(context: Context) {
     @Volatile
     private var sessionToken: String? = null
 
+    init {
+        registerNetworkCallback()
+    }
+
+    /**
+     * Wakes reconnect the moment connectivity returns rather than waiting out the current backoff.
+     * Phones hop between Wi-Fi and mobile data constantly; without this a backgrounded app can sit
+     * in RECONNECTING for a full backoff cycle after a network change that already succeeded.
+     */
+    private fun registerNetworkCallback() {
+        runCatching {
+            val manager = appContext.getSystemService(ConnectivityManager::class.java) ?: return
+            manager.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    wake()
+                }
+            })
+        }
+    }
+
     fun events() = events
 
     fun storedSession(): StoredSession? = store.readSession()
+
+    /** The bearer credential backing media requests, or `null` while signed out. */
+    fun currentBearerToken(): String? = sessionToken
+
+    /** URL for an attachment id served by the paired server's media route. */
+    fun attachmentUrl(attachmentId: String): HttpUrl? {
+        val base = baseUrl ?: return null
+        if (attachmentId.isBlank()) return null
+        return base.newBuilder()
+            .addEncodedPathSegments("api/attachments")
+            .addPathSegment(attachmentId)
+            .build()
+    }
+
+    /**
+     * Forces a reconnection attempt now instead of waiting out the backoff.
+     *
+     * Called when the network changes or the app comes to the foreground — the two moments at
+     * which a dead socket becomes worth retrying immediately. Throttled so a burst of callbacks
+     * cannot stack attempts; [force] bypasses the throttle for an explicit user tap.
+     */
+    fun wake(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force) {
+            synchronized(this) {
+                if (now - lastWakeAtMs < WAKE_THROTTLE_MS) return
+                lastWakeAtMs = now
+            }
+        }
+        if (intentionallyDisconnected || store.readSession() == null) return
+        if (currentState == ConnectionState.CONNECTED || currentState == ConnectionState.CONNECTING) return
+        backgroundScope.launch {
+            connectMutex.withLock {
+                if (intentionallyDisconnected || currentState == ConnectionState.CONNECTED) return@withLock
+                runCatching { reconnectStoredInternal() }
+                    .onFailure { error ->
+                        if (error is AuthRequiredException) {
+                            // Same rule as the backoff loop: a revoked token never heals by retrying.
+                            intentionallyDisconnected = true
+                            disconnectLocked(clearCredentials = true)
+                            setConnectionState(ConnectionState.DISCONNECTED)
+                        } else {
+                            scheduleReconnectLocked(error)
+                        }
+                    }
+            }
+        }
+    }
+
+    private fun setConnectionState(state: ConnectionState) {
+        currentState = state
+        events.tryEmit(RepositoryEvent.ConnectionChanged(state))
+    }
+
+    /** Link state for callers outside the event flow, such as notification actions. */
+    fun isConnected(): Boolean = currentState == ConnectionState.CONNECTED
+
+    /**
+     * Suspends until the socket is live or [timeoutMs] elapses.
+     *
+     * A notification action button fires into a process that may still be reconnecting; waiting
+     * out the backoff here is what lets an inline Approve actually land instead of bouncing off
+     * a half-open connection. Returns whether the connection came up in time.
+     */
+    suspend fun awaitConnected(timeoutMs: Long = 10_000L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!isConnected()) {
+            if (System.currentTimeMillis() >= deadline) return false
+            delay(200)
+        }
+        return true
+    }
 
     suspend fun connectWithPairing(serverUrlInput: String, pairingInput: String) {
         val serverUrl = normalizeBaseUrl(serverUrlInput)
         val credential = extractPairingCredential(pairingInput)
         require(credential.isNotBlank()) { "Paste a Synara pairing link or token." }
 
-        closeSocket()
-        setConnectionState(ConnectionState.CONNECTING)
-        baseUrl = serverUrl
-        val result = postJson(
-            serverUrl,
-            "/api/auth/bootstrap/bearer",
-            JSONObject().put("credential", credential),
-        )
-        val token = result.stringOrNull("sessionToken")
-            ?: throw IOException("The server did not return a session token.")
-        store.saveBaseUrl(serverUrl.toString().trimEnd('/'))
-        store.saveSessionToken(token)
-        sessionToken = token
-        openAuthenticatedSocket(serverUrl, token)
+        connectMutex.withLock {
+            intentionallyDisconnected = false
+            closeSocket()
+            setConnectionState(ConnectionState.CONNECTING)
+            baseUrl = serverUrl
+            val result = postJson(
+                serverUrl,
+                "/api/auth/bootstrap/bearer",
+                JSONObject().put("credential", credential),
+            )
+            val token = result.stringOrNull("sessionToken")
+                ?: throw IOException("The server did not return a session token.")
+            store.saveBaseUrl(serverUrl.toString().trimEnd('/'))
+            store.saveSessionToken(token)
+            sessionToken = token
+            try {
+                openAuthenticatedSocket(serverUrl, token)
+            } catch (error: Throwable) {
+                // A failed pairing must not leave the automatic loop hammering bad credentials.
+                if (error !is AuthRequiredException) scheduleReconnectLocked(error)
+                throw error
+            }
+            reconnectAttempts.set(0)
+        }
     }
 
     suspend fun reconnectStored() {
+        connectMutex.withLock {
+            try {
+                reconnectStoredInternal()
+            } catch (error: Throwable) {
+                if (error is AuthRequiredException) {
+                    intentionallyDisconnected = true
+                    disconnectLocked(clearCredentials = true)
+                } else {
+                    scheduleReconnectLocked(error)
+                }
+                throw error
+            }
+            reconnectAttempts.set(0)
+        }
+    }
+
+    /**
+     * Opens the stored session, expecting [connectMutex] to already be held. The separate
+     * lock-free body exists so [wake] and the backoff loop can drive it inside their own lock.
+     */
+    private suspend fun reconnectStoredInternal() {
         val stored = store.readSession() ?: throw AuthRequiredException("Pair this phone with Synara first.")
+        intentionallyDisconnected = false
         closeSocket()
         setConnectionState(ConnectionState.CONNECTING)
         baseUrl = normalizeBaseUrl(stored.baseUrl)
         sessionToken = stored.sessionToken
         openAuthenticatedSocket(baseUrl!!, stored.sessionToken)
+    }
+
+    /**
+     * Schedules the next automatic attempt after a failure. Backoff grows with consecutive
+     * failures and resets on any success, so a healthy link never pays a penalty for one old drop.
+     * Must be called while holding [connectMutex].
+     */
+    private fun scheduleReconnectLocked(error: Throwable?) {
+        if (intentionallyDisconnected) return
+        if (store.readSession() == null) return
+        if (currentState == ConnectionState.CONNECTED) return
+        setConnectionState(ConnectionState.RECONNECTING)
+        if (reconnectJob?.isActive == true) return
+        val attempt = reconnectAttempts.incrementAndGet()
+        reconnectJob = backgroundScope.launch {
+            delay(backoff.delayForAttempt(attempt))
+            connectMutex.withLock {
+                if (intentionallyDisconnected || currentState == ConnectionState.CONNECTED) return@withLock
+                try {
+                    reconnectStoredInternal()
+                    reconnectAttempts.set(0)
+                } catch (retryError: Throwable) {
+                    if (retryError is AuthRequiredException) {
+                        // The token was revoked while we were away; looping cannot fix that.
+                        intentionallyDisconnected = true
+                        disconnectLocked(clearCredentials = true)
+                        setConnectionState(ConnectionState.DISCONNECTED)
+                    } else {
+                        scheduleReconnectLocked(retryError)
+                    }
+                }
+            }
+        }
     }
 
     suspend fun refreshWorkspace(): WorkspaceSnapshot {
@@ -126,20 +326,44 @@ class SynaraRepository(context: Context) {
         return detail
     }
 
-    suspend fun subscribeThread(threadId: String): String = streamRpc(
-        "orchestration.subscribeThread",
-        JSONObject().put("threadId", threadId),
-    ) { item ->
-        when (item.stringOrNull("kind")) {
-            "snapshot" -> item.objectOrNull("snapshot")?.let { snapshot ->
-                ThreadDetail.fromSnapshot(snapshot)?.let {
-                    events.tryEmit(RepositoryEvent.ThreadSnapshot(it))
+    /**
+     * Subscribes to a thread's live events.
+     *
+     * The last sequence applied for this thread travels as the resume cursor, so after a
+     * reconnect the server replays only what was missed instead of shipping the whole transcript
+     * again. A stale or impossible cursor simply falls back to the snapshot path on the server,
+     * so trusting it optimistically is always safe.
+     */
+    suspend fun subscribeThread(threadId: String): String {
+        val payload = JSONObject().put("threadId", threadId)
+        threadCursors.resumeFor(threadId)?.let { payload.put("afterSequence", it) }
+        val streamId = streamRpc(
+            "orchestration.subscribeThread",
+            payload,
+        ) { item ->
+            when (item.stringOrNull("kind")) {
+                "snapshot" -> item.objectOrNull("snapshot")?.let { snapshot ->
+                    ThreadDetail.fromSnapshot(snapshot)?.let { detail ->
+                        threadCursors.advance(threadId, snapshot.optLong("snapshotSequence", 0L))
+                        events.tryEmit(RepositoryEvent.ThreadSnapshot(detail))
+                    }
+                }
+                "event" -> item.objectOrNull("event")?.let { event ->
+                    // A frame at or below the cursor is a replay of something already applied;
+                    // applying it twice would duplicate messages in the transcript.
+                    if (threadCursors.advance(threadId, event.optLong("sequence", 0L))) {
+                        events.tryEmit(RepositoryEvent.ThreadEvent(threadId, event))
+                    }
                 }
             }
-            "event" -> item.objectOrNull("event")?.let {
-                events.tryEmit(RepositoryEvent.ThreadEvent(threadId, it))
-            }
         }
+        streamThreads[streamId] = threadId
+        return streamId
+    }
+
+    /** Drops a failed thread subscription's cursor so the next subscribe takes a fresh snapshot. */
+    private fun forgetStream(streamId: String) {
+        streamThreads.remove(streamId)?.let(threadCursors::forget)
     }
 
     suspend fun subscribeShell(): String = streamRpc(
@@ -170,6 +394,7 @@ class SynaraRepository(context: Context) {
     fun stopStream(requestId: String) {
         streams.remove(requestId)
         streamCompletions.remove(requestId)
+        streamThreads.remove(requestId)
         sendFrame(JSONObject().put("_tag", "Interrupt").put("requestId", requestId))
     }
 
@@ -218,6 +443,7 @@ class SynaraRepository(context: Context) {
         text: String,
         messageId: String,
         attachments: List<JSONObject> = emptyList(),
+        dispatchMode: String = "queue",
     ) {
         dispatch("thread.turn.start") {
             put("threadId", thread.id)
@@ -231,7 +457,7 @@ class SynaraRepository(context: Context) {
             )
             put("runtimeMode", thread.runtimeMode)
             put("interactionMode", thread.interactionMode)
-            put("dispatchMode", "queue")
+            put("dispatchMode", dispatchMode)
             put("createdAt", nowIso())
         }
     }
@@ -252,6 +478,25 @@ class SynaraRepository(context: Context) {
             put("createdAt", nowIso())
             interaction.lifecycleGeneration?.let { put("lifecycleGeneration", it) }
         }
+    }
+
+    /**
+     * Answers a thread's oldest still-pending approval without the UI being open.
+     *
+     * Notification action buttons only know the thread, not the request id — that lives in the
+     * thread detail. Fetching it here first means one round trip before the decision, which is
+     * the price of acting straight from the notification shade. Returns whether a decision was
+     * actually delivered; `false` means the caller should leave the notification standing.
+     */
+    suspend fun respondToOldestPendingApproval(threadId: String, decision: String): Boolean {
+        val detail = loadThread(threadId) ?: return false
+        val interaction = detail.pendingInteractions.firstOrNull { pending ->
+            pending.isApproval && (pending.status == "pending" || pending.status == "retryable")
+        } ?: return false
+        return runCatching {
+            respondToApproval(threadId, interaction, decision)
+            true
+        }.getOrDefault(false)
     }
 
     suspend fun respondToUserInput(
@@ -321,6 +566,10 @@ class SynaraRepository(context: Context) {
             put("modelSelection", modelSelectionJson(model))
             put("runtimeMode", runtimeMode)
             put("interactionMode", interactionMode)
+            // Pinned to the checkout on purpose. A worktree thread is only coherent once someone
+            // has actually created the worktree and can name its path, and this app has no way to
+            // do that — so it would be recording a location that does not exist. The server-side
+            // "New threads run in" preference governs the desktop, which can provision one.
             put("envMode", "local")
             put("branch", JSONObject.NULL)
             put("worktreePath", JSONObject.NULL)
@@ -1082,16 +1331,65 @@ class SynaraRepository(context: Context) {
      * Model discovery per provider is independent and slow-ish, so the providers are queried
      * concurrently and a provider that is not installed simply contributes nothing rather than
      * failing the whole load.
+     *
+     * `provider.listModels` is an `expensive-read` on the server, and that class admits only
+     * [RpcCapacity.EXPENSIVE_READ_BUDGET] requests per client at a time. Fanning out to all nine
+     * providers at once therefore had eight of them rejected outright, and because each failure is
+     * swallowed here the picker silently kept whatever single provider won the slot. The fan-out is
+     * paced to the budget so every provider actually gets asked.
      */
     suspend fun listAllModels(): List<ModelOption> = withContext(Dispatchers.IO) {
+        val slots = Semaphore(RpcCapacity.EXPENSIVE_READ_BUDGET)
         Provider.entries
-            .map { provider -> async { runCatching { listModels(provider.kind) }.getOrDefault(emptyList()) } }
+            .map { provider ->
+                async {
+                    slots.withPermit {
+                        runCatching { listModels(provider.kind) }.getOrDefault(emptyList())
+                    }
+                }
+            }
             .awaitAll()
             .flatten()
     }
 
+    /**
+     * A live socket just died. Emits the offline state, fails every in-flight RPC, and starts the
+     * automatic reconnect loop unless the drop was deliberate or the event belongs to a socket
+     * that has already been replaced.
+     */
+    private fun handleSocketDown(webSocket: WebSocket, error: Throwable) {
+        if (socket !== webSocket) return
+        socket = null
+        // Cursors deliberately survive this: they are what lets the next subscribe replay the
+        // gap instead of re-downloading history.
+        failPending(error)
+        streams.clear()
+        streamCompletions.clear()
+        setConnectionState(ConnectionState.DISCONNECTED)
+        if (intentionallyDisconnected) return
+        events.tryEmit(RepositoryEvent.Error(readableDropMessage(error)))
+        backgroundScope.launch {
+            connectMutex.withLock { scheduleReconnectLocked(error) }
+        }
+    }
+
+    private fun readableDropMessage(error: Throwable): String =
+        error.message?.takeIf { it.isNotBlank() } ?: "Connection lost."
+
     fun disconnect(clearCredentials: Boolean = false) {
+        backgroundScope.launch {
+            connectMutex.withLock { disconnectLocked(clearCredentials) }
+        }
+    }
+
+    /** Must be called while holding [connectMutex]. */
+    private fun disconnectLocked(clearCredentials: Boolean) {
+        intentionallyDisconnected = true
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectAttempts.set(0)
         closeSocket()
+        threadCursors.clear()
         if (clearCredentials) store.clearAll()
         sessionToken = null
         baseUrl = null
@@ -1110,7 +1408,7 @@ class SynaraRepository(context: Context) {
         val httpFeatureUrl = serverUrl.newBuilder()
             .encodedPath("/ws")
             .addQueryParameter("wsToken", wsToken)
-            .addQueryParameter("x-synara-client-build", "android-0.1.0")
+            .addQueryParameter("x-synara-client-build", "android-${BuildConfig.VERSION_NAME}")
             .addQueryParameter("x-synara-protocol-epoch", compatibility.optInt("protocolEpoch", 1).toString())
             .addQueryParameter("x-synara-protocol-revision", compatibility.optInt("negotiatedRevision", 1).toString())
             .addQueryParameter("x-synara-server-instance", compatibility.stringOrNull("serverInstanceId") ?: "")
@@ -1126,7 +1424,7 @@ class SynaraRepository(context: Context) {
         val request = Request.Builder().url(wsUrl).build()
         socket = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                events.tryEmit(RepositoryEvent.ConnectionChanged(ConnectionState.CONNECTED))
+                setConnectionState(ConnectionState.CONNECTED)
                 opened.complete(Unit)
             }
 
@@ -1140,14 +1438,12 @@ class SynaraRepository(context: Context) {
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (!opened.isCompleted) opened.completeExceptionally(IOException(reason.ifBlank { "Connection closed." }))
-                events.tryEmit(RepositoryEvent.ConnectionChanged(ConnectionState.DISCONNECTED))
+                handleSocketDown(webSocket, IOException(reason.ifBlank { "Connection closed." }))
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (!opened.isCompleted) opened.completeExceptionally(t)
-                events.tryEmit(RepositoryEvent.ConnectionChanged(ConnectionState.DISCONNECTED))
-                events.tryEmit(RepositoryEvent.Error(t.message ?: "Connection lost."))
-                failPending(t)
+                handleSocketDown(webSocket, t)
             }
         })
         try {
@@ -1155,8 +1451,7 @@ class SynaraRepository(context: Context) {
             refreshWorkspace()
             subscribeShell()
         } catch (error: Throwable) {
-            socket?.cancel()
-            socket = null
+            closeSocket()
             throw error
         }
     }
@@ -1164,7 +1459,7 @@ class SynaraRepository(context: Context) {
     private suspend fun negotiate(serverUrl: HttpUrl): JSONObject {
         val builder = serverUrl.newBuilder()
             .encodedPath("/ws/negotiate")
-            .addQueryParameter("x-synara-client-build", "android-0.1.0")
+            .addQueryParameter("x-synara-client-build", "android-${BuildConfig.VERSION_NAME}")
             .addQueryParameter("x-synara-protocol-epoch", "1")
             .addQueryParameter("x-synara-protocol-min-revision", "1")
             .addQueryParameter("x-synara-protocol-max-revision", "1")
@@ -1200,7 +1495,7 @@ class SynaraRepository(context: Context) {
             }
             if (!response.isSuccessful) {
                 val detail = body.stringOrNull("message") ?: body.stringOrNull("error")
-                throw IOException(detail ?: "Synara returned HTTP ${response.code}.")
+                throw IOException(detail ?: httpFailureMessage(response.code))
             }
             HttpResult(response.code, body)
         }
@@ -1218,7 +1513,27 @@ class SynaraRepository(context: Context) {
         return rpc("orchestration.dispatchCommand", command)
     }
 
+    /**
+     * Sends one RPC, retrying only the server's admission-control rejections.
+     *
+     * Those rejections happen before the request is admitted, so nothing ran and a retry cannot
+     * duplicate a side effect — which is why this is safe to apply to every call, mutations
+     * included, rather than to reads alone. Any other failure propagates untouched.
+     */
     private suspend fun rpc(tag: String, payload: JSONObject): JSONObject? {
+        var attempt = 0
+        while (true) {
+            try {
+                return rpcOnce(tag, payload)
+            } catch (error: IOException) {
+                if (!RpcCapacity.shouldRetry(attempt, error)) throw error
+                delay(RpcCapacity.retryDelayMs(error))
+                attempt += 1
+            }
+        }
+    }
+
+    private suspend fun rpcOnce(tag: String, payload: JSONObject): JSONObject? {
         val id = requestIds.getAndIncrement().toString()
         val deferred = CompletableDeferred<JSONObject?>()
         pending[id] = deferred
@@ -1283,34 +1598,20 @@ class SynaraRepository(context: Context) {
                     }
                     pending[requestId]?.complete(response)
                     streams.remove(requestId)?.let { streamCompletions.remove(requestId)?.invoke() }
+                    streamThreads.remove(requestId)
                 } else {
-                    val error = rpcFailureMessage(exit)
-                    pending[requestId]?.completeExceptionally(IOException(error))
+                    val error = RpcCapacity.fromExit(exit)
+                    pending[requestId]?.completeExceptionally(error)
                     streams.remove(requestId)
                     streamCompletions.remove(requestId)?.invoke()
+                    // A thread subscription that ended in an error cannot be resumed from its
+                    // cursor: the server rejected the resume or the stream broke mid-gap, so the
+                    // next subscribe must take a fresh snapshot instead.
+                    forgetStream(requestId)
                 }
             }
             "Defect" -> failPending(IOException(frame.optString("defect", "Synara RPC failed.")))
         }
-    }
-
-    private fun rpcFailureMessage(exit: JSONObject): String {
-        fun findMessage(value: Any?): String? = when (value) {
-            is JSONObject -> {
-                value.stringOrNull("message")
-                    ?: value.stringOrNull("error")
-                    ?: findMessage(value.opt("error"))
-                    ?: findMessage(value.opt("cause"))
-                    ?: findMessage(value.opt("data"))
-            }
-            is JSONArray -> (0 until value.length()).asSequence()
-                .mapNotNull { index -> findMessage(value.opt(index)) }
-                .firstOrNull()
-            else -> null
-        }
-        return findMessage(exit.opt("cause"))
-            ?: exit.stringOrNull("message")
-            ?: "Synara rejected the request."
     }
 
     private fun sendFrame(frame: JSONObject): Boolean {
@@ -1335,16 +1636,15 @@ class SynaraRepository(context: Context) {
         pending.clear()
     }
 
-    private fun setConnectionState(state: ConnectionState) {
-        events.tryEmit(RepositoryEvent.ConnectionChanged(state))
-    }
-
     private fun newId(): String = java.util.UUID.randomUUID().toString()
 
     private data class HttpResult(val code: Int, val body: JSONObject)
 
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        /** Minimum spacing between throttled [wake] calls. */
+        private const val WAKE_THROTTLE_MS = 2_000L
 
         fun normalizeBaseUrl(input: String): HttpUrl {
             val candidate = input.trim().let { value ->
