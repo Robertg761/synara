@@ -105,6 +105,12 @@ import Migration0086 from "./Migrations/086_NormalizeStudioThreadWorkspaces.ts";
 import Migration0087 from "./Migrations/087_DropUnusedOrchestrationEventIndexes.ts";
 import Migration0088 from "./Migrations/088_ProjectionThreadsSettledAt.ts";
 import Migration0089 from "./Migrations/089_RecoverRetentionHiddenThreads.ts";
+import Migration0090 from "./Migrations/090_ProjectionThreadMessageTextSegments.ts";
+import Migration0091 from "./Migrations/091_AutomationFailureTolerance.ts";
+import Migration0092 from "./Migrations/092_BackfillAutomationRunThreadSource.ts";
+import Migration0093 from "./Migrations/093_BackfillMaxIterationsDisabledReason.ts";
+import Migration0094 from "./Migrations/094_ProjectionThreadsGoal.ts";
+import Migration0095 from "./Migrations/095_ProjectionThreadsGoalTiming.ts";
 import Migration0096 from "./Migrations/096_ProjectionThreadsGoalAchievements.ts";
 import Migration0097 from "./Migrations/097_AuthSessionRenewalPolicy.ts";
 

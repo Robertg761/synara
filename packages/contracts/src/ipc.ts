@@ -554,8 +554,6 @@ export interface DesktopRemoteAccessState {
 
 export interface DesktopRemoteAccessSetEnabledInput {
   readonly enabled: boolean;
-export interface DesktopRemoteAccessSetEnabledInput {
-  readonly enabled: boolean;
   readonly port?: number;
 }
 

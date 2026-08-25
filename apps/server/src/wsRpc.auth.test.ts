@@ -137,8 +137,14 @@ it.effect("preserves the legacy loopback token on the device frame socket", () =
     );
 
     const authorized = yield* authorizeDeviceFrameWebSocketUpgrade({
-      config: { host: "127.0.0.1", authToken: "desktop-secret", publicUrl: undefined },
+      config: {
+        host: "127.0.0.1",
+        authToken: "desktop-secret",
+        publicUrl: undefined,
+        mode: "desktop",
+      },
       legacyToken: "desktop-secret",
+      remoteAddress: "127.0.0.1",
       request: {
         headers: {},
         cookies: {},
@@ -159,8 +165,14 @@ it.effect("rejects an invalid legacy token on a remotely exposed device frame so
     );
 
     const authorized = yield* authorizeDeviceFrameWebSocketUpgrade({
-      config: { host: "0.0.0.0", authToken: "remote-secret", publicUrl: undefined },
+      config: {
+        host: "0.0.0.0",
+        authToken: "remote-secret",
+        publicUrl: undefined,
+        mode: "desktop",
+      },
       legacyToken: "wrong-secret",
+      remoteAddress: "192.168.1.50",
       request: {
         headers: {},
         cookies: {},

@@ -146,7 +146,9 @@ describe("resolveWsHttpUrl", () => {
 
   it("does not forward the websocket token to an absolute external URL", () => {
     stubWindow({ bridgeWsUrl: "wss://synara.test/ws?token=legacy-secret" });
-    expect(resolveWsHttpUrl("https://example.test/image.png")).toBe("https://example.test/image.png");
+    expect(resolveWsHttpUrl("https://example.test/image.png")).toBe(
+      "https://example.test/image.png",
+    );
   });
 
   it("falls back to the page origin when the configured WS URL is unparsable", () => {

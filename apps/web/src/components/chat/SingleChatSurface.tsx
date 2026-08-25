@@ -1311,6 +1311,13 @@ export function SingleChatSurface(props: {
           />
         )}
         <WorkspaceSearchPalette
+          open={searchPaletteOpen}
+          mode={searchPaletteMode}
+          onOpenChange={setSearchPaletteOpen}
+          cwd={workspaceRoot}
+          onOpenFile={handleOpenWorkspaceSearchFile}
+          onOpenDirectory={handleOpenWorkspaceSearchDirectory}
+        />
       </div>
     </WorkspaceFileOpenerContext.Provider>
   );

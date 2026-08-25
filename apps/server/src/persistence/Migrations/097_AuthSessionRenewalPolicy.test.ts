@@ -43,7 +43,7 @@ describe("097_AuthSessionRenewalPolicy", () => {
   it.effect("backfills pre-existing rows from the lifetime they were issued with", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 89 });
+      yield* runMigrations({ toMigrationInclusive: 96 });
       // Issued with the default 30-day TTL: the population that must keep sliding.
       yield* insertLegacySession(sql, {
         sessionId: "default-ttl",
@@ -63,7 +63,7 @@ describe("097_AuthSessionRenewalPolicy", () => {
         expiresAt: "2026-01-01T01:00:00.000Z",
       });
 
-      yield* runMigrations({ toMigrationInclusive: 90 });
+      yield* runMigrations({ toMigrationInclusive: 97 });
 
       const policies = yield* readPolicies(sql);
       assert.strictEqual(policies.get("default-ttl"), "sliding");
@@ -75,7 +75,7 @@ describe("097_AuthSessionRenewalPolicy", () => {
   it.effect("adds the column once and safely accepts a pre-existing one", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 89 });
+      yield* runMigrations({ toMigrationInclusive: 96 });
       yield* sql`
         ALTER TABLE auth_sessions
         ADD COLUMN renewal_policy TEXT NOT NULL DEFAULT 'sliding'
@@ -86,7 +86,7 @@ describe("097_AuthSessionRenewalPolicy", () => {
         expiresAt: "2026-01-01T01:00:00.000Z",
       });
 
-      yield* runMigrations({ toMigrationInclusive: 90 });
+      yield* runMigrations({ toMigrationInclusive: 97 });
 
       const columns = yield* sql<{ readonly name: string }>`
         SELECT name FROM pragma_table_info('auth_sessions')
@@ -99,19 +99,19 @@ describe("097_AuthSessionRenewalPolicy", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
 
-  it.effect("propagates schema failures and leaves migration 90 retryable", () =>
+  it.effect("propagates schema failures and leaves migration 97 retryable", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 89 });
+      yield* runMigrations({ toMigrationInclusive: 96 });
       yield* sql`DROP TABLE auth_sessions`;
 
-      const exit = yield* Effect.exit(runMigrations({ toMigrationInclusive: 90 }));
+      const exit = yield* Effect.exit(runMigrations({ toMigrationInclusive: 97 }));
       assert.isTrue(Exit.isFailure(exit));
 
       const tracker = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count
         FROM effect_sql_migrations
-        WHERE migration_id = 90
+        WHERE migration_id = 97
       `;
       assert.strictEqual(tracker[0]?.count, 0);
     }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),

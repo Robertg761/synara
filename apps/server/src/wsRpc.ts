@@ -2141,8 +2141,9 @@ export function authenticateRpcWebSocketUpgrade(input: {
  * the RPC socket rather than calling ServerAuth directly.
  */
 export function authorizeDeviceFrameWebSocketUpgrade(input: {
-  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">;
+  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl" | "mode">;
   readonly legacyToken: string | null;
+  readonly remoteAddress: string | null | undefined;
   readonly request: AuthRequest;
   readonly serverAuth: Pick<ServerAuthShape, "authenticateWebSocketUpgrade">;
 }): Effect.Effect<boolean> {
@@ -2359,6 +2360,7 @@ const deviceFrameRouteLayer = makeDeviceFrameRouteLayer({
       return yield* authorizeDeviceFrameWebSocketUpgrade({
         config,
         legacyToken: url.searchParams.get("token"),
+        remoteAddress: request.remoteAddress,
         request: makeEffectAuthRequest(request),
         serverAuth,
       });
@@ -2375,6 +2377,7 @@ const computerFrameRouteLayer = makeComputerFrameRouteLayer({
       return yield* authorizeComputerFrameWebSocketUpgrade({
         config,
         legacyToken: url.searchParams.get("token"),
+        remoteAddress: request.remoteAddress,
         request: makeEffectAuthRequest(request),
         serverAuth,
       });
