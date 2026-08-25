@@ -14,6 +14,7 @@ TOPICS=(
   computer-use-linux
   android-app
   session-sync
+  desktop-flavor-env
   workflow
 )
 
