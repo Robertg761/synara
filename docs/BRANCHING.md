@@ -10,6 +10,7 @@ the branches have distinct jobs.
 | `computer-use-linux` | Linux computer use. → PR #780 | Yes |
 | `android-app` | The Android app and remote access. | Yes |
 | `session-sync` | Importing external agent sessions. | Yes |
+| `desktop-flavor-env` | One-line turbo fix so `SYNARA_DESKTOP_FLAVOR` reaches Electron. | Yes |
 | `workflow` | This script and this document. | Yes |
 | `integration` | Every topic merged onto `upstream/main`. | **No.** It is regenerated. |
 

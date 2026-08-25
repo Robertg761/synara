@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # Topic branches, in merge order. Add a branch here the day you create it.
-TOPICS=(
+TOPICS=(computer-use-linux android-app session-sync desktop-flavor-env workflow)
   computer-use-linux
   android-app
   session-sync
