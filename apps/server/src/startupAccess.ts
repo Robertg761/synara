@@ -7,6 +7,11 @@ export const isLoopbackHost = (host: string | undefined): boolean => {
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 };
 
+export const isLoopbackPeerAddress = (remoteAddress: string | null | undefined): boolean => {
+  const normalized = remoteAddress?.trim().toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "::ffff:127.0.0.1";
+};
+
 export const formatHostForUrl = (host: string): string =>
   host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 

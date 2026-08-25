@@ -16,6 +16,7 @@ import {
   useSyncExternalStore,
 } from "react";
 
+import { goBackInAppHistory, resolveAppNavigationState } from "../../appNavigation";
 import { useAppSettings } from "../../appSettings";
 import { useComposerDraftStore } from "../../composerDraftStore";
 import type { DiffRouteSearch } from "../../diffRouteSearch";
@@ -44,6 +45,8 @@ import {
 import type { DockPaneRuntimeMode } from "../../lib/dockPaneActivation";
 import type { FileCommentSelection } from "../../lib/fileComments";
 import { gitBranchesQueryOptions } from "../../lib/gitReactQuery";
+import { ChevronLeftIcon } from "../../lib/icons";
+import { useLayoutMode } from "../../lib/layoutMode";
 import { canComposerHandlePanelWidth } from "../../lib/panelResize";
 import { projectListDirectoriesQueryOptions } from "../../lib/projectReactQuery";
 import { waitForSidechatCreator } from "../../lib/sidechatCreatorRegistry";
@@ -64,6 +67,8 @@ import { requestExplorerReveal } from "../../explorerRevealRequestStore";
 import { selectRightDockState, useRightDockStore } from "../../rightDockStore";
 import {
   resolveActivePane,
+  resolveDockVisibility,
+  resolveVisibleDockPane,
   findMissingSidechatPaneIds,
   type RightDockPane,
   type RightDockPaneKind,
@@ -93,7 +98,11 @@ import {
 } from "./ChatThreadSurfacePrimitives";
 import { PanelStateMessage } from "./PanelStateMessage";
 import { RightDock } from "./RightDock";
-import { getRightDockPaneMeta, resolveRightDockLauncherItems } from "./rightDockPaneMeta";
+import {
+  getRightDockPaneMeta,
+  resolveRightDockLauncherItems,
+  resolveRightDockPaneLabel,
+} from "./rightDockPaneMeta";
 import {
   CHAT_BACKGROUND_CLASS_NAME,
   CHAT_MAIN_CONTENT_SURFACE_CLASS_NAME,
@@ -106,6 +115,10 @@ import {
 } from "../pullRequest/pullRequestDetail.logic";
 import { usePullRequestPaneStateIcon } from "../pullRequest/usePullRequestPaneStateIcon";
 import { RouteInsetSurface } from "../RouteInsetSurface";
+import { PHONE_HEADER_ICON_BUTTON_CLASS } from "../phone/phoneChrome";
+import { PhonePaneScreen } from "../phone/PhonePaneScreen";
+import { usePhonePaneRouteSync } from "../phone/usePhonePaneRoute";
+import { IconButton } from "../ui/icon-button";
 import { SidebarInset } from "../ui/sidebar";
 import { toastManager } from "../ui/toast";
 import { WorkspaceSearchPalette, type WorkspaceSearchPaletteMode } from "../WorkspaceSearchPalette";
@@ -189,6 +202,11 @@ export function SingleChatSurface(props: {
   projectId: ProjectId | null;
 }) {
   const navigate = useNavigate();
+  // The one flag that decides this arrangement: the right dock is a nested Sidebar,
+  // which turns into a Sheet below the phone breakpoint, so phone layouts never mount
+  // it and present dock panes as pushed full-screen routes instead.
+  const layoutMode = useLayoutMode();
+  const isPhoneLayout = layoutMode === "phone";
   const createSplitView = useSplitViewStore((store) => store.createFromThread);
   const createSplitViewFromDrop = useSplitViewStore((store) => store.createFromDrop);
   const dockState = useRightDockStore(
@@ -292,15 +310,69 @@ export function SingleChatSurface(props: {
   const [searchPaletteOpen, setSearchPaletteOpen] = useState(false);
   const [searchPaletteMode, setSearchPaletteMode] = useState<WorkspaceSearchPaletteMode>("files");
 
+  // The store's notion of an active pane, which is NOT the same question as "what is on
+  // screen" (see dockVisibility below). It still drives the chat shell's panel bridge and the
+  // editor view, where the dock is not rendered but its pane runtime must not be torn down.
   const activePane = resolveActivePane(dockState);
+  // Single source of truth for "is a dock pane on screen, and which one" — shared with the
+  // sidechat detail leases and toast visibility so the rule cannot drift per call site.
+  const dockVisibility = resolveDockVisibility({
+    layoutMode,
+    view: props.search.view,
+    urlPaneId: props.search.pane,
+  });
+  // The pushed screen renders off the URL, not off the store: persisted dock state must
+  // never flash a full-screen pane on a cold load, and back must clear the screen on the
+  // same frame the history entry pops (the store follows via the sync below).
+  const phonePaneScreenPane = dockVisibility.dockRendered
+    ? null
+    : resolveVisibleDockPane(dockVisibility, dockState);
+
+  // Phone only: `?pane=<paneId>` is the history entry backing the pushed pane screen.
+  // Opening a pane pushes it, browser/hardware back pops it, and a param that no
+  // longer resolves is dropped in place. The editor view has no dock (it is the other
+  // `dockRendered: false` case), so it opts out.
+  const phonePaneRouteEnabled = !dockVisibility.dockRendered && !editorViewActive;
+  usePhonePaneRouteSync({
+    enabled: phonePaneRouteEnabled,
+    threadId: props.threadId,
+    urlPaneId: props.search.pane ?? null,
+    dockState,
+  });
   const {
     activePaneRuntimeMode,
     requestActivePaneLive: requestActiveDockPaneLive,
     requestImmediateHydration: requestImmediateDockHydration,
   } = useDockPaneRuntimeActivation({
     threadId: props.threadId,
-    activePane,
+    // Runtime hydration must follow the pane that is actually on screen. On phone that is the
+    // URL-named pane, which the sync above is still converging the store onto — deriving from
+    // `resolveActivePane` would hand the pushed screen another pane's runtime mode (a sleeping
+    // terminal, a preview browser) for the frames in between. Desktop is unchanged:
+    // `phonePaneScreenPane` is always null there.
+    activePane: phonePaneScreenPane ?? activePane,
   });
+  // The pushed screen IS an open dock surface, so pane runtimes must not be gated on
+  // `dockState.open` alone: on the first frame of a deep link the store has not been adopted
+  // yet, which would idle the visible pane's queries and sleep its terminal. Desktop keeps the
+  // exact `dockState.open` gate (`phonePaneScreenPane` is null).
+  const dockSurfaceOpen = dockState.open || phonePaneScreenPane !== null;
+
+  // Leaving the phone layout (rotation, window resize, desktop hand-off) must not strand a
+  // `?pane=` the desktop dock has no use for: the dock renders from the store there, and a
+  // lingering param would come back as a full-screen pane the moment the viewport narrows
+  // again. Replace, never push, so this is invisible to history.
+  useEffect(() => {
+    if (!dockVisibility.dockRendered || props.search.pane === undefined) {
+      return;
+    }
+    void navigate({
+      to: "/$threadId",
+      params: { threadId: props.threadId },
+      replace: true,
+      search: (previous) => ({ ...previous, pane: undefined }),
+    });
+  }, [dockVisibility.dockRendered, navigate, props.search.pane, props.threadId]);
 
   // Bridge the dock's active browser/diff pane back into the panelState shape the
   // chat shell still consumes (diff badge, toggle pressed state, transcript gating).
@@ -530,6 +602,17 @@ export function SingleChatSurface(props: {
       return true;
     },
     prefetchFile: prefetchOpenerFile,
+  };
+
+  // Phone chat header leading control: leaves the thread for the phone home. An in-app
+  // previous entry is popped (so the home screen keeps its scroll/state); a cold entry
+  // into the thread has nothing to pop and navigates to the chat index instead.
+  const handlePhoneLeaveThread = () => {
+    if (resolveAppNavigationState().canGoBack) {
+      goBackInAppHistory();
+      return;
+    }
+    void navigate({ to: "/" });
   };
 
   const handleSplitSurface = () => {
@@ -910,8 +993,8 @@ export function SingleChatSurface(props: {
               })
             }
             onClosePanel={() => closePane(props.threadId, pane.id)}
-            liveRefreshEnabled={context.isActive && dockState.open}
-            queriesEnabled={context.isActive && dockState.open}
+            liveRefreshEnabled={context.isActive && dockSurfaceOpen}
+            queriesEnabled={context.isActive && dockSurfaceOpen}
           />
         );
       case "terminal":
@@ -928,7 +1011,7 @@ export function SingleChatSurface(props: {
             <DockTerminalPane
               hostThreadId={props.threadId}
               projectId={props.projectId}
-              isActive={context.isActive && dockState.open}
+              isActive={context.isActive && dockSurfaceOpen}
               onClosePanel={() => closePane(props.threadId, pane.id)}
             />
           </Suspense>
@@ -1142,7 +1225,15 @@ export function SingleChatSurface(props: {
           onDrop={handleDropThread}
           className="flex h-full min-h-0 min-w-0 flex-1"
         >
-          <RouteInsetSurface surfaceClassName={CHAT_BACKGROUND_CLASS_NAME}>
+          <RouteInsetSurface
+            surfaceClassName={CHAT_BACKGROUND_CLASS_NAME}
+            // The phone pane screen is `fixed inset-0` over a chat surface that stays mounted, so
+            // without this Tab and screen-reader swipe would walk into the covered composer and
+            // header. `inert` (not a focus trap) is the right tool: the pane is a pushed route,
+            // not a modal, and this keeps the covered surface out of the a11y tree and the tab
+            // order for exactly as long as it is covered.
+            inert={phonePaneScreenPane !== null}
+          >
             <DeferredChatView
               threadId={props.threadId}
               paneScopeId={SINGLE_CHAT_PANE_SCOPE_ID}
@@ -1151,12 +1242,36 @@ export function SingleChatSurface(props: {
               isFocusedPane
               panelState={chatPanelState}
               onToggleDiff={handleToggleDiff}
-              onToggleRightDock={handleToggleRightDock}
-              onToggleBrowser={handleToggleBrowser}
-              {...(hasDeviceSupport ? { onToggleDevice: handleToggleDevice } : {})}
               onOpenBrowserUrl={handleOpenBrowserUrl}
               onOpenTurnDiff={handleOpenTurnDiff}
-              onSplitSurface={handleSplitSurface}
+              // Split view, the in-app browser toggle and the right-dock toggle are desktop-only
+              // affordances: omit the props on phone so the header never offers them (the dock
+              // is not mounted there, so a toggle would only flip persisted `open` and show
+              // nothing), and supply the phone back chevron in the header's leading slot
+              // instead.
+              {...(isPhoneLayout
+                ? {
+                    headerLeadingControl: (
+                      <IconButton
+                        label="Back to chats"
+                        variant="ghost"
+                        size="icon"
+                        className={PHONE_HEADER_ICON_BUTTON_CLASS}
+                        onClick={handlePhoneLeaveThread}
+                      >
+                        <ChevronLeftIcon />
+                      </IconButton>
+                    ),
+                    // The phone shell mounts no sidebar, so the header's
+                    // sidebar-toggle would be a dead control.
+                    hideSidebarControls: true,
+                  }
+                : {
+                    onToggleBrowser: handleToggleBrowser,
+                    onToggleRightDock: handleToggleRightDock,
+                    ...(hasDeviceSupport ? { onToggleDevice: handleToggleDevice } : {}),
+                    onSplitSurface: handleSplitSurface,
+                  })}
               viewModeAction={{
                 label: "Editor view",
                 active: false,
@@ -1165,32 +1280,37 @@ export function SingleChatSurface(props: {
             />
           </RouteInsetSurface>
         </ChatPaneDropOverlay>
-        <RightDock
-          state={dockState}
-          minWidth={SINGLE_PANEL_MIN_WIDTH}
-          defaultWidth={DIFF_INLINE_DEFAULT_WIDTH}
-          shouldAcceptWidth={shouldAcceptDockWidth}
-          addMenuKinds={availableDockPaneKinds}
-          launcherItems={dockLauncherItems}
-          motionKey={props.threadId}
-          activePaneRuntimeMode={activePaneRuntimeMode}
-          {...(paneLabelOverrides ? { paneLabelOverrides } : {})}
-          {...(paneIconOverrides ? { paneIconOverrides } : {})}
-          onSelectPane={handleSelectDockPane}
-          onClosePane={(paneId) => closePane(props.threadId, paneId)}
-          onCollapse={() => setDockOpen(props.threadId, false)}
-          onOpenChange={(open) => setDockOpen(props.threadId, open)}
-          onAddPane={handleAddDockPane}
-          renderPane={renderDockPane}
-        />
+        {!dockVisibility.dockRendered ? (
+          phonePaneScreenPane ? (
+            <PhonePaneScreen
+              pane={phonePaneScreenPane}
+              title={resolveRightDockPaneLabel(phonePaneScreenPane, paneLabelOverrides)}
+              runtimeMode={activePaneRuntimeMode}
+              onClose={() => closePane(props.threadId, phonePaneScreenPane.id)}
+              renderPane={renderDockPane}
+            />
+          ) : null
+        ) : (
+          <RightDock
+            state={dockState}
+            minWidth={SINGLE_PANEL_MIN_WIDTH}
+            defaultWidth={DIFF_INLINE_DEFAULT_WIDTH}
+            shouldAcceptWidth={shouldAcceptDockWidth}
+            addMenuKinds={availableDockPaneKinds}
+            launcherItems={dockLauncherItems}
+            motionKey={props.threadId}
+            activePaneRuntimeMode={activePaneRuntimeMode}
+            {...(paneLabelOverrides ? { paneLabelOverrides } : {})}
+            {...(paneIconOverrides ? { paneIconOverrides } : {})}
+            onSelectPane={handleSelectDockPane}
+            onClosePane={(paneId) => closePane(props.threadId, paneId)}
+            onCollapse={() => setDockOpen(props.threadId, false)}
+            onOpenChange={(open) => setDockOpen(props.threadId, open)}
+            onAddPane={handleAddDockPane}
+            renderPane={renderDockPane}
+          />
+        )}
         <WorkspaceSearchPalette
-          open={searchPaletteOpen}
-          mode={searchPaletteMode}
-          onOpenChange={setSearchPaletteOpen}
-          cwd={workspaceRoot}
-          onOpenFile={handleOpenWorkspaceSearchFile}
-          onOpenDirectory={handleOpenWorkspaceSearchDirectory}
-        />
       </div>
     </WorkspaceFileOpenerContext.Provider>
   );

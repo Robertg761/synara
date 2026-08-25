@@ -8,6 +8,23 @@ const CSS_WIDE_KEYWORDS = new Set(["inherit", "initial", "revert", "revert-layer
 export const DEFAULT_MONOSPACE_FONT_FAMILY_STACK =
   '"JetBrains Mono Variable", "JetBrains Mono", "SF Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace';
 
+/**
+ * Self-hosted variable faces register under a `"<Family> Variable"` name
+ * (@fontsource-variable, see src/fonts.ts), while themes and users type the plain
+ * family name ("Inter", "Geist"). Every known family is therefore expanded to
+ * `"<Family> Variable", <Family>`: the bundled face wins, and a locally installed
+ * copy of the plain family still resolves for anyone who has one.
+ *
+ * JetBrains Mono is deliberately absent — DEFAULT_MONOSPACE_FONT_FAMILY_STACK already
+ * carries "JetBrains Mono Variable" and is appended to every code-font value.
+ */
+const SELF_HOSTED_VARIABLE_FONT_FAMILIES = new Map<string, string>([
+  ["dm sans", "DM Sans Variable"],
+  ["geist", "Geist Variable"],
+  ["geist mono", "Geist Mono Variable"],
+  ["inter", "Inter Variable"],
+]);
+
 const GENERIC_FONT_FAMILIES = new Set([
   "cursive",
   "emoji",
@@ -101,6 +118,13 @@ function unquoteFontFamily(family: string): string {
   return trimmedFamily;
 }
 
+// Prepends the bundled variable alias for the families we self-host, keeping the
+// requested name right behind it as a fallback. No-op for every other family.
+function expandSelfHostedFontFamily(family: string): string {
+  const alias = SELF_HOSTED_VARIABLE_FONT_FAMILIES.get(unquoteFontFamily(family).toLowerCase());
+  return alias === undefined ? family : `${quoteFontFamily(alias)}, ${family}`;
+}
+
 function hasGenericFontFamily(value: string): boolean {
   return splitFontFamilyList(value).some((family) =>
     GENERIC_FONT_FAMILIES.has(unquoteFontFamily(family).toLowerCase()),
@@ -113,7 +137,10 @@ export function normalizeFontFamilyCssValue(value: string | null | undefined): s
     return null;
   }
 
-  return splitFontFamilyList(trimmedValue).map(normalizeSingleFontFamily).join(", ");
+  return splitFontFamilyList(trimmedValue)
+    .map(normalizeSingleFontFamily)
+    .map(expandSelfHostedFontFamily)
+    .join(", ");
 }
 
 // Keeps theme-provided code fonts from falling through to the browser's serif default.

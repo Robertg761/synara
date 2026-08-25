@@ -13,7 +13,14 @@ import {
   type ThreadId,
 } from "@synara/contracts";
 import { isGenericChatThreadTitle } from "@synara/shared/chatThreads";
-import React, { type Dispatch, type SetStateAction, useEffect, useRef, useState } from "react";
+import React, {
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { FiGitBranch } from "react-icons/fi";
 import { HiMiniArrowsPointingOut } from "react-icons/hi2";
 import { TbExchange } from "react-icons/tb";
@@ -83,6 +90,11 @@ interface ChatHeaderProps {
     title: string;
   }>;
   className?: string;
+  // Optional control pinned to the very leading edge of the header, before the sidebar
+  // navigation cluster (phone chat passes its back affordance here). The slot only keeps
+  // the node from being squeezed by the flex row; sizing and the touch target are the
+  // caller's responsibility. Omitting it leaves the header markup exactly as it was.
+  leadingControl?: ReactNode;
   hideSidebarControls?: boolean;
   hideHandoffControls?: boolean;
   // Empty-draft landings hide all thread-scoped chrome (title, Hand off, project
@@ -509,6 +521,7 @@ export function ChatHeader({
   activeProjectName,
   threadBreadcrumbs,
   className,
+  leadingControl,
   hideSidebarControls: hideSidebarControlsProp,
   hideHandoffControls: hideHandoffControlsProp,
   minimalChrome: minimalChromeProp,
@@ -670,6 +683,10 @@ export function ChatHeader({
           !isMobile && state === "collapsed" ? "gap-4" : "gap-2 sm:gap-3",
         )}
       >
+        {/* Leading slot: rendered before every other leading item, and only when supplied so
+            the desktop header keeps its exact markup. `shrink-0` mirrors the sidebar cluster
+            so a compact (<700px) header shrinks the title instead of the control. */}
+        {leadingControl ? <div className="flex shrink-0 items-center">{leadingControl}</div> : null}
         {hideSidebarControls ? null : <SidebarHeaderNavigationControls />}
         <div
           className={cn(

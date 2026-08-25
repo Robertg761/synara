@@ -2,8 +2,9 @@
 // Purpose: Builds authenticated local-image URLs for markdown image previews and downloads.
 // Layer: Web utility
 // Exports: local image URL detection and builders
-// Depends on: wsHttpUrl (so desktop requests carry the legacy startup token used by attachments)
-//             and @synara/shared/localPreviewFiles for the canonical route + extension allowlist.
+// Depends on: mediaAssetUrls (so requests carry whatever credential this runtime has: the desktop
+//             startup token, or the mobile shell's media credential) and
+//             @synara/shared/localPreviewFiles for the canonical route + extension allowlist.
 
 import {
   LOCAL_IMAGE_ROUTE_PATH,
@@ -11,7 +12,7 @@ import {
 } from "@synara/shared/localPreviewFiles";
 import { isWindowsAbsolutePath } from "@synara/shared/path";
 
-import { resolveWsHttpUrl } from "./wsHttpUrl";
+import { resolveMediaHttpUrl } from "./mediaAssetUrls";
 
 function normalizeMarkdownImagePath(src: string): string {
   const trimmed = src.trim();
@@ -69,10 +70,11 @@ export function buildLocalImageUrl(input: {
   if (input.download) {
     params.set("download", "1");
   }
-  // Always route through the WS-derived HTTP origin so desktop builds (custom protocol)
-  // include the same legacy startup token attachments already use; in web/dev (where
-  // the page and server share an origin) this falls back to the same relative path.
-  return resolveWsHttpUrl(`${LOCAL_IMAGE_ROUTE_PATH}?${params.toString()}`);
+  // Always route through the media URL builder so desktop builds (custom protocol) include the
+  // same legacy startup token attachments already use and the mobile shell gets its media
+  // credential; in web/dev (where the page and server share an origin) this resolves to the same
+  // relative path against the page origin.
+  return resolveMediaHttpUrl(`${LOCAL_IMAGE_ROUTE_PATH}?${params.toString()}`);
 }
 
 export function localImageFileName(src: string): string {

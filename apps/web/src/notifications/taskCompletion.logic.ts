@@ -1,7 +1,8 @@
 // FILE: taskCompletion.logic.ts
 // Purpose: Detects new thread lifecycle notifications and builds alert copy.
 // Layer: Notification logic
-// Exports: lifecycle detection helpers and notification copy helpers
+// Exports: lifecycle detection helpers, shell notification support helpers, and
+//          notification copy helpers
 
 import {
   defaultTerminalTitleForCliKind,
@@ -9,6 +10,7 @@ import {
   type TerminalVisualState,
 } from "@synara/shared/terminalThreads";
 import { pendingRequestInstanceKey } from "@synara/shared/threadSummary";
+import type { AppRuntime } from "../env";
 import type { Thread, ThreadSession } from "../types";
 import {
   derivePendingApprovals,
@@ -862,6 +864,71 @@ export function buildTerminalAttentionCopy(candidate: TerminalAttentionCandidate
 export const collectInputNeededThreadCandidates = collectThreadAttentionCandidates;
 
 export const buildInputNeededCopy = buildThreadAttentionCopy;
+
+/**
+ * Browser Notification permission as the settings UI models it: the three DOM
+ * states plus the two reasons the API is unusable altogether.
+ */
+export type BrowserNotificationPermissionState =
+  | NotificationPermission
+  | "unsupported"
+  | "insecure";
+
+/**
+ * Single decision point for whether the Web Notification path is usable in the
+ * current shell.
+ *
+ * The mobile shell is an Android WebView with no Web Notification UI:
+ * `Notification.requestPermission()` never surfaces a prompt and
+ * `new Notification(...)` displays nothing. Reporting "unsupported" there is
+ * what keeps every caller off that path at once — the permission prompt, the
+ * OS-notification web fallback, and the settings status line all key off this
+ * value, so mobile gating lives here rather than at each call site. Mobile
+ * notifications are delivered by the Synara app's background watch instead.
+ */
+export function resolveBrowserNotificationPermissionState(input: {
+  runtime: AppRuntime;
+  hasNotificationApi: boolean;
+  isSecureContext: boolean;
+  permission: NotificationPermission;
+}): BrowserNotificationPermissionState {
+  if (input.runtime === "mobile") {
+    return "unsupported";
+  }
+  if (!input.hasNotificationApi) {
+    return "unsupported";
+  }
+  if (!input.isSecureContext) {
+    return "insecure";
+  }
+  return input.permission;
+}
+
+// Native shells deliver OS notifications themselves, so their status line
+// explains the delivery channel instead of a browser permission.
+export function resolveNotificationSettingsSupportText(
+  runtime: AppRuntime,
+  permissionState: BrowserNotificationPermissionState,
+): string {
+  if (runtime === "electron") {
+    return "Desktop app notifications use your operating system notification center.";
+  }
+  if (runtime === "mobile") {
+    return "Mobile app notifications come from Synara's background watch once it is switched on, not from the browser.";
+  }
+  switch (permissionState) {
+    case "granted":
+      return "Browser notifications are enabled for this app.";
+    case "denied":
+      return "Browser notifications are blocked. Re-enable them in your browser site settings.";
+    case "insecure":
+      return "Browser notifications need a secure context. Localhost works; plain HTTP does not.";
+    case "unsupported":
+      return "This browser does not support desktop notifications.";
+    case "default":
+      return "Allow browser notifications to get alerts when chats or terminal agents finish or need input in the background.";
+  }
+}
 
 // Hydration can replay old thread details after refresh; only timestamps after
 // this notification runtime mounted should be treated as live events.

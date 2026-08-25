@@ -4,6 +4,7 @@ import type {
   AuthClientMetadata,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
+  AuthMediaTokenResult,
   AuthPairingCredentialResult,
   AuthPairingLink,
   AuthSessionId,
@@ -82,9 +83,21 @@ export interface ServerAuthShape {
   readonly authenticateWebSocketUpgrade: (
     request: AuthRequest,
   ) => Effect.Effect<AuthenticatedSession, AuthError>;
+  /**
+   * Authentication for the read-only media GET routes, and *only* those: identical to
+   * {@link ServerAuthShape.authenticateHttpRequest} except that a media token in the query
+   * string also authorizes the request. Never call this from a mutation or a data route — the
+   * capability it accepts is replayable from any URL the client has ever rendered.
+   */
+  readonly authenticateMediaHttpRequest: (
+    request: AuthRequest,
+  ) => Effect.Effect<AuthenticatedSession, AuthError>;
   readonly issueWebSocketToken: (
     session: AuthenticatedSession,
   ) => Effect.Effect<AuthWebSocketTokenResult, AuthError>;
+  readonly issueMediaToken: (
+    session: AuthenticatedSession,
+  ) => Effect.Effect<AuthMediaTokenResult, AuthError>;
   readonly issueStartupPairingUrl: (baseUrl: string) => Effect.Effect<string, AuthError>;
 }
 

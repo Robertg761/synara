@@ -1,3 +1,9 @@
+// FILE: ExpandedImagePreview.tsx
+// Purpose: Shapes the lightbox payload for a set of message image attachments.
+// Layer: Chat UI logic
+
+import { withCurrentMediaCredential } from "~/lib/mediaAssetUrls";
+
 export interface ExpandedImageItem {
   src: string;
   name: string;
@@ -13,7 +19,10 @@ export function buildExpandedImagePreview(
   selectedImageId: string,
 ): ExpandedImagePreview | null {
   const previewableImages = images.flatMap((image) =>
-    image.previewUrl ? [{ id: image.id, src: image.previewUrl, name: image.name }] : [],
+    // Built when the lightbox opens, from a store URL that carries no credential of its own.
+    image.previewUrl
+      ? [{ id: image.id, src: withCurrentMediaCredential(image.previewUrl), name: image.name }]
+      : [],
   );
   if (previewableImages.length === 0) {
     return null;

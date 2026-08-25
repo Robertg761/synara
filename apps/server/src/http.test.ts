@@ -99,15 +99,20 @@ const readiness: ServerReadiness = {
   }),
 };
 
+const authenticatedTestSession = () =>
+  Effect.succeed({
+    sessionId: "11111111-1111-4111-8111-111111111111" as never,
+    subject: "test-owner",
+    method: "browser-session-cookie" as const,
+    role: "owner" as const,
+    credentialSource: "cookie" as const,
+  });
+
 const serverAuth = {
-  authenticateHttpRequest: () =>
-    Effect.succeed({
-      sessionId: "11111111-1111-4111-8111-111111111111" as never,
-      subject: "test-owner",
-      method: "browser-session-cookie" as const,
-      role: "owner" as const,
-      credentialSource: "cookie" as const,
-    }),
+  authenticateHttpRequest: authenticatedTestSession,
+  // The media GET routes go through their own guard, which additionally accepts the short-lived
+  // read-only credential from the query string.
+  authenticateMediaHttpRequest: authenticatedTestSession,
 } as unknown as ServerAuthShape;
 
 const projectFaviconResolver: ProjectFaviconResolverShape = {
@@ -195,18 +200,47 @@ describe("production Effect HTTP routes", () => {
       isLegacyTokenAuthorized({
         config: loopback,
         url: new URL("http://127.0.0.1/attachments/id?token=desktop-secret"),
+        remoteAddress: "127.0.0.1",
       }),
     ).toBe(true);
     expect(
       isLegacyTokenAuthorized({
         config: { ...loopback, host: "0.0.0.0", allowInsecureRemote: true },
         url: new URL("http://192.168.1.50/attachments/id?token=desktop-secret"),
+        remoteAddress: "192.168.1.60",
       }),
     ).toBe(false);
     expect(
       isLegacyTokenAuthorized({
         config: { ...loopback, publicUrl: new URL("https://synara.example.test/") },
         url: new URL("http://127.0.0.1/attachments/id?token=desktop-secret"),
+        remoteAddress: "127.0.0.1",
+      }),
+    ).toBe(false);
+  });
+
+  it("extends startup-token trust to loopback peers on desktop remote binds only", () => {
+    const remoteDesktop = makeConfig({
+      mode: "desktop",
+      host: "0.0.0.0",
+      allowInsecureRemote: true,
+      authToken: "desktop-secret",
+    });
+    const url = new URL("http://127.0.0.1/attachments/id?token=desktop-secret");
+    expect(
+      isLegacyTokenAuthorized({ config: remoteDesktop, url, remoteAddress: "::ffff:127.0.0.1" }),
+    ).toBe(true);
+    expect(
+      isLegacyTokenAuthorized({ config: remoteDesktop, url, remoteAddress: "100.71.203.50" }),
+    ).toBe(false);
+    expect(isLegacyTokenAuthorized({ config: remoteDesktop, url, remoteAddress: undefined })).toBe(
+      false,
+    );
+    expect(
+      isLegacyTokenAuthorized({
+        config: { ...remoteDesktop, mode: "web" },
+        url,
+        remoteAddress: "127.0.0.1",
       }),
     ).toBe(false);
   });
@@ -290,12 +324,10 @@ describe("production Effect HTTP routes", () => {
     await expect(Effect.runPromise(controller.requestStop)).resolves.toBe(true);
   });
 
-  it("keeps the route unavailable outside a private desktop loopback deployment", async () => {
+  it("keeps the route unavailable outside a private desktop deployment", async () => {
     const shutdownToken = "a".repeat(64);
     const unsafeConfigs: ReadonlyArray<Partial<ServerConfigShape>> = [
       { mode: "web" },
-      { mode: "desktop", host: "0.0.0.0", allowInsecureRemote: true },
-      { mode: "desktop", host: "192.168.1.50", allowInsecureRemote: true },
       { mode: "desktop", publicUrl: new URL("https://synara.example.test/") },
       { mode: "desktop", desktopShutdownToken: undefined },
     ];
@@ -315,6 +347,31 @@ describe("production Effect HTTP routes", () => {
       );
       await expect(Effect.runPromise(controller.requestStop)).resolves.toBe(true);
     }
+  });
+
+  // Remote-access desktop binds keep the shutdown route reachable for the
+  // desktop app itself: the guard is the loopback peer, not the listen host.
+  it("keeps the route available to loopback peers on a desktop remote bind", async () => {
+    const shutdownToken = "a".repeat(64);
+    const controller = await Effect.runPromise(makeServerShutdownController());
+    await withEffectServer(
+      makeConfig({
+        mode: "desktop",
+        host: "0.0.0.0",
+        allowInsecureRemote: true,
+        desktopShutdownToken: shutdownToken,
+      }),
+      { kind: "shutdown", controller },
+      async (origin) => {
+        const response = await fetch(`${origin}${DESKTOP_SHUTDOWN_ROUTE_PATH}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${shutdownToken}` },
+        });
+        expect(response.status).toBe(202);
+      },
+    );
+    // The route accepted the request above, so it already consumed the first stop.
+    await expect(Effect.runPromise(controller.requestStop)).resolves.toBe(false);
   });
 
   it("does not register GET or OPTIONS shutdown handlers", async () => {

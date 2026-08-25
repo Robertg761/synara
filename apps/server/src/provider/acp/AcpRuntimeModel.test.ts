@@ -172,6 +172,7 @@ describe("AcpRuntimeModel", () => {
         toolCallId: "tool-denied",
         title: "Terminal",
         kind: "execute",
+        title: "Terminal",
         status: "pending",
         rawInput: { command: "git pull" },
       },
