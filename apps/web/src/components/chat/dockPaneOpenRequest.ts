@@ -1,26 +1,10 @@
 // FILE: dockPaneOpenRequest.ts
 // Purpose: One routing rule for every agent-triggered "open my dock pane" request.
 // Layer: Web chat surface logic
-// Exports: routeSingleDockPaneOpenRequest, DockPaneCrossThreadPolicy
+// Exports: routeSingleDockPaneOpenRequest
 // Depends on: nothing (pure)
 
 import type { ThreadId } from "@synara/contracts";
-
-/**
- * What a pane does when the request names a thread other than the one on screen.
- *
- * - `refuse`: drop the request. The browser pane uses this — its native runtime
- *   stays alive without mounting the route, so there is nothing to gain by
- *   stealing the user's current chat merely to make the browser executable.
- *   Nothing runs, not even hydration.
- * - `navigate`: seed the requested thread's dock and route there. The device and
- *   computer panes use this — the event carries its own thread, so an agent
- *   driving a desktop from a background thread lands the user on the thread that
- *   is actually doing the work rather than showing nothing at all.
- */
-export type DockPaneCrossThreadPolicy =
-  | { readonly kind: "refuse" }
-  | { readonly kind: "navigate"; readonly navigateToThread: (threadId: ThreadId) => void };
 
 interface DockPaneOpenRequestInput {
   readonly currentThreadId: ThreadId;
@@ -31,22 +15,23 @@ interface DockPaneOpenRequestInput {
    */
   readonly requestImmediateHydration: () => void;
   readonly openPane: (threadId: ThreadId) => void;
-  readonly crossThread: DockPaneCrossThreadPolicy;
+  /**
+   * Where to send the user when the request names some other thread. The event
+   * carries its own thread, so an agent driving a desktop from a background
+   * thread should land the user on the thread doing the work rather than show
+   * nothing at all.
+   */
+  readonly navigateToThread: (threadId: ThreadId) => void;
 }
 
 export function routeSingleDockPaneOpenRequest(input: DockPaneOpenRequestInput): void {
+  input.requestImmediateHydration();
+
   if (input.requestedThreadId === input.currentThreadId) {
-    input.requestImmediateHydration();
     input.openPane(input.currentThreadId);
     return;
   }
 
-  const crossThread = input.crossThread;
-  if (crossThread.kind === "refuse") {
-    return;
-  }
-
-  input.requestImmediateHydration();
   input.openPane(input.requestedThreadId);
-  crossThread.navigateToThread(input.requestedThreadId);
+  input.navigateToThread(input.requestedThreadId);
 }
