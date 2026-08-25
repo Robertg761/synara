@@ -1,0 +1,19 @@
+[Unit]
+Description=Synara provider-session sync daemon
+Documentation=file:///home/robert/Projects/synara/apps/session-sync/README.md
+# Start with the desktop session so Synara's runtime file already exists.
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/mise/installs/bun/1.3.12/bin/bun run %h/Projects/synara/apps/session-sync/src/main.ts
+Restart=on-failure
+RestartSec=5s
+# Point at an explicit instance if discovery via ~/.synara/userdata/server-runtime.json
+# does not match what you want synced, e.g.:
+# Environment=SESSION_SYNC_URL=http://127.0.0.1:33853
+# Environment=SESSION_SYNC_TOKEN=your-owner-token
+# Environment=SESSION_SYNC_BACKFILL=1
+
+[Install]
+WantedBy=default.target
