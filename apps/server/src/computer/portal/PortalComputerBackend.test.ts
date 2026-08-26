@@ -3,7 +3,11 @@ import { EventEmitter } from "node:events";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { COMPUTER_MESSAGE_MAX_LENGTH, type ComputerRect, type ComputerWindow } from "@synara/contracts";
+import {
+  COMPUTER_MESSAGE_MAX_LENGTH,
+  type ComputerRect,
+  type ComputerWindow,
+} from "@synara/contracts";
 
 import { ComputerBackendError } from "../ComputerBackend.ts";
 import type { DesktopHelperProvisionResult } from "../provisioning/desktopHelperProvisioning.ts";

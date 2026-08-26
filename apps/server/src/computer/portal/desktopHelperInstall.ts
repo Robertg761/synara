@@ -29,9 +29,9 @@
  * was built on. `/etc/os-release`'s `ID` and `VERSION_ID` name that system
  * exactly, are a two-line file read with no process spawned, and are already
  * what a distribution's own packaging keys on — so `(ID, VERSION_ID, arch)` is
- * the key, matched exactly, never nearest, for the same reason the plugin is:
- * a near miss does not degrade, it fails at `execve` with a message about a
- * missing `.so` that no user can act on.
+ * the key, matched exactly first, for the same reason the plugin is: a near
+ * miss does not degrade, it fails at `execve` with a message about a missing
+ * `.so` that no user can act on.
  *
  * Rolling distributions are the one place exactness cannot be spelled that way.
  * Arch publishes no `VERSION_ID` at all and Tumbleweed publishes a snapshot
@@ -41,6 +41,22 @@
  * glibc is what keeps that safe: glibc is backwards compatible but not
  * forwards, so a binary built against a newer glibc than the host has would
  * fail to start, and that entry is skipped rather than installed.
+ *
+ * ## The lineage fallback, and what keeps it honest
+ *
+ * Exact matching alone writes off most of the Linux desktop population: Mint,
+ * Pop!_OS, and elementary are `ID_LIKE=ubuntu`; Manjaro, EndeavourOS, and
+ * CachyOS are `ID_LIKE=arch`; Rocky and Alma name `fedora` in theirs; and a
+ * fresh Fedora release ages every versioned entry out of the manifest until the
+ * matrix catches up. When nothing matches exactly, a build from the host's own
+ * lineage — its `ID`, then each entry of `ID_LIKE` in the order the
+ * distribution wrote them — is tried instead. That path is only taken when both
+ * the host's glibc and the build's recorded glibc are known, because on it the
+ * version key means nothing (Mint 22's `VERSION_ID` is not Ubuntu's) and the
+ * glibc floor is the entire guard against the `execve` failure above. Among the
+ * candidates that fit, the closest ancestor wins, then the highest glibc,
+ * because the build linked against the newest libraries that still fit is the
+ * one compiled on the system most like this one.
  */
 import { access, chmod, constants, copyFile, mkdir, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -81,6 +97,8 @@ export interface HostSystem {
   readonly osVersionId: string;
   readonly arch: string;
   readonly glibc?: string;
+  /** `ID_LIKE` ancestors, closest first, for the lineage fallback. */
+  readonly idLike?: readonly string[];
 }
 
 export type DesktopHelperSource = "override" | "installed" | "prebuilt";
@@ -197,23 +215,57 @@ export async function resolveDesktopHelper(
 }
 
 /**
- * Exact on the identity, a floor on the glibc.
+ * Exact on the identity first, then the lineage fallback; a floor on the glibc
+ * either way.
  *
  * An entry with an empty `osVersionId` is a rolling distribution's, and matches
  * any version of that ID — see the module header for why that is the only
- * spelling available there, and why the glibc floor is what makes it safe.
+ * spelling available there, why the glibc floor is what makes it safe, and what
+ * keeps the fallback honest.
  */
 export function selectDesktopHelperPrebuild(
   manifest: DesktopHelperPrebuiltManifest,
   system: HostSystem,
 ): DesktopHelperPrebuild | undefined {
-  return manifest.builds.find((build) => {
+  const exact = manifest.builds.find((build) => {
     if (!same(build.arch, system.arch)) return false;
     if (!same(build.osId, system.osId)) return false;
     const version = build.osVersionId.trim();
     if (version !== "" && !same(version, system.osVersionId)) return false;
     return glibcIsAvailable(build.glibc, system.glibc);
   });
+  return exact ?? selectByLineage(manifest, system);
+}
+
+/**
+ * The nearest build in this host's lineage: its own ID at a version the
+ * manifest no longer carries, then each `ID_LIKE` ancestor in the order the
+ * distribution wrote them. Only entered with the glibc on both sides known —
+ * on this path the version key means nothing and the floor is the whole guard.
+ */
+function selectByLineage(
+  manifest: DesktopHelperPrebuiltManifest,
+  system: HostSystem,
+): DesktopHelperPrebuild | undefined {
+  if (!system.glibc) return undefined;
+  const lineage = [system.osId, ...(system.idLike ?? [])]
+    .map((id) => id.trim().toLowerCase())
+    .filter((id) => id !== "");
+  let best: DesktopHelperPrebuild | undefined;
+  let bestRank = Number.POSITIVE_INFINITY;
+  let bestGlibc = "";
+  for (const build of manifest.builds) {
+    if (!same(build.arch, system.arch)) continue;
+    if (!build.glibc || !glibcIsAvailable(build.glibc, system.glibc)) continue;
+    const rank = lineage.indexOf(build.osId.trim().toLowerCase());
+    if (rank === -1) continue;
+    if (rank < bestRank || (rank === bestRank && compareVersions(build.glibc, bestGlibc) > 0)) {
+      best = build;
+      bestRank = rank;
+      bestGlibc = build.glibc;
+    }
+  }
+  return best;
 }
 
 /** Reads a manifest, dropping any entry that could not be acted on anyway. */
@@ -254,23 +306,30 @@ export async function readDesktopHelperManifest(
   };
 }
 
-/** `ID=fedora` and `VERSION_ID="44"`, quotes stripped, everything else ignored. */
+/**
+ * `ID=fedora`, `VERSION_ID="44"`, and `ID_LIKE="ubuntu debian"` — quotes
+ * stripped, the space-separated ancestors kept in the order the distribution
+ * wrote them, everything else ignored.
+ */
 export function parseOsRelease(text: string): {
   readonly osId: string;
   readonly osVersionId: string;
+  readonly idLike: readonly string[];
 } {
   let osId = "";
   let osVersionId = "";
+  let idLike: readonly string[] = [];
   for (const line of text.split("\n")) {
     const separator = line.indexOf("=");
     if (separator <= 0) continue;
     const key = line.slice(0, separator).trim();
-    if (key !== "ID" && key !== "VERSION_ID") continue;
+    if (key !== "ID" && key !== "VERSION_ID" && key !== "ID_LIKE") continue;
     const value = unquote(line.slice(separator + 1).trim());
     if (key === "ID") osId = value;
-    else osVersionId = value;
+    else if (key === "VERSION_ID") osVersionId = value;
+    else idLike = value.split(/\s+/).filter((entry) => entry !== "");
   }
-  return { osId, osVersionId };
+  return { osId, osVersionId, idLike };
 }
 
 /** What this machine is, for the manifest to be matched against. */
@@ -278,11 +337,12 @@ export async function readHostSystem(
   dependencies: DesktopHelperResolutionDependencies = {},
 ): Promise<HostSystem> {
   const text = await (dependencies.readOsRelease ?? defaultReadOsRelease)();
-  const { osId, osVersionId } = parseOsRelease(text ?? "");
+  const { osId, osVersionId, idLike } = parseOsRelease(text ?? "");
   const glibc = (dependencies.glibc ?? runtimeGlibcVersion)();
   return {
     osId,
     osVersionId,
+    idLike,
     arch: dependencies.arch ?? process.arch,
     ...(glibc ? { glibc } : {}),
   };

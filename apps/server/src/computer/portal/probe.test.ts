@@ -360,9 +360,12 @@ describe("planPortalProviders", () => {
     expect(plan.input.implementation).toBe("portal-remote-desktop");
     expect(plan.input.blockedBy).toBeUndefined();
     expect(plan.clipboard.implementation).toBe("portal-selection");
-    // Only the frames need the native seam, and the sentence names it.
+    // Only the frames are missing, and the sentence says the gap is Synara's
+    // unwritten PipeWire receiver — not a package or rebuild the user owes.
     expect(plan.capture.implementation).toBe("pipewire-screencast");
-    expect(plan.capture.blockedBy).toMatch(/pipewire-devel/);
+    expect(plan.capture.blockedBy).toMatch(/not implemented/);
+    expect(plan.capture.blockedBy).toMatch(/SYNARA_COMPUTER_NESTED=window/);
+    expect(plan.capture.blockedBy).not.toMatch(/pipewire-devel|rebuild the helper|build\.sh/);
   });
 
   it("blocks portal input when the desktop has no ScreenCast to anchor motion to", () => {

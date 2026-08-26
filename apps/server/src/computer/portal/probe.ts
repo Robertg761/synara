@@ -585,24 +585,29 @@ function helperBacked(implementation: PortalProviderId, probe: PortalProbe): Por
 }
 
 /**
- * The one Tier 2 gap that is a missing *library*, not missing code.
+ * The one Tier 2 gap that is Synara's missing code, not the user's missing
+ * package.
  *
  * The ScreenCast portal is reachable and its session is already brokered — the
  * granted stream's node id, position, and size come back in the `Start`
  * response, which is what makes absolute pointing work on this desktop today.
  * What is missing is the other half: the frames themselves arrive over
- * PipeWire, and neither Node nor the current native helper can receive them.
- * Saying that precisely is what stops a user concluding GNOME is unsupported.
+ * PipeWire, and Synara has no PipeWire receiver written — not in Node, not in
+ * the native helper. This refusal must not read as an instruction: an earlier
+ * version told users to install the PipeWire headers and rebuild the helper,
+ * which changes nothing, because there is no PipeWire code waiting on those
+ * headers. Saying plainly that the feature is not implemented yet — and what
+ * works instead — is what stops a user chasing a rebuild that cannot help, or
+ * concluding GNOME is unsupported.
  */
 function nativeCaptureGap(): PortalProviderChoice {
   return {
     implementation: "pipewire-screencast",
     blockedBy:
-      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara's native " +
-      "desktop helper has no PipeWire support compiled in: it needs the PipeWire development headers present at build " +
-      "time (dnf install pipewire-devel / apt install libpipewire-0.3-dev) and a rebuild with " +
-      "apps/server/native/computer-desktop-helper/build.sh. Until then this desktop's screen cannot be read; " +
-      "SYNARA_COMPUTER_NESTED=window runs an isolated agent desktop that can be captured today.",
+      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara cannot " +
+      "receive PipeWire streams yet — that part is not implemented, so no package install or helper rebuild will " +
+      "enable it. Until it ships this desktop's screen cannot be read; SYNARA_COMPUTER_NESTED=window runs an " +
+      "isolated agent desktop that can be captured today.",
   };
 }
 

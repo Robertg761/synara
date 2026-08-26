@@ -1269,7 +1269,10 @@ function resourceFamily(
 }
 
 /** Field-wise equality, for deciding whether an adoption moved a capability. */
-function sameComputerCapabilities(left: ComputerCapabilities, right: ComputerCapabilities): boolean {
+function sameComputerCapabilities(
+  left: ComputerCapabilities,
+  right: ComputerCapabilities,
+): boolean {
   return (Object.keys(left) as ReadonlyArray<keyof ComputerCapabilities>).every(
     (key) => left[key] === right[key],
   );

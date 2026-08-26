@@ -268,7 +268,7 @@ describe("the GNOME backend's consent projection", () => {
     await backend.dispose();
   });
 
-  it("names PipeWire, not the desktop, when GNOME capture is asked for", async () => {
+  it("names Synara's unwritten PipeWire receiver, not the desktop, when GNOME capture is asked for", async () => {
     const portal = new FakePortalService({ screenCastVersion: 5 });
     const backend = backendFor(portal);
 
@@ -277,7 +277,7 @@ describe("the GNOME backend's consent projection", () => {
         kind: "region",
         region: { x: 0, y: 0, width: 100, height: 100 },
       }),
-    ).rejects.toThrow(/delivers frames over PipeWire.*pipewire-devel.*build\.sh/s);
+    ).rejects.toThrow(/delivers frames over PipeWire.*not implemented.*SYNARA_COMPUTER_NESTED/s);
     await backend.dispose();
   });
 

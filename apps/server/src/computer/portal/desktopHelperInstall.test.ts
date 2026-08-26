@@ -92,16 +92,29 @@ describe("desktopHelperPath", () => {
 });
 
 describe("parseOsRelease", () => {
-  it("reads ID and VERSION_ID, quoted or not, and ignores everything else", () => {
-    expect(parseOsRelease(FEDORA_OS_RELEASE)).toEqual({ osId: "fedora", osVersionId: "44" });
+  it("reads ID, VERSION_ID, and ID_LIKE, quoted or not, and ignores everything else", () => {
+    expect(parseOsRelease(FEDORA_OS_RELEASE)).toEqual({
+      osId: "fedora",
+      osVersionId: "44",
+      idLike: [],
+    });
     expect(parseOsRelease('ID="opensuse-tumbleweed"\nVERSION_ID="20260817"')).toEqual({
       osId: "opensuse-tumbleweed",
       osVersionId: "20260817",
+      idLike: [],
     });
     // Arch publishes no VERSION_ID at all, which is a fact about it rather than
     // a parse failure.
-    expect(parseOsRelease(ARCH_OS_RELEASE)).toEqual({ osId: "arch", osVersionId: "" });
-    expect(parseOsRelease("")).toEqual({ osId: "", osVersionId: "" });
+    expect(parseOsRelease(ARCH_OS_RELEASE)).toEqual({ osId: "arch", osVersionId: "", idLike: [] });
+    expect(parseOsRelease("")).toEqual({ osId: "", osVersionId: "", idLike: [] });
+  });
+
+  it("keeps the ID_LIKE ancestors in the order the distribution wrote them", () => {
+    // Mint's order is the lineage: ubuntu is the base it tracks, debian is
+    // ubuntu's, and the fallback believes the closer one first.
+    expect(parseOsRelease('ID=linuxmint\nVERSION_ID="22"\nID_LIKE="ubuntu debian"').idLike).toEqual(
+      ["ubuntu", "debian"],
+    );
   });
 });
 
@@ -149,6 +162,66 @@ describe("selectDesktopHelperPrebuild", () => {
     // An unreadable host glibc is no constraint rather than a refusal: the
     // os-release ID already carried the system's identity.
     expect(selectDesktopHelperPrebuild(manifest, arch)).toBeDefined();
+  });
+
+  it("falls back to an ID_LIKE ancestor's build when nothing matches exactly", () => {
+    // Mint, Pop!_OS, Manjaro: the distributions exact matching writes off,
+    // which is most of the desktop Linux population outside the big five.
+    const ubuntu = build({ osId: "ubuntu", osVersionId: "26.04", glibc: "2.41", file: "u" });
+    const mint = {
+      osId: "linuxmint",
+      osVersionId: "23",
+      arch: "x64",
+      glibc: "2.41",
+      idLike: ["ubuntu", "debian"],
+    };
+
+    expect(selectDesktopHelperPrebuild({ builds: [ubuntu] }, mint)).toEqual(ubuntu);
+    // The version key means nothing across the lineage; the glibc floor is the
+    // entire guard, so it still refuses in the one direction that fails.
+    expect(
+      selectDesktopHelperPrebuild({ builds: [ubuntu] }, { ...mint, glibc: "2.40" }),
+    ).toBeUndefined();
+  });
+
+  it("only walks the lineage with the glibc known on both sides", () => {
+    const ubuntu = build({ osId: "ubuntu", osVersionId: "26.04", glibc: "2.41", file: "u" });
+    const unguarded = build({ osId: "debian", osVersionId: "13", file: "d" });
+    const mint = { osId: "linuxmint", osVersionId: "23", arch: "x64", idLike: ["ubuntu"] };
+
+    // Without a floor to check, a lineage match is a coin flip that fails at
+    // execve; the exact path already tolerates unknowns, this one must not.
+    expect(selectDesktopHelperPrebuild({ builds: [ubuntu] }, mint)).toBeUndefined();
+    expect(
+      selectDesktopHelperPrebuild(
+        { builds: [unguarded] },
+        { ...mint, glibc: "2.41", idLike: ["debian"] },
+      ),
+    ).toBeUndefined();
+  });
+
+  it("prefers the closest ancestor, then the highest glibc that still fits", () => {
+    const debian = build({ osId: "debian", osVersionId: "13", glibc: "2.41", file: "d" });
+    const ubuntuOld = build({ osId: "ubuntu", osVersionId: "25.10", glibc: "2.39", file: "u1" });
+    const ubuntuNew = build({ osId: "ubuntu", osVersionId: "26.04", glibc: "2.41", file: "u2" });
+    const manifest = { builds: [debian, ubuntuOld, ubuntuNew] };
+    const mint = {
+      osId: "linuxmint",
+      osVersionId: "23",
+      arch: "x64",
+      glibc: "2.42",
+      idLike: ["ubuntu", "debian"],
+    };
+
+    // ubuntu outranks debian because Mint wrote it first, and among the ubuntu
+    // builds the one linked against the newest libraries that still fit came
+    // from the system most like this one.
+    expect(selectDesktopHelperPrebuild(manifest, mint)).toEqual(ubuntuNew);
+    // A host its own manifest entry has aged out of walks the same path: a
+    // fedora build still fits a newer fedora while the matrix catches up.
+    const fedora45 = { osId: "fedora", osVersionId: "45", arch: "x64", glibc: "2.43" };
+    const fedora44 = build({ glibc: "2.42" });
+    expect(selectDesktopHelperPrebuild({ builds: [fedora44] }, fedora45)).toEqual(fedora44);
   });
 });
 
