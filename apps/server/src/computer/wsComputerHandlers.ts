@@ -20,6 +20,8 @@ import {
   type ComputerMoveCursorInput,
   type ComputerPerformActionInput,
   type ComputerPressKeyInput,
+  type ComputerProvisionInput,
+  type ComputerProvisionResult,
   type ComputerRightClickInput,
   type ComputerScrollInput,
   type ComputerSetValueInput,
@@ -68,6 +70,9 @@ export interface WsComputerHandlers {
   readonly [COMPUTER_WS_METHODS.getStatus]: (
     input: ComputerGetStatusInput,
   ) => Effect.Effect<ComputerStatusResult, WsRpcError>;
+  readonly [COMPUTER_WS_METHODS.provision]: (
+    input: ComputerProvisionInput,
+  ) => Effect.Effect<ComputerProvisionResult, WsRpcError>;
   readonly [COMPUTER_WS_METHODS.listWindows]: (
     input: ComputerListWindowsInput,
   ) => Effect.Effect<ComputerListWindowsResult, WsRpcError>;
@@ -165,6 +170,7 @@ export function makeWsComputerHandlers(
       }, "Failed to read computer availability");
     return {
       [COMPUTER_WS_METHODS.getStatus]: () => Effect.succeed(unsupportedStatus),
+      [COMPUTER_WS_METHODS.provision]: () => unsupported(),
       [COMPUTER_WS_METHODS.listWindows]: () => unsupported(),
       [COMPUTER_WS_METHODS.getState]: () => unsupported(),
       [COMPUTER_WS_METHODS.getScreenSize]: () => unsupported(),
@@ -191,6 +197,8 @@ export function makeWsComputerHandlers(
   return {
     [COMPUTER_WS_METHODS.getStatus]: () =>
       attempt(() => manager.getStatus(), "Failed to read computer status"),
+    [COMPUTER_WS_METHODS.provision]: () =>
+      attempt(() => manager.provision(), "Failed to set up computer control"),
     [COMPUTER_WS_METHODS.listWindows]: () =>
       attempt(() => manager.listWindows(), "Failed to list computer windows"),
     [COMPUTER_WS_METHODS.getState]: (input) =>

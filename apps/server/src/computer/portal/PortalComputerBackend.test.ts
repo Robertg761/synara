@@ -55,6 +55,7 @@ function probeFor(overrides: Partial<PortalProbe> = {}): PortalProbe {
     portal: { present: false },
     desktopExtensionPresent: false,
     wlClipboard: false,
+    helperPath: "/home/test/.local/share/synara/computer/synara-computer-desktop-helper",
     gaps: [],
     ...overrides,
   };
@@ -827,6 +828,161 @@ describe("PortalComputerBackend lifecycle", () => {
     await expect(backend.dispose()).resolves.toBeUndefined();
     expect(disposeWindows).toHaveBeenCalledOnce();
     await expect(backend.listWindows()).rejects.toThrow("has been disposed");
+  });
+});
+
+describe("the Tier 2 provisioning lifecycle", () => {
+  /** A wlroots desktop with the helper missing, and then with it present. */
+  const withoutHelper = () =>
+    probeFor({
+      desktop: "wlroots",
+      portal: { present: true, screenCastVersion: 6 },
+      wlClipboard: true,
+    });
+  const withHelper = () =>
+    probeFor({
+      desktop: "wlroots",
+      portal: { present: true, screenCastVersion: 6 },
+      wlClipboard: true,
+      helperBinary: "/tmp/synara-computer-desktop-helper",
+      waylandGlobals: [
+        WLROOTS_GLOBALS.virtualPointer,
+        WLROOTS_GLOBALS.virtualKeyboard,
+        WLROOTS_GLOBALS.screencopy,
+        WLROOTS_GLOBALS.foreignToplevel,
+        WLROOTS_GLOBALS.dataControl,
+      ],
+    });
+
+  const workingProviders = (): PortalProviders => ({
+    input: resolvedProvider<PortalInputProvider>({
+      pointerTo: () => Promise.resolve(),
+      button: () => Promise.resolve(),
+      scroll: () => Promise.resolve(),
+      key: () => Promise.resolve(),
+      dispose: () => Promise.resolve(),
+    } as unknown as PortalInputProvider),
+    capture: resolvedProvider<PortalCaptureProvider>({
+      capture: () => Promise.resolve({ width: 1, height: 1, bytes: new Uint8Array(4) }),
+      dispose: () => Promise.resolve(),
+    } as unknown as PortalCaptureProvider),
+    windows: missingProvider<PortalWindowProvider>("no windows here"),
+    clipboard: missingProvider<PortalClipboardProvider>("no clipboard here"),
+  });
+
+  it("stays available while the helper is only compilable, so the tools keep being offered", async () => {
+    // `supported` gates whether the agent is given the computer tools at all,
+    // so a passive "no" here would mean nothing ever reaches the establishing
+    // read that installs the helper. Tier 1 makes exactly this trade.
+    const backend = new PortalComputerBackend({
+      probe: withoutHelper(),
+      providers: resolvePortalProviders(withoutHelper()),
+      platform: "linux",
+      couldProvisionHelper: () => Promise.resolve(true),
+    });
+
+    await expect(backend.probeAvailability()).resolves.toMatchObject({ kind: "available" });
+    await backend.dispose();
+  });
+
+  it("reports the blockers when nothing could produce a helper", async () => {
+    const backend = new PortalComputerBackend({
+      probe: withoutHelper(),
+      providers: resolvePortalProviders(withoutHelper()),
+      platform: "linux",
+      couldProvisionHelper: () => Promise.resolve(false),
+    });
+
+    const availability = await backend.probeAvailability();
+    expect(availability.kind).toBe("backend-unavailable");
+    expect(availability.kind === "backend-unavailable" && availability.message).toContain(
+      "native desktop helper is not built",
+    );
+    await backend.dispose();
+  });
+
+  it("provisions on the establishing read and adopts the desktop it uncovers", async () => {
+    let provisioned = 0;
+    const disposed: string[] = [];
+    const backend = new PortalComputerBackend({
+      probe: withoutHelper(),
+      providers: {
+        input: missingProvider<PortalInputProvider>("no helper yet"),
+        capture: missingProvider<PortalCaptureProvider>("no helper yet"),
+        windows: missingProvider<PortalWindowProvider>("no helper yet"),
+        clipboard: missingProvider<PortalClipboardProvider>("no helper yet"),
+      },
+      platform: "linux",
+      provisionHelper: () => {
+        provisioned += 1;
+        return Promise.resolve({
+          action: "installed-from-source" as const,
+          path: "/tmp/synara-computer-desktop-helper",
+          summary: "compiled",
+        });
+      },
+      reprobe: () => Promise.resolve(withHelper()),
+      buildProviders: () => {
+        disposed.push("built");
+        return workingProviders();
+      },
+    });
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(provisioned).toBe(1);
+    expect(backend.capabilities().input).toBe(true);
+    expect(backend.capabilities().capture).toBe(true);
+    expect(backend.providerPlan().input.implementation).toBe("wlroots-virtual-input");
+
+    // Memoized: every tool call goes through availability(), and a compile
+    // that takes seconds must not start once per call.
+    await backend.availability();
+    expect(provisioned).toBe(1);
+    await backend.dispose();
+  });
+
+  it("reports why provisioning failed rather than the plan's guess at it", async () => {
+    const backend = new PortalComputerBackend({
+      probe: withoutHelper(),
+      providers: resolvePortalProviders(withoutHelper()),
+      platform: "linux",
+      provisionHelper: () => Promise.reject(new Error("this machine is missing cc")),
+      reprobe: () => Promise.resolve(withoutHelper()),
+      buildProviders: () => resolvePortalProviders(withoutHelper()),
+    });
+
+    const availability = await backend.availability();
+    expect(availability.kind === "backend-unavailable" && availability.message).toContain(
+      "missing cc",
+    );
+    await backend.dispose();
+  });
+
+  it("leaves a live provider set alone when the re-probe changes nothing", async () => {
+    // A GNOME desktop may be holding a portal grant the user has already
+    // answered; rebuilding an identical set would drop it and raise a second
+    // dialog for no gain.
+    let builds = 0;
+    const backend = new PortalComputerBackend({
+      probe: withoutHelper(),
+      providers: workingProviders(),
+      platform: "linux",
+      provisionHelper: () =>
+        Promise.resolve({
+          action: "already-current" as const,
+          path: "/tmp/synara-computer-desktop-helper",
+          summary: "current",
+        }),
+      reprobe: () => Promise.resolve(withoutHelper()),
+      buildProviders: () => {
+        builds += 1;
+        return workingProviders();
+      },
+    });
+
+    await backend.availability();
+    expect(builds).toBe(0);
+    await backend.dispose();
   });
 });
 

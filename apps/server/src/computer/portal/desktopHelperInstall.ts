@@ -46,7 +46,7 @@ import { access, chmod, constants, copyFile, mkdir, readFile, rename, rm } from 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { verifyPrebuilt } from "../kwinPluginProvisioning.ts";
+import { verifyPrebuilt } from "../provisioning/prebuiltVerification.ts";
 
 /** Points at a directory of prebuilt helpers, for a packager or a developer. */
 export const DESKTOP_HELPER_PREBUILT_DIR_ENV = "SYNARA_COMPUTER_HELPER_PREBUILT_DIR";

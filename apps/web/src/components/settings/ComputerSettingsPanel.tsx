@@ -8,7 +8,7 @@ import {
   COMPUTER_RELEASE_CONTROL_HOTKEY,
   type ComputerCapabilities,
 } from "@synara/contracts";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { AppSettingsBinding } from "~/appSettings";
 import { resolveComputerAvailabilityView } from "~/components/ComputerPanel.logic";
@@ -17,6 +17,8 @@ import { Switch } from "~/components/ui/switch";
 import {
   COMPUTER_STATUS_VISIBLE_REFETCH_INTERVAL_MS,
   computerStatusQueryOptions,
+  provisionComputer,
+  serverQueryKeys,
 } from "~/lib/serverReactQuery";
 import { cn } from "~/lib/utils";
 import { SettingResetButton } from "./SettingControls";
@@ -72,6 +74,17 @@ export function ComputerSettingsPanel({
     refetchInterval: active ? COMPUTER_STATUS_VISIBLE_REFETCH_INTERVAL_MS : false,
   });
 
+  const queryClient = useQueryClient();
+  const setupMutation = useMutation({
+    mutationFn: provisionComputer,
+    onSuccess: (result) => {
+      // The call already returns the refreshed status, so the card repaints
+      // from the same round trip rather than racing a refetch against a
+      // backend that has only just rebuilt its providers.
+      queryClient.setQueryData(serverQueryKeys.computerStatus(), result.status);
+    },
+  });
+
   if (!active) return null;
 
   const status = statusQuery.data;
@@ -95,6 +108,30 @@ export function ComputerSettingsPanel({
     backend === COMPUTER_KWIN_BACKEND && status?.capabilities.visibleDesktop === true
       ? `The agent drives its own seat, so your cursor and focus stay untouched. Press ${COMPUTER_RELEASE_CONTROL_HOTKEY} at any time to stop it from acting on the desktop, and press it again to let it resume.`
       : "The agent drives its own seat, so your cursor and focus stay untouched.";
+  const setupNote = setupMutation.isPending
+    ? "Installing the desktop helper. On a machine without a prebuilt binary this compiles one, which takes a few seconds."
+    : setupMutation.isError
+      ? `Setting up failed. ${
+          setupMutation.error instanceof Error && setupMutation.error.message
+            ? setupMutation.error.message
+            : "The server gave no reason."
+        }`
+      : setupMutation.isSuccess
+        ? setupMutation.data.summary
+        : undefined;
+  /**
+   * Whether this desktop still needs something installed.
+   *
+   * Keyed on the capabilities rather than on the availability kind, because
+   * those two deliberately disagree on a machine that has never provisioned:
+   * `probeAvailability()` answers "available" as long as a helper *could* be
+   * built — otherwise the computer tools are withheld and nothing ever triggers
+   * the install — while the providers behind perception and action have not
+   * resolved yet. The card would read "ready" with no capabilities and no way
+   * to act on it.
+   */
+  const needsSetup =
+    status !== undefined && (!status.capabilities.input || !status.capabilities.capture);
   const healthNotes = [
     ...(health?.status === "awaiting-consent"
       ? ["Waiting for you to answer the desktop's permission dialog."]
@@ -114,14 +151,30 @@ export function ComputerSettingsPanel({
       <SettingsSectionShell
         title="Desktop backend"
         action={
-          <Button
-            size="xs"
-            variant="outline"
-            disabled={statusQuery.isFetching}
-            onClick={() => void statusQuery.refetch()}
-          >
-            {statusQuery.isFetching ? "Checking…" : "Refresh"}
-          </Button>
+          <div className="flex items-center gap-2">
+            {/* Offered whenever the desktop is not ready. Setting up is
+                installing or compiling Synara's own helper into the user's
+                data directory — the thing that used to require finding
+                build.sh in a checkout. */}
+            {needsSetup && !statusQuery.isError ? (
+              <Button
+                size="xs"
+                variant="default"
+                disabled={setupMutation.isPending}
+                onClick={() => setupMutation.mutate()}
+              >
+                {setupMutation.isPending ? "Setting up…" : "Set up"}
+              </Button>
+            ) : null}
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={statusQuery.isFetching || setupMutation.isPending}
+              onClick={() => void statusQuery.refetch()}
+            >
+              {statusQuery.isFetching ? "Checking…" : "Refresh"}
+            </Button>
+          </div>
         }
       >
         <SettingsCard>
@@ -143,7 +196,7 @@ export function ComputerSettingsPanel({
               </span>
             }
             description={availabilityView.description}
-            status={healthNotes.length > 0 ? healthNotes.join(" ") : undefined}
+            status={[setupNote, ...healthNotes].filter(Boolean).join(" ") || undefined}
           />
           {backend ? (
             <SettingsRow

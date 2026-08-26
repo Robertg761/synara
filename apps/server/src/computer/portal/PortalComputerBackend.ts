@@ -40,6 +40,7 @@ import type {
   ComputerState,
   ComputerWindow,
 } from "@synara/contracts";
+import { describeErrorMessage } from "@synara/shared/errorMessages";
 
 import {
   clampComputerMessage,
@@ -56,6 +57,7 @@ import {
   type ComputerResolvedTarget,
 } from "../ComputerBackend.ts";
 import { resolveAppLaunchOnHost, type AppLaunchResolver } from "../appLaunchResolution.ts";
+import type { DesktopHelperProvisionResult } from "../provisioning/desktopHelperProvisioning.ts";
 import {
   alignRect,
   formatRect,
@@ -137,14 +139,32 @@ export interface PortalComputerBackendOptions {
    * `not-required`; GNOME's portal starts at `not-requested`.
    */
   readonly consent?: PortalConsentState;
+  /**
+   * Installs or compiles the desktop helper. Absent in tests and in nested
+   * sessions, where the helper is supplied by whatever started the compositor.
+   */
+  readonly provisionHelper?: () => Promise<DesktopHelperProvisionResult>;
+  /** Whether provisioning could plausibly succeed, asked without doing it. */
+  readonly couldProvisionHelper?: () => Promise<boolean>;
+  /** Takes a fresh probe of the same desktop, after provisioning changed it. */
+  readonly reprobe?: () => Promise<PortalProbe>;
+  /** Rebuilds the provider set for a probe whose answer changed. */
+  readonly buildProviders?: (probe: PortalProbe) => PortalProviders;
 }
 
 export class PortalComputerBackend implements ComputerBackend {
   readonly computerId: ComputerId;
 
-  private readonly probe: PortalProbe;
-  private readonly plan: PortalProviderPlan;
-  private readonly providers: PortalProviders;
+  /**
+   * Replaced when provisioning installs a helper this desktop did not have.
+   * Everything derived from the probe — the plan, the providers, the capability
+   * set, the arbiter — is replaced with it, because all four are pure functions
+   * of the probe and a half-updated set would report capabilities the providers
+   * cannot serve.
+   */
+  private probe: PortalProbe;
+  private plan: PortalProviderPlan;
+  private providers: PortalProviders;
   private readonly platform: string;
   private readonly now: () => number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
@@ -154,7 +174,7 @@ export class PortalComputerBackend implements ComputerBackend {
   private readonly stillIntervalMs: number;
   private readonly captureMaxDimension: number;
   private readonly healthState: ComputerHealthState;
-  private readonly capabilitySet: ComputerCapabilities;
+  private capabilitySet: ComputerCapabilities;
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
   /**
    * The traffic rule between the agent and the human, on the desktops where
@@ -162,7 +182,7 @@ export class PortalComputerBackend implements ComputerBackend {
    * means there is nobody to yield to, and every mutating action runs straight
    * through.
    */
-  private readonly arbiter: SharedSeatArbiter | undefined;
+  private arbiter: SharedSeatArbiter | undefined;
 
   private consent: PortalConsentState;
   private consentReason: string | undefined;
@@ -173,6 +193,12 @@ export class PortalComputerBackend implements ComputerBackend {
   private streamTimer: ReturnType<typeof setInterval> | undefined;
   private stillInFlight = false;
   private nextSequence = 1;
+  private readonly provisionHelper: (() => Promise<DesktopHelperProvisionResult>) | undefined;
+  private readonly couldProvisionHelper: (() => Promise<boolean>) | undefined;
+  private readonly reprobe: (() => Promise<PortalProbe>) | undefined;
+  private readonly buildProviders: ((probe: PortalProbe) => PortalProviders) | undefined;
+  /** Memoized so concurrent tool calls share one install rather than racing. */
+  private provisionPromise: Promise<string | undefined> | undefined;
 
   constructor(options: PortalComputerBackendOptions) {
     this.computerId = (options.computerId ?? DEFAULT_COMPUTER_ID) as ComputerId;
@@ -192,6 +218,10 @@ export class PortalComputerBackend implements ComputerBackend {
     this.consent =
       options.consent ?? (options.probe.portal.present ? "not-requested" : "not-required");
     this.capabilitySet = capabilitiesFromProviders(options.providers);
+    this.provisionHelper = options.provisionHelper;
+    this.couldProvisionHelper = options.couldProvisionHelper;
+    this.reprobe = options.reprobe;
+    this.buildProviders = options.buildProviders;
     this.healthState = new ComputerHealthState({
       readStatus: () => {
         const seat = this.seatHealth();
@@ -240,17 +270,77 @@ export class PortalComputerBackend implements ComputerBackend {
   }
 
   /**
-   * The portal backend's availability is already the passive answer: it reads
-   * the desktop probe taken at construction and the provider plan derived from
-   * it, and starts no session, opens no dialog, and spawns no helper. So the
-   * two are the same call rather than a second implementation that could drift
-   * from the first.
+   * "Could this machine drive this desktop?", answered without touching it.
+   *
+   * Split from `availability()` for the same reason Tier 1 splits them: this
+   * runs at server boot and on every render of the settings card, while the
+   * establishing read compiles a helper on a cold machine. Nothing here spawns
+   * a helper, opens a portal session, or puts a dialog on the user's screen.
+   *
+   * The one judgement call is the same trade `KWinComputerBackend` documents.
+   * A desktop whose only blocker is a helper that does not exist *yet* answers
+   * "available", because a shipped binary matches or this machine can compile
+   * one. A wrong yes costs the first real use one error card — the same card
+   * provisioning already produces — while a wrong no costs the user the feature
+   * outright, and, worse, is self-fulfilling: `supported` gates whether the
+   * computer tools are offered at all, so a "no" here means nothing ever calls
+   * the establishing read that would have fixed the machine.
    */
-  probeAvailability(): Promise<ComputerAvailability> {
-    return this.availability();
+  async probeAvailability(): Promise<ComputerAvailability> {
+    const refusal = this.platformRefusal();
+    if (refusal) return refusal;
+    const blockers = this.capabilityBlockers();
+    if (blockers.length === 0) return { kind: "available", backend: "portal" };
+    if (this.probe.helperBinary === undefined && (await this.helperCouldExist())) {
+      return { kind: "available", backend: "portal" };
+    }
+    return { kind: "backend-unavailable", message: blockers.join(" ") };
   }
 
+  /**
+   * The establishing read: provisions the helper if that is what this desktop
+   * is waiting on, then answers from what actually resolved.
+   *
+   * Before this existed, Tier 2 had no establishing step at all — this method
+   * and `probeAvailability()` were the same function, the probe was taken once
+   * at construction, and nothing anywhere could install or build the helper the
+   * whole tier runs on.
+   */
   async availability(): Promise<ComputerAvailability> {
+    const refusal = this.platformRefusal();
+    if (refusal) return refusal;
+    const failure = await this.ensureProvisioned();
+    const blockers = this.capabilityBlockers();
+    if (blockers.length > 0) {
+      // The provisioning failure wins when there is one: "this machine is
+      // missing gcc" is actionable, where the plan's refusal can only say the
+      // helper is absent without knowing why installing it did not work.
+      return { kind: "backend-unavailable", message: failure ?? blockers.join(" ") };
+    }
+    return { kind: "available", backend: "portal" };
+  }
+
+  /**
+   * Provision on demand, for the Computer settings panel's setup action.
+   *
+   * Forces a fresh attempt rather than returning the memoized one: a user
+   * pressing the button has usually just installed the packages the last
+   * attempt named, and handing them that same failure back would be absurd.
+   */
+  async provision(): Promise<string> {
+    this.throwIfDisposed();
+    if (!this.provisionHelper) {
+      throw new ComputerBackendError("This backend has no desktop helper to install.", {
+        retryable: false,
+      });
+    }
+    this.provisionPromise = undefined;
+    const result = await this.provisionHelper();
+    await this.adoptProbe();
+    return result.summary;
+  }
+
+  private platformRefusal(): ComputerAvailability | undefined {
     if (this.platform !== "linux") {
       return { kind: "unsupported-platform", platform: this.platform };
     }
@@ -263,18 +353,84 @@ export class PortalComputerBackend implements ComputerBackend {
             : `Linux computer control requires a Wayland session; this is an ${this.probe.sessionType} session.`,
       };
     }
-    // Perception and action are the floor: a desktop that can supply neither is
-    // not a desktop Synara can drive, whatever else resolved. Windows and
-    // clipboard missing is a degraded but usable backend — the agent works in
-    // desktop coordinates — so it does not fail availability, only capability.
-    const blockers = [
+    return undefined;
+  }
+
+  /**
+   * Perception and action are the floor: a desktop that can supply neither is
+   * not a desktop Synara can drive, whatever else resolved. Windows and
+   * clipboard missing is a degraded but usable backend — the agent works in
+   * desktop coordinates — so it does not fail availability, only capability.
+   */
+  private capabilityBlockers(): readonly string[] {
+    return [
       describeSlot("Input", this.providers.input),
       describeSlot("Screen capture", this.providers.capture),
     ].filter((message): message is string => message !== undefined);
-    if (blockers.length > 0) {
-      return { kind: "backend-unavailable", message: blockers.join(" ") };
+  }
+
+  private async helperCouldExist(): Promise<boolean> {
+    if (!this.couldProvisionHelper) return false;
+    return await this.couldProvisionHelper().catch(() => false);
+  }
+
+  /**
+   * Runs provisioning at most once per backend, resolving to the failure
+   * message if there was one.
+   *
+   * Memoized the way `KWinComputerBackend.provisionPromises` is, and for the
+   * same reason: every tool call goes through `availability()`, and a compile
+   * that takes seconds must not be started once per call.
+   */
+  private ensureProvisioned(): Promise<string | undefined> {
+    if (this.disposed) return Promise.resolve(undefined);
+    // A desktop that already has its helper has nothing to provision, and one
+    // whose providers all resolved is not waiting on anything.
+    if (this.probe.helperBinary !== undefined) return Promise.resolve(undefined);
+    if (!this.provisionHelper) return Promise.resolve(undefined);
+    this.provisionPromise ??= this.runProvision();
+    return this.provisionPromise;
+  }
+
+  private async runProvision(): Promise<string | undefined> {
+    try {
+      await this.provisionHelper?.();
+      await this.adoptProbe();
+      return undefined;
+    } catch (error) {
+      return describeErrorMessage(error, "installing the desktop helper failed without a reason.");
     }
-    return { kind: "available", backend: "portal" };
+  }
+
+  /**
+   * Re-probe and, if the answer changed, swap in the provider set it implies.
+   *
+   * The plan is compared rather than applied unconditionally. On GNOME the
+   * live providers may be holding a portal session the user has already
+   * consented to, and rebuilding an identical set would drop that grant and put
+   * a second dialog on their screen for no gain.
+   */
+  private async adoptProbe(): Promise<void> {
+    if (this.disposed || !this.reprobe || !this.buildProviders) return;
+    const probe = await this.reprobe();
+    const plan = planPortalProviders(probe);
+    if (samePlan(plan, this.plan)) {
+      this.probe = probe;
+      return;
+    }
+    const previous = this.providers;
+    this.probe = probe;
+    this.plan = plan;
+    this.providers = this.buildProviders(probe);
+    this.capabilitySet = capabilitiesFromProviders(this.providers);
+    // The seat has to be re-primed against the new idle source, and the old
+    // arbiter's source belonged to the provider set being disposed below.
+    this.arbiter =
+      this.providers.seatIdle !== undefined && this.capabilitySet.sharedSeat
+        ? new SharedSeatArbiter({ source: this.providers.seatIdle, now: () => this.now() })
+        : undefined;
+    this.seatPrimed = false;
+    await disposeProviderSet(previous);
   }
 
   /**
@@ -605,22 +761,7 @@ export class PortalComputerBackend implements ComputerBackend {
     if (this.disposed) return;
     this.disposed = true;
     await this.detachStream();
-    // Disposal order does not matter between providers, but a provider that
-    // throws must not strand the others: the portal session and the EIS fd are
-    // the kill switch, so every one of them gets its chance to close.
-    const slots = [
-      this.providers.input,
-      this.providers.capture,
-      this.providers.windows,
-      this.providers.clipboard,
-    ];
-    await Promise.allSettled([
-      ...slots.map((slot) => (slot.available ? slot.provider.dispose() : Promise.resolve())),
-      // Disposed with the rest: on wlroots it holds a share of the same helper
-      // the three Wayland-native providers do, so skipping it would leave the
-      // process attached to the compositor forever.
-      this.providers.seatIdle?.dispose() ?? Promise.resolve(),
-    ]);
+    await disposeProviderSet(this.providers);
     this.eventListeners.clear();
   }
 
@@ -884,6 +1025,41 @@ export function resolvePortalProviders(
 }
 
 /**
+ * Closes every provider in a set, whether it is being replaced or the backend
+ * is going away.
+ *
+ * Disposal order does not matter between providers, but a provider that throws
+ * must not strand the others: the portal session and the EIS fd are the kill
+ * switch, so every one of them gets its chance to close.
+ */
+async function disposeProviderSet(providers: PortalProviders): Promise<void> {
+  const slots = [providers.input, providers.capture, providers.windows, providers.clipboard];
+  await Promise.allSettled([
+    ...slots.map((slot) => (slot.available ? slot.provider.dispose() : Promise.resolve())),
+    // Disposed with the rest: on wlroots it holds a share of the same helper
+    // the three Wayland-native providers do, so skipping it would leave the
+    // process attached to the compositor forever.
+    providers.seatIdle?.dispose() ?? Promise.resolve(),
+  ]);
+}
+
+/**
+ * Whether two plans would resolve to the same providers.
+ *
+ * Compared on both the implementation and the refusal, because a slot that
+ * moved from "blocked, no helper" to "blocked, no such protocol" is a different
+ * answer to the user even though neither resolves a provider.
+ */
+function samePlan(left: PortalProviderPlan, right: PortalProviderPlan): boolean {
+  const slots = ["input", "capture", "windows", "clipboard"] as const;
+  return slots.every(
+    (slot) =>
+      left[slot].implementation === right[slot].implementation &&
+      left[slot].blockedBy === right[slot].blockedBy,
+  );
+}
+
+/**
  * The one idle source to keep, with the other disposed rather than dropped.
  *
  * Both families can produce one — a desktop can take input from the portal
@@ -951,9 +1127,11 @@ export function createPortalComputerBackend(
 ): PortalComputerBackend {
   const { providers, providerOptions, ...rest } = options;
   let backend: PortalComputerBackend | undefined;
-  const resolved =
-    providers ??
-    resolvePortalProviders(probe, {
+  // Named once and reused for the initial set and for every rebuild, so a
+  // provider set built after provisioning is wired to consent exactly the way
+  // the first one was.
+  const build = (forProbe: PortalProbe): PortalProviders =>
+    resolvePortalProviders(forProbe, {
       ...providerOptions,
       onConsentChanged: (state, reason) => {
         backend?.setConsentState(state, reason);
@@ -963,7 +1141,19 @@ export function createPortalComputerBackend(
         providerOptions?.onSessionClosed?.(reason);
       },
     });
-  backend = new PortalComputerBackend({ ...rest, probe, providers: resolved });
+  backend = new PortalComputerBackend({
+    // Rebuilding is a pure function of the probe and this factory's own
+    // provider options, so it is safe to default. Provisioning and re-probing
+    // are not: this factory is handed a probe and has no way to know whether it
+    // describes the machine it is running on or a desktop a caller made up, and
+    // defaulting them would let a unit test install a helper on the developer's
+    // laptop and then re-probe their real session. `ComputerService` is the one
+    // place that knows the probe came from this host, so it supplies them.
+    buildProviders: build,
+    ...rest,
+    probe,
+    providers: providers ?? build(probe),
+  });
   return backend;
 }
 

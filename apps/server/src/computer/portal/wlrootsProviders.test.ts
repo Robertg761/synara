@@ -243,6 +243,7 @@ describe("resolveWlrootsProviders", () => {
       portal: { present: false },
       desktopExtensionPresent: false,
       wlClipboard: true,
+      helperPath: "/home/test/.local/share/synara/computer/synara-computer-desktop-helper",
       gaps: [],
       ...(helperBinary === undefined ? {} : { helperBinary }),
     }) as PortalProbe;

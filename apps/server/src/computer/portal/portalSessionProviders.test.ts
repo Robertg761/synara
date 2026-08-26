@@ -24,6 +24,7 @@ function gnomeProbe(overrides: Partial<PortalProbe> = {}): PortalProbe {
       screenCastVersion: 5,
       availableDeviceTypes: 3,
     },
+    helperPath: "/home/test/.local/share/synara/computer/synara-computer-desktop-helper",
     desktopExtensionPresent: false,
     wlClipboard: false,
     gaps: [],

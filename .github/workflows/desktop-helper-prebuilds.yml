@@ -24,6 +24,9 @@
 name: Desktop Helper Prebuilds
 
 on:
+  # Callable so a release builds its binaries from the commit being released,
+  # rather than inheriting whatever the last scheduled run happened to produce.
+  workflow_call:
   workflow_dispatch:
   push:
     tags:
@@ -39,7 +42,9 @@ permissions: {}
 
 concurrency:
   group: desktop-helper-prebuilds-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancelled: a release job waits on this run, and cancelling it out from
+  # under the release ships a build with no prebuilt binaries in it.
+  cancel-in-progress: false
 
 jobs:
   build:

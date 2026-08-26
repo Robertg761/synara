@@ -23,6 +23,7 @@ import {
   RUNTIME_MODE_PRESENTATION,
   providerModelSupportsAutoRuntimeMode,
 } from "../lib/runtimeMode";
+import { Badge } from "./ui/badge";
 import { useStore } from "../store";
 import {
   createAllThreadsSelector,
@@ -303,7 +304,12 @@ export function RuntimeUsageControls({
                   title={computerControlAvailable ? undefined : computerControlDisabledReason}
                 >
                   <span className="flex min-w-0 flex-col gap-0.5 py-0.5">
-                    <span className="font-medium text-xs">Computer control</span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="font-medium text-xs">Computer control</span>
+                      <Badge variant="warning" size="sm">
+                        Beta
+                      </Badge>
+                    </span>
                     <span className="text-[11px] leading-4 text-muted-foreground">
                       {computerControlAvailable
                         ? "Lets the agent see and control the desktop with a separate cursor."

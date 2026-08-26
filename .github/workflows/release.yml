@@ -153,9 +153,27 @@ jobs:
       - name: Test
         run: bun run test
 
+  # The two native computer-use binaries, built in distribution containers from
+  # the commit being released. Before this, both prebuild workflows uploaded
+  # artifacts that nothing ever downloaded, so every release shipped an empty
+  # `prebuilt/` and every Linux user had to find `build.sh` themselves.
+  desktop_helper_prebuilds:
+    name: Desktop helper prebuilds
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/desktop-helper-prebuilds.yml
+
+  kwin_plugin_prebuilds:
+    name: KWin plugin prebuilds
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/kwin-plugin-prebuilds.yml
+
   build:
     name: Build ${{ matrix.label }}
-    needs: preflight
+    needs: [preflight, desktop_helper_prebuilds, kwin_plugin_prebuilds]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -205,6 +223,41 @@ jobs:
         # Preflight already runs the full lifecycle-script install plus lint,
         # typecheck, and tests. Artifact jobs only need dependencies available.
         run: bun install --frozen-lockfile --ignore-scripts
+
+      # Linux only: these are ELF binaries for Linux desktops, and the packaging
+      # step copies whatever is in these directories into `dist/`. The manifest
+      # check fails the release rather than warning, because shipping an empty
+      # `prebuilt/` is indistinguishable from success at build time and only
+      # shows up as every user on a distribution in the matrix compiling the
+      # helper themselves — which is the bug this wiring exists to fix.
+      - name: Fetch prebuilt computer-use binaries
+        if: matrix.platform == 'linux'
+        uses: actions/download-artifact@v6
+        with:
+          name: desktop-helper-prebuilt
+          path: apps/server/native/computer-desktop-helper/prebuilt/
+
+      - name: Fetch prebuilt KWin plugin
+        if: matrix.platform == 'linux'
+        uses: actions/download-artifact@v6
+        with:
+          name: kwin-plugin-prebuilt
+          path: apps/server/native/computer-use-kwin/prebuilt/
+
+      - name: Check the prebuilt manifests landed
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for root in \
+            apps/server/native/computer-desktop-helper/prebuilt \
+            apps/server/native/computer-use-kwin/prebuilt; do
+            if [ ! -f "$root/manifest.json" ]; then
+              echo "::error::$root/manifest.json is missing; this release would ship no prebuilt binaries for it"
+              exit 1
+            fi
+            echo "$root: $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["builds"]))' "$root/manifest.json") build(s)"
+          done
 
       - id: build_artifact
         name: Build desktop artifact

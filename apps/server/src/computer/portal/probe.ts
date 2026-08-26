@@ -21,10 +21,8 @@
  * pin: the mapping from a desktop's observable facts to the exact sentence the
  * user is shown.
  */
-import { access, constants } from "node:fs/promises";
-import { join } from "node:path";
-
 import { KWIN_SERVICE } from "../kwinDbus.ts";
+import { commandExists as commandOnPath } from "../provisioning/toolchain.ts";
 import { readSessionBusProperty, sessionBusNameHasOwner } from "../sessionBusNames.ts";
 import { unwrapDbusValue } from "../computerGeometry.ts";
 import { readWaylandGlobals } from "./desktopHelperClient.ts";
@@ -112,6 +110,11 @@ export interface PortalProbe {
   readonly desktopExtensionPresent: boolean;
   /** Absolute path of the native desktop helper, when it is built and executable. */
   readonly helperBinary?: string;
+  /**
+   * Where the helper belongs, built or not. Carried so a refusal can name the
+   * path rather than making the reader go and find it.
+   */
+  readonly helperPath: string;
   readonly wlClipboard: boolean;
   readonly gaps: readonly PortalProbeGap[];
 }
@@ -281,7 +284,7 @@ export async function probeDesktop(
     }
   }
 
-  const commandExists = dependencies.commandExists ?? defaultCommandExists;
+  const commandExists = dependencies.commandExists ?? ((name: string) => commandOnPath(name));
   const wlClipboard = (await commandExists("wl-copy")) && (await commandExists("wl-paste"));
   if (!wlClipboard) {
     record(
@@ -304,6 +307,7 @@ export async function probeDesktop(
     ...(waylandGlobals ? { waylandGlobals } : {}),
     desktopExtensionPresent,
     ...(helperBinary ? { helperBinary } : {}),
+    helperPath,
     wlClipboard,
     gaps,
   };
@@ -423,6 +427,7 @@ function planInput(probe: PortalProbe): PortalProviderChoice {
     }
     return { implementation: "portal-remote-desktop" };
   }
+  if (globalsUnknown(probe)) return { blockedBy: helperUnknownRefusal(probe, "inject input") };
   return {
     blockedBy:
       "This desktop offers neither the wlroots virtual-pointer protocol nor a RemoteDesktop portal, so there is no way to inject input. " +
@@ -434,6 +439,15 @@ function planCapture(probe: PortalProbe): PortalProviderChoice {
   if (probe.sessionType !== "wayland") return { blockedBy: sessionGap(probe) };
   if (probe.waylandGlobals?.includes(WLROOTS_GLOBALS.screencopy)) {
     return helperBacked("wlr-screencopy", probe);
+  }
+  // Ahead of the ScreenCast branch, and only off GNOME. On a wlroots desktop
+  // with no helper the globals could not be read at all, so `wlr-screencopy` is
+  // unruled-out rather than absent, and answering "install the PipeWire headers"
+  // would send the user to rebuild for a mechanism this desktop never uses.
+  // GNOME is the exception: PipeWire genuinely is its capture path, and
+  // `nativeCaptureGap` already names the helper and the build script.
+  if (globalsUnknown(probe) && probe.desktop !== "gnome") {
+    return { blockedBy: helperUnknownRefusal(probe, "capture the screen") };
   }
   if (probe.portal.screenCastVersion !== undefined) return nativeCaptureGap();
   return {
@@ -463,6 +477,7 @@ function planWindows(probe: PortalProbe): PortalProviderChoice {
         "capture and desktop coordinates; window-scoped capture and targeting will refuse.",
     };
   }
+  if (globalsUnknown(probe)) return { blockedBy: helperUnknownRefusal(probe, "list windows") };
   return {
     blockedBy:
       "This desktop exposes no window enumeration: there is no foreign-toplevel protocol and no Synara desktop extension. " +
@@ -491,11 +506,47 @@ function planClipboard(probe: PortalProbe): PortalProviderChoice {
         "so the clipboard cannot be read or written. Install the wl-clipboard package.",
     };
   }
+  if (globalsUnknown(probe)) {
+    return { blockedBy: helperUnknownRefusal(probe, "read or write the clipboard") };
+  }
   return {
     blockedBy:
       "wl-clipboard is installed but this compositor advertises no data-control protocol, and its portal is too old for " +
       "SelectionRead/SelectionWrite. Clipboard access needs wlr-data-control (or ext-data-control on GNOME 48+).",
   };
+}
+
+/**
+ * Whether this desktop's protocol list is simply unknown, and the helper is why.
+ *
+ * The helper is what holds the `wl_display` the registry is read on, so a
+ * machine without one produces no global list at all — not an empty one. Those
+ * two are not the same answer, and treating them as the same is what told a
+ * Hyprland user that their compositor "offers neither the wlroots
+ * virtual-pointer protocol nor a RemoteDesktop portal" when it advertises the
+ * former and every capability was one `build.sh` away.
+ */
+function globalsUnknown(probe: PortalProbe): boolean {
+  return probe.waylandGlobals === undefined && probe.helperBinary === undefined;
+}
+
+/**
+ * The refusal for a capability that could not even be assessed.
+ *
+ * Says the thing that is actually true — a binary is missing, and it is the
+ * same binary that would have answered the question — rather than reporting the
+ * absence of protocols nobody managed to look for. Provisioning installs or
+ * compiles this automatically on first use; the script is named for the case
+ * where that fails and the user wants to see why.
+ */
+function helperUnknownRefusal(probe: PortalProbe, attempted: string): string {
+  return (
+    `Synara's native desktop helper is not built at ${probe.helperPath}, so there is no way to ` +
+    `${attempted} — and because the helper is also what reads the compositor's protocol list, ` +
+    "what this desktop supports could not be established either. Synara installs or compiles it " +
+    "the first time an agent uses the desktop; if that failed, the Computer settings panel can " +
+    "retry it, or you can run apps/server/native/computer-desktop-helper/build.sh yourself."
+  );
 }
 
 /**
@@ -585,23 +636,6 @@ async function defaultWaylandGlobals(
     );
   }
   return await readWaylandGlobals({ command, env });
-}
-
-async function defaultExecutableExists(path: string): Promise<boolean> {
-  try {
-    await access(path, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function defaultCommandExists(command: string): Promise<boolean> {
-  const directories = (process.env.PATH ?? "").split(":").filter((entry) => entry.length > 0);
-  for (const directory of directories) {
-    if (await defaultExecutableExists(join(directory, command))) return true;
-  }
-  return false;
 }
 
 function describe(error: unknown): string {

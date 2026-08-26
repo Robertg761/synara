@@ -9,6 +9,10 @@ export const COMPUTER_WS_METHODS = {
   // such as the settings screen. Everything else on this surface either acts on
   // the desktop or answers for one thread.
   getStatus: "computer.getStatus",
+  // Installs or compiles whatever this desktop is missing, on the user's
+  // explicit request from the settings panel. Separate from `getStatus`
+  // because reading status must never be the thing that compiles a helper.
+  provision: "computer.provision",
   listWindows: "computer.listWindows",
   getState: "computer.getState",
   getScreenSize: "computer.getScreenSize",
@@ -426,6 +430,20 @@ export const ComputerStatusResult = Schema.Struct({
   capabilities: ComputerCapabilities,
 });
 export type ComputerStatusResult = typeof ComputerStatusResult.Type;
+
+export const ComputerProvisionInput = Schema.Struct({});
+export type ComputerProvisionInput = typeof ComputerProvisionInput.Type;
+
+/**
+ * The refreshed status travels with the summary so the panel repaints from one
+ * round trip: provisioning is the one action whose whole point is that the
+ * card it was pressed from is now wrong.
+ */
+export const ComputerProvisionResult = Schema.Struct({
+  summary: TrimmedNonEmptyString,
+  status: ComputerStatusResult,
+});
+export type ComputerProvisionResult = typeof ComputerProvisionResult.Type;
 
 export const ComputerListWindowsInput = Schema.Struct({});
 export type ComputerListWindowsInput = typeof ComputerListWindowsInput.Type;

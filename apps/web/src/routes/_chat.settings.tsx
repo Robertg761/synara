@@ -78,6 +78,7 @@ import {
   AutocompleteList,
   AutocompletePopup,
 } from "../components/ui/autocomplete";
+import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { SelectItem } from "../components/ui/select";
@@ -1257,8 +1258,13 @@ function SettingsRouteView() {
               {activeSection !== "profile" ? (
                 <div className="mb-8 flex items-start justify-between gap-4">
                   <div className="min-w-0">
-                    <h1 className="text-xl font-medium tracking-tight text-foreground">
+                    <h1 className="flex items-center gap-2 text-xl font-medium tracking-tight text-foreground">
                       {activeSectionItem.label}
+                      {activeSectionItem.badge ? (
+                        <Badge variant="warning" size="lg">
+                          {activeSectionItem.badge}
+                        </Badge>
+                      ) : null}
                     </h1>
                     <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
                       {activeSectionItem.description}

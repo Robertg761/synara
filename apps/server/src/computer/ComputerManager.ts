@@ -14,6 +14,7 @@ import {
   type ComputerScreenshot,
   type ComputerGetScreenSizeResult,
   type ComputerListWindowsResult,
+  type ComputerProvisionResult,
   type ComputerLaunchAppResult,
   type ComputerState,
   type ComputerStatusResult,
@@ -342,6 +343,23 @@ export class ComputerManager {
       health: this.backendHealth,
       capabilities: this.backendCapabilities,
     };
+  }
+
+  /**
+   * Set this desktop up, then answer with what it looks like now.
+   *
+   * Engages the backend first: the user pressing "Set up" is exactly the real
+   * reason `engageBackend` exists to wait for, and the establishing reads that
+   * follow have to see an engaged backend or they will answer from the passive
+   * probe the button was pressed to get past.
+   */
+  async provision(): Promise<ComputerProvisionResult> {
+    this.engageBackend();
+    if (!this.backend.provision) {
+      throw new Error("This desktop backend has nothing to install.");
+    }
+    const summary = await this.backend.provision();
+    return { summary, status: await this.getStatus() };
   }
 
   async listWindows(): Promise<ComputerListWindowsResult> {

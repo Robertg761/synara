@@ -228,6 +228,7 @@ function probeFor(overrides: Partial<PortalProbe> = {}): PortalProbe {
     portal: { present: false },
     desktopExtensionPresent: false,
     wlClipboard: false,
+    helperPath: "/home/test/.local/share/synara/computer/synara-computer-desktop-helper",
     gaps: [],
     ...overrides,
   };
@@ -264,6 +265,67 @@ describe("planPortalProviders", () => {
     }
     // The clipboard is its own pair of processes and needs no helper at all.
     expect(plan.clipboard.blockedBy).toBeUndefined();
+  });
+
+  it("names the unbuilt helper rather than calling a wlroots desktop unsupported", () => {
+    // The exact shape that made this necessary: Hyprland, which advertises
+    // every protocol Synara needs, with no helper built. The globals cannot be
+    // read *because* the helper is what reads them, so the old plan concluded
+    // the compositor offered nothing and told the user to install a portal
+    // backend they already had — and to compile PipeWire support for a
+    // mechanism this desktop never uses.
+    const plan = planPortalProviders(
+      probeFor({
+        desktop: "wlroots",
+        portal: { present: true, screenCastVersion: 6 },
+        // Installed, as it is on the machine this was found on: whether it can
+        // actually *read* a selection depends on a data-control global, which
+        // is exactly what could not be looked up.
+        wlClipboard: true,
+        // No `waylandGlobals` and no `helperBinary`: unknown, not empty.
+      }),
+    );
+
+    for (const slot of ["input", "capture", "windows", "clipboard"] as const) {
+      expect(plan[slot].blockedBy).toContain("native desktop helper is not built");
+    }
+    expect(plan.input.blockedBy).not.toContain("offers neither");
+    expect(plan.capture.blockedBy).not.toContain("PipeWire");
+    expect(plan.windows.blockedBy).not.toContain("exposes no window enumeration");
+    expect(plan.clipboard.blockedBy).not.toContain("advertises no data-control");
+  });
+
+  it("still blames PipeWire on GNOME, where PipeWire really is the capture path", () => {
+    // The one desktop where an unreadable global list changes nothing: GNOME
+    // captures through the ScreenCast portal either way, and that refusal
+    // already names the helper and the build script.
+    const plan = planPortalProviders(
+      probeFor({
+        desktop: "gnome",
+        portal: { present: true, remoteDesktopVersion: 2, screenCastVersion: 5 },
+      }),
+    );
+
+    expect(plan.capture.implementation).toBe("pipewire-screencast");
+    expect(plan.capture.blockedBy).toContain("PipeWire");
+    // Input is the portal's, which needs no helper and no global list.
+    expect(plan.input.implementation).toBe("portal-remote-desktop");
+    expect(plan.input.blockedBy).toBeUndefined();
+  });
+
+  it("keeps saying a real protocol is absent when the globals were actually read", () => {
+    // The guard must not swallow the honest answer: a desktop whose list was
+    // read and simply does not contain the protocol is still told so.
+    const plan = planPortalProviders(
+      probeFor({
+        desktop: "wlroots",
+        helperBinary: "/tmp/synara-computer-desktop-helper",
+        waylandGlobals: [],
+      }),
+    );
+
+    expect(plan.input.blockedBy).toContain("offers neither");
+    expect(plan.windows.blockedBy).toContain("exposes no window enumeration");
   });
 
   it("prefers wlroots protocols over the portal even when both are present", () => {

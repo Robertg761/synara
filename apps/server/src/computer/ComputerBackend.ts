@@ -159,6 +159,16 @@ export interface ComputerBackend {
    * use the desktop. See `probeAvailability` for the passive counterpart.
    */
   availability(): Promise<ComputerAvailability>;
+
+  /**
+   * Install or compile whatever this backend needs, on explicit request.
+   *
+   * Optional because not every backend has anything to provision: the fake and
+   * the unavailable backends have nothing, and a nested session's compositor
+   * arrived with its own. A backend that implements it returns one sentence
+   * describing what it did, for the settings card that asked.
+   */
+  provision?(): Promise<string>;
   /**
    * Live supervision health. Synchronous and side-effect free on purpose: it
    * reports what the connect and reconnect paths already know, so reading it
