@@ -21,11 +21,32 @@ name: KWin Plugin Prebuilds
 on:
   # Callable so a release builds its binaries from the commit being released,
   # rather than inheriting whatever the last scheduled run happened to produce.
+  # There is deliberately no tag trigger: the release workflow calls this one,
+  # and a standalone tag run would share its `${{ github.ref }}` concurrency
+  # group and queue the release behind a duplicate of itself.
   workflow_call:
+    inputs:
+      ref:
+        description: >-
+          The commit to build from. The release passes its provenance-verified
+          commit so the binaries match what is being released; empty means the
+          triggering commit.
+        required: false
+        type: string
+        default: ""
+      strict:
+        description: >-
+          Fail the run when any expected matrix build is missing, instead of
+          warning. A release sets this: a scheduled run losing a distribution
+          costs its users a local build, but a release doing so ships that gap
+          to everyone until the next release.
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
     paths:
       - "apps/server/native/computer-use-kwin/**"
   # KWin moves on the distributions' schedule, not ours, so a monthly rebuild
@@ -108,6 +129,8 @@ jobs:
       - name: Checkout
         if: steps.deps.outcome == 'success'
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Read the KWin version this image ships
         if: steps.deps.outcome == 'success'
@@ -180,6 +203,10 @@ jobs:
       - name: Download every build
         uses: actions/download-artifact@v6
         with:
+          # In a release run this workflow shares its artifact namespace with the
+          # caller and the desktop helper prebuilds; the pattern keeps their
+          # uploads out.
+          pattern: kwin-plugin-*
           path: downloaded
           merge-multiple: true
 
@@ -190,19 +217,42 @@ jobs:
         # a claim made upstream of it. A duplicate (kwinVersion, arch) is a real
         # ambiguity - two distributions shipping the same KWin - and the first
         # wins, deterministically, by sorted build id.
+        #
+        # Coverage is judged against the build matrix, over the entries that
+        # arrived rather than the manifest rows that survived deduplication:
+        # two distributions shipping the same KWin both built successfully. An
+        # empty manifest always fails - it means the wiring broke, not that a
+        # distribution drifted - and a partial one is a warning on a scheduled
+        # run but an error under `strict`, because a release that ships a gap
+        # ships it to everyone until the next release.
+        env:
+          STRICT: ${{ inputs.strict }}
         run: |
           set -euo pipefail
           mkdir -p prebuilt
           python3 - <<'PY'
-          import hashlib, json, pathlib, shutil
+          import hashlib, json, os, pathlib, shutil, sys
+
+          # Mirrors the build matrix above; a distribution added there must be
+          # added here for coverage to guard it.
+          expected = [
+              ("fedora-43", "x64"), ("fedora-43", "arm64"),
+              ("fedora-44", "x64"), ("fedora-44", "arm64"),
+              ("debian-trixie", "x64"), ("debian-trixie", "arm64"),
+              ("ubuntu-2604", "x64"), ("ubuntu-2604", "arm64"),
+              ("opensuse-tumbleweed", "x64"), ("opensuse-tumbleweed", "arm64"),
+              ("arch", "x64"),
+          ]
 
           source = pathlib.Path("downloaded")
           out = pathlib.Path("prebuilt")
-          builds, seen = [], set()
+          builds, seen, arrived = [], set(), set()
           for entry in sorted(source.glob("*.so.json")):
               meta = json.loads(entry.read_text())
               key = (meta["kwinVersion"], meta["arch"])
               binary = source / meta["file"]
+              if binary.is_file():
+                  arrived.add((meta["builtOn"], meta["arch"]))
               if key in seen or not binary.is_file():
                   print(f"skipping {meta['file']}: duplicate or missing")
                   continue
@@ -213,6 +263,17 @@ jobs:
 
           (out / "manifest.json").write_text(json.dumps({"builds": builds}, indent=2) + "\n")
           print(f"{len(builds)} build(s) in the manifest")
+
+          if not builds:
+              print("::error::No KWin plugin builds arrived at all; the release would ship an empty prebuilt/")
+              sys.exit(1)
+          strict = os.environ.get("STRICT") == "true"
+          missing = [pair for pair in expected if pair not in arrived]
+          for distro, arch in missing:
+              kind = "error" if strict else "warning"
+              print(f"::{kind}::No KWin plugin build from {distro} ({arch}); its KWin version may be uncovered")
+          if strict and missing:
+              sys.exit(1)
           PY
           cat prebuilt/manifest.json
 

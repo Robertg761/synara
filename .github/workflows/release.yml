@@ -163,6 +163,12 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/desktop-helper-prebuilds.yml
+    with:
+      # The provenance-verified commit, so the shipped binaries are built from
+      # exactly what is being released; strict, so a matrix gap fails the
+      # release instead of silently shipping without that distribution.
+      ref: ${{ needs.preflight.outputs.ref }}
+      strict: true
 
   kwin_plugin_prebuilds:
     name: KWin plugin prebuilds
@@ -170,6 +176,9 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/kwin-plugin-prebuilds.yml
+    with:
+      ref: ${{ needs.preflight.outputs.ref }}
+      strict: true
 
   build:
     name: Build ${{ matrix.label }}
@@ -256,7 +265,12 @@ jobs:
               echo "::error::$root/manifest.json is missing; this release would ship no prebuilt binaries for it"
               exit 1
             fi
-            echo "$root: $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["builds"]))' "$root/manifest.json") build(s)"
+            count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["builds"]))' "$root/manifest.json")"
+            if [ "$count" -eq 0 ]; then
+              echo "::error::$root/manifest.json lists no builds; this release would ship an empty prebuilt/"
+              exit 1
+            fi
+            echo "$root: $count build(s)"
           done
 
       - id: build_artifact
@@ -435,7 +449,10 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
+          # `desktop-app-`, not `desktop-`: the called prebuild workflows upload
+          # `desktop-helper-*` artifacts into this same run, and the publish
+          # job's download pattern must not be able to catch those.
+          name: desktop-app-${{ matrix.platform }}-${{ matrix.arch }}
           path: release-publish/*
           if-no-files-found: error
 
@@ -540,7 +557,7 @@ jobs:
       - name: Download all desktop artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: desktop-*
+          pattern: desktop-app-*
           merge-multiple: true
           path: release-assets
 
