@@ -40,6 +40,7 @@ import {
   type McpToolCallResult,
 } from "../../agentGateway/protocol.ts";
 import {
+  filterToolsByCapability,
   gatewayToolErrorResult,
   GatewayToolError,
   READ_ONLY_TOOL_ANNOTATIONS,
@@ -102,7 +103,7 @@ export function filterExternalMcpTools(
   tools: ReadonlyArray<ExternalTool>,
   capabilities: ReadonlySet<ExternalMcpCapability>,
 ) {
-  return tools.filter((tool) => capabilities.has(tool.requiredCapability));
+  return filterToolsByCapability(tools, capabilities);
 }
 
 const decodeExternalCreateTask = Schema.decodeUnknownEffect(ExternalMcpCreateTaskInput);

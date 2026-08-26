@@ -1,0 +1,221 @@
+# Prebuilt KWin plugin binaries, one per KWin version we can reach.
+#
+# The plugin is a binary KWin module: it loads into the exact KWin version it was
+# compiled against and no other, and KWin refuses everything else with no reason
+# given. That made a compiler, cmake, and the KWin development headers a hard
+# requirement on the user's own machine - which almost nobody has, and which is
+# not a thing to ask of someone who just turned on a setting.
+#
+# So the versions get built here instead. Each job is a distribution container
+# pinned to whatever KWin that distribution ships; the version is read off the
+# built system rather than declared, because the point is to cover what users
+# actually run, not what we wish they ran. Synara picks a build by exact KWin
+# version and architecture at install time and falls back to building from source
+# when there is no match - so a distribution missing from this matrix costs a user
+# a local build, not the feature.
+#
+# The artifacts land in `apps/server/native/computer-use-kwin/prebuilt/` in a
+# packaged build, next to the `manifest.json` the assemble job writes.
+name: KWin Plugin Prebuilds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+    paths:
+      - "apps/server/native/computer-use-kwin/**"
+  # KWin moves on the distributions' schedule, not ours, so a monthly rebuild
+  # keeps the matrix honest between releases.
+  schedule:
+    - cron: "0 6 1 * *"
+
+permissions: {}
+
+concurrency:
+  group: kwin-plugin-prebuilds-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.distro.id }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    container: ${{ matrix.distro.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        distro:
+          - { id: fedora-43, image: "fedora:43" }
+          - { id: fedora-44, image: "fedora:44" }
+          - { id: debian-trixie, image: "debian:trixie" }
+          - { id: ubuntu-2604, image: "ubuntu:26.04" }
+          - { id: opensuse-tumbleweed, image: "opensuse/tumbleweed" }
+          - { id: arch, image: "archlinux:latest" }
+        exclude:
+          # Arch publishes no official arm64 image.
+          - arch: arm64
+            distro: { id: arch, image: "archlinux:latest" }
+    steps:
+      - name: Install the toolchain and KWin headers
+        id: deps
+        shell: bash
+        # A distribution that has dropped or renamed its KWin development
+        # package is a gap in the matrix, not a broken build: it is reported and
+        # skipped, and its users get a source build.
+        continue-on-error: true
+        env:
+          DISTRO_ID: ${{ matrix.distro.id }}
+        run: |
+          set -euxo pipefail
+          case "$DISTRO_ID" in
+            fedora-*)
+              dnf -y install cmake ninja-build gcc-c++ kwin-devel qt6-qtbase-devel \
+                kf6-kwindowsystem-devel wayland-devel extra-cmake-modules pkgconf \
+                coreutils util-linux gawk grep git
+              ;;
+            debian-*|ubuntu-*)
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends cmake ninja-build g++ \
+                kwin-dev qt6-base-dev libkf6windowsystem-dev libwayland-dev \
+                extra-cmake-modules pkg-config coreutils util-linux gawk grep ca-certificates git
+              ;;
+            opensuse-*)
+              zypper --non-interactive refresh
+              zypper --non-interactive install cmake ninja gcc-c++ kwin6-devel \
+                qt6-base-devel kf6-kwindowsystem-devel wayland-devel \
+                extra-cmake-modules pkgconf-pkg-config coreutils util-linux gawk grep git
+              ;;
+            arch)
+              pacman -Syu --noconfirm cmake ninja gcc kwin qt6-base kwindowsystem \
+                wayland extra-cmake-modules pkgconf coreutils util-linux gawk grep git
+              ;;
+            *)
+              echo "::error::No package recipe for $DISTRO_ID"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        if: steps.deps.outcome == 'success'
+        uses: actions/checkout@v6
+
+      - name: Read the KWin version this image ships
+        if: steps.deps.outcome == 'success'
+        id: kwin
+        shell: bash
+        # Read from the installed KWin rather than declared in this file, so the
+        # manifest describes what was actually linked against. The cmake package
+        # version is the authority; the binary is the fallback for images that
+        # ship headers without the compositor.
+        run: |
+          set -euo pipefail
+          version=""
+          for config in /usr/lib64/cmake/KWin/KWinConfigVersion.cmake \
+                        /usr/lib/cmake/KWin/KWinConfigVersion.cmake \
+                        /usr/lib/*/cmake/KWin/KWinConfigVersion.cmake; do
+            if [ -f "$config" ]; then
+              version="$(grep -oE 'PACKAGE_VERSION "[0-9.]+"' "$config" | grep -oE '[0-9.]+' | head -n 1 || true)"
+              if [ -n "$version" ]; then break; fi
+            fi
+          done
+          if [ -z "$version" ] && command -v kwin_wayland >/dev/null 2>&1; then
+            version="$(kwin_wayland --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n 1)"
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::Could not read a KWin version from ${{ matrix.distro.image }}"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "Building against KWin $version"
+
+      - name: Build the plugin
+        if: steps.deps.outcome == 'success'
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          path="$(bash apps/server/native/computer-use-kwin/scripts/install-and-load.sh --build-only | tail -n 1)"
+          [ -f "$path" ] || { echo "::error::--build-only printed no usable path"; exit 1; }
+          mkdir -p out
+          name="SynaraComputerUsePlugin-kwin${{ steps.kwin.outputs.version }}-${{ matrix.arch }}.so"
+          cp "$path" "out/$name"
+          # The entry the assemble job folds into manifest.json. Written here
+          # because this is the only place that knows what was actually linked.
+          cat >"out/${name}.json" <<EOF
+          {
+            "kwinVersion": "${{ steps.kwin.outputs.version }}",
+            "arch": "${{ matrix.arch }}",
+            "file": "$name",
+            "builtOn": "${{ matrix.distro.id }}"
+          }
+          EOF
+
+      - name: Upload
+        if: steps.deps.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwin-plugin-${{ matrix.distro.id }}-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble the manifest
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download every build
+        uses: actions/download-artifact@v6
+        with:
+          path: downloaded
+          merge-multiple: true
+
+      - name: Write manifest.json
+        shell: bash
+        # Checksums are computed here, over the bytes that will actually ship, so
+        # the runtime check verifies the same file this job produced rather than
+        # a claim made upstream of it. A duplicate (kwinVersion, arch) is a real
+        # ambiguity - two distributions shipping the same KWin - and the first
+        # wins, deterministically, by sorted build id.
+        run: |
+          set -euo pipefail
+          mkdir -p prebuilt
+          python3 - <<'PY'
+          import hashlib, json, pathlib, shutil
+
+          source = pathlib.Path("downloaded")
+          out = pathlib.Path("prebuilt")
+          builds, seen = [], set()
+          for entry in sorted(source.glob("*.so.json")):
+              meta = json.loads(entry.read_text())
+              key = (meta["kwinVersion"], meta["arch"])
+              binary = source / meta["file"]
+              if key in seen or not binary.is_file():
+                  print(f"skipping {meta['file']}: duplicate or missing")
+                  continue
+              seen.add(key)
+              meta["sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+              shutil.copy2(binary, out / meta["file"])
+              builds.append(meta)
+
+          (out / "manifest.json").write_text(json.dumps({"builds": builds}, indent=2) + "\n")
+          print(f"{len(builds)} build(s) in the manifest")
+          PY
+          cat prebuilt/manifest.json
+
+      - name: Upload the drop-in directory
+        uses: actions/upload-artifact@v4
+        with:
+          # Unpacks over apps/server/native/computer-use-kwin/prebuilt/, which is
+          # where the server looks when no SYNARA_KWIN_PREBUILT_DIR is set.
+          name: kwin-plugin-prebuilt
+          path: prebuilt/
+          if-no-files-found: error

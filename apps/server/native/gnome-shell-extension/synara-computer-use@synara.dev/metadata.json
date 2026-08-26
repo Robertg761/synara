@@ -1,0 +1,10 @@
+{
+  "uuid": "synara-computer-use@synara.dev",
+  "name": "Synara Computer Use",
+  "description": "Exposes window enumeration, activation, raise, and close to Synara over the session bus (org.synara.ComputerUse). GNOME offers no client-visible window list, so an extension running inside GNOME Shell is the only route to window geometry on Wayland.",
+  "url": "https://github.com/Robertg761/synara",
+  "version": 1,
+  "version-name": "1.0.0",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "session-modes": ["user"]
+}

@@ -8,7 +8,7 @@ import type {
   ThreadId,
   RuntimeMode,
 } from "@synara/contracts";
-import { CheckIcon, ChevronDownIcon, HandoffIcon, WorktreeIcon } from "~/lib/icons";
+import { CheckIcon, ChevronDownIcon, HandoffIcon, MonitorIcon, WorktreeIcon } from "~/lib/icons";
 import { HiOutlineHandRaised } from "react-icons/hi2";
 import { CentralIcon } from "~/lib/central-icons";
 import { useCallback, useMemo, useState, type ReactNode } from "react";
@@ -60,6 +60,7 @@ import { Collapsible, CollapsiblePanel } from "./ui/collapsible";
 import { DisclosureChevron } from "./ui/DisclosureChevron";
 import {
   Menu,
+  MenuCheckboxItem,
   MenuGroup,
   MenuGroupLabel,
   MenuItem,
@@ -173,6 +174,10 @@ export interface RuntimeUsageControlsProps {
   providerStatus?: ServerProviderStatus | null | undefined;
   runtimeMode?: RuntimeMode | undefined;
   onRuntimeModeChange?: ((mode: RuntimeMode) => void) | undefined;
+  computerControlEnabled?: boolean | undefined;
+  computerControlAvailable?: boolean | undefined;
+  computerControlDisabledReason?: string | undefined;
+  onComputerControlChange?: ((enabled: boolean) => void) | undefined;
   contextWindow?: ContextWindowSnapshot | null | undefined;
   cumulativeCostUsd?: number | null | undefined;
   activeContextWindowLabel?: string | null | undefined;
@@ -190,6 +195,10 @@ export function RuntimeUsageControls({
   providerStatus,
   runtimeMode,
   onRuntimeModeChange,
+  computerControlEnabled = false,
+  computerControlAvailable = false,
+  computerControlDisabledReason = "Checking computer availability.",
+  onComputerControlChange,
   className,
   hideLabel: hideLabelProp,
 }: RuntimeUsageControlsProps) {
@@ -218,7 +227,7 @@ export function RuntimeUsageControls({
                   runtimeMode === "auto" && RUNTIME_AUTO_ACCENT_CLASS_NAME,
                   runtimeMode === "full-access" && RUNTIME_FULL_ACCESS_ACCENT_CLASS_NAME,
                 )}
-                title={`${runtimePresentation.label}: ${runtimePresentation.description}. Click to change permissions.`}
+                title={`${runtimePresentation.label}: ${runtimePresentation.description}.${computerControlEnabled ? " Computer control is on." : ""} Click to change permissions.`}
               />
             }
           >
@@ -233,6 +242,12 @@ export function RuntimeUsageControls({
               <span className={cn("truncate", hideLabel ? "sr-only" : "@max-[480px]:sr-only")}>
                 {runtimePresentation.label}
               </span>
+              {computerControlEnabled ? (
+                <>
+                  <MonitorIcon className="size-3.5 shrink-0" aria-hidden />
+                  <span className="sr-only">Computer control is on.</span>
+                </>
+              ) : null}
               <ChevronDownIcon
                 className={cn(
                   "size-3 shrink-0 opacity-70",
@@ -277,6 +292,27 @@ export function RuntimeUsageControls({
                 icon={<CentralIcon name="shield-access" className="size-4 shrink-0" />}
               />
             </MenuRadioGroup>
+            {onComputerControlChange ? (
+              <>
+                <MenuSeparator />
+                <MenuCheckboxItem
+                  variant="switch"
+                  checked={computerControlEnabled}
+                  disabled={!computerControlAvailable}
+                  onCheckedChange={(checked) => onComputerControlChange(checked === true)}
+                  title={computerControlAvailable ? undefined : computerControlDisabledReason}
+                >
+                  <span className="flex min-w-0 flex-col gap-0.5 py-0.5">
+                    <span className="font-medium text-xs">Computer control</span>
+                    <span className="text-[11px] leading-4 text-muted-foreground">
+                      {computerControlAvailable
+                        ? "Lets the agent see and control the desktop with a separate cursor."
+                        : computerControlDisabledReason}
+                    </span>
+                  </span>
+                </MenuCheckboxItem>
+              </>
+            ) : null}
           </ComposerPickerMenuPopup>
         </Menu>
       ) : null}
