@@ -88,12 +88,16 @@ import {
   planPortalProviders,
   usesProvider,
   type PortalProbe,
+  type PortalProviderChoice,
   type PortalProviderPlan,
 } from "./probe.ts";
 import {
   missingProvider,
+  PORTAL_CAPABILITY_SLOTS,
   requireProvider,
   resolvedProvider,
+  type PortalCapabilitySlot,
+  type PortalProviderId,
   type PortalProviders,
   type PortalWindowProvider,
   type ProviderSlot,
@@ -105,6 +109,9 @@ const DEFAULT_GLIDE_DURATION_MS = 180;
 const DEFAULT_STILL_INTERVAL_MS = 500;
 /** Names this backend in a capture failure, which reaches a tool call verbatim. */
 const CAPTURE_SOURCE = "Synara portal capture";
+/** Stands in when an availability refusal arrives empty, which the contract forbids. */
+const UNAVAILABLE_FALLBACK_MESSAGE =
+  "The Synara portal backend is unavailable, and the failure carried no message.";
 
 /**
  * Where the desktop's permission dialog stands.
@@ -199,6 +206,18 @@ export class PortalComputerBackend implements ComputerBackend {
   private readonly buildProviders: ((probe: PortalProbe) => PortalProviders) | undefined;
   /** Memoized so concurrent tool calls share one install rather than racing. */
   private provisionPromise: Promise<string | undefined> | undefined;
+  /**
+   * The install itself, shared between `availability()` and the settings
+   * panel's `provision()`. Two concurrent installs would collide in the
+   * staging directory, so whoever asks while one is in flight joins it.
+   */
+  private provisionInFlight: Promise<DesktopHelperProvisionResult> | undefined;
+  /**
+   * Serializes probe adoption. Two adoptions interleaving would each capture
+   * the same previous provider set and dispose it twice, while both of their
+   * fresh sets survive — one of them assigned, the other leaked.
+   */
+  private adoptChain: Promise<void> = Promise.resolve();
 
   constructor(options: PortalComputerBackendOptions) {
     this.computerId = (options.computerId ?? DEFAULT_COMPUTER_ID) as ComputerId;
@@ -294,7 +313,10 @@ export class PortalComputerBackend implements ComputerBackend {
     if (this.probe.helperBinary === undefined && (await this.helperCouldExist())) {
       return { kind: "available", backend: "portal" };
     }
-    return { kind: "backend-unavailable", message: blockers.join(" ") };
+    return {
+      kind: "backend-unavailable",
+      message: clampComputerMessage(blockers.join(" "), UNAVAILABLE_FALLBACK_MESSAGE),
+    };
   }
 
   /**
@@ -314,8 +336,14 @@ export class PortalComputerBackend implements ComputerBackend {
     if (blockers.length > 0) {
       // The provisioning failure wins when there is one: "this machine is
       // missing gcc" is actionable, where the plan's refusal can only say the
-      // helper is absent without knowing why installing it did not work.
-      return { kind: "backend-unavailable", message: failure ?? blockers.join(" ") };
+      // helper is absent without knowing why installing it did not work. It is
+      // also error text this backend does not control — a compiler diagnostic,
+      // a checksum mismatch — so it is clamped to the contract's message bound
+      // rather than allowed to fail the state payload carrying it.
+      return {
+        kind: "backend-unavailable",
+        message: clampComputerMessage(failure ?? blockers.join(" "), UNAVAILABLE_FALLBACK_MESSAGE),
+      };
     }
     return { kind: "available", backend: "portal" };
   }
@@ -323,9 +351,10 @@ export class PortalComputerBackend implements ComputerBackend {
   /**
    * Provision on demand, for the Computer settings panel's setup action.
    *
-   * Forces a fresh attempt rather than returning the memoized one: a user
-   * pressing the button has usually just installed the packages the last
-   * attempt named, and handing them that same failure back would be absurd.
+   * Discards the memoized answer rather than returning it: a user pressing the
+   * button has usually just installed the packages the last attempt named, and
+   * handing them that same failure back would be absurd. An attempt still in
+   * flight is joined rather than raced — see `startProvision`.
    */
   async provision(): Promise<string> {
     this.throwIfDisposed();
@@ -335,7 +364,7 @@ export class PortalComputerBackend implements ComputerBackend {
       });
     }
     this.provisionPromise = undefined;
-    const result = await this.provisionHelper();
+    const result = await this.startProvision();
     await this.adoptProbe();
     return result.summary;
   }
@@ -380,13 +409,20 @@ export class PortalComputerBackend implements ComputerBackend {
    *
    * Memoized the way `KWinComputerBackend.provisionPromises` is, and for the
    * same reason: every tool call goes through `availability()`, and a compile
-   * that takes seconds must not be started once per call.
+   * that takes seconds must not be started once per call. The two outcomes
+   * memoize differently. Success sticks for the life of the process — the
+   * stamp check ran and passed, and re-hashing the helper sources on every
+   * tool call buys nothing. Failure clears itself (see `runProvision`): the
+   * usual cause is a missing package the message names, and the user who just
+   * installed it must not be handed the memoized refusal.
+   *
+   * A helper already on disk is deliberately not a reason to skip: the stamp
+   * check inside provisioning is the only thing that notices an installed
+   * helper gone stale against the sources this build shipped, and it is cheap
+   * when nothing changed.
    */
   private ensureProvisioned(): Promise<string | undefined> {
     if (this.disposed) return Promise.resolve(undefined);
-    // A desktop that already has its helper has nothing to provision, and one
-    // whose providers all resolved is not waiting on anything.
-    if (this.probe.helperBinary !== undefined) return Promise.resolve(undefined);
     if (!this.provisionHelper) return Promise.resolve(undefined);
     this.provisionPromise ??= this.runProvision();
     return this.provisionPromise;
@@ -394,43 +430,177 @@ export class PortalComputerBackend implements ComputerBackend {
 
   private async runProvision(): Promise<string | undefined> {
     try {
-      await this.provisionHelper?.();
-      await this.adoptProbe();
+      const result = await this.startProvision();
+      // "Already current" with the helper already probed means nothing about
+      // this desktop changed, and re-probing would spawn the helper to re-read
+      // a registry the plan already reflects. Every other outcome — a fresh
+      // install, or a helper the construction probe did not see — changes what
+      // the desktop can do, so the probe is retaken.
+      if (result.action !== "already-current" || this.probe.helperBinary === undefined) {
+        await this.adoptProbe();
+      }
       return undefined;
     } catch (error) {
+      // A failed attempt is a fact about that attempt, not about this machine
+      // forever. Clearing the memo is what makes the next availability() retry
+      // after the user installs the package the message names.
+      this.provisionPromise = undefined;
       return describeErrorMessage(error, "installing the desktop helper failed without a reason.");
     }
   }
 
   /**
+   * The install itself, deduplicated across every path that can start one.
+   *
+   * `availability()` and the settings panel's `provision()` can race — a tool
+   * call arriving while the user presses "Set up" — and two concurrent
+   * installs would collide in the staging directory. Whoever asks while one is
+   * in flight joins it and shares its outcome.
+   */
+  private startProvision(): Promise<DesktopHelperProvisionResult> {
+    const provisionHelper = this.provisionHelper;
+    if (!provisionHelper) {
+      return Promise.reject(
+        new ComputerBackendError("This backend has no desktop helper to install.", {
+          retryable: false,
+        }),
+      );
+    }
+    this.provisionInFlight ??= Promise.resolve()
+      .then(provisionHelper)
+      .finally(() => {
+        this.provisionInFlight = undefined;
+      });
+    return this.provisionInFlight;
+  }
+
+  /**
    * Re-probe and, if the answer changed, swap in the provider set it implies.
    *
-   * The plan is compared rather than applied unconditionally. On GNOME the
-   * live providers may be holding a portal session the user has already
-   * consented to, and rebuilding an identical set would drop that grant and put
-   * a second dialog on their screen for no gain.
+   * Serialized on `adoptChain`: two adoptions interleaving would each capture
+   * the same previous provider set and dispose it twice while both fresh sets
+   * survive. The real work is in `adoptProbeNow`.
    */
-  private async adoptProbe(): Promise<void> {
+  private adoptProbe(): Promise<void> {
+    const run = this.adoptChain.then(() => this.adoptProbeNow());
+    this.adoptChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
+   * The plan is compared rather than applied unconditionally, slot by slot. On
+   * GNOME the live providers may be holding a portal session the user has
+   * already consented to, and rebuilding an identical set would drop that
+   * grant and put a second dialog on their screen for no gain — so a slot
+   * whose choice is unchanged keeps its live provider and only the slots whose
+   * answer actually changed take fresh ones.
+   *
+   * The one constraint on that grafting is that providers share resources in
+   * families: the wlroots providers hold refcounted shares of one
+   * compositor-attached helper process, the portal providers shares of one
+   * consent-gated session. Splitting a family across old and new sets would
+   * leave two helper processes attached to the compositor, or two portal
+   * sessions each raising its own dialog — so a changed slot pulls every slot
+   * sharing its resource family along with it. Discarding an unused fresh
+   * provider is free: it was never opened, and releasing it only drops its
+   * share of a resource that spawns lazily.
+   */
+  private async adoptProbeNow(): Promise<void> {
     if (this.disposed || !this.reprobe || !this.buildProviders) return;
     const probe = await this.reprobe();
+    // Disposal may have happened while the probe was in flight, and a provider
+    // set adopted now would never be disposed.
+    if (this.disposed) return;
     const plan = planPortalProviders(probe);
     if (samePlan(plan, this.plan)) {
       this.probe = probe;
       return;
     }
+    // Built before anything is assigned, so a construction failure leaves the
+    // backend on its previous, internally consistent set.
+    const fresh = this.buildProviders(probe);
     const previous = this.providers;
+    const previousPlan = this.plan;
+    const changedFamilies = new Set<ProviderResourceFamily>();
+    for (const slot of PORTAL_CAPABILITY_SLOTS) {
+      if (!slotResourceChanged(plan[slot], previousPlan[slot])) continue;
+      // Both sides count: the family the slot is leaving loses a member, and
+      // the family it is joining must not end up split across two resources.
+      for (const choice of [previousPlan[slot], plan[slot]]) {
+        const family = resourceFamily(choice.implementation);
+        if (family !== undefined) changedFamilies.add(family);
+      }
+    }
+    const discards: Array<() => Promise<void> | void> = [];
+    const pick = <T extends { dispose(): Promise<void> }>(
+      slot: PortalCapabilitySlot,
+      previousSlot: ProviderSlot<T>,
+      freshSlot: ProviderSlot<T>,
+    ): ProviderSlot<T> => {
+      const dragged = [previousPlan[slot].implementation, plan[slot].implementation].some(
+        (implementation) => {
+          const family = resourceFamily(implementation);
+          return family !== undefined && changedFamilies.has(family);
+        },
+      );
+      const keep =
+        !dragged && !slotResourceChanged(plan[slot], previousPlan[slot]) && previousSlot.available;
+      if (keep) {
+        if (freshSlot.available) discards.push(() => freshSlot.provider.dispose());
+        return previousSlot;
+      }
+      if (previousSlot.available) discards.push(() => previousSlot.provider.dispose());
+      return freshSlot;
+    };
+    // The previous idle source belongs to whichever family produced it — the
+    // helper-backed source wins in `pickSeatIdle`, so it is helper-backed
+    // exactly when a helper-family provider was live. It survives only if that
+    // family did; otherwise it would hold the last share of a resource every
+    // other slot just left.
+    const previousSeatIdleFamily: ProviderResourceFamily = PORTAL_CAPABILITY_SLOTS.some(
+      (slot) =>
+        resourceFamily(previousPlan[slot].implementation) === "helper" && previous[slot].available,
+    )
+      ? "helper"
+      : "session";
+    const keepSeatIdle =
+      previous.seatIdle !== undefined && !changedFamilies.has(previousSeatIdleFamily);
+    const seatIdle = keepSeatIdle ? previous.seatIdle : fresh.seatIdle;
+    const discardedSeatIdle = keepSeatIdle ? fresh.seatIdle : previous.seatIdle;
+    if (discardedSeatIdle !== undefined) discards.push(() => discardedSeatIdle.dispose());
+    const next: PortalProviders = {
+      input: pick("input", previous.input, fresh.input),
+      capture: pick("capture", previous.capture, fresh.capture),
+      windows: pick("windows", previous.windows, fresh.windows),
+      clipboard: pick("clipboard", previous.clipboard, fresh.clipboard),
+      ...(seatIdle !== undefined ? { seatIdle } : {}),
+    };
     this.probe = probe;
     this.plan = plan;
-    this.providers = this.buildProviders(probe);
-    this.capabilitySet = capabilitiesFromProviders(this.providers);
-    // The seat has to be re-primed against the new idle source, and the old
-    // arbiter's source belonged to the provider set being disposed below.
-    this.arbiter =
-      this.providers.seatIdle !== undefined && this.capabilitySet.sharedSeat
-        ? new SharedSeatArbiter({ source: this.providers.seatIdle, now: () => this.now() })
-        : undefined;
-    this.seatPrimed = false;
-    await disposeProviderSet(previous);
+    this.providers = next;
+    const capabilities = capabilitiesFromProviders(next);
+    const capabilitiesChanged = !sameComputerCapabilities(capabilities, this.capabilitySet);
+    this.capabilitySet = capabilities;
+    // The arbiter follows its idle source: an unchanged source keeps its
+    // primed seat sample, a replaced one has to be re-primed against the new
+    // resource.
+    const wantArbiter = seatIdle !== undefined && capabilities.sharedSeat;
+    if (!(wantArbiter && this.arbiter !== undefined && seatIdle === previous.seatIdle)) {
+      this.arbiter =
+        wantArbiter && seatIdle !== undefined
+          ? new SharedSeatArbiter({ source: seatIdle, now: () => this.now() })
+          : undefined;
+      this.seatPrimed = false;
+    }
+    if (capabilitiesChanged) {
+      this.emit({ type: "capabilities-changed", capabilities: this.capabilitySet });
+    }
+    // Health can move with the capture slot, and the panel reads it live.
+    this.healthState.publish();
+    await Promise.allSettled(discards.map((dispose) => Promise.resolve().then(dispose)));
   }
 
   /**
@@ -1048,14 +1218,60 @@ async function disposeProviderSet(providers: PortalProviders): Promise<void> {
  *
  * Compared on both the implementation and the refusal, because a slot that
  * moved from "blocked, no helper" to "blocked, no such protocol" is a different
- * answer to the user even though neither resolves a provider.
+ * answer to the user even though neither resolves a provider. This is the
+ * adopt path's do-nothing fast path; when it fails, `slotResourceChanged`
+ * decides per slot whether a live provider actually has to be replaced.
  */
 function samePlan(left: PortalProviderPlan, right: PortalProviderPlan): boolean {
-  const slots = ["input", "capture", "windows", "clipboard"] as const;
-  return slots.every(
+  return PORTAL_CAPABILITY_SLOTS.every(
     (slot) =>
       left[slot].implementation === right[slot].implementation &&
       left[slot].blockedBy === right[slot].blockedBy,
+  );
+}
+
+/**
+ * Whether a slot's choice changed in a way that changes which provider serves
+ * it. The refusal text is deliberately not compared here: a blocked slot's
+ * message changing is a reason to adopt the fresh `missingProvider` — which is
+ * free — never a reason to tear down a live one.
+ */
+function slotResourceChanged(next: PortalProviderChoice, previous: PortalProviderChoice): boolean {
+  return (
+    next.implementation !== previous.implementation ||
+    (next.blockedBy === undefined) !== (previous.blockedBy === undefined)
+  );
+}
+
+type ProviderResourceFamily = "helper" | "session";
+
+/**
+ * Which long-lived resource an implementation's provider holds a share of.
+ * Helper-family providers ride one compositor-attached helper process,
+ * session-family providers one consent-gated portal session. Standalone
+ * implementations — wl-clipboard, the GNOME Shell extension — own nothing
+ * shared and graft independently.
+ */
+function resourceFamily(
+  implementation: PortalProviderId | undefined,
+): ProviderResourceFamily | undefined {
+  switch (implementation) {
+    case "wlroots-virtual-input":
+    case "wlr-screencopy":
+    case "wlr-foreign-toplevel":
+      return "helper";
+    case "portal-remote-desktop":
+    case "portal-selection":
+      return "session";
+    default:
+      return undefined;
+  }
+}
+
+/** Field-wise equality, for deciding whether an adoption moved a capability. */
+function sameComputerCapabilities(left: ComputerCapabilities, right: ComputerCapabilities): boolean {
+  return (Object.keys(left) as ReadonlyArray<keyof ComputerCapabilities>).every(
+    (key) => left[key] === right[key],
   );
 }
 

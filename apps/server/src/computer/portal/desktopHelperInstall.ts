@@ -353,19 +353,29 @@ async function locatePrebuilt(
  * The packaged location is a sibling of the bundle, the way the AT-SPI helper
  * script is, and the checkout location is the directory the prebuild workflow's
  * artifact unpacks over — so a developer who downloads that artifact gets the
- * same code path a user does.
+ * same code path a user does. Exported because provisioning answers the same
+ * question — a second list of candidates is a second place for the packaged
+ * root to be forgotten, which is exactly how the runtime once looked only in
+ * the checkout location while releases shipped to the packaged one.
  */
-function prebuiltRoots(
-  dependencies: DesktopHelperResolutionDependencies,
+export function desktopHelperPrebuiltRoots(
   env: NodeJS.ProcessEnv,
+  override?: string,
 ): readonly string[] {
-  if (dependencies.prebuiltRoot) return [dependencies.prebuiltRoot];
+  if (override) return [override];
   const configured = env[DESKTOP_HELPER_PREBUILT_DIR_ENV]?.trim();
   if (configured) return [configured];
   return [
     fileURLToPath(new URL("./computer-desktop-helper/prebuilt/", import.meta.url)),
     fileURLToPath(new URL("../../../native/computer-desktop-helper/prebuilt/", import.meta.url)),
   ];
+}
+
+function prebuiltRoots(
+  dependencies: DesktopHelperResolutionDependencies,
+  env: NodeJS.ProcessEnv,
+): readonly string[] {
+  return desktopHelperPrebuiltRoots(env, dependencies.prebuiltRoot);
 }
 
 async function defaultReadOsRelease(): Promise<string | undefined> {

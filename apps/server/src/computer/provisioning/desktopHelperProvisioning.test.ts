@@ -121,6 +121,60 @@ describe("provisionDesktopHelper", () => {
     await expect(readFile(helperPath(), "utf8")).resolves.toBe("shipped-helper");
   });
 
+  it("compiles from source when the shipped binary fails its checksum, and says so", async () => {
+    // A corrupted download must not leave a machine with a working toolchain
+    // helper-less, but it must not be silent either: the summary carries it.
+    const prebuiltRoot = join(sources, "prebuilt");
+    await writePrebuilt(prebuiltRoot, "shipped-helper");
+    await writeFile(join(prebuiltRoot, "synara-computer-desktop-helper-test"), "tampered");
+
+    const result = await provisionDesktopHelper(
+      deps({
+        prebuiltRoot,
+        readOsRelease: () => Promise.resolve(OS_RELEASE),
+        buildFromSource: async () => {
+          const path = helperPath();
+          await mkdir(join(home, ".local", "share", "synara", "computer"), { recursive: true });
+          await writeFile(path, "#!/bin/sh\ntrue\n");
+          await chmod(path, 0o755);
+          return path;
+        },
+      }),
+    );
+
+    expect(result.action).toBe("installed-from-source");
+    expect(result.summary).toContain("failed its checksum");
+    expect(result.summary).toContain("compiled from source instead");
+  });
+
+  it("replaces a stamped prebuilt when a build without sources ships a different one", async () => {
+    // A build that ships only prebuilts has no source tree to fingerprint, so
+    // the shipped binary's checksum is the only thing that can call the
+    // install stale on update.
+    const noSources = join(home, "no-sources-shipped");
+    const rootA = join(sources, "prebuilt-a");
+    const rootB = join(sources, "prebuilt-b");
+    await writePrebuilt(rootA, "helper-release-one");
+    await writePrebuilt(rootB, "helper-release-two");
+    const shippedOnly = (prebuiltRoot: string) =>
+      deps({
+        prebuiltRoot,
+        sourceDirectory: noSources,
+        readOsRelease: () => Promise.resolve(OS_RELEASE),
+        buildFromSource: () => Promise.reject(new Error("nothing to compile")),
+      });
+
+    const first = await provisionDesktopHelper(shippedOnly(rootA));
+    expect(first.action).toBe("installed-prebuilt");
+
+    const unchanged = await provisionDesktopHelper(shippedOnly(rootA));
+    expect(unchanged.action).toBe("already-current");
+
+    const updated = await provisionDesktopHelper(shippedOnly(rootB));
+    expect(updated.action).toBe("installed-prebuilt");
+    await expect(readFile(helperPath(), "utf8")).resolves.toBe("helper-release-two");
+  });
+
   it("does not reinstall when the installed helper matches this build", async () => {
     const install = async () => {
       const path = helperPath();

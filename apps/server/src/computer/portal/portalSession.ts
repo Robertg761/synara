@@ -33,6 +33,7 @@
 import type { ComputerPoint, ComputerRect } from "@synara/contracts";
 
 import { ComputerBackendError } from "../ComputerBackend.ts";
+import { takeDiscreteSteps } from "../scrollUnits.ts";
 import {
   connectSessionPortalBus,
   portalBoolean,
@@ -605,6 +606,20 @@ export class PortalSession {
   }
 
   /**
+   * Sub-notch scroll owed per axis. `NotifyPointerAxisDiscrete` speaks whole
+   * wheel notches while every caller speaks logical pixels, so the fraction of
+   * a notch each call leaves behind is carried into the next one — repeated
+   * small deltas add up instead of vanishing, and nothing is invented.
+   */
+  private scrollRemainderX = 0;
+  private scrollRemainderY = 0;
+
+  /**
+   * Takes logical pixels, like every other backend's scroll, and converts to
+   * notches here — this portal call is the one wire in the codebase that still
+   * speaks notches, and `takeDiscreteSteps` keeps the constant and the
+   * remainder semantics identical to the wlroots helper's `take_discrete_steps`.
+   *
    * Discrete steps only, unlike the wlroots provider's paired axis events.
    * There the pair rides one `wl_pointer.frame`; the portal has no frame
    * grouping, so `NotifyPointerAxis` alongside this would arrive as a second,
@@ -613,20 +628,24 @@ export class PortalSession {
    */
   async scroll(deltaX: number, deltaY: number): Promise<void> {
     const state = await this.ensureOpen();
-    if (deltaY !== 0) {
+    const vertical = takeDiscreteSteps(this.scrollRemainderY, deltaY);
+    this.scrollRemainderY = vertical.remainder;
+    const horizontal = takeDiscreteSteps(this.scrollRemainderX, deltaX);
+    this.scrollRemainderX = horizontal.remainder;
+    if (vertical.steps !== 0) {
       await this.notify("NotifyPointerAxisDiscrete", "oa{sv}ui", [
         state.sessionHandle,
         {},
         POINTER_AXIS_VERTICAL,
-        Math.trunc(deltaY),
+        vertical.steps,
       ]);
     }
-    if (deltaX !== 0) {
+    if (horizontal.steps !== 0) {
       await this.notify("NotifyPointerAxisDiscrete", "oa{sv}ui", [
         state.sessionHandle,
         {},
         POINTER_AXIS_HORIZONTAL,
-        Math.trunc(deltaX),
+        horizontal.steps,
       ]);
     }
   }

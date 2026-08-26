@@ -35,11 +35,13 @@ import { promisify } from "node:util";
 
 import {
   desktopHelperPath,
+  desktopHelperPrebuiltRoots,
   installExecutable,
   readDesktopHelperManifest,
   readHostSystem,
   selectDesktopHelperPrebuild,
   type DesktopHelperPrebuild,
+  type HostSystem,
 } from "../portal/desktopHelperInstall.ts";
 import {
   fingerprintSourceTree,
@@ -146,15 +148,19 @@ export async function provisionDesktopHelper(
 
   if (await exists(path)) {
     const installed = await readInstallStamp(stampPath);
-    // No fingerprint means this build shipped no sources to compare against, so
-    // there is nothing that could call the install stale. An unstamped binary
-    // is one `build.sh` put there by hand, and replacing a build the user made
-    // themselves is not this function's call to make.
-    if (
-      fingerprint === undefined ||
+    // An unstamped binary is one `build.sh` put there by hand, and replacing a
+    // build the user made themselves is not this function's call to make. With
+    // a stamp, staleness is judged against whatever version signal this build
+    // carries: the shipped sources' fingerprint when there are sources, or —
+    // in a build that ships only prebuilts — the shipped binary's checksum
+    // against the checksum the stamp recorded. A build that carries neither
+    // has nothing that could call the install stale.
+    const current =
       installed === undefined ||
-      installed.fingerprint === fingerprint
-    ) {
+      (fingerprint !== undefined
+        ? installed.fingerprint === fingerprint
+        : !(await shippedPrebuiltSupersedes(installed.fingerprint, dependencies, env)));
+    if (current) {
       return {
         action: "already-current",
         path,
@@ -164,11 +170,11 @@ export async function provisionDesktopHelper(
   }
 
   const prebuilt = await installShippedHelper(dependencies, env, path);
-  if (prebuilt) {
+  if (prebuilt.installed) {
     await recordInstall(
       stampPath,
-      fingerprint ?? `prebuilt:${prebuilt.sha256}`,
-      describeBuild(prebuilt),
+      fingerprint ?? `prebuilt:${prebuilt.installed.sha256}`,
+      describeBuild(prebuilt.installed),
       dependencies,
     );
     return {
@@ -177,20 +183,27 @@ export async function provisionDesktopHelper(
       summary: "The desktop helper that shipped with this build is installed and ready.",
     };
   }
+  // A checksum failure is worth saying out loud even when a source build can
+  // still rescue this machine: the file that shipped is not the file that was
+  // built. It is carried into whatever happens next rather than thrown, so a
+  // machine with a working toolchain is not left helper-less over a corrupted
+  // download it never needed.
+  const checksumFailure = prebuilt.checksumFailure;
 
   if (!sourceDirectory) {
     throw new DesktopHelperProvisionError(
-      "No desktop helper shipped with this build for this system, and its sources are not " +
-        `present either, so one could not be built. Point ${DESKTOP_HELPER_SOURCE_DIR_ENV} at a ` +
-        `checkout of ${BUILD_SCRIPT_PATH}'s directory, or SYNARA_COMPUTER_HELPER at a helper you built.`,
+      checksumFailure ??
+        "No desktop helper shipped with this build for this system, and its sources are not " +
+          `present either, so one could not be built. Point ${DESKTOP_HELPER_SOURCE_DIR_ENV} at a ` +
+          `checkout of ${BUILD_SCRIPT_PATH}'s directory, or SYNARA_COMPUTER_HELPER at a helper you built.`,
     );
   }
 
   const gaps = await desktopHelperToolchainGaps(dependencies);
   if (gaps.length > 0) {
     throw new DesktopHelperProvisionError(
-      `The desktop helper has to be compiled on this machine, and the tools to do it are not ` +
-        `installed. ${describeToolchainGaps(gaps)}`,
+      `${checksumFailure ? `${checksumFailure} ` : ""}The desktop helper has to be compiled on ` +
+        `this machine, and the tools to do it are not installed. ${describeToolchainGaps(gaps)}`,
     );
   }
 
@@ -200,8 +213,8 @@ export async function provisionDesktopHelper(
     built = await build(sourceDirectory, env);
   } catch (error) {
     throw new DesktopHelperProvisionError(
-      `The desktop helper failed to compile (${describe(error)}). ` +
-        `You can run ${BUILD_SCRIPT_PATH} yourself to see the full output.`,
+      `${checksumFailure ? `${checksumFailure} ` : ""}The desktop helper failed to compile ` +
+        `(${describe(error)}). You can run ${BUILD_SCRIPT_PATH} yourself to see the full output.`,
     );
   }
   // `build.sh` already writes to the install path when it is given no output
@@ -212,7 +225,9 @@ export async function provisionDesktopHelper(
   return {
     action: "installed-from-source",
     path,
-    summary: "The desktop helper was compiled for this machine and is ready.",
+    summary: checksumFailure
+      ? `${checksumFailure} The helper was compiled from source instead and is ready.`
+      : "The desktop helper was compiled for this machine and is ready.",
   };
 }
 
@@ -282,47 +297,71 @@ async function selectShippedHelper(
   dependencies: DesktopHelperProvisionDependencies,
   env: NodeJS.ProcessEnv,
 ): Promise<{ readonly root: string; readonly build: DesktopHelperPrebuild } | undefined> {
-  const root = dependencies.prebuiltRoot ?? defaultPrebuiltRoot(env);
-  if (!root) return undefined;
-  const manifest = await readDesktopHelperManifest(join(root, "manifest.json"));
-  if (!manifest) return undefined;
-  const system = await readHostSystem({
-    env,
-    ...(dependencies.readOsRelease ? { readOsRelease: dependencies.readOsRelease } : {}),
-    ...(dependencies.arch !== undefined ? { arch: dependencies.arch } : {}),
-    ...(dependencies.glibc ? { glibc: dependencies.glibc } : {}),
-  });
-  const build = selectDesktopHelperPrebuild(manifest, system);
-  return build ? { root, build } : undefined;
+  // The same candidate roots `resolveDesktopHelper` searches, from the same
+  // function: a packaged build ships its prebuilts beside the bundle, and a
+  // second hand-maintained list here is how the runtime once searched only the
+  // checkout location while releases shipped to the packaged one.
+  let system: HostSystem | undefined;
+  for (const root of desktopHelperPrebuiltRoots(env, dependencies.prebuiltRoot)) {
+    const manifest = await readDesktopHelperManifest(join(root, "manifest.json"));
+    if (!manifest) continue;
+    system ??= await readHostSystem({
+      env,
+      ...(dependencies.readOsRelease ? { readOsRelease: dependencies.readOsRelease } : {}),
+      ...(dependencies.arch !== undefined ? { arch: dependencies.arch } : {}),
+      ...(dependencies.glibc ? { glibc: dependencies.glibc } : {}),
+    });
+    const build = selectDesktopHelperPrebuild(manifest, system);
+    if (build) return { root, build };
+  }
+  return undefined;
+}
+
+/**
+ * Whether this build ships a prebuilt that supersedes the stamped install, for
+ * builds that carry no sources. The prebuilt's checksum is the only version
+ * signal such a build has: a stamp that recorded a different checksum is an
+ * install from some other release. Stamps that recorded anything else — a
+ * source fingerprint, "source" — cannot be compared to a checksum, and calling
+ * them stale would replace a build the machine compiled for itself.
+ */
+async function shippedPrebuiltSupersedes(
+  stampedFingerprint: string,
+  dependencies: DesktopHelperProvisionDependencies,
+  env: NodeJS.ProcessEnv,
+): Promise<boolean> {
+  if (!stampedFingerprint.startsWith("prebuilt:")) return false;
+  const shipped = await selectShippedHelper(dependencies, env);
+  if (!shipped) return false;
+  return stampedFingerprint !== `prebuilt:${shipped.build.sha256}`;
 }
 
 async function installShippedHelper(
   dependencies: DesktopHelperProvisionDependencies,
   env: NodeJS.ProcessEnv,
   destination: string,
-): Promise<DesktopHelperPrebuild | undefined> {
+): Promise<{
+  readonly installed?: DesktopHelperPrebuild;
+  /**
+   * Set when a binary shipped for this system but was not the file that was
+   * built. Reported rather than thrown, because a machine with a toolchain can
+   * still compile its own helper — the caller folds this into whatever it says
+   * next so the corruption is never silent.
+   */
+  readonly checksumFailure?: string;
+}> {
   const shipped = await selectShippedHelper(dependencies, env);
-  if (!shipped) return undefined;
+  if (!shipped) return {};
   const source = join(shipped.root, shipped.build.file);
   if (!(await verifyPrebuilt(source, shipped.build.sha256))) {
-    // Not a silent fall-through to the source build: a checksum failure means
-    // the file that shipped is not the file that was built, and that is worth
-    // saying out loud even though a build can still rescue this machine.
-    throw new DesktopHelperProvisionError(
-      `The helper binary shipped for ${describeBuild(shipped.build)} failed its checksum, so it ` +
-        "was not installed. Reinstalling Synara replaces it.",
-    );
+    return {
+      checksumFailure:
+        `The helper binary shipped for ${describeBuild(shipped.build)} failed its checksum, so it ` +
+        "was not installed; reinstalling Synara replaces it.",
+    };
   }
   await installExecutable(source, destination);
-  return shipped.build;
-}
-
-function defaultPrebuiltRoot(env: NodeJS.ProcessEnv): string | undefined {
-  const configured = env.SYNARA_COMPUTER_HELPER_PREBUILT_DIR?.trim();
-  if (configured) return configured;
-  return fileURLToPath(
-    new URL("../../../native/computer-desktop-helper/prebuilt/", import.meta.url),
-  );
+  return { installed: shipped.build };
 }
 
 async function recordInstall(

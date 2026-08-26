@@ -517,7 +517,7 @@ function planClipboard(probe: PortalProbe): PortalProviderChoice {
 }
 
 /**
- * Whether this desktop's protocol list is simply unknown, and the helper is why.
+ * Whether this desktop's protocol list is simply unknown.
  *
  * The helper is what holds the `wl_display` the registry is read on, so a
  * machine without one produces no global list at all — not an empty one. Those
@@ -525,21 +525,35 @@ function planClipboard(probe: PortalProbe): PortalProviderChoice {
  * Hyprland user that their compositor "offers neither the wlroots
  * virtual-pointer protocol nor a RemoteDesktop portal" when it advertises the
  * former and every capability was one `build.sh` away.
+ *
+ * Keyed on the globals alone, not on the helper's absence: a helper that exists
+ * but failed to report the registry — it crashed, timed out, or predates
+ * `--print-globals` — leaves the protocol list exactly as unknown as no helper
+ * at all, and falling through to "this compositor advertises no such protocol"
+ * would state as fact something nobody managed to look up.
  */
 function globalsUnknown(probe: PortalProbe): boolean {
-  return probe.waylandGlobals === undefined && probe.helperBinary === undefined;
+  return probe.waylandGlobals === undefined;
 }
 
 /**
  * The refusal for a capability that could not even be assessed.
  *
- * Says the thing that is actually true — a binary is missing, and it is the
- * same binary that would have answered the question — rather than reporting the
- * absence of protocols nobody managed to look for. Provisioning installs or
- * compiles this automatically on first use; the script is named for the case
- * where that fails and the user wants to see why.
+ * Says the thing that is actually true — the binary that would have answered
+ * the question is missing or did not answer — rather than reporting the absence
+ * of protocols nobody managed to look for. Provisioning installs or compiles
+ * the helper automatically on first use; the script is named for the case where
+ * that fails and the user wants to see why.
  */
 function helperUnknownRefusal(probe: PortalProbe, attempted: string): string {
+  if (probe.helperBinary !== undefined) {
+    return (
+      `Synara's native desktop helper at ${probe.helperBinary} did not report this compositor's protocol list, ` +
+      `so there is no way to know whether this desktop can ${attempted}. The helper may be from an older build ` +
+      "or failing to reach the compositor; rebuild it with apps/server/native/computer-desktop-helper/build.sh, " +
+      "or retry from the Computer settings panel."
+    );
+  }
   return (
     `Synara's native desktop helper is not built at ${probe.helperPath}, so there is no way to ` +
     `${attempted} — and because the helper is also what reads the compositor's protocol list, ` +

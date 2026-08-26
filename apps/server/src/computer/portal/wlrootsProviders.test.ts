@@ -8,6 +8,11 @@
  * region, and that three provider slots over one process spawn one process and
  * dispose it once.
  */
+import {
+  COMPUTER_ID_MAX_LENGTH,
+  COMPUTER_LABEL_MAX_LENGTH,
+  COMPUTER_WINDOW_LIST_MAX_LENGTH,
+} from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
 import type { ClipboardCommandSpec } from "../wlClipboard.ts";
@@ -177,6 +182,36 @@ describe("ForeignToplevelWindowProvider", () => {
       },
     ]);
     for (const window of windows) expect(window.bounds).toBeUndefined();
+  });
+
+  it("clamps compositor-relayed text and the list length to the contract", async () => {
+    const base = { activated: false, minimized: false, maximized: false, fullscreen: false };
+    const helper = fakeDesktopHelper({
+      windows: [
+        {
+          ...base,
+          id: `long-${"i".repeat(COMPUTER_ID_MAX_LENGTH * 2)}`,
+          title: "t".repeat(COMPUTER_LABEL_MAX_LENGTH * 2),
+          appId: "a".repeat(COMPUTER_LABEL_MAX_LENGTH * 2),
+        },
+        ...Array.from({ length: COMPUTER_WINDOW_LIST_MAX_LENGTH + 8 }, (_, index) => ({
+          ...base,
+          id: `filler-${index}`,
+          title: `Window ${index}`,
+          appId: "",
+        })),
+      ],
+    });
+    const provider = new ForeignToplevelWindowProvider(helper, noRelease);
+
+    const windows = await provider.listWindows();
+
+    // One SPA tab title over the schema bound used to fail the encode of every
+    // list and state push on this desktop; now it is truncated instead.
+    expect(windows[0]?.id.length).toBe(COMPUTER_ID_MAX_LENGTH);
+    expect(windows[0]?.title.length).toBe(COMPUTER_LABEL_MAX_LENGTH);
+    expect(windows[0]?.appName?.length).toBe(COMPUTER_LABEL_MAX_LENGTH);
+    expect(windows).toHaveLength(COMPUTER_WINDOW_LIST_MAX_LENGTH);
   });
 
   it("declares that it knows neither geometry nor stacking", () => {

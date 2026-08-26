@@ -101,7 +101,7 @@ export function parseComputerPoint(value: unknown): ComputerPoint | null {
  * event for the rest of the session. Clamping here keeps one bad window from
  * silencing the whole desktop.
  */
-function truncateLabel(text: string, max: number): string {
+export function truncateLabel(text: string, max: number): string {
   if (text.length <= max) return text;
   // Leave room for the ellipsis so the result is exactly `max`, and never cut
   // between the halves of an astral character — a lone surrogate is a symbol
@@ -117,9 +117,11 @@ function truncateLabel(text: string, max: number): string {
  * for the compositor calls that follow, whereas dropping the entry hides a real
  * window from the model entirely.
  */
-function clampId(id: string): ComputerWindow["id"] {
+export function clampId(id: string): ComputerWindow["id"] {
+  // The contract's id type is trimmed as well as bounded, and a cut that lands
+  // on whitespace would fail encode over the one thing clamping is for.
   return (
-    id.length <= COMPUTER_ID_MAX_LENGTH ? id : id.slice(0, COMPUTER_ID_MAX_LENGTH)
+    id.length <= COMPUTER_ID_MAX_LENGTH ? id : id.slice(0, COMPUTER_ID_MAX_LENGTH).trimEnd()
   ) as ComputerWindow["id"];
 }
 

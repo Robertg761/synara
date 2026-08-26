@@ -81,6 +81,7 @@ export interface ComputerBackendActionResult {
 export type ComputerBackendEvent =
   | { readonly type: "windows-changed"; readonly windows: readonly ComputerWindow[] }
   | { readonly type: "health-changed"; readonly health: ComputerHealth }
+  | { readonly type: "capabilities-changed"; readonly capabilities: ComputerCapabilities }
   | { readonly type: "frame"; readonly frame: ComputerStreamFrame };
 
 export type ComputerFrameListener = (frame: ComputerStreamFrame) => void;
@@ -178,10 +179,13 @@ export interface ComputerBackend {
    */
   health(): ComputerHealth;
   /**
-   * What this backend can do, decided by which providers its probe resolved at
-   * construction. Synchronous and constant for the backend's lifetime: a
-   * capability is a property of the display server this process is talking to,
-   * not a live reading, so it is safe to cache and cheap to publish with state.
+   * What this backend can do, decided by which providers its probe resolved.
+   * Synchronous and cheap by contract: a capability is a property of the
+   * display server this process is talking to, not a live reading, so it is
+   * safe to publish with every state snapshot. It changes for exactly one
+   * reason — provisioning installed something the construction probe did not
+   * see — and that transition arrives through `onEvent` as
+   * `capabilities-changed`, so a caller may cache this until that event fires.
    */
   capabilities(): ComputerCapabilities;
   listWindows(): Promise<readonly ComputerWindow[]>;

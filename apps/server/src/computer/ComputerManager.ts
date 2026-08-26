@@ -221,11 +221,13 @@ export class ComputerManager {
   private windowsPublishTimer: ReturnType<typeof setTimeout> | undefined;
   private backendHealth: ComputerHealth;
   /**
-   * Read once. A backend's capability set is decided by which providers its
-   * probe resolved at construction, so it cannot change under a live backend,
-   * and re-reading it per snapshot would put a call on every state publish.
+   * Read once and then event-driven. A backend's capability set changes for
+   * exactly one reason — provisioning installed something the construction
+   * probe did not see — and the backend announces that as
+   * `capabilities-changed`, so this cache follows the event rather than
+   * putting a re-read on every state publish.
    */
-  private readonly backendCapabilities: ComputerCapabilities;
+  private backendCapabilities: ComputerCapabilities;
   private lease: DesktopLease | null = null;
   /**
    * Whether anything has yet asked this backend for the desktop itself.
@@ -282,6 +284,9 @@ export class ComputerManager {
           this.scheduleWindowsPublish();
         } else if (event.type === "health-changed") {
           this.backendHealth = event.health;
+          this.republishAllThreads();
+        } else if (event.type === "capabilities-changed") {
+          this.backendCapabilities = event.capabilities;
           this.republishAllThreads();
         }
       });
