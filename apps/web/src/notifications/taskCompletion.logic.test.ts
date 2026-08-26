@@ -15,6 +15,8 @@ import {
   collectInputNeededThreadCandidates,
   completedThreadNotificationKey,
   isNotificationRuntimeFreshTimestamp,
+  resolveBrowserNotificationPermissionState,
+  resolveNotificationSettingsSupportText,
   shouldAttemptSystemTaskNotification,
   shouldShowThreadNotificationToast,
 } from "./taskCompletion.logic";
@@ -1193,5 +1195,82 @@ describe("isNotificationRuntimeFreshTimestamp", () => {
     expect(
       isNotificationRuntimeFreshTimestamp("2026-04-05T10:00:11.000Z", runtimeStartedAtMs),
     ).toBe(true);
+  });
+});
+
+describe("resolveBrowserNotificationPermissionState", () => {
+  const browserInput = {
+    runtime: "browser" as const,
+    hasNotificationApi: true,
+    isSecureContext: true,
+    permission: "default" as const,
+  };
+
+  it("reports the mobile shell as unsupported even with a usable Notification API", () => {
+    expect(
+      resolveBrowserNotificationPermissionState({
+        ...browserInput,
+        runtime: "mobile",
+        permission: "granted",
+      }),
+    ).toBe("unsupported");
+  });
+
+  it("passes the live permission through in a browser tab", () => {
+    expect(resolveBrowserNotificationPermissionState(browserInput)).toBe("default");
+    expect(
+      resolveBrowserNotificationPermissionState({ ...browserInput, permission: "granted" }),
+    ).toBe("granted");
+  });
+
+  it("separates a missing API from an insecure context", () => {
+    expect(
+      resolveBrowserNotificationPermissionState({ ...browserInput, hasNotificationApi: false }),
+    ).toBe("unsupported");
+    expect(
+      resolveBrowserNotificationPermissionState({ ...browserInput, isSecureContext: false }),
+    ).toBe("insecure");
+  });
+
+  it("leaves the Electron shell on the regular browser resolution", () => {
+    expect(
+      resolveBrowserNotificationPermissionState({
+        ...browserInput,
+        runtime: "electron",
+        permission: "granted",
+      }),
+    ).toBe("granted");
+  });
+});
+
+describe("resolveNotificationSettingsSupportText", () => {
+  it("explains the delivery channel on native shells instead of a browser permission", () => {
+    expect(resolveNotificationSettingsSupportText("electron", "default")).toBe(
+      "Desktop app notifications use your operating system notification center.",
+    );
+    expect(resolveNotificationSettingsSupportText("mobile", "unsupported")).toBe(
+      "Mobile app notifications come from Synara's background watch once it is switched on, not from the browser.",
+    );
+  });
+
+  it("keeps the mobile copy stable for every permission state", () => {
+    const permissionStates = ["default", "granted", "denied", "insecure", "unsupported"] as const;
+    const texts = new Set(
+      permissionStates.map((state) => resolveNotificationSettingsSupportText("mobile", state)),
+    );
+
+    expect(texts.size).toBe(1);
+  });
+
+  it("describes each browser permission state", () => {
+    expect(resolveNotificationSettingsSupportText("browser", "granted")).toContain("enabled");
+    expect(resolveNotificationSettingsSupportText("browser", "denied")).toContain("blocked");
+    expect(resolveNotificationSettingsSupportText("browser", "insecure")).toContain(
+      "secure context",
+    );
+    expect(resolveNotificationSettingsSupportText("browser", "unsupported")).toContain(
+      "does not support",
+    );
+    expect(resolveNotificationSettingsSupportText("browser", "default")).toContain("Allow browser");
   });
 });

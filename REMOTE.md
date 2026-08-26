@@ -2,6 +2,31 @@
 
 Use this when you want to open Synara from another device (phone, tablet, another laptop).
 
+## Anywhere access (quick tunnel)
+
+For "connect from any network" without port forwarding, Tailscale, or an account, run the server
+behind a Cloudflare quick tunnel:
+
+```bash
+bun run --cwd apps/server start -- --tunnel --no-browser
+# or: SYNARA_TUNNEL=1
+```
+
+- Requires the `cloudflared` binary (`pacman -S cloudflared`, `brew install cloudflared`, or
+  `winget install Cloudflare.cloudflared`).
+- The server stays on its normal bind (loopback by default); cloudflared dials it from the same
+  machine and publishes a random `https://<name>.trycloudflare.com` URL.
+- The startup pairing link is minted against the tunnel URL and printed **with a QR code** — scan
+  it from a phone on any network.
+- The tunnel closes with the server. Quick-tunnel URLs change between runs, which is fine:
+  pairing links are one-time anyway, and paired devices re-resolve nothing (they store the URL
+  they paired with; re-pair after a URL change).
+
+In the desktop app this is **Settings → Remote access → Connect from anywhere**. The tunnel is
+independent of the LAN bind toggle and never restarts the backend, so enabling it does not
+interrupt running agents. The panel's **Android QR** encodes a `synara://pair?…` deep link that
+opens the Android app with the pairing prefilled.
+
 ## CLI ↔ Env option map
 
 The Synara CLI accepts the following configuration options, available either as CLI flags or environment variables:

@@ -17,6 +17,13 @@ export type SynaraDesktopFlavor = "production" | "development" | "canary";
 export interface SynaraDesktopIdentity {
   readonly flavor: SynaraDesktopFlavor;
   readonly displayName: string;
+  /**
+   * Short in-app label for the flavor, used where the full display name would
+   * crowd the UI (the sidebar surface picker). Production keeps the product
+   * name; the side-by-side flavors name themselves so a window is identifiable
+   * from its contents alone, not just its title bar.
+   */
+  readonly shortDisplayName: string;
   readonly bundleId: string;
   readonly scheme: string;
   readonly origin: string;
@@ -41,6 +48,7 @@ export function synaraDesktopIdentity(flavor: SynaraDesktopFlavor): SynaraDeskto
     return {
       flavor,
       displayName: "Synara Canary",
+      shortDisplayName: "Canary",
       bundleId: SYNARA_CANARY_BUNDLE_ID,
       scheme: SYNARA_CANARY_DESKTOP_SCHEME,
       origin: SYNARA_CANARY_DESKTOP_ORIGIN,
@@ -54,6 +62,7 @@ export function synaraDesktopIdentity(flavor: SynaraDesktopFlavor): SynaraDeskto
     return {
       flavor,
       displayName: "Synara (Dev)",
+      shortDisplayName: "Dev",
       bundleId: SYNARA_DEVELOPMENT_BUNDLE_ID,
       scheme: SYNARA_DESKTOP_SCHEME,
       origin: SYNARA_DESKTOP_ORIGIN,
@@ -66,6 +75,7 @@ export function synaraDesktopIdentity(flavor: SynaraDesktopFlavor): SynaraDeskto
   return {
     flavor,
     displayName: "Synara",
+    shortDisplayName: "Synara",
     bundleId: SYNARA_PRODUCTION_BUNDLE_ID,
     scheme: SYNARA_DESKTOP_SCHEME,
     origin: SYNARA_DESKTOP_ORIGIN,

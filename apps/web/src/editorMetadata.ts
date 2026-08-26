@@ -34,7 +34,8 @@ import {
 import { FolderClosed } from "./components/FolderClosed";
 import { AppsIcon } from "./lib/icons";
 import { isMacPlatform, isWindowsPlatform } from "./lib/utils";
-import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
+import { resolveMediaHttpUrl } from "./lib/mediaAssetUrls";
+import { useMediaAuthToken } from "./hooks/useMediaAuthToken";
 
 export interface EditorOption {
   readonly value: EditorId;
@@ -77,7 +78,7 @@ const NATIVE_EDITOR_ICON_COMPONENTS = new Map<EditorId, Icon>();
 
 export function resolveEditorNativeIconUrl(editorId: EditorId): string {
   const params = new URLSearchParams({ id: editorId });
-  return resolveWsHttpUrl(`${EDITOR_ICON_ROUTE_PATH}?${params.toString()}`);
+  return resolveMediaHttpUrl(`${EDITOR_ICON_ROUTE_PATH}?${params.toString()}`);
 }
 
 function resolveNativeEditorIcon(editorId: EditorId): Icon {
@@ -86,8 +87,14 @@ function resolveNativeEditorIcon(editorId: EditorId): Icon {
 
   const FallbackIcon = resolveEditorIcon(editorId);
   const EditorNativeIcon: Icon = ({ className, style, ...props }) => {
-    const [failed, setFailed] = useState(false);
-    if (failed) {
+    // On the mobile shell the icon URL carries a credential that may not exist yet at first
+    // render. Subscribing rebuilds the href when it arrives, and remembering *which* credential
+    // failed keeps a pre-credential 401 from latching the fallback glyph forever.
+    const mediaToken = useMediaAuthToken();
+    const [failedCredential, setFailedCredential] = useState<{
+      readonly value: string | null;
+    } | null>(null);
+    if (failedCredential !== null && failedCredential.value === mediaToken) {
       return createElement(FallbackIcon, { className, style, ...props });
     }
 
@@ -106,7 +113,7 @@ function resolveNativeEditorIcon(editorId: EditorId): Icon {
         href: resolveEditorNativeIconUrl(editorId),
         preserveAspectRatio: "xMidYMid meet",
         width: 1,
-        onError: () => setFailed(true),
+        onError: () => setFailedCredential({ value: mediaToken }),
       }),
     );
   };

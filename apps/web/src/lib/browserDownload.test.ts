@@ -5,7 +5,19 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { downloadUrlAsBlob } from "./browserDownload";
+import { downloadServerFileAsBlob, downloadUrlAsBlob } from "./browserDownload";
+
+// The server-route download goes through `authenticatedServerFetch`; these stand in for the
+// runtime it asks about. The credential rules themselves are covered in authenticatedFetch.test.
+vi.mock("../env", () => ({ isMobileShell: true, isNativeShell: true, isElectron: false }));
+vi.mock("../shellAuthSession", () => ({
+  acquireShellBearerToken: () => Promise.resolve("shell-bearer"),
+  invalidateShellBearerToken: () => {},
+}));
+vi.mock("../shellSessionExit", () => ({ handleShellSessionRevoked: () => Promise.resolve() }));
+vi.mock("./serverEndpoint", () => ({
+  resolveWsHttpUrl: (path: string) => `http://192.168.1.5:3773${path}`,
+}));
 
 describe("browserDownload", () => {
   const originalDocument = globalThis.document;
@@ -151,6 +163,50 @@ describe("browserDownload", () => {
         filename: "favicon.ico",
       }),
     ).rejects.toThrow("Download failed with HTTP 404 Not Found.");
+
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it("carries the shell session in a header for a server-route download", async () => {
+    // The transcript archive is fetched, not navigated to, which is precisely why it can hold its
+    // credential in a header — and why the route need not accept the replayable media one.
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve(
+        new Response("zip", {
+          status: 200,
+          headers: { "Content-Disposition": 'attachment; filename="synara-thread-1.zip"' },
+        }),
+      ),
+    );
+
+    await downloadServerFileAsBlob({
+      path: "/api/thread-export?threadId=thread-1",
+      filename: "synara-thread-thread-1.zip",
+    });
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "http://192.168.1.5:3773/api/thread-export?threadId=thread-1",
+      expect.objectContaining({
+        method: "GET",
+        headers: { Authorization: "Bearer shell-bearer" },
+      }),
+    );
+    expect(link.download).toBe("synara-thread-1.zip");
+    expect(click).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a rejected server-route download instead of saving it", async () => {
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve(new Response("Unauthorized", { status: 401, statusText: "Unauthorized" })),
+    );
+
+    await expect(
+      downloadServerFileAsBlob({
+        path: "/api/thread-export?threadId=thread-1",
+        filename: "synara-thread-thread-1.zip",
+      }),
+    ).rejects.toThrow("Download failed with HTTP 401 Unauthorized.");
 
     expect(URL.createObjectURL).not.toHaveBeenCalled();
     expect(click).not.toHaveBeenCalled();

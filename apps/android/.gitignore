@@ -1,0 +1,9 @@
+# Written by Android Studio / the Gradle Android plugin on first open; contains an absolute
+# sdk.dir path for whoever generated it, so it must never be shared.
+local.properties
+
+# Gradle and build output are covered by the root .gitignore, repeated here so the module stays
+# self-contained if it is ever extracted.
+.gradle/
+build/
+.cxx/

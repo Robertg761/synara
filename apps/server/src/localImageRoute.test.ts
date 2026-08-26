@@ -109,8 +109,12 @@ function makeFakeServerAuth(): ServerAuthShape {
     revokeOtherClientSessions: () => Effect.succeed(1),
     logoutSession: () => Effect.succeed(true),
     authenticateHttpRequest: () => Effect.succeed({ ...session, credentialSource: "cookie" }),
+    // These routes are media GETs, so they go through the media guard; the real one additionally
+    // accepts the short-lived read-only credential from the query string.
+    authenticateMediaHttpRequest: () => Effect.succeed({ ...session, credentialSource: "cookie" }),
     authenticateWebSocketUpgrade: () => Effect.succeed(session),
     issueWebSocketToken: () => Effect.succeed({ token: "ws-token", expiresAt }),
+    issueMediaToken: () => Effect.succeed({ token: "media-token", expiresAt }),
     issueStartupPairingUrl: () => Effect.succeed("http://127.0.0.1:3773/pair#token=PAIRINGTOKEN"),
   } satisfies ServerAuthShape;
 }

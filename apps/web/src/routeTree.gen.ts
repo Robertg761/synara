@@ -9,6 +9,8 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as SignedOutRouteImport } from './routes/signed-out'
+import { Route as ConnectRouteImport } from './routes/connect'
 import { Route as ChatRouteImport } from './routes/_chat'
 import { Route as ChatIndexRouteImport } from './routes/_chat.index'
 import { Route as ChatSettingsRouteImport } from './routes/_chat.settings'
@@ -23,6 +25,16 @@ import { Route as ChatAutomationsIndexRouteImport } from './routes/_chat.automat
 import { Route as ChatKanbanProjectIdRouteImport } from './routes/_chat.kanban.$projectId'
 import { Route as ChatAutomationsAutomationIdRouteImport } from './routes/_chat.automations.$automationId'
 
+const SignedOutRoute = SignedOutRouteImport.update({
+  id: '/signed-out',
+  path: '/signed-out',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ConnectRoute = ConnectRouteImport.update({
+  id: '/connect',
+  path: '/connect',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ChatRoute = ChatRouteImport.update({
   id: '/_chat',
   getParentRoute: () => rootRouteImport,
@@ -91,6 +103,8 @@ const ChatAutomationsAutomationIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
+  '/connect': typeof ConnectRoute
+  '/signed-out': typeof SignedOutRoute
   '/$threadId': typeof ChatThreadIdRoute
   '/automations': typeof ChatAutomationsRouteWithChildren
   '/plugins': typeof ChatPluginsRoute
@@ -104,6 +118,8 @@ export interface FileRoutesByFullPath {
   '/studio/': typeof ChatStudioIndexRoute
 }
 export interface FileRoutesByTo {
+  '/connect': typeof ConnectRoute
+  '/signed-out': typeof SignedOutRoute
   '/$threadId': typeof ChatThreadIdRoute
   '/plugins': typeof ChatPluginsRoute
   '/settings': typeof ChatSettingsRoute
@@ -118,6 +134,8 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_chat': typeof ChatRouteWithChildren
+  '/connect': typeof ConnectRoute
+  '/signed-out': typeof SignedOutRoute
   '/_chat/$threadId': typeof ChatThreadIdRoute
   '/_chat/automations': typeof ChatAutomationsRouteWithChildren
   '/_chat/plugins': typeof ChatPluginsRoute
@@ -135,6 +153,8 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/connect'
+    | '/signed-out'
     | '/$threadId'
     | '/automations'
     | '/plugins'
@@ -148,6 +168,8 @@ export interface FileRouteTypes {
     | '/studio/'
   fileRoutesByTo: FileRoutesByTo
   to:
+    | '/connect'
+    | '/signed-out'
     | '/$threadId'
     | '/plugins'
     | '/settings'
@@ -161,6 +183,8 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/_chat'
+    | '/connect'
+    | '/signed-out'
     | '/_chat/$threadId'
     | '/_chat/automations'
     | '/_chat/plugins'
@@ -177,10 +201,26 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   ChatRoute: typeof ChatRouteWithChildren
+  ConnectRoute: typeof ConnectRoute
+  SignedOutRoute: typeof SignedOutRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/signed-out': {
+      id: '/signed-out'
+      path: '/signed-out'
+      fullPath: '/signed-out'
+      preLoaderRoute: typeof SignedOutRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/connect': {
+      id: '/connect'
+      path: '/connect'
+      fullPath: '/connect'
+      preLoaderRoute: typeof ConnectRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/_chat': {
       id: '/_chat'
       path: ''
@@ -328,6 +368,8 @@ const ChatRouteWithChildren = ChatRoute._addFileChildren(ChatRouteChildren)
 
 const rootRouteChildren: RootRouteChildren = {
   ChatRoute: ChatRouteWithChildren,
+  ConnectRoute: ConnectRoute,
+  SignedOutRoute: SignedOutRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

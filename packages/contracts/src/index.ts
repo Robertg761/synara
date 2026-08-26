@@ -12,6 +12,7 @@ export * from "./browserAutomationToolOutputs";
 export * from "./browserAutomationToolCatalogue";
 export * from "./browserAnnotations";
 export * from "./ipc";
+export * from "./mobileBridge";
 export * from "./terminal";
 export * from "./provider";
 export * from "./providerDiscovery";

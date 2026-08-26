@@ -6,6 +6,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useMemo, useState } from "react";
 
+import { appRouteDocumentHref } from "~/appNavigation";
 import { logoutCurrentBrowserSession } from "~/authLogout";
 import { APP_VERSION } from "~/branding";
 import { resolveAndPersistPreferredEditor } from "~/editorPreferences";
@@ -17,6 +18,7 @@ import { ensureNativeApi, readNativeApi } from "~/nativeApi";
 import { serverAuthSessionQueryOptions, serverConfigQueryOptions } from "~/lib/serverReactQuery";
 import { cn } from "~/lib/utils";
 import { SETTINGS_INSET_LIST_CLASS_NAME } from "~/settingsPanelStyles";
+import { signedOutRoutePath } from "~/shellSessionExit";
 import { useStore } from "~/store";
 import { createAllThreadsMessagelessSelector, createThreadShellsSelector } from "~/storeSelectors";
 import { useSettingsRestoreSignal } from "./SettingControls";
@@ -121,7 +123,12 @@ export function AdvancedSettingsPanel(props: {
           "Sign out this browser?\n\nIts session and every live connection opened with it will be revoked.",
         ),
       logout: () => api.server.logoutAuthSession(),
-      navigate: (path) => window.location.assign(path),
+      // Browser history: a real navigation the server answers with index.html, which renders
+      // the pre-React signed-out screen. Hash history: a fragment move inside the loaded
+      // document, which the router resolves to the in-app /signed-out route. On the mobile
+      // shell the destination is the connect screen instead: `logoutAuthSession` has already
+      // dropped the pairing this device stored, and pairing again is the only way back in.
+      navigate: (path) => window.location.assign(appRouteDocumentHref(signedOutRoutePath(path))),
       onError: (error) =>
         toastManager.add({
           type: "error",

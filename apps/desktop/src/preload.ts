@@ -65,6 +65,14 @@ function parseBrowserAnnotationEvent(payload: unknown): BrowserAnnotationEvent |
 
 contextBridge.exposeInMainWorld("desktopBridge", {
   getWsUrl: getDesktopWsUrl,
+  getFlavor: () => {
+    try {
+      const flavor = ipcRenderer.sendSync(IPC.flavor);
+      return typeof flavor === "string" && flavor.length > 0 ? flavor : null;
+    } catch {
+      return null;
+    }
+  },
   // Absolute path for OS-dropped File objects (folders with spaces/parens, etc.).
   getPathForFile: (file: File) => {
     try {
@@ -209,6 +217,26 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   storageMigration: {
     readSnapshot: () => ipcRenderer.sendSync(IPC.storageMigration.read),
     acknowledgeSnapshot: () => ipcRenderer.invoke(IPC.storageMigration.acknowledge),
+  },
+  remoteAccess: {
+    getState: () => ipcRenderer.invoke(IPC.remoteAccess.getState),
+    setEnabled: (input) => ipcRenderer.invoke(IPC.remoteAccess.setEnabled, input),
+    onState: (listener) => {
+      const wrappedListener = (_event: Electron.IpcRendererEvent, state: unknown) => {
+        if (typeof state !== "object" || state === null) return;
+        listener(state as Parameters<typeof listener>[0]);
+      };
+      ipcRenderer.on(IPC.remoteAccess.state, wrappedListener);
+      return () => ipcRenderer.removeListener(IPC.remoteAccess.state, wrappedListener);
+    },
+    getAuthBootstrapCredential: () => {
+      try {
+        const credential = ipcRenderer.sendSync(IPC.remoteAccess.bootstrapCredential);
+        return typeof credential === "string" && credential.length > 0 ? credential : null;
+      } catch {
+        return null;
+      }
+    },
   },
   server: {
     transcribeVoice: (input) => ipcRenderer.invoke(IPC.transcribeVoice, input),

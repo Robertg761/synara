@@ -2,6 +2,7 @@
 // Purpose: Pins which browser origins can use local-data HTTP/WS surfaces.
 // Layer: Server utility tests
 
+import { SYNARA_MOBILE_APP_ORIGIN } from "@synara/shared/mobileIdentity";
 import { describe, expect, it } from "vitest";
 
 import type { ServerConfigShape } from "./config";
@@ -49,6 +50,39 @@ describe("trustedOrigins", () => {
     ).toBe(true);
   });
 
+  it("trusts the packaged mobile shell origin", () => {
+    expect(normalizeCorsOrigin(SYNARA_MOBILE_APP_ORIGIN)).toBe(SYNARA_MOBILE_APP_ORIGIN);
+    expect(normalizeCorsOrigin(`${SYNARA_MOBILE_APP_ORIGIN}/`)).toBe(SYNARA_MOBILE_APP_ORIGIN);
+    expect(
+      isTrustedAppOrigin({
+        origin: SYNARA_MOBILE_APP_ORIGIN,
+        requestOrigin: "http://127.0.0.1:58090",
+        config,
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects lookalike variations of the mobile shell origin", () => {
+    for (const origin of [
+      "https://app.synara.local.evil.example",
+      "https://xapp.synara.local",
+      "http://app.synara.local",
+    ]) {
+      expect(
+        isTrustedAppOrigin({ origin, requestOrigin: "http://127.0.0.1:58090", config }),
+        origin,
+      ).toBe(false);
+      expect(
+        shouldRejectUntrustedRequestOrigin({
+          rawOrigin: origin,
+          requestOrigin: "http://127.0.0.1:58090",
+          config,
+        }),
+        origin,
+      ).toBe(true);
+    }
+  });
+
   it("rejects unrelated browser origins but allows non-browser requests without Origin", () => {
     expect(
       isTrustedAppOrigin({
@@ -90,7 +124,7 @@ describe("trustedOrigins", () => {
     ).toBe(true);
   });
 
-  it("trusts only the HTTPS public origin for browser traffic in proxy-backed remote mode", () => {
+  it("narrows browser traffic to the HTTPS public origin in proxy-backed remote mode while keeping the app shells", () => {
     const remoteConfig = {
       ...config,
       host: "0.0.0.0",
@@ -110,6 +144,18 @@ describe("trustedOrigins", () => {
         config: remoteConfig,
       }),
     ).toBe(false);
+    // The packaged shells stay trusted in every deployment by design: they are cross-origin
+    // clients of whatever server they point at, so a public URL must not lock them out.
+    for (const shellOrigin of [SYNARA_MOBILE_APP_ORIGIN, "synara://app", "synara-canary://app"]) {
+      expect(
+        isTrustedAppOrigin({
+          origin: shellOrigin,
+          requestOrigin: "http://synara.example.test",
+          config: remoteConfig,
+        }),
+        shellOrigin,
+      ).toBe(true);
+    }
   });
 
   it("normalizes desktop origins with trailing slashes", () => {

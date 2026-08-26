@@ -72,6 +72,10 @@
       "types": "./src/desktopIdentity.ts",
       "import": "./src/desktopIdentity.ts"
     },
+    "./mobileIdentity": {
+      "types": "./src/mobileIdentity.ts",
+      "import": "./src/mobileIdentity.ts"
+    },
     "./Net": {
       "types": "./src/Net.ts",
       "import": "./src/Net.ts"
@@ -239,6 +243,10 @@
     "./cli": {
       "types": "./src/cli.ts",
       "import": "./src/cli.ts"
+    },
+    "./cloudflaredQuickTunnel": {
+      "types": "./src/cloudflaredQuickTunnel.ts",
+      "import": "./src/cloudflaredQuickTunnel.ts"
     },
     "./migrationRecovery": {
       "types": "./src/migrationRecovery.ts",

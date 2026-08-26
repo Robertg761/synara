@@ -71,6 +71,21 @@ export interface SessionCredentialServiceShape {
   readonly verifyWebSocketToken: (
     token: string,
   ) => Effect.Effect<VerifiedSession, SessionCredentialError>;
+  /**
+   * Mints the short-lived read-only credential the media GET routes accept in their query
+   * string. Stateless by design: no ledger row, so it is replayable until it expires — which is
+   * exactly the property `<img src>` needs and the reason its scope is limited to reads.
+   */
+  readonly issueMediaToken: (
+    sessionId: AuthSessionId,
+    input?: { readonly ttl?: Duration.Duration },
+  ) => Effect.Effect<
+    { readonly token: string; readonly expiresAt: DateTime.DateTime },
+    SessionCredentialError
+  >;
+  readonly verifyMediaToken: (
+    token: string,
+  ) => Effect.Effect<VerifiedSession, SessionCredentialError>;
   readonly listActive: () => Effect.Effect<
     ReadonlyArray<AuthClientSession>,
     SessionCredentialError
