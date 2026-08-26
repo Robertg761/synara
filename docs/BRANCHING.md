@@ -57,3 +57,17 @@ Then add `my-topic` to `TOPICS` in `scripts/branches.sh` so the rebuild picks it
 `rerere` is enabled, so a conflict resolved once is replayed automatically the next
 time `rebuild` hits it. Resolve, `git commit`, rerun. You should not have to resolve
 the same conflict twice.
+
+### Breaks git merges cleanly
+
+`rerere` only covers textual conflicts. Two topics can each be internally consistent
+and still combine into code that does not compile, with no conflict markers to warn
+you. Run `bun typecheck` after every rebuild — that is the real check.
+
+The known standing case: `android-app` widens
+`authorizeDeviceFrameWebSocketUpgrade` to require `remoteAddress`, and
+`computer-use-linux` aliases it as `authorizeComputerFrameWebSocketUpgrade`. Neither
+branch can carry the fix alone (adding the field on `computer-use-linux` is an excess
+property against the narrower signature there), so the callsite in
+`apps/server/src/wsRpc.ts` has to gain `remoteAddress: request.remoteAddress` during
+the merge, every time.
