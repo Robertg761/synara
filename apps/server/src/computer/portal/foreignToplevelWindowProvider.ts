@@ -15,17 +15,31 @@
  * point — reporting a window at the origin, or an empty list, is the failure
  * mode that had an agent relaunching the same app until its turn ended.
  */
-import type { ComputerWindow } from "@synara/contracts";
+import {
+  COMPUTER_LABEL_MAX_LENGTH,
+  COMPUTER_WINDOW_LIST_MAX_LENGTH,
+  type ComputerWindow,
+} from "@synara/contracts";
 
+import { clampId, truncateLabel } from "../computerGeometry.ts";
 import type { DesktopHelperTransport, DesktopHelperWindow } from "./desktopHelperClient.ts";
 import type { PortalProviderId, PortalWindowProvider } from "./providers.ts";
 
-/** The taskbar-shaped toplevel, translated into the contract's window shape. */
+/**
+ * The taskbar-shaped toplevel, translated into the contract's window shape.
+ *
+ * Titles and app ids are clamped to the contract's bounds here for the same
+ * reason `parseWindows` clamps them: they are compositor-relayed application
+ * text, and one paragraph-long browser title failing schema encode would
+ * silence every window list and state push for the rest of the session.
+ */
 function toComputerWindow(toplevel: DesktopHelperWindow): ComputerWindow {
   return {
-    id: toplevel.id as ComputerWindow["id"],
-    title: toplevel.title,
-    ...(toplevel.appId ? { appName: toplevel.appId } : {}),
+    id: clampId(toplevel.id),
+    title: truncateLabel(toplevel.title, COMPUTER_LABEL_MAX_LENGTH),
+    ...(toplevel.appId
+      ? { appName: truncateLabel(toplevel.appId, COMPUTER_LABEL_MAX_LENGTH) }
+      : {}),
     // Activation is the only focus signal the protocol carries, and it is the
     // one that matters for input: a toolkit dispatches keyboard shortcuts only
     // to the activated window.
@@ -56,7 +70,7 @@ export class ForeignToplevelWindowProvider implements PortalWindowProvider {
 
   async listWindows(): Promise<readonly ComputerWindow[]> {
     const toplevels = await this.helper.listWindows();
-    return toplevels.map(toComputerWindow);
+    return toplevels.slice(0, COMPUTER_WINDOW_LIST_MAX_LENGTH).map(toComputerWindow);
   }
 
   /**

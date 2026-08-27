@@ -190,7 +190,7 @@ describe("PortalSession", () => {
     await session.movePointerTo({ x: 2000, y: 40 });
     await session.pointerButton(EVDEV_BUTTON_CODES.left, true);
     await session.key(30, false);
-    await session.scroll(0, -3);
+    await session.scroll(0, -150);
 
     expect(portal.notifications).toEqual([
       { member: "NotifyPointerMotionAbsolute", body: [expect.any(String), {}, 2, 80, 40] },
@@ -199,8 +199,37 @@ describe("PortalSession", () => {
         body: [expect.any(String), {}, EVDEV_BUTTON_CODES.left, 1],
       },
       { member: "NotifyKeyboardKeycode", body: [expect.any(String), {}, 30, 0] },
-      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, -3] },
+      // 150 logical px at 15 px per notch: the portal wire speaks whole wheel
+      // notches, so one scroll means the same thing here as on kwin/wlroots.
+      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, -10] },
     ]);
+    await session.dispose();
+  });
+
+  it("converts scroll pixels to notches, carrying the sub-notch remainder", async () => {
+    const portal = new FakePortalService({
+      screenCastVersion: 5,
+      streams: [{ nodeId: 1, rect: { x: 0, y: 0, width: 1920, height: 1080 } }],
+    });
+    const { session } = sessionFor(portal);
+
+    // 10 px is under one 15 px notch: nothing goes on the wire, nothing is lost.
+    await session.scroll(0, 10);
+    expect(portal.notifications).toEqual([]);
+
+    // The carried 10 px plus 10 px crosses the notch; 5 px stays owed.
+    await session.scroll(0, 10);
+    expect(portal.notifications).toEqual([
+      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, 1] },
+    ]);
+
+    // Each axis carries its own remainder: 20 px horizontal is 1 notch + 5 px,
+    // unaffected by the vertical axis's 5 px debt.
+    await session.scroll(20, 0);
+    expect(portal.notifications.at(-1)).toEqual({
+      member: "NotifyPointerAxisDiscrete",
+      body: [expect.any(String), {}, 1, 1],
+    });
     await session.dispose();
   });
 

@@ -21,10 +21,8 @@
  * pin: the mapping from a desktop's observable facts to the exact sentence the
  * user is shown.
  */
-import { access, constants } from "node:fs/promises";
-import { join } from "node:path";
-
 import { KWIN_SERVICE } from "../kwinDbus.ts";
+import { commandExists as commandOnPath } from "../provisioning/toolchain.ts";
 import { readSessionBusProperty, sessionBusNameHasOwner } from "../sessionBusNames.ts";
 import { unwrapDbusValue } from "../computerGeometry.ts";
 import { readWaylandGlobals } from "./desktopHelperClient.ts";
@@ -112,6 +110,11 @@ export interface PortalProbe {
   readonly desktopExtensionPresent: boolean;
   /** Absolute path of the native desktop helper, when it is built and executable. */
   readonly helperBinary?: string;
+  /**
+   * Where the helper belongs, built or not. Carried so a refusal can name the
+   * path rather than making the reader go and find it.
+   */
+  readonly helperPath: string;
   readonly wlClipboard: boolean;
   readonly gaps: readonly PortalProbeGap[];
 }
@@ -281,7 +284,7 @@ export async function probeDesktop(
     }
   }
 
-  const commandExists = dependencies.commandExists ?? defaultCommandExists;
+  const commandExists = dependencies.commandExists ?? ((name: string) => commandOnPath(name));
   const wlClipboard = (await commandExists("wl-copy")) && (await commandExists("wl-paste"));
   if (!wlClipboard) {
     record(
@@ -304,6 +307,7 @@ export async function probeDesktop(
     ...(waylandGlobals ? { waylandGlobals } : {}),
     desktopExtensionPresent,
     ...(helperBinary ? { helperBinary } : {}),
+    helperPath,
     wlClipboard,
     gaps,
   };
@@ -423,6 +427,7 @@ function planInput(probe: PortalProbe): PortalProviderChoice {
     }
     return { implementation: "portal-remote-desktop" };
   }
+  if (globalsUnknown(probe)) return { blockedBy: helperUnknownRefusal(probe, "inject input") };
   return {
     blockedBy:
       "This desktop offers neither the wlroots virtual-pointer protocol nor a RemoteDesktop portal, so there is no way to inject input. " +
@@ -434,6 +439,15 @@ function planCapture(probe: PortalProbe): PortalProviderChoice {
   if (probe.sessionType !== "wayland") return { blockedBy: sessionGap(probe) };
   if (probe.waylandGlobals?.includes(WLROOTS_GLOBALS.screencopy)) {
     return helperBacked("wlr-screencopy", probe);
+  }
+  // Ahead of the ScreenCast branch, and only off GNOME. On a wlroots desktop
+  // with no helper the globals could not be read at all, so `wlr-screencopy` is
+  // unruled-out rather than absent, and answering "install the PipeWire headers"
+  // would send the user to rebuild for a mechanism this desktop never uses.
+  // GNOME is the exception: PipeWire genuinely is its capture path, and
+  // `nativeCaptureGap` already names the helper and the build script.
+  if (globalsUnknown(probe) && probe.desktop !== "gnome") {
+    return { blockedBy: helperUnknownRefusal(probe, "capture the screen") };
   }
   if (probe.portal.screenCastVersion !== undefined) return nativeCaptureGap();
   return {
@@ -463,6 +477,7 @@ function planWindows(probe: PortalProbe): PortalProviderChoice {
         "capture and desktop coordinates; window-scoped capture and targeting will refuse.",
     };
   }
+  if (globalsUnknown(probe)) return { blockedBy: helperUnknownRefusal(probe, "list windows") };
   return {
     blockedBy:
       "This desktop exposes no window enumeration: there is no foreign-toplevel protocol and no Synara desktop extension. " +
@@ -491,11 +506,61 @@ function planClipboard(probe: PortalProbe): PortalProviderChoice {
         "so the clipboard cannot be read or written. Install the wl-clipboard package.",
     };
   }
+  if (globalsUnknown(probe)) {
+    return { blockedBy: helperUnknownRefusal(probe, "read or write the clipboard") };
+  }
   return {
     blockedBy:
       "wl-clipboard is installed but this compositor advertises no data-control protocol, and its portal is too old for " +
       "SelectionRead/SelectionWrite. Clipboard access needs wlr-data-control (or ext-data-control on GNOME 48+).",
   };
+}
+
+/**
+ * Whether this desktop's protocol list is simply unknown.
+ *
+ * The helper is what holds the `wl_display` the registry is read on, so a
+ * machine without one produces no global list at all — not an empty one. Those
+ * two are not the same answer, and treating them as the same is what told a
+ * Hyprland user that their compositor "offers neither the wlroots
+ * virtual-pointer protocol nor a RemoteDesktop portal" when it advertises the
+ * former and every capability was one `build.sh` away.
+ *
+ * Keyed on the globals alone, not on the helper's absence: a helper that exists
+ * but failed to report the registry — it crashed, timed out, or predates
+ * `--print-globals` — leaves the protocol list exactly as unknown as no helper
+ * at all, and falling through to "this compositor advertises no such protocol"
+ * would state as fact something nobody managed to look up.
+ */
+function globalsUnknown(probe: PortalProbe): boolean {
+  return probe.waylandGlobals === undefined;
+}
+
+/**
+ * The refusal for a capability that could not even be assessed.
+ *
+ * Says the thing that is actually true — the binary that would have answered
+ * the question is missing or did not answer — rather than reporting the absence
+ * of protocols nobody managed to look for. Provisioning installs or compiles
+ * the helper automatically on first use; the script is named for the case where
+ * that fails and the user wants to see why.
+ */
+function helperUnknownRefusal(probe: PortalProbe, attempted: string): string {
+  if (probe.helperBinary !== undefined) {
+    return (
+      `Synara's native desktop helper at ${probe.helperBinary} did not report this compositor's protocol list, ` +
+      `so there is no way to know whether this desktop can ${attempted}. The helper may be from an older build ` +
+      "or failing to reach the compositor; rebuild it with apps/server/native/computer-desktop-helper/build.sh, " +
+      "or retry from the Computer settings panel."
+    );
+  }
+  return (
+    `Synara's native desktop helper is not built at ${probe.helperPath}, so there is no way to ` +
+    `${attempted} — and because the helper is also what reads the compositor's protocol list, ` +
+    "what this desktop supports could not be established either. Synara installs or compiles it " +
+    "the first time an agent uses the desktop; if that failed, the Computer settings panel can " +
+    "retry it, or you can run apps/server/native/computer-desktop-helper/build.sh yourself."
+  );
 }
 
 /**
@@ -520,24 +585,29 @@ function helperBacked(implementation: PortalProviderId, probe: PortalProbe): Por
 }
 
 /**
- * The one Tier 2 gap that is a missing *library*, not missing code.
+ * The one Tier 2 gap that is Synara's missing code, not the user's missing
+ * package.
  *
  * The ScreenCast portal is reachable and its session is already brokered — the
  * granted stream's node id, position, and size come back in the `Start`
  * response, which is what makes absolute pointing work on this desktop today.
  * What is missing is the other half: the frames themselves arrive over
- * PipeWire, and neither Node nor the current native helper can receive them.
- * Saying that precisely is what stops a user concluding GNOME is unsupported.
+ * PipeWire, and Synara has no PipeWire receiver written — not in Node, not in
+ * the native helper. This refusal must not read as an instruction: an earlier
+ * version told users to install the PipeWire headers and rebuild the helper,
+ * which changes nothing, because there is no PipeWire code waiting on those
+ * headers. Saying plainly that the feature is not implemented yet — and what
+ * works instead — is what stops a user chasing a rebuild that cannot help, or
+ * concluding GNOME is unsupported.
  */
 function nativeCaptureGap(): PortalProviderChoice {
   return {
     implementation: "pipewire-screencast",
     blockedBy:
-      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara's native " +
-      "desktop helper has no PipeWire support compiled in: it needs the PipeWire development headers present at build " +
-      "time (dnf install pipewire-devel / apt install libpipewire-0.3-dev) and a rebuild with " +
-      "apps/server/native/computer-desktop-helper/build.sh. Until then this desktop's screen cannot be read; " +
-      "SYNARA_COMPUTER_NESTED=window runs an isolated agent desktop that can be captured today.",
+      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara cannot " +
+      "receive PipeWire streams yet — that part is not implemented, so no package install or helper rebuild will " +
+      "enable it. Until it ships this desktop's screen cannot be read; SYNARA_COMPUTER_NESTED=window runs an " +
+      "isolated agent desktop that can be captured today.",
   };
 }
 
@@ -585,23 +655,6 @@ async function defaultWaylandGlobals(
     );
   }
   return await readWaylandGlobals({ command, env });
-}
-
-async function defaultExecutableExists(path: string): Promise<boolean> {
-  try {
-    await access(path, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function defaultCommandExists(command: string): Promise<boolean> {
-  const directories = (process.env.PATH ?? "").split(":").filter((entry) => entry.length > 0);
-  for (const directory of directories) {
-    if (await defaultExecutableExists(join(directory, command))) return true;
-  }
-  return false;
 }
 
 function describe(error: unknown): string {

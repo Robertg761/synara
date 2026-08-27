@@ -81,6 +81,7 @@ export interface ComputerBackendActionResult {
 export type ComputerBackendEvent =
   | { readonly type: "windows-changed"; readonly windows: readonly ComputerWindow[] }
   | { readonly type: "health-changed"; readonly health: ComputerHealth }
+  | { readonly type: "capabilities-changed"; readonly capabilities: ComputerCapabilities }
   | { readonly type: "frame"; readonly frame: ComputerStreamFrame };
 
 export type ComputerFrameListener = (frame: ComputerStreamFrame) => void;
@@ -159,6 +160,16 @@ export interface ComputerBackend {
    * use the desktop. See `probeAvailability` for the passive counterpart.
    */
   availability(): Promise<ComputerAvailability>;
+
+  /**
+   * Install or compile whatever this backend needs, on explicit request.
+   *
+   * Optional because not every backend has anything to provision: the fake and
+   * the unavailable backends have nothing, and a nested session's compositor
+   * arrived with its own. A backend that implements it returns one sentence
+   * describing what it did, for the settings card that asked.
+   */
+  provision?(): Promise<string>;
   /**
    * Live supervision health. Synchronous and side-effect free on purpose: it
    * reports what the connect and reconnect paths already know, so reading it
@@ -168,10 +179,13 @@ export interface ComputerBackend {
    */
   health(): ComputerHealth;
   /**
-   * What this backend can do, decided by which providers its probe resolved at
-   * construction. Synchronous and constant for the backend's lifetime: a
-   * capability is a property of the display server this process is talking to,
-   * not a live reading, so it is safe to cache and cheap to publish with state.
+   * What this backend can do, decided by which providers its probe resolved.
+   * Synchronous and cheap by contract: a capability is a property of the
+   * display server this process is talking to, not a live reading, so it is
+   * safe to publish with every state snapshot. It changes for exactly one
+   * reason — provisioning installed something the construction probe did not
+   * see — and that transition arrives through `onEvent` as
+   * `capabilities-changed`, so a caller may cache this until that event fires.
    */
   capabilities(): ComputerCapabilities;
   listWindows(): Promise<readonly ComputerWindow[]>;

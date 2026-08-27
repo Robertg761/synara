@@ -14,6 +14,7 @@ import {
   type ComputerScreenshot,
   type ComputerGetScreenSizeResult,
   type ComputerListWindowsResult,
+  type ComputerProvisionResult,
   type ComputerLaunchAppResult,
   type ComputerState,
   type ComputerStatusResult,
@@ -220,11 +221,13 @@ export class ComputerManager {
   private windowsPublishTimer: ReturnType<typeof setTimeout> | undefined;
   private backendHealth: ComputerHealth;
   /**
-   * Read once. A backend's capability set is decided by which providers its
-   * probe resolved at construction, so it cannot change under a live backend,
-   * and re-reading it per snapshot would put a call on every state publish.
+   * Read once and then event-driven. A backend's capability set changes for
+   * exactly one reason — provisioning installed something the construction
+   * probe did not see — and the backend announces that as
+   * `capabilities-changed`, so this cache follows the event rather than
+   * putting a re-read on every state publish.
    */
-  private readonly backendCapabilities: ComputerCapabilities;
+  private backendCapabilities: ComputerCapabilities;
   private lease: DesktopLease | null = null;
   /**
    * Whether anything has yet asked this backend for the desktop itself.
@@ -281,6 +284,9 @@ export class ComputerManager {
           this.scheduleWindowsPublish();
         } else if (event.type === "health-changed") {
           this.backendHealth = event.health;
+          this.republishAllThreads();
+        } else if (event.type === "capabilities-changed") {
+          this.backendCapabilities = event.capabilities;
           this.republishAllThreads();
         }
       });
@@ -342,6 +348,23 @@ export class ComputerManager {
       health: this.backendHealth,
       capabilities: this.backendCapabilities,
     };
+  }
+
+  /**
+   * Set this desktop up, then answer with what it looks like now.
+   *
+   * Engages the backend first: the user pressing "Set up" is exactly the real
+   * reason `engageBackend` exists to wait for, and the establishing reads that
+   * follow have to see an engaged backend or they will answer from the passive
+   * probe the button was pressed to get past.
+   */
+  async provision(): Promise<ComputerProvisionResult> {
+    this.engageBackend();
+    if (!this.backend.provision) {
+      throw new Error("This desktop backend has nothing to install.");
+    }
+    const summary = await this.backend.provision();
+    return { summary, status: await this.getStatus() };
   }
 
   async listWindows(): Promise<ComputerListWindowsResult> {

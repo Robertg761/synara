@@ -25,11 +25,12 @@
  * and never thinks about it again - every later update loads live, because the
  * path is already there.
  */
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+
+import { verifyPrebuilt } from "./provisioning/prebuiltVerification.ts";
 
 /**
  * The env script's name, which is also the uninstall instruction: this file and
@@ -175,18 +176,11 @@ export async function readPrebuiltManifest(path: string): Promise<PrebuiltManife
 }
 
 /**
- * Verified before it is installed, not after.
- *
- * These binaries are downloaded with the app and then loaded into the user's
- * compositor process, which is about as trusted as code gets on a desktop. A
- * truncated download is the likely case and a tampered file is the one that
- * matters; both are the same check.
+ * Re-exported rather than reimplemented: the check is identical for the Tier 2
+ * helper, and one definition of "is this the binary that was built" is the
+ * point. See `provisioning/prebuiltVerification.ts`.
  */
-export async function verifyPrebuilt(path: string, sha256: string): Promise<boolean> {
-  const bytes = await readFile(path).catch(() => undefined);
-  if (!bytes) return false;
-  return createHash("sha256").update(bytes).digest("hex") === sha256;
-}
+export { verifyPrebuilt };
 
 /** `SynaraComputerUsePluginV7.so` -> 7, so the next install can outrank it. */
 const INSTALLED_PLUGIN_FILE = /^SynaraComputerUsePluginV(\d+)\.so$/;

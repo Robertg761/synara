@@ -41,8 +41,9 @@ Boot the server, open the computer panel, and stop there.
 
 Pass: no dialog at boot and none at probe, availability is `available`, consent is `not-requested`,
 and the bus trace contains no `CreateSession`. Health reads `unavailable` here for one reason only, the
-missing capture provider, and the capture message names `pipewire-devel` and `build.sh` rather than
-blaming GNOME. Copy the availability string verbatim into the notes; it is user-facing text that has
+missing capture provider, and the capture message says Synara's PipeWire receiver is not implemented
+yet (and offers `SYNARA_COMPUTER_NESTED=window`) rather than blaming GNOME or prescribing a rebuild
+that would change nothing. Copy the availability string verbatim into the notes; it is user-facing text that has
 never been read on the desktop it describes.
 
 ## 2. One dialog, one session

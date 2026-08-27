@@ -22,6 +22,7 @@ import {
   resolveComputerHealthBadge,
   shouldSubscribeToComputerStream,
 } from "./ComputerPanel.logic";
+import { Badge } from "./ui/badge";
 import { createComputerInputQueue } from "./computer/computerInputQueue";
 import { useComputerImageStream } from "./computer/useComputerImageStream";
 import { DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
@@ -273,6 +274,11 @@ export default function ComputerPanel(props: {
     <div className="flex h-full w-full min-w-0 items-center gap-2">
       <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
       <span className="truncate font-medium text-xs">Computer</span>
+      {/* The pane a user watches the agent drive from is the one surface where
+          the maturity of the feature is most worth repeating. */}
+      <Badge variant="warning" size="sm" className="shrink-0">
+        Beta
+      </Badge>
       {/* Backend health first, then the lease: a desktop that is gone explains
           more than who was holding it, and this thread may still be reading a
           desktop another conversation drives, which is the more useful of those
