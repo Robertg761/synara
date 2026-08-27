@@ -1166,9 +1166,16 @@ export class KWinComputerBackend implements ComputerBackend {
    * there is not.
    */
   protected async provisionOnce(allowPrebuilt = true): Promise<ProvisionResult> {
-    const pending =
-      this.provisionPromises.get(allowPrebuilt) ?? this.provisionPlugin({ allowPrebuilt });
-    this.provisionPromises.set(allowPrebuilt, pending);
+    const cached = this.provisionPromises.get(allowPrebuilt);
+    const pending = cached ?? this.provisionPlugin({ allowPrebuilt });
+    if (!cached) {
+      this.provisionPromises.set(allowPrebuilt, pending);
+      // Only success is cached. A failed install's usual causes — missing
+      // packages, missing headers — are exactly what the user fixes next, and
+      // replaying the stale rejection would turn a fixed machine into one that
+      // still reports the old error until the server restarts.
+      pending.catch(() => this.provisionPromises.delete(allowPrebuilt));
+    }
     return await pending;
   }
 

@@ -5,7 +5,14 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(ECM REQUIRED NO_MODULE)
+# This is a Qt 6 / KF6 plugin, and ECM must be told so before any KDE module
+# runs: without a version request (>= 5.240) or an explicit QT_MAJOR_VERSION,
+# ECM's QtVersionOption defaults to Qt 5, and on a host that also has Qt 5
+# installed KDEInstallDirs then loads Qt5Core, which pins
+# QT_DEFAULT_MAJOR_VERSION=5 and makes the later find_package(Qt6) fail inside
+# Qt6Qml's macros ("only available in Qt 6").
+set(QT_MAJOR_VERSION 6)
+find_package(ECM 5.240 REQUIRED NO_MODULE)
 set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
 
 include(KDEInstallDirs)
