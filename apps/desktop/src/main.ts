@@ -38,6 +38,8 @@ import type {
 import * as Effect from "effect/Effect";
 import type {
   DesktopAppIcon,
+  DesktopRemoteAccessSetEnabledInput,
+  DesktopRemoteAccessState,
   DesktopTheme,
   DesktopUpdateActionResult,
   DesktopUpdateState,
@@ -243,6 +245,13 @@ import {
   writeDesktopWindowState,
 } from "./windowState";
 import {
+  DISABLED_REMOTE_ACCESS_STATE,
+  readDesktopRemoteAccessState,
+  writeDesktopRemoteAccessState,
+  type PersistedDesktopRemoteAccessState,
+} from "./remoteAccessState";
+import { listRemoteAccessUrls } from "./remoteAccessUrls";
+import {
   acknowledgeSynaraStorageSnapshot,
   readSynaraStorageSnapshot,
   resolveSynaraStorageSnapshotPath,
@@ -291,6 +300,7 @@ const STATE_DIR = Path.join(BASE_DIR, "userdata");
 const DESKTOP_WINDOW_STATE_PATH = Path.join(STATE_DIR, "desktop-window-state.json");
 const DESKTOP_APP_ICON_PATH = Path.join(STATE_DIR, "desktop-app-icon");
 const DESKTOP_CUSTOM_TITLE_BAR_PATH = Path.join(STATE_DIR, "desktop-custom-title-bar.json");
+const DESKTOP_REMOTE_ACCESS_STATE_PATH = Path.join(STATE_DIR, "remote-access.json");
 const DESKTOP_SCHEME = desktopIdentity.scheme;
 const ROOT_DIR = Path.resolve(__dirname, "../../..");
 const APP_DISPLAY_NAME = desktopIdentity.displayName;
@@ -350,8 +360,14 @@ let customTitleBarActive = false;
 let backendProcess: ChildProcess.ChildProcess | null = null;
 let backendPort = 0;
 let backendAuthToken = "";
+let backendBootstrapCredential = "";
 let backendHttpUrl = "";
 let backendWsUrl = "";
+let remoteAccessConfig: PersistedDesktopRemoteAccessState = DISABLED_REMOTE_ACCESS_STATE;
+let remoteAccessStatus: DesktopRemoteAccessState["status"] = "running";
+// Serializes toggle requests: a second toggle while the backend restarts must
+// wait for the first restart to finish rather than racing the spawn.
+let remoteAccessApplyInFlight: Promise<void> = Promise.resolve();
 let backendReadinessAbortController: AbortController | null = null;
 let backendInitialWindowOpenInFlight: Promise<void> | null = null;
 // Guards every blocking backend-lifecycle dialog (startup block, give-up) so a
@@ -623,8 +639,15 @@ function cancelBackendReadinessWait(): void {
 }
 
 async function reserveBackendEndpoint(reason: string): Promise<void> {
+  // Remote access pins a stable port so remote URLs (and the port-suffixed
+  // desktop session cookie) survive restarts; when the pin is taken this
+  // session falls back to an ephemeral port and the settings panel warns.
   backendPort = await Effect.service(NetService).pipe(
-    Effect.flatMap((net) => net.reserveLoopbackPort()),
+    Effect.flatMap((net) =>
+      remoteAccessConfig.enabled
+        ? net.findAvailablePort(remoteAccessConfig.port)
+        : net.reserveLoopbackPort(),
+    ),
     Effect.provide(NetService.layer),
     Effect.runPromise,
   );
@@ -3451,6 +3474,17 @@ function backendEnv(): NodeJS.ProcessEnv {
     SYNARA_HOME: BASE_DIR,
     SYNARA_AUTH_TOKEN: backendAuthToken,
     SYNARA_DESKTOP_SHUTDOWN_TOKEN: DESKTOP_BACKEND_SHUTDOWN_TOKEN,
+    // Remote access binds every interface (loopback included — the desktop's
+    // own connections stay on 127.0.0.1) and accepts the plaintext-LAN trade
+    // the user opted into. The bootstrap credential lets this window exchange
+    // an owner bearer session for the auth management API.
+    ...(remoteAccessConfig.enabled
+      ? {
+          SYNARA_HOST: "0.0.0.0",
+          SYNARA_ALLOW_INSECURE_REMOTE: "1",
+          SYNARA_DESKTOP_BOOTSTRAP_CREDENTIAL: backendBootstrapCredential,
+        }
+      : {}),
   };
   // The backend runs the same login-shell probe at startup and does not begin listening
   // until it returns, so an unmarked child serializes a second ~1s hydration behind ours.
@@ -3803,6 +3837,82 @@ function startBackend(trigger: BackendStartTrigger = "lifecycle"): void {
   });
 }
 
+function currentRemoteAccessState(): DesktopRemoteAccessState {
+  const enabled = remoteAccessConfig.enabled;
+  return {
+    enabled,
+    port: remoteAccessConfig.port,
+    portFallback: enabled && backendPort !== remoteAccessConfig.port ? backendPort : null,
+    urls: enabled
+      ? listRemoteAccessUrls({ interfaces: OS.networkInterfaces(), port: backendPort })
+      : [],
+    status: remoteAccessStatus,
+  };
+}
+
+function broadcastRemoteAccessState(): void {
+  const state = currentRemoteAccessState();
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.webContents.send(DESKTOP_IPC_CHANNELS.remoteAccess.state, state);
+  }
+}
+
+async function applyRemoteAccessConfig(
+  input: DesktopRemoteAccessSetEnabledInput,
+): Promise<DesktopRemoteAccessState> {
+  const previous = remoteAccessApplyInFlight;
+  let release!: () => void;
+  remoteAccessApplyInFlight = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+
+  try {
+    const next: PersistedDesktopRemoteAccessState = {
+      version: 1,
+      enabled: input.enabled,
+      port: input.port ?? remoteAccessConfig.port,
+    };
+    if (next.enabled === remoteAccessConfig.enabled && next.port === remoteAccessConfig.port) {
+      return currentRemoteAccessState();
+    }
+
+    writeDesktopRemoteAccessState(DESKTOP_REMOTE_ACCESS_STATE_PATH, next);
+    remoteAccessConfig = next;
+    remoteAccessStatus = "restarting";
+    broadcastRemoteAccessState();
+    writeDesktopLogHeader(
+      `remote access ${next.enabled ? `enabling port=${next.port}` : "disabling"} backend restart`,
+    );
+
+    try {
+      await stopBackendAndWaitForExit();
+    } catch (error) {
+      // The old process is wedged; force-stop so the rebind cannot race it.
+      writeDesktopLogHeader(
+        `remote access graceful stop failed message=${formatErrorMessage(error)}`,
+      );
+      stopBackend();
+    }
+    await restartBackendAfterCrash("remote access configuration change", "lifecycle");
+    try {
+      await waitForBackendWindowReady(backendHttpUrl);
+    } catch (error) {
+      if (!isBackendReadinessAborted(error)) {
+        writeDesktopLogHeader(
+          `remote access readiness warning message=${formatErrorMessage(error)}`,
+        );
+      }
+    }
+    remoteAccessStatus = "running";
+    return currentRemoteAccessState();
+  } finally {
+    remoteAccessStatus = "running";
+    broadcastRemoteAccessState();
+    release();
+  }
+}
+
 function takeBackendProcessForShutdown(): ChildProcess.ChildProcess | null {
   cancelBackendReadinessWait();
   backendListeningDetector = null;
@@ -4019,6 +4129,36 @@ function registerIpcHandlers(): void {
   ipcMain.removeAllListeners(IPC.zoomFactor);
   ipcMain.on(IPC.zoomFactor, (event: IpcMainEvent) => {
     event.returnValue = event.sender.getZoomFactor();
+  });
+
+  ipcMain.removeHandler(IPC.remoteAccess.getState);
+  ipcMain.handle(IPC.remoteAccess.getState, () => currentRemoteAccessState());
+
+  ipcMain.removeHandler(IPC.remoteAccess.setEnabled);
+  ipcMain.handle(IPC.remoteAccess.setEnabled, async (_event, input: unknown) => {
+    if (!input || typeof input !== "object") {
+      throw new Error("Invalid remote access input.");
+    }
+    const candidate = input as { enabled?: unknown; port?: unknown };
+    if (typeof candidate.enabled !== "boolean") {
+      throw new Error("Invalid remote access input.");
+    }
+    const port = candidate.port;
+    if (
+      port !== undefined &&
+      (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)
+    ) {
+      throw new Error("Invalid remote access port.");
+    }
+    return applyRemoteAccessConfig({
+      enabled: candidate.enabled,
+      ...(port === undefined ? {} : { port }),
+    });
+  });
+
+  ipcMain.removeAllListeners(IPC.remoteAccess.bootstrapCredential);
+  ipcMain.on(IPC.remoteAccess.bootstrapCredential, (event: IpcMainEvent) => {
+    event.returnValue = backendBootstrapCredential || null;
   });
 
   ipcMain.removeHandler(IPC.pickFolder);
@@ -4838,6 +4978,8 @@ async function bootstrap(): Promise<void> {
   }
 
   backendAuthToken = Crypto.randomBytes(24).toString("hex");
+  backendBootstrapCredential = Crypto.randomBytes(24).toString("hex");
+  remoteAccessConfig = readDesktopRemoteAccessState(DESKTOP_REMOTE_ACCESS_STATE_PATH);
   await reserveBackendEndpoint("bootstrap");
 
   registerIpcHandlers();

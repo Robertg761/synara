@@ -32,7 +32,14 @@ const harness = vi.hoisted(() => ({
   toastAdd: vi.fn(),
 }));
 
-vi.mock("~/env", () => ({ isElectron: false }));
+// Whole-module factory: it must carry every env export the panels read, or the
+// first new shell flag they touch resolves to undefined instead of false.
+vi.mock("~/env", () => ({
+  isElectron: false,
+  isMobileShell: false,
+  isNativeShell: false,
+  appRuntime: "browser",
+}));
 
 vi.mock("~/notifications/taskCompletion", () => ({
   buildNotificationSettingsSupportText: (permission: string) => `Permission: ${permission}`,

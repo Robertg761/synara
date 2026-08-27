@@ -14,6 +14,7 @@
 import { useEffect, useState } from "react";
 
 import { basenameOfPath } from "~/file-icons";
+import { useMediaAuthToken } from "~/hooks/useMediaAuthToken";
 import { Loader2Icon, TriangleAlertIcon } from "~/lib/icons";
 import { buildLocalImageUrl } from "~/lib/localImageUrls";
 import { useContainerSize } from "~/lib/pdf/useContainerSize";
@@ -38,6 +39,10 @@ export function PdfFilePreview(props: {
   onPreviewReady?: (() => void) | undefined;
   onPreviewError?: (() => void) | undefined;
 }) {
+  // Rebuild the URL when the mobile shell's media credential arrives or rotates; `usePdfDocument`
+  // reloads on a URL change, so a fetch made before the credential existed is retried rather than
+  // left as a permanent error. A no-op on every other runtime.
+  useMediaAuthToken();
   const previewUrl = buildLocalImageUrl({
     src: props.filePath,
     cwd: props.cwd ?? undefined,

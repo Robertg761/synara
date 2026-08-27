@@ -117,7 +117,7 @@ import { ExternalMcpService } from "./externalMcp/Services/ExternalMcpService";
 import { ServerLifecycleEvents } from "./serverLifecycleEvents";
 import { ServerRuntimeStartup } from "./serverRuntimeStartup";
 import { ServerSettingsService } from "./serverSettings";
-import { isLoopbackHost } from "./startupAccess";
+import { isLoopbackHost, isLoopbackPeerAddress } from "./startupAccess";
 import { TerminalManager } from "./terminal/Services/Manager";
 import { TerminalThreadTitleTracker } from "./terminal/terminalThreadTitleTracker";
 import { resolveOutOfRootFileReference } from "./workspace/outOfRootFileReference";
@@ -853,10 +853,17 @@ const makeWsRpcHandlersLayer = () =>
             new WsRpcError({ message: "Owner authorization is required for this operation." }),
           );
         }
-        if (!isLoopbackHost(config.host) || config.publicUrl !== undefined) {
+        // Desktop instances stay eligible while remote access binds 0.0.0.0:
+        // the gate above already restricts management to owner sessions, and
+        // integrations themselves remain local stdio bridges. Proxied (web)
+        // deployments keep the loopback-only restriction.
+        if (
+          config.publicUrl !== undefined ||
+          (!isLoopbackHost(config.host) && config.mode !== "desktop")
+        ) {
           return yield* Effect.fail(
             new WsRpcError({
-              message: "External MCP management is available only on a loopback-only instance.",
+              message: "External MCP management is available only on a local Synara instance.",
             }),
           );
         }
@@ -2116,14 +2123,24 @@ function trustedWebSocketRequestUrl(
 }
 
 export function authenticateRpcWebSocketUpgrade(input: {
-  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">;
+  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl" | "mode">;
   readonly legacyToken: string | null;
+  readonly remoteAddress: string | null | undefined;
   readonly request: AuthRequest;
   readonly serverAuth: Pick<ServerAuthShape, "authenticateWebSocketUpgrade">;
 }): Effect.Effect<AuthenticatedSession | null, AuthError> {
+  // The static startup token grants the implicit local-owner connection. Its
+  // scope is the machine itself: a loopback-only bind, or — when a desktop
+  // instance binds 0.0.0.0 for remote access — a loopback peer (the desktop
+  // app's own window). Proxied deployments (`publicUrl`) are excluded because
+  // forwarded traffic could present loopback peers; remote peers always go
+  // through session authentication.
+  const legacyTokenHasLocalScope =
+    isLoopbackHost(input.config.host) ||
+    (input.config.mode === "desktop" && isLoopbackPeerAddress(input.remoteAddress));
   if (
     !requiresWebSocketAuthentication(input.config) ||
-    (isLoopbackHost(input.config.host) &&
+    (legacyTokenHasLocalScope &&
       !input.config.publicUrl &&
       input.legacyToken === input.config.authToken)
   ) {
@@ -2139,8 +2156,9 @@ export function authenticateRpcWebSocketUpgrade(input: {
  * the RPC socket rather than calling ServerAuth directly.
  */
 export function authorizeDeviceFrameWebSocketUpgrade(input: {
-  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl">;
+  readonly config: Pick<ServerConfigShape, "authToken" | "host" | "publicUrl" | "mode">;
   readonly legacyToken: string | null;
+  readonly remoteAddress: string | null | undefined;
   readonly request: AuthRequest;
   readonly serverAuth: Pick<ServerAuthShape, "authenticateWebSocketUpgrade">;
 }): Effect.Effect<boolean> {
@@ -2213,6 +2231,7 @@ export function makeWebsocketRpcRouteLayer<R>(
           const authenticatedSession = yield* authenticateRpcWebSocketUpgrade({
             config,
             legacyToken,
+            remoteAddress: request.remoteAddress,
             request: makeEffectAuthRequest(request),
             serverAuth,
           });
@@ -2356,6 +2375,7 @@ const deviceFrameRouteLayer = makeDeviceFrameRouteLayer({
       return yield* authorizeDeviceFrameWebSocketUpgrade({
         config,
         legacyToken: url.searchParams.get("token"),
+        remoteAddress: request.remoteAddress,
         request: makeEffectAuthRequest(request),
         serverAuth,
       });
@@ -2372,6 +2392,7 @@ const computerFrameRouteLayer = makeComputerFrameRouteLayer({
       return yield* authorizeComputerFrameWebSocketUpgrade({
         config,
         legacyToken: url.searchParams.get("token"),
+        remoteAddress: request.remoteAddress,
         request: makeEffectAuthRequest(request),
         serverAuth,
       });

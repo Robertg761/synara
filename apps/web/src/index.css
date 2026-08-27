@@ -67,6 +67,13 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+  /* Display cutouts / rounded corners / home indicator, as spacing tokens so any
+     spacing utility can consume them (`pb-safe-b`, `pl-safe-l`, …). They resolve to
+     0px wherever the platform reports no inset, which is every desktop surface. */
+  --spacing-safe-t: env(safe-area-inset-top);
+  --spacing-safe-b: env(safe-area-inset-bottom);
+  --spacing-safe-l: env(safe-area-inset-left);
+  --spacing-safe-r: env(safe-area-inset-right);
   @keyframes skeleton {
     to {
       background-position: -200% 0;
@@ -77,6 +84,14 @@
       transform: rotate(360deg);
     }
   }
+}
+
+/* Bottom padding for surfaces an on-screen keyboard can cover (composer, sheets):
+   the larger of the safe-area inset and the visual-viewport keyboard overlap.
+   `--app-keyboard-inset` is published by the runtime keyboard hook and defaults to
+   0px, so this reduces to the plain safe-area inset on desktop. */
+@utility pb-keyboard-safe {
+  padding-bottom: max(env(safe-area-inset-bottom), var(--app-keyboard-inset, 0px));
 }
 
 @layer base {

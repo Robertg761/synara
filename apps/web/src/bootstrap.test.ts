@@ -13,8 +13,9 @@ describe("renderer bootstrap ordering", () => {
     expect(INDEX_SOURCE).toContain('<script type="module" src="/src/bootstrap.ts"></script>');
 
     const migrationImportIndex = BOOTSTRAP_SOURCE.indexOf('import "./storageOriginMigration";');
-    const signedOutBootstrapIndex = BOOTSTRAP_SOURCE.indexOf("bootstrapSignedOutScreen()");
-    const pairingBootstrapIndex = BOOTSTRAP_SOURCE.indexOf("bootstrapPairingSession()");
+    const signedOutBootstrapIndex = BOOTSTRAP_SOURCE.indexOf("bootstrapSignedOutScreen({");
+    const pairingBootstrapIndex = BOOTSTRAP_SOURCE.indexOf("bootstrapPairingSession({");
+    const shellSessionHydrationIndex = BOOTSTRAP_SOURCE.indexOf("hydrateShellSession()");
     const appImportIndex = BOOTSTRAP_SOURCE.indexOf('import("./main")');
     expect(migrationImportIndex).toBeGreaterThanOrEqual(0);
     expect(signedOutBootstrapIndex).toBeGreaterThan(migrationImportIndex);
@@ -22,6 +23,9 @@ describe("renderer bootstrap ordering", () => {
     expect(pairingBootstrapIndex).toBeGreaterThan(signedOutBootstrapIndex);
     expect(appImportIndex).toBeGreaterThan(migrationImportIndex);
     expect(appImportIndex).toBeGreaterThan(pairingBootstrapIndex);
+    // The mobile shell's stored session must be in memory before main opens a transport.
+    expect(shellSessionHydrationIndex).toBeGreaterThan(pairingBootstrapIndex);
+    expect(appImportIndex).toBeGreaterThan(shellSessionHydrationIndex);
 
     expect(MAIN_SOURCE).not.toContain('import "./storageOriginMigration";');
   });

@@ -38,6 +38,7 @@ import {
   rememberProjectUiState,
 } from "./storePersistence";
 import { initialState, type AppState } from "./storeState";
+import { flushStorageBeforePageHide } from "./lib/storage";
 import type { Project, ThreadWorkspacePatch } from "./types";
 
 type ReadModelThread = OrchestrationReadModel["threads"][number];
@@ -359,12 +360,12 @@ useStore.subscribe((state) => {
   debouncedPersistState.maybeExecute(state);
 });
 
-// Flush pending writes synchronously before page unload to prevent data loss.
-if (typeof window !== "undefined") {
-  window.addEventListener("beforeunload", () => {
-    persistAppStateNow();
-  });
-}
+// Flush pending writes synchronously before the page goes away to prevent data loss.
+// `beforeunload` alone is not enough on mobile, where the app is usually swiped away or
+// killed by the OS — the shared helper also covers `pagehide` / `visibilitychange`.
+flushStorageBeforePageHide(() => {
+  persistAppStateNow();
+});
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {

@@ -684,6 +684,7 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
       !current ||
       current.truncated ||
       current.version === null ||
+      current.relativePath === null ||
       current.encoding === null ||
       current.lineEnding === null ||
       current.lineEnding === "mixed"
@@ -699,6 +700,10 @@ export function WorkspaceFilePreview(props: WorkspaceFilePreviewProps) {
     if (nextContents === null) {
       return;
     }
+    // Capture the null-narrowed metadata here: property narrowing does not
+    // survive into the queued async closure below, and the write requires
+    // non-null encoding/line-ending values.
+    const { encoding, lineEnding, version } = current;
     // No API means no write can happen — bail before the optimistic update
     // so the preview never shows a toggle that was silently dropped.
     const api = readNativeApi();

@@ -6,11 +6,36 @@ import {
   shouldRenderToastForVisibleThreads,
 } from "./toastRouteVisibility";
 import type { SplitView } from "../../splitViewStore";
+import type { DockVisibility, RightDockPane } from "../../rightDockStore.logic";
 
 const PROJECT_ID = ProjectId.makeUnsafe("project-1");
 const THREAD_A = ThreadId.makeUnsafe("thread-a");
 const THREAD_B = ThreadId.makeUnsafe("thread-b");
 const THREAD_C = ThreadId.makeUnsafe("thread-c");
+
+/** Desktop chat route: the dock component is mounted, the store picks the pane. */
+const DESKTOP_DOCK: DockVisibility = { dockRendered: true, phonePaneId: null };
+/** Editor view (either layout): nothing dock-shaped is on screen. */
+const NO_DOCK: DockVisibility = { dockRendered: false, phonePaneId: null };
+/** Phone chat route with `?pane=` pushed full screen. */
+function phoneDock(paneId: string): DockVisibility {
+  return { dockRendered: false, phonePaneId: paneId };
+}
+
+function sidechatPane(id: string, threadId: ThreadId): RightDockPane {
+  return {
+    id,
+    kind: "sidechat",
+    threadId,
+    diffTurnId: null,
+    diffFilePath: null,
+    filePath: null,
+    pullRequestProjectId: null,
+    pullRequestRepository: null,
+    pullRequestNumber: null,
+    pullRequestInitialTab: null,
+  };
+}
 
 function createSplitView(): SplitView {
   const firstLeaf = {
@@ -61,7 +86,7 @@ describe("resolveVisibleToastThreadIds", () => {
       resolveVisibleToastThreadIds({
         activeThreadId: THREAD_A,
         splitView: null,
-        rightDockRendered: true,
+        dockVisibility: DESKTOP_DOCK,
       }),
     ).toEqual(new Set([THREAD_A]));
   });
@@ -71,7 +96,7 @@ describe("resolveVisibleToastThreadIds", () => {
       resolveVisibleToastThreadIds({
         activeThreadId: THREAD_A,
         splitView: createSplitView(),
-        rightDockRendered: true,
+        dockVisibility: DESKTOP_DOCK,
       }),
     ).toEqual(new Set([THREAD_A, THREAD_B]));
   });
@@ -81,7 +106,7 @@ describe("resolveVisibleToastThreadIds", () => {
       resolveVisibleToastThreadIds({
         activeThreadId: THREAD_A,
         splitView: null,
-        rightDockRendered: true,
+        dockVisibility: DESKTOP_DOCK,
         rightDockState: {
           open: true,
           activePaneId: "sidechat-pane",
@@ -109,7 +134,7 @@ describe("resolveVisibleToastThreadIds", () => {
       resolveVisibleToastThreadIds({
         activeThreadId: THREAD_A,
         splitView: null,
-        rightDockRendered: true,
+        dockVisibility: DESKTOP_DOCK,
         rightDockState: {
           open: false,
           activePaneId: "sidechat-pane",
@@ -137,7 +162,7 @@ describe("resolveVisibleToastThreadIds", () => {
       resolveVisibleToastThreadIds({
         activeThreadId: THREAD_A,
         splitView: null,
-        rightDockRendered: false,
+        dockVisibility: NO_DOCK,
         rightDockState: {
           open: true,
           activePaneId: "sidechat-pane",
@@ -165,7 +190,7 @@ describe("resolveVisibleToastThreadIds", () => {
       resolveVisibleToastThreadIds({
         activeThreadId: THREAD_A,
         splitView: createSplitView(),
-        rightDockRendered: true,
+        dockVisibility: DESKTOP_DOCK,
         rightDockState: {
           open: true,
           activePaneId: "sidechat-pane",
@@ -186,6 +211,49 @@ describe("resolveVisibleToastThreadIds", () => {
         },
       }),
     ).toEqual(new Set([THREAD_A, THREAD_B]));
+  });
+
+  it("treats the phone pane screen's sidechat as visible even while the dock store lags", () => {
+    expect(
+      resolveVisibleToastThreadIds({
+        activeThreadId: THREAD_A,
+        splitView: null,
+        dockVisibility: phoneDock("sidechat-pane"),
+        rightDockState: {
+          // The store follows the URL asynchronously, so neither `open` nor
+          // `activePaneId` may gate what the pushed screen already shows.
+          open: false,
+          activePaneId: null,
+          panes: [sidechatPane("sidechat-pane", THREAD_B)],
+        },
+      }),
+    ).toEqual(new Set([THREAD_A, THREAD_B]));
+  });
+
+  it("keeps phone sidechats hidden unless the URL pane is that sidechat", () => {
+    const rightDockState = {
+      open: true,
+      activePaneId: "sidechat-pane",
+      panes: [sidechatPane("sidechat-pane", THREAD_B)],
+    };
+    // A different pane is pushed: the sidechat is off screen.
+    expect(
+      resolveVisibleToastThreadIds({
+        activeThreadId: THREAD_A,
+        splitView: null,
+        dockVisibility: phoneDock("terminal-pane"),
+        rightDockState,
+      }),
+    ).toEqual(new Set([THREAD_A]));
+    // No pane pushed at all: the phone shows the chat only.
+    expect(
+      resolveVisibleToastThreadIds({
+        activeThreadId: THREAD_A,
+        splitView: null,
+        dockVisibility: NO_DOCK,
+        rightDockState,
+      }),
+    ).toEqual(new Set([THREAD_A]));
   });
 });
 

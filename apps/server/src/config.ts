@@ -106,6 +106,12 @@ export interface ServerConfigShape extends ServerDerivedPaths {
   readonly noBrowser: boolean;
   readonly authToken: string | undefined;
   readonly desktopShutdownToken?: string | undefined;
+  /**
+   * One-time-use credential the desktop shell mints per launch so its own
+   * window can bootstrap an owner session when the server is remote-reachable.
+   * Seeded in memory only — never persisted.
+   */
+  readonly desktopBootstrapCredential?: string | undefined;
   readonly autoBootstrapProjectFromCwd: boolean;
   readonly logProviderEvents: boolean;
   readonly logWebSocketEvents: boolean;

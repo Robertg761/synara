@@ -571,6 +571,28 @@ export interface DesktopCustomTitleBarState {
 export const DesktopAppIcon = Schema.Literals(["default", "icon", "dark"]);
 export type DesktopAppIcon = typeof DesktopAppIcon.Type;
 
+export type DesktopRemoteAccessUrlKind = "tailscale" | "lan" | "other";
+
+export interface DesktopRemoteAccessUrl {
+  readonly url: string;
+  readonly kind: DesktopRemoteAccessUrlKind;
+}
+
+export interface DesktopRemoteAccessState {
+  readonly enabled: boolean;
+  /** The pinned port remote URLs should use while enabled. */
+  readonly port: number;
+  /** Set when the pinned port was taken and this session runs elsewhere. */
+  readonly portFallback: number | null;
+  readonly urls: ReadonlyArray<DesktopRemoteAccessUrl>;
+  readonly status: "running" | "restarting";
+}
+
+export interface DesktopRemoteAccessSetEnabledInput {
+  readonly enabled: boolean;
+  readonly port?: number;
+}
+
 export interface SynaraStorageSnapshot {
   readonly version: 1;
   readonly exportedAt: string;
@@ -656,6 +678,17 @@ export interface DesktopBridge {
   storageMigration: {
     readSnapshot: () => SynaraStorageSnapshot | null;
     acknowledgeSnapshot: () => Promise<void>;
+  };
+  /**
+   * Desktop-managed remote access for the embedded backend. Absent outside the
+   * desktop app, which also keeps the settings surface desktop-only.
+   */
+  remoteAccess?: {
+    getState: () => Promise<DesktopRemoteAccessState>;
+    setEnabled: (input: DesktopRemoteAccessSetEnabledInput) => Promise<DesktopRemoteAccessState>;
+    onState: (listener: (state: DesktopRemoteAccessState) => void) => () => void;
+    /** Per-launch credential the window exchanges for an owner bearer session. */
+    getAuthBootstrapCredential: () => string | null;
   };
   server?: {
     transcribeVoice: (

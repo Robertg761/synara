@@ -10,6 +10,7 @@ packages/*/dist
 .env
 .env.local
 build/
+**/.gradle/
 .logs/
 release/
 .synara

@@ -56,14 +56,49 @@ import { VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH } from "@synara/shared/binaryTran
 
 import { showConfirmDialogFallback } from "./confirmDialogFallback";
 import { showContextMenuFallback } from "./contextMenuFallback";
+import { forgetShellSession } from "./shellSessionExit";
 import { requireHttpExternalUrl } from "./lib/externalUrl";
 import { WsTransport, type WsThreadStreamFailure } from "./wsTransport";
 import { emitWsCompatibilityIssue, emitWsTransportState } from "./wsTransportEvents";
-import { resolveWsHttpUrl } from "./lib/wsHttpUrl";
+import { authenticatedServerFetch } from "./lib/authenticatedFetch";
 
 export type { WsThreadStreamFailure } from "./wsTransport";
 
-let instance: { api: NativeApi; transport: WsTransport } | null = null;
+let instance: {
+  api: NativeApi;
+  transport: WsTransport;
+  detachWakeListeners: () => void;
+} | null = null;
+
+/**
+ * Nudge the transport whenever the environment hints connectivity returned:
+ * the network coming back online or the tab/app becoming visible again (on
+ * mobile the WebView can sit frozen for minutes with a silently dead socket).
+ * Listeners self-detach on the first signal after the transport is disposed,
+ * covering dispose paths that never tear the instance down (e.g. logout).
+ */
+function attachTransportWakeListeners(transport: WsTransport): () => void {
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
+    return () => {};
+  }
+  const onWakeSignal = () => {
+    if (transport.getState() === "disposed") {
+      detach();
+      return;
+    }
+    transport.wakeUp();
+  };
+  const onVisibilityChange = () => {
+    if (document.visibilityState === "visible") onWakeSignal();
+  };
+  window.addEventListener("online", onWakeSignal);
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  const detach = () => {
+    window.removeEventListener("online", onWakeSignal);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+  };
+  return detach;
+}
 
 export function readWsServerCapabilities(): ReadonlyArray<string> | null {
   return instance?.transport.getCompatibility()?.capabilities ?? null;
@@ -219,14 +254,12 @@ async function requestAuthJson<T>(
   } = {},
 ): Promise<T> {
   const hasBody = options.body !== undefined;
-  const response = await fetch(path, {
+  // Credential selection, the 401 re-bootstrap and the mobile revocation verdict all live in
+  // `authenticatedServerFetch`, which every authenticated HTTP call in the app shares.
+  const response = await authenticatedServerFetch(path, {
     method: options.method ?? "GET",
-    credentials: "same-origin",
     ...(hasBody
-      ? {
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(options.body),
-        }
+      ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(options.body) }
       : {}),
   });
   const payload = (await response.json().catch(() => null)) as unknown;
@@ -259,8 +292,8 @@ async function requestVoiceTranscriptionUpload(
   for (let index = 0; index < decoded.length; index += 1) {
     bytes[index] = decoded.charCodeAt(index);
   }
-  const response = await fetch(
-    resolveWsHttpUrl(`${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}?${params.toString()}`),
+  const response = await authenticatedServerFetch(
+    `${VOICE_TRANSCRIPTION_UPLOAD_ROUTE_PATH}?${params.toString()}`,
     { method: "POST", credentials: "include", body: bytes },
   );
   const payload = (await response.json().catch(() => null)) as
@@ -432,10 +465,15 @@ export function createWsNativeApi(): NativeApi {
     if (instance.transport.getState() !== "disposed") {
       return instance.api;
     }
+    // The discarded instance's wake listeners only self-detach on their next
+    // signal; dropping the reference without this strands them on the window
+    // holding a dead transport.
+    instance.detachWakeListeners();
     instance = null;
   }
 
   const transport = new WsTransport();
+  const detachWakeListeners = attachTransportWakeListeners(transport);
   let unsubscribeDomainEventTransport: (() => void) | null = null;
   transport.onStateChange((state) => emitWsTransportState(state));
   transport.onCompatibilityIssue((issue) => emitWsCompatibilityIssue(issue), {
@@ -688,7 +726,14 @@ export function createWsNativeApi(): NativeApi {
         const result = await requestAuthJson<AuthLogoutResult>("/api/auth/logout", {
           method: "POST",
         });
+        // Detach before disposing: the wake listeners only self-detach on their
+        // next signal, and this transport is never coming back.
+        detachWakeListeners();
         await transport.dispose();
+        // The mobile shell keeps this session's bearer in secure storage, and the
+        // server has just revoked it, so it must not survive on the device. The
+        // caller owns the navigation that follows (see `signedOutRoutePath`).
+        await forgetShellSession();
         return result;
       },
       listExternalMcpIntegrations: () =>
@@ -1060,7 +1105,7 @@ export function createWsNativeApi(): NativeApi {
     },
   };
 
-  instance = { api, transport };
+  instance = { api, transport, detachWakeListeners };
   return api;
 }
 
@@ -1068,6 +1113,7 @@ export function createWsNativeApi(): NativeApi {
 // singleton so each test gets a fresh WebSocket stream and cached push state.
 export async function resetWsNativeApiForTest(): Promise<void> {
   const transport = instance?.transport;
+  instance?.detachWakeListeners();
   instance = null;
   clearWsNativeApiListeners();
   fallbackBrowserStates.clear();
@@ -1077,6 +1123,7 @@ export async function resetWsNativeApiForTest(): Promise<void> {
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
     void instance?.transport.dispose();
+    instance?.detachWakeListeners();
     instance = null;
     clearWsNativeApiListeners();
   });

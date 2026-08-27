@@ -3,7 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { Deferred, Effect } from "effect";
 
 import type { ServerConfigShape } from "./config";
-import { isLoopbackHost } from "./startupAccess";
+import { isLoopbackPeerAddress } from "./startupAccess";
 
 export const DESKTOP_SHUTDOWN_ROUTE_PATH = "/api/desktop/shutdown";
 
@@ -43,10 +43,7 @@ export function matchesDesktopShutdownToken(expected: string, presented: string)
   return timingSafeEqual(digestToken(expected), digestToken(presented));
 }
 
-export function isDesktopShutdownLoopbackPeer(remoteAddress: string | null | undefined): boolean {
-  const normalized = remoteAddress?.trim().toLowerCase();
-  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "::ffff:127.0.0.1";
-}
+export const isDesktopShutdownLoopbackPeer = isLoopbackPeerAddress;
 
 function readBearerToken(authorization: string | undefined): string | undefined {
   const match = /^Bearer ([^\s]+)$/iu.exec(authorization ?? "");
@@ -55,9 +52,11 @@ function readBearerToken(authorization: string | undefined): string | undefined 
 
 /**
  * Keeps desktop shutdown authority separate from browser authentication. The
- * route is hidden unless both the configured deployment and the actual peer
- * are local-only; only then do credential failures return an authentication
- * response.
+ * route is hidden unless the deployment is a directly-bound desktop instance
+ * and the actual peer is local-only; only then do credential failures return
+ * an authentication response. The listen host itself may be non-loopback
+ * (desktop remote access binds 0.0.0.0) — a proxied deployment (`publicUrl`)
+ * stays excluded because forwarded traffic could present loopback peers.
  */
 export function authorizeDesktopShutdown(input: {
   readonly config: Pick<ServerConfigShape, "mode" | "host" | "publicUrl" | "desktopShutdownToken">;
@@ -67,9 +66,8 @@ export function authorizeDesktopShutdown(input: {
   const expectedToken = input.config.desktopShutdownToken;
   if (
     input.config.mode !== "desktop" ||
-    !isLoopbackHost(input.config.host) ||
     input.config.publicUrl !== undefined ||
-    !isDesktopShutdownLoopbackPeer(input.remoteAddress) ||
+    !isLoopbackPeerAddress(input.remoteAddress) ||
     !expectedToken?.trim()
   ) {
     return { authorized: false, reason: "unavailable", status: 404 };

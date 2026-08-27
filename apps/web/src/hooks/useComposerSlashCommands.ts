@@ -41,8 +41,7 @@ import { resolveForkThreadEnvironment } from "../lib/threadEnvironment";
 import { type SplitViewId } from "../splitViewStore";
 import { useRightDockStore } from "../rightDockStore";
 import { registerSidechatCreator } from "../lib/sidechatCreatorRegistry";
-import { downloadUrlAsBlob } from "../lib/browserDownload";
-import { resolveWsHttpUrl } from "../lib/wsHttpUrl";
+import { downloadServerFileAsBlob } from "../lib/browserDownload";
 import { useFeedbackDialogStore } from "../feedbackDialogStore";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { dispatchThreadGoal, dispatchThreadGoalPaused } from "../threadGoal";
@@ -750,8 +749,10 @@ export function useComposerSlashCommands(input: {
       return;
     }
     const params = new URLSearchParams({ threadId: threadId });
-    void downloadUrlAsBlob({
-      url: resolveWsHttpUrl(`/api/thread-export?${params.toString()}`),
+    // A session, not the media credential: the archive is the whole transcript, and this fetch
+    // can carry a bearer header where an <img> cannot.
+    void downloadServerFileAsBlob({
+      path: `/api/thread-export?${params.toString()}`,
       filename: `synara-thread-${threadId}.zip`,
     }).catch((error: unknown) => {
       toastManager.add({
