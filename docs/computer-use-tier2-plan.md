@@ -3,8 +3,11 @@
 > **Superseded 2026-08-26 by the seat policy** (design doc, "Current capabilities"): the agent
 > never drives the seat the human is sitting at, so the shared-seat portal backend described in
 > this plan is disabled and unreachable — no auto-selection, and the `portal` override is refused.
-> Non-KDE desktops default to the windowed nested KWin session (Phase A) instead. The plan below
-> is kept as the build log of the portal work, which remains in the tree unwired.
+> Non-KDE desktops default to the nested KWin session instead — headless (`--virtual`) as of
+> 2026-08-27, per the design doc's minimum acceptance bar (no windows pop up on the host desktop;
+> the Computer pane is the agent desktop's only screen), with Phase A's windowed session kept as a
+> debugging opt-in (`SYNARA_COMPUTER_NESTED=window`). The plan below is kept as the build log of
+> the portal work, which remains in the tree unwired.
 
 Decided 2026-08-17. Scope decision: the feature ships full and complete, so Tier 2 is in the shippable cut (design doc open question 3). This plan replaces the design doc's original Tier 2 mechanism sketch.
 

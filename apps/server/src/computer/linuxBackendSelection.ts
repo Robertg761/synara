@@ -110,7 +110,7 @@ export interface LinuxBackendSelectionDependencies {
 
 /**
  * Resolves the backend in order: override, nested opt-in, KWin presence, and
- * the windowed nested compositor for every other desktop.
+ * the headless nested compositor for every other desktop.
  */
 export async function selectLinuxBackend(
   dependencies: LinuxBackendSelectionDependencies,
@@ -157,10 +157,11 @@ export async function selectLinuxBackend(
   }
 
   return {
-    choice: "nested-window",
+    choice: "nested",
     forced: false,
     reason:
       `No process owns ${KWIN_SERVICE}, so this desktop has no seat to dedicate to the agent; ` +
-      "the windowed nested compositor gives it one of its own instead of sharing the human's.",
+      "a headless nested compositor gives it one of its own instead of sharing the human's, " +
+      "with the Computer pane as its screen — nothing appears on this desktop.",
   };
 }

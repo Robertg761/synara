@@ -1,7 +1,8 @@
 /**
  * The default Linux backend on every desktop that is not already KWin: the
  * KWin backend, pointed at a private nested compositor this server boots on
- * demand.
+ * demand — headless by default, so nothing appears on the host desktop and
+ * the Computer pane is the only place the agent's desktop is ever seen.
  *
  * The whole point of this class is *when* things happen, not *what* happens —
  * `KWinComputerBackend` already knows how to connect, load the plugin, and
@@ -22,13 +23,16 @@
  *   dependencies in one authorization, provisions the plugin, and boots the
  *   session so the card can say the desktop is running.
  *
- * A nested compositor that dies is not restarted behind anyone's back — the
- * desktop is an ordinary window of the host session, so "it died" is usually
- * "the human closed it", and a window that respawns on a supervision timer is
- * a haunting. Instead the dead session is reaped, the reconnect loop is told
- * the desktop is dormant and stands down, and the next *real* use — an agent
- * action, a pane attach, the settings panel's Refresh or Set up — boots a
- * fresh session, exactly like first use did.
+ * A nested compositor that dies is not restarted behind anyone's back. In the
+ * windowed debug mode the desktop is an ordinary window of the host session,
+ * so "it died" is usually "the human closed it", and a window that respawns on
+ * a supervision timer is a haunting; headless mode has no window to close, but
+ * a compositor that just crashed could crash again, and a respawn loop nobody
+ * asked for is the same haunting without the visuals. Either way the dead
+ * session is reaped, the reconnect loop is told the desktop is dormant and
+ * stands down, and the next *real* use — an agent action, a pane attach, the
+ * settings panel's Refresh or Set up — boots a fresh session, exactly like
+ * first use did.
  */
 import type { ComputerAvailability, ComputerCapabilities } from "@synara/contracts";
 import { COMPUTER_NESTED_KWIN_BACKEND } from "@synara/contracts";
@@ -67,16 +71,25 @@ import {
 
 const KWIN_COMMAND = "kwin_wayland";
 const INSTALLED_PLUGIN_FILE = /^SynaraComputerUsePluginV\d+\.so$/;
-const DESKTOP_DORMANT_MESSAGE =
-  "The agent's isolated desktop is not running — its window may have been closed. " +
-  "It starts again the next time an agent uses the computer, or click Refresh to start it now.";
+/**
+ * Only the windowed mode blames a closed window: the headless desktop has no
+ * window anyone could have closed, so naming one would send the user hunting
+ * for something that never existed.
+ */
+function desktopDormantMessage(mode: NestedSessionMode): string {
+  const restart =
+    "It starts again the next time an agent uses the computer, or click Refresh to start it now.";
+  return mode === "window"
+    ? `The agent's isolated desktop is not running — its window may have been closed. ${restart}`
+    : `The agent's isolated desktop is not running. ${restart}`;
+}
 const NO_WAYLAND_HOST_MESSAGE =
   "The agent's isolated desktop runs as a window of your Wayland session, and WAYLAND_DISPLAY " +
   "is not set for this server. Start Synara from inside the desktop session, or set " +
   "SYNARA_COMPUTER_NESTED=1 for a headless virtual desktop.";
 
 export interface NestedComputerBackendOptions {
-  /** `window` nests into the host session; `virtual` is headless. */
+  /** `virtual` (the default) is headless; `window` nests into the host session. */
   readonly mode?: NestedSessionMode;
   readonly size?: NestedSize;
   readonly atspiMode?: NestedAtspiMode;
@@ -154,7 +167,11 @@ export class NestedComputerBackend extends KWinComputerBackend {
     });
     ref.backend = this;
     this.ref = ref;
-    this.mode = options.mode ?? "window";
+    // Headless is the default and the acceptance bar: an agent using the
+    // computer must never pop a window onto the host desktop. The windowed
+    // mode stays reachable (`SYNARA_COMPUTER_NESTED=window`) for debugging a
+    // compositor you want to see directly.
+    this.mode = options.mode ?? "virtual";
     this.size = options.size;
     this.nestedPlatform = options.platform ?? process.platform;
     this.hostEnv = hostEnv;
@@ -307,20 +324,23 @@ export class NestedComputerBackend extends KWinComputerBackend {
     const current = this.ref.session;
     if (current) {
       if (current.exited() === undefined) return current;
-      // The desktop is an ordinary window of the host session, so a dead
-      // compositor is usually a window the human closed. Its bus address never
-      // comes back; reap the session so it stops pinning dead pipes and so the
-      // next boot is not mistaken for a duplicate of a live one.
+      // In windowed mode a dead compositor is usually a window the human
+      // closed; headless it simply crashed. Its bus address never comes back
+      // either way; reap the session so it stops pinning dead pipes and so
+      // the next boot is not mistaken for a duplicate of a live one.
       this.ref.session = undefined;
       await current.dispose().catch(() => undefined);
     }
     if (this.sessionStart) return await this.sessionStart;
     if (automatic) {
       // The reconnect loop is asking, with no user or agent behind it. Booting
-      // here would respawn the desktop window seconds after the human closed
-      // it, so report dormancy — which stands the loop down — and leave the
-      // boot to the next real use.
-      throw new ComputerBackendError(DESKTOP_DORMANT_MESSAGE, { dormant: true, retryable: true });
+      // here would respawn a window the human just closed, or crash-loop a
+      // headless compositor that just died, so report dormancy — which stands
+      // the loop down — and leave the boot to the next real use.
+      throw new ComputerBackendError(desktopDormantMessage(this.mode), {
+        dormant: true,
+        retryable: true,
+      });
     }
     this.sessionStart = this.bootSession().finally(() => {
       this.sessionStart = undefined;
