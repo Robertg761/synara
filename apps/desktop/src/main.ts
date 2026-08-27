@@ -53,7 +53,6 @@ import {
 
 import type { ContextMenuItem } from "@synara/contracts";
 import { isKeyboardShortcutsHelpChord } from "@synara/shared/browserShortcuts";
-import { startQuickTunnel, type QuickTunnelHandle } from "@synara/shared/cloudflaredQuickTunnel";
 import { getMacTrafficLightPosition } from "@synara/shared/desktopChrome";
 import { DEVICE_HELPER_SOURCE_DIR_ENV } from "@synara/shared/deviceHelperCache";
 import {
@@ -4127,13 +4126,6 @@ function registerIpcHandlers(): void {
       normalizeDesktopWsUrl(backendWsUrl) ?? resolveDesktopWsUrlFromEnv(process.env);
   });
 
-  ipcMain.removeAllListeners(IPC.flavor);
-  ipcMain.on(IPC.flavor, (event: IpcMainEvent) => {
-    // Resolved once at startup from SYNARA_DESKTOP_FLAVOR; the renderer brands
-    // itself from this so a canary window is identifiable from its contents.
-    event.returnValue = desktopFlavor;
-  });
-
   ipcMain.removeAllListeners(IPC.zoomFactor);
   ipcMain.on(IPC.zoomFactor, (event: IpcMainEvent) => {
     event.returnValue = event.sender.getZoomFactor();
@@ -4999,11 +4991,6 @@ async function bootstrap(): Promise<void> {
   }
   startBackend();
   writeDesktopLogHeader("bootstrap backend start requested");
-  if (remoteAccessConfig.tunnel) {
-    // cloudflared dials the loopback port per request, so it can come up before
-    // the backend finishes booting without losing anything.
-    void applyQuickTunnelState(true);
-  }
 
   if (isDevelopment) {
     void waitForBackendWindowReady(backendHttpUrl)
@@ -5035,8 +5022,6 @@ async function bootstrap(): Promise<void> {
 
 app.on("before-quit", (event) => {
   writeDesktopLogHeader("before-quit received");
-  void quickTunnel?.stop();
-  quickTunnel = null;
   if (desktopShutdownComplete) {
     return;
   }

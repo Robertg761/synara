@@ -602,14 +602,6 @@ export interface SynaraStorageSnapshot {
 export interface DesktopBridge {
   getWsUrl: () => string | null;
   /**
-   * Which desktop flavor this window belongs to ("production" | "development" |
-   * "canary"), or null in a plain browser. Typed as a string because the flavor
-   * union lives in @synara/shared, which depends on this package; callers narrow
-   * it through `resolveSynaraDesktopFlavor`. Synchronous so first paint can brand
-   * itself without a flash of the production name.
-   */
-  getFlavor?: () => string | null;
-  /**
    * Absolute filesystem path for a File from drag/drop or file inputs.
    * Electron only (`webUtils.getPathForFile`). Returns null when unavailable.
    */

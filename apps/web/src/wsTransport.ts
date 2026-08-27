@@ -224,13 +224,6 @@ export function getReconnectRetryDelayMs(attempt: number): number {
  */
 const WAKE_BACKOFF_RESET_THROTTLE_MS = 5_000;
 
-/**
- * Minimum gap between two wake signals that are allowed to clear the reconnect backoff. Above the
- * backoff cap, so a server that is simply down settles at the capped retry interval no matter how
- * many connectivity signals the platform emits meanwhile.
- */
-const WAKE_BACKOFF_RESET_THROTTLE_MS = 5_000;
-
 function resolveRpcUrl(rawUrl: string, path: string): string {
   const url = new URL(rawUrl);
   url.pathname = path;
