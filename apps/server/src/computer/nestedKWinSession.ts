@@ -30,8 +30,10 @@ import { asRecord, parseJsonPayload } from "./computerGeometry.ts";
 import {
   resolveSynaraPluginLoad,
   scanInstalledPluginIds,
+  SYSTEM_QT_PLUGIN_ROOTS,
   type KWinComputerBackendOptions,
 } from "./KWinComputerBackend.ts";
+import { resolveInstallTarget } from "./kwinPluginProvisioning.ts";
 import {
   createSessionKWinComputerDbus,
   KWIN_SERVICE,
@@ -383,8 +385,9 @@ function kwinNotReadyError(
   if (exit?.includes("ENOENT")) {
     return new ComputerBackendError(
       `${KWIN_COMMAND} is not installed, and the agent's isolated desktop is KWin running as ` +
-        "a window of this session. Install the kwin package (kwin-wayland on Debian and " +
-        "Ubuntu) and try again; it will not change which desktop this machine runs.",
+        "a window of this session. Open Settings → Computer use and click Set up to install " +
+        "it, or install the kwin package (kwin-wayland on Debian and Ubuntu) yourself; it " +
+        "will not change which desktop this machine runs.",
     );
   }
   const nested = `The nested ${KWIN_COMMAND} (${nestedModeLabel(mode)} mode)`;
@@ -439,10 +442,22 @@ function compositorEnv(
     // behind Xwayland be driven here: they each keep only the first seat, and
     // here the first seat is the one being driven.
     SYNARA_COMPUTER_USE_OWNS_COMPOSITOR: "1",
+    // Provisioning installs the plugin under the user's home Qt plugin root
+    // and teaches the *Plasma* session about it through an env script sourced
+    // at login. This compositor is spawned by the server on hosts that mostly
+    // are not Plasma, so the same root has to ride the environment here or the
+    // freshly installed plugin is invisible to the very KWin booted to load it.
+    QT_PLUGIN_PATH: prependQtPluginRoot(hostEnv.QT_PLUGIN_PATH),
   };
   if (mode === "virtual") delete env.WAYLAND_DISPLAY;
   delete env.DISPLAY;
   return env;
+}
+
+function prependQtPluginRoot(existing: string | undefined): string {
+  const root = resolveInstallTarget(SYSTEM_QT_PLUGIN_ROOTS).qtPluginRoot;
+  if (!existing) return root;
+  return existing.split(":").includes(root) ? existing : `${root}:${existing}`;
 }
 
 /**

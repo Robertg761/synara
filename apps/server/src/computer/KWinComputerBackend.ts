@@ -1165,7 +1165,7 @@ export class KWinComputerBackend implements ComputerBackend {
    * for this KWin when there is one, and builds against the local headers when
    * there is not.
    */
-  private async provisionOnce(allowPrebuilt = true): Promise<ProvisionResult> {
+  protected async provisionOnce(allowPrebuilt = true): Promise<ProvisionResult> {
     const pending =
       this.provisionPromises.get(allowPrebuilt) ?? this.provisionPlugin({ allowPrebuilt });
     this.provisionPromises.set(allowPrebuilt, pending);
@@ -1584,7 +1584,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.healthState.publish();
   }
 
-  private emit(event: Parameters<ComputerBackendEventListener>[0]): void {
+  protected emit(event: Parameters<ComputerBackendEventListener>[0]): void {
     for (const listener of this.eventListeners) {
       try {
         listener(event);
@@ -1775,9 +1775,9 @@ export function resolveInstallScriptPath(
   );
 }
 
-const SYSTEM_QT_PLUGIN_ROOTS = ["/usr/lib64/qt6/plugins", "/usr/lib/qt6/plugins"] as const;
+export const SYSTEM_QT_PLUGIN_ROOTS = ["/usr/lib64/qt6/plugins", "/usr/lib/qt6/plugins"] as const;
 
-function defaultPluginDirectories(): readonly string[] {
+export function defaultPluginDirectories(): readonly string[] {
   const configured = process.env.SYNARA_KWIN_PLUGIN_DIR;
   return [
     ...(configured ? [configured] : []),
