@@ -7,6 +7,7 @@ import {
   nestedModeForChoice,
   parseComputerBackendOverride,
   selectLinuxBackend,
+  SharedSeatBackendDisabledError,
 } from "./linuxBackendSelection.ts";
 
 /** A host that owns the given bus names, or one whose bus cannot be reached. */
@@ -38,6 +39,15 @@ describe("parseComputerBackendOverride", () => {
     );
     expect(() => parseComputerBackendOverride("protal")).toThrow("nested-window");
   });
+
+  it("refuses the shared-seat portal backend with the policy, not a typo error", () => {
+    // The portal backend exists in the tree, so "no such backend" would be a
+    // lie; the refusal has to say it is unreachable on purpose and why.
+    expect(() => parseComputerBackendOverride("portal")).toThrow(SharedSeatBackendDisabledError);
+    expect(() => parseComputerBackendOverride("PORTAL")).toThrow(
+      /seat the human is sitting at.*seat of its own/s,
+    );
+  });
 });
 
 describe("selectLinuxBackend", () => {
@@ -52,10 +62,13 @@ describe("selectLinuxBackend", () => {
     );
   });
 
-  it("picks the portal backend when nothing owns the KWin name", async () => {
-    await expect(
-      selectLinuxBackend({ env: {}, busNameHasOwner: GNOME_HOST }),
-    ).resolves.toMatchObject({ choice: "portal", forced: false });
+  it("gives the agent its own windowed desktop when nothing owns the KWin name", async () => {
+    // The non-KDE default: never the human's seat, so the windowed nested
+    // compositor is the resolution, not the shared-seat portal backend.
+    const selection = await selectLinuxBackend({ env: {}, busNameHasOwner: GNOME_HOST });
+
+    expect(selection).toMatchObject({ choice: "nested-window", forced: false });
+    expect(selection.reason).toContain("instead of sharing the human's");
   });
 
   it("ignores XDG_CURRENT_DESKTOP entirely, in both directions", async () => {
@@ -66,17 +79,23 @@ describe("selectLinuxBackend", () => {
     ).resolves.toMatchObject({ choice: "kwin" });
     await expect(
       selectLinuxBackend({ env: { XDG_CURRENT_DESKTOP: "KDE" }, busNameHasOwner: GNOME_HOST }),
-    ).resolves.toMatchObject({ choice: "portal" });
+    ).resolves.toMatchObject({ choice: "nested-window" });
   });
 
   it("puts the override ahead of everything, including a running KWin", async () => {
     const selection = await selectLinuxBackend({
-      env: { SYNARA_COMPUTER_BACKEND: "portal", SYNARA_COMPUTER_NESTED: "1" },
+      env: { SYNARA_COMPUTER_BACKEND: "nested", SYNARA_COMPUTER_NESTED: "window" },
       busNameHasOwner: KDE_HOST,
     });
 
-    expect(selection).toMatchObject({ choice: "portal", forced: true });
+    expect(selection).toMatchObject({ choice: "nested", forced: true });
     expect(selection.reason).toContain("no other backend is tried");
+  });
+
+  it("refuses SYNARA_COMPUTER_BACKEND=portal rather than sharing the human's seat", async () => {
+    await expect(
+      selectLinuxBackend({ env: { SYNARA_COMPUTER_BACKEND: "portal" }, busNameHasOwner: KDE_HOST }),
+    ).rejects.toThrow(SharedSeatBackendDisabledError);
   });
 
   it("does not consult the bus at all when an override is set", async () => {
@@ -128,6 +147,5 @@ describe("nestedModeForChoice", () => {
     expect(nestedModeForChoice("nested")).toBe("virtual");
     expect(nestedModeForChoice("nested-window")).toBe("window");
     expect(nestedModeForChoice("kwin")).toBeUndefined();
-    expect(nestedModeForChoice("portal")).toBeUndefined();
   });
 });

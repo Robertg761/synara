@@ -376,6 +376,17 @@ function kwinNotReadyError(
   timeoutMs: number,
 ): ComputerBackendError {
   const exit = kwin.exitDiagnostic();
+  // The one failure every non-KDE machine hits first, so it names the package
+  // instead of the errno: the nested desktop is KWin running as a window of the
+  // host session, whichever compositor that session runs, and installing kwin
+  // does not switch anyone's desktop.
+  if (exit?.includes("ENOENT")) {
+    return new ComputerBackendError(
+      `${KWIN_COMMAND} is not installed, and the agent's isolated desktop is KWin running as ` +
+        "a window of this session. Install the kwin package (kwin-wayland on Debian and " +
+        "Ubuntu) and try again; it will not change which desktop this machine runs.",
+    );
+  }
   const nested = `The nested ${KWIN_COMMAND} (${nestedModeLabel(mode)} mode)`;
   return new ComputerBackendError(
     exit === undefined

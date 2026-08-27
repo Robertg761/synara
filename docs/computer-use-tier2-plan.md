@@ -1,5 +1,11 @@
 # Tier 2 plan: computer use on non-KDE Wayland desktops
 
+> **Superseded 2026-08-26 by the seat policy** (design doc, "Current capabilities"): the agent
+> never drives the seat the human is sitting at, so the shared-seat portal backend described in
+> this plan is disabled and unreachable — no auto-selection, and the `portal` override is refused.
+> Non-KDE desktops default to the windowed nested KWin session (Phase A) instead. The plan below
+> is kept as the build log of the portal work, which remains in the tree unwired.
+
 Decided 2026-08-17. Scope decision: the feature ships full and complete, so Tier 2 is in the shippable cut (design doc open question 3). This plan replaces the design doc's original Tier 2 mechanism sketch.
 
 ## The mechanism correction

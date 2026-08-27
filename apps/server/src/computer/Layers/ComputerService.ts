@@ -20,12 +20,6 @@ import {
   type NestedKWinSession,
   type NestedSessionMode,
 } from "../nestedKWinSession.ts";
-import { createPortalComputerBackend } from "../portal/PortalComputerBackend.ts";
-import { probeDesktop } from "../portal/probe.ts";
-import {
-  desktopHelperCouldExist,
-  provisionDesktopHelper,
-} from "../provisioning/desktopHelperProvisioning.ts";
 import { ComputerService, type ComputerServiceShape } from "../Services/ComputerService.ts";
 import type { ComputerBackend } from "../ComputerBackend.ts";
 
@@ -114,30 +108,7 @@ async function makeLinuxBackend(): Promise<LinuxBackend> {
     case "nested":
     case "nested-window":
       return await makeNestedBackend(nestedModeForChoice(selection.choice) ?? "virtual");
-    case "portal":
-      return await makePortalBackend();
   }
-}
-
-/**
- * Tier 2 against the real desktop, with the helper wiring only this call site
- * may supply.
- *
- * `createPortalComputerBackend` is handed a probe and cannot tell whether it
- * describes this machine or one a test invented, so it defaults neither
- * provisioning nor re-probing. Here both are known to be about this host: the
- * probe came from `probeDesktop()` a line ago, so a later `probeDesktop()` asks
- * the same desktop, and installing a helper installs it for the session the
- * server is actually in.
- */
-async function makePortalBackend(): Promise<LinuxBackend> {
-  return {
-    backend: createPortalComputerBackend(await probeDesktop(), {
-      provisionHelper: () => provisionDesktopHelper(),
-      couldProvisionHelper: () => desktopHelperCouldExist(),
-      reprobe: () => probeDesktop(),
-    }),
-  };
 }
 
 /**
