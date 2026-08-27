@@ -4126,6 +4126,13 @@ function registerIpcHandlers(): void {
       normalizeDesktopWsUrl(backendWsUrl) ?? resolveDesktopWsUrlFromEnv(process.env);
   });
 
+  ipcMain.removeAllListeners(IPC.flavor);
+  ipcMain.on(IPC.flavor, (event: IpcMainEvent) => {
+    // Resolved once at startup from SYNARA_DESKTOP_FLAVOR; the renderer brands
+    // itself from this so a canary window is identifiable from its contents.
+    event.returnValue = desktopFlavor;
+  });
+
   ipcMain.removeAllListeners(IPC.zoomFactor);
   ipcMain.on(IPC.zoomFactor, (event: IpcMainEvent) => {
     event.returnValue = event.sender.getZoomFactor();
