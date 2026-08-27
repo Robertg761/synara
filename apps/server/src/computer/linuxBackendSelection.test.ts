@@ -62,13 +62,15 @@ describe("selectLinuxBackend", () => {
     );
   });
 
-  it("gives the agent its own windowed desktop when nothing owns the KWin name", async () => {
-    // The non-KDE default: never the human's seat, so the windowed nested
-    // compositor is the resolution, not the shared-seat portal backend.
+  it("gives the agent its own headless desktop when nothing owns the KWin name", async () => {
+    // The non-KDE default: never the human's seat, and never a window popping
+    // up on the human's desktop either — the headless nested compositor is
+    // the resolution, watched through the Computer pane alone.
     const selection = await selectLinuxBackend({ env: {}, busNameHasOwner: GNOME_HOST });
 
-    expect(selection).toMatchObject({ choice: "nested-window", forced: false });
+    expect(selection).toMatchObject({ choice: "nested", forced: false });
     expect(selection.reason).toContain("instead of sharing the human's");
+    expect(selection.reason).toContain("nothing appears on this desktop");
   });
 
   it("ignores XDG_CURRENT_DESKTOP entirely, in both directions", async () => {
@@ -79,7 +81,7 @@ describe("selectLinuxBackend", () => {
     ).resolves.toMatchObject({ choice: "kwin" });
     await expect(
       selectLinuxBackend({ env: { XDG_CURRENT_DESKTOP: "KDE" }, busNameHasOwner: GNOME_HOST }),
-    ).resolves.toMatchObject({ choice: "nested-window" });
+    ).resolves.toMatchObject({ choice: "nested" });
   });
 
   it("puts the override ahead of everything, including a running KWin", async () => {

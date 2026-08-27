@@ -122,7 +122,9 @@ function makeHarness(
     });
 
   const backendOptions: NestedComputerBackendOptions = {
-    mode: options.mode ?? "window",
+    // Left unset unless a test names it, so the suite exercises the real
+    // default (headless) rather than baking its own into every test.
+    ...(options.mode !== undefined ? { mode: options.mode } : {}),
     platform: options.platform ?? "linux",
     hostEnv: options.hostEnv ?? { WAYLAND_DISPLAY: "wayland-0", PATH: "/usr/bin" },
     startSession,
@@ -188,7 +190,7 @@ describe("probeAvailability", () => {
   });
 
   it("refuses a windowed session with no Wayland host to nest into", async () => {
-    const harness = makeHarness({ hostEnv: { PATH: "/usr/bin" } });
+    const harness = makeHarness({ mode: "window", hostEnv: { PATH: "/usr/bin" } });
     const availability = await harness.backend.probeAvailability();
     expect(availability).toMatchObject({
       kind: "backend-unavailable",
@@ -197,8 +199,8 @@ describe("probeAvailability", () => {
     expect(harness.sessionStarts).toHaveLength(0);
   });
 
-  it("keeps the virtual mode independent of the host display", async () => {
-    const harness = makeHarness({ mode: "virtual", hostEnv: { PATH: "/usr/bin" } });
+  it("keeps the default headless mode independent of the host display", async () => {
+    const harness = makeHarness({ hostEnv: { PATH: "/usr/bin" } });
     await expect(harness.backend.probeAvailability()).resolves.toMatchObject({
       kind: "available",
     });
@@ -245,7 +247,9 @@ describe("lazy session boot", () => {
       backend: "nested-kwin",
     });
     expect(harness.sessionStarts).toHaveLength(1);
-    expect(harness.sessionStarts[0]?.mode).toBe("window");
+    // The default session is headless: real use must never pop a window
+    // onto the host desktop.
+    expect(harness.sessionStarts[0]?.mode).toBe("virtual");
   });
 
   it("boots once and reuses the session across reads", async () => {
@@ -477,7 +481,7 @@ describe("provision", () => {
   it("never lets the reconnect loop reopen a window the human closed", async () => {
     vi.useFakeTimers();
     try {
-      const harness = makeHarness();
+      const harness = makeHarness({ mode: "window" });
       await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
 
       harness.startedSessions[0]?.kill();
@@ -496,6 +500,31 @@ describe("provision", () => {
       // Dormant, not dead: the next real use still boots a fresh desktop.
       await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
       expect(harness.sessionStarts).toHaveLength(2);
+      await harness.backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not blame a closed window when the headless desktop dies", async () => {
+    // The headless desktop has no window anyone could have closed; sending the
+    // user hunting for one would be worse than saying nothing.
+    vi.useFakeTimers();
+    try {
+      const harness = makeHarness();
+      await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+
+      harness.startedSessions[0]?.kill();
+      harness.dbusHandles[0]?.fireDisconnect();
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(harness.sessionStarts).toHaveLength(1);
+      const health = harness.backend.health();
+      expect(health).toMatchObject({
+        status: "unavailable",
+        lastFailure: { message: expect.stringContaining("is not running") },
+      });
+      expect(health.lastFailure?.message).not.toContain("window");
       await harness.backend.dispose();
     } finally {
       vi.useRealTimers();
