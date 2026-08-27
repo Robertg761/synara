@@ -38,7 +38,6 @@ const PAIRING_LINKS_QUERY_KEY = ["server", "authPairingLinks"] as const;
 const CLIENT_SESSIONS_QUERY_KEY = ["server", "authClientSessions"] as const;
 
 const URL_KIND_LABELS: Record<DesktopRemoteAccessUrlKind, string> = {
-  tunnel: "Anywhere",
   tailscale: "Tailscale",
   lan: "LAN",
   other: "Other",
@@ -96,7 +95,6 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
   const [portDraft, setPortDraft] = useState<string | null>(null);
   const [issued, setIssued] = useState<AuthPairingCredentialResult | null>(null);
   const [qrOpen, setQrOpen] = useState(false);
-  const [androidQrOpen, setAndroidQrOpen] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -126,15 +124,11 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
 
   const state = stateQuery.data ?? null;
   const remoteReady = state?.enabled === true && state.status === "running";
-  const tunnelUrl = state?.urls.find((entry) => entry.kind === "tunnel")?.url ?? null;
-  // Pairing needs one reachable address — the tunnel counts even with the LAN
-  // bind off, which is the "anywhere but nowhere on my network" combination.
-  const pairingReady = remoteReady || tunnelUrl != null;
 
   const pairingLinksQuery = useQuery({
     queryKey: PAIRING_LINKS_QUERY_KEY,
     queryFn: () => ensureNativeApi().server.listAuthPairingLinks(),
-    enabled: props.active && pairingReady,
+    enabled: props.active && remoteReady,
     staleTime: 5_000,
     // Consuming a link on the phone removes it from this list — poll fast
     // while a just-issued link is waiting to be claimed.
@@ -143,7 +137,7 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
   const clientsQuery = useQuery({
     queryKey: CLIENT_SESSIONS_QUERY_KEY,
     queryFn: () => ensureNativeApi().server.listAuthClients(),
-    enabled: props.active && pairingReady,
+    enabled: props.active && remoteReady,
     staleTime: 5_000,
     refetchInterval: issued ? 2_000 : 30_000,
   });
@@ -183,38 +177,6 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
       }),
   });
 
-  const setTunnelMutation = useMutation({
-    mutationFn: async (tunnel: boolean) => {
-      const remoteAccess = remoteAccessBridge();
-      if (!remoteAccess) throw new Error("Remote access requires the desktop app.");
-      // No restart confirmation here on purpose: the tunnel dials the loopback
-      // backend from this machine, so toggling it never interrupts agents.
-      return remoteAccess.setEnabled({
-        enabled: state?.enabled ?? false,
-        ...(state?.port != null ? { port: state.port } : {}),
-        tunnel,
-      });
-    },
-    onSuccess: (result) => {
-      if (!result) return;
-      queryClient.setQueryData<DesktopRemoteAccessState>(REMOTE_ACCESS_STATE_QUERY_KEY, result);
-      void queryClient.invalidateQueries({ queryKey: PAIRING_LINKS_QUERY_KEY });
-      toastManager.add({
-        type: "success",
-        title: result.tunnelEnabled ? "Connecting Synara to the internet" : "Anywhere access off",
-        description: result.tunnelEnabled
-          ? "A public HTTPS address appears below once the tunnel is up."
-          : "The public address is withdrawn; LAN and Tailscale are unaffected.",
-      });
-    },
-    onError: (error: unknown) =>
-      toastManager.add({
-        type: "error",
-        title: "Could not change anywhere access",
-        description: error instanceof Error ? error.message : "The tunnel toggle failed.",
-      }),
-  });
-
   const issuePairingMutation = useMutation({
     mutationFn: () => {
       const label = pairingLabel.trim();
@@ -223,7 +185,6 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
     onSuccess: (result) => {
       setIssued(result);
       setQrOpen(false);
-      setAndroidQrOpen(false);
       void queryClient.invalidateQueries({ queryKey: PAIRING_LINKS_QUERY_KEY });
     },
     onError: (error: unknown) =>
@@ -317,15 +278,6 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
     !pairingLinksQuery.data.some((link) => link.id === issued.id);
   const issuedPairingUrl =
     issued && primaryUrl ? makePairingUrl(primaryUrl.url, issued.credential) : null;
-  /**
-   * The native Android app consumes `synara://pair` deep links: a camera-app scan of this QR
-   * offers to open Synara with the server and credential already filled in. The standard QR
-   * above stays the https link for browsers and the mobile web shell.
-   */
-  const issuedAndroidLink =
-    issued && primaryUrl
-      ? `synara://pair?server=${encodeURIComponent(primaryUrl.url)}&token=${encodeURIComponent(issued.credential)}`
-      : null;
 
   return (
     <div className="space-y-6">
@@ -407,29 +359,9 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
             />
           )
         ) : null}
-        {state ? (
-          <SettingsRow
-            title="Connect from anywhere"
-            description="Publishes a public HTTPS address through a Cloudflare quick tunnel, so a phone on mobile data reaches this Synara with no port forwarding and no account. Needs the cloudflared binary on this machine."
-            status={
-              !state.tunnelEnabled
-                ? undefined
-                : tunnelUrl != null
-                  ? undefined
-                  : (state.tunnelDetail ?? "Starting the tunnel…")
-            }
-            control={
-              <Switch
-                checked={state.tunnelEnabled}
-                disabled={setTunnelMutation.isPending || state.status === "restarting"}
-                onCheckedChange={(checked) => setTunnelMutation.mutate(checked)}
-              />
-            }
-          />
-        ) : null}
       </SettingsSection>
 
-      {pairingReady ? (
+      {remoteReady ? (
         <SettingsSection title="Pair a device">
           <SettingsRow
             title="Create a pairing link"
@@ -507,16 +439,6 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
                     QR code
                     <DisclosureChevron open={qrOpen} className="ml-1 size-3.5" />
                   </Button>
-                  <Button
-                    size="xs"
-                    variant="ghost"
-                    aria-expanded={androidQrOpen}
-                    disabled={issuedExpired || issuedClaimed}
-                    onClick={() => setAndroidQrOpen((current) => !current)}
-                  >
-                    Android QR
-                    <DisclosureChevron open={androidQrOpen} className="ml-1 size-3.5" />
-                  </Button>
                 </div>
               }
             >
@@ -531,15 +453,6 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
                       <p className="max-w-56 text-[11px] leading-relaxed text-muted-foreground">
                         Scan with the device's camera. Anyone who opens this link before it expires
                         gets access — share it carefully.
-                      </p>
-                    </div>
-                  </DisclosureRegion>
-                  <DisclosureRegion open={androidQrOpen} contentClassName="mt-3">
-                    <div className="flex items-center gap-4">
-                      <QrCode value={issuedAndroidLink ?? ""} label="Android app pairing QR code" />
-                      <p className="max-w-56 text-[11px] leading-relaxed text-muted-foreground">
-                        Scan with an Android phone to open the Synara app with this pairing
-                        prefilled — works over the tunnel from any network.
                       </p>
                     </div>
                   </DisclosureRegion>
@@ -567,7 +480,7 @@ export function RemoteAccessSettingsPanel(props: { active: boolean }) {
         </SettingsSection>
       ) : null}
 
-      {pairingReady ? (
+      {remoteReady ? (
         <SettingsSectionShell
           title="Connected devices"
           action={

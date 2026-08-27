@@ -91,22 +91,15 @@ class SynaraConnectionService : Service() {
 
     private fun startForegroundNotice(connected: Boolean) {
         val notification = SynaraNotifier.connectionNotification(this, connected)
-        // Android can refuse a foreground start made while the app is backgrounded — the sticky
-        // restart path lands here after process death with no activity to lean on. Losing the
-        // watch notice beats crashing the process over a notification.
-        runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                ServiceCompat.startForeground(
-                    this,
-                    SynaraNotifier.SERVICE_NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-                )
-            } else {
-                startForeground(SynaraNotifier.SERVICE_NOTIFICATION_ID, notification)
-            }
-        }.onFailure {
-            stopSelf()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceCompat.startForeground(
+                this,
+                SynaraNotifier.SERVICE_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            startForeground(SynaraNotifier.SERVICE_NOTIFICATION_ID, notification)
         }
     }
 

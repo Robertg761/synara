@@ -181,10 +181,23 @@ interface KWinPluginState {
   readonly msSinceHumanInput: number | undefined;
 }
 
+/**
+ * Why the backend is dialing D-Bus right now. The default factories ignore it;
+ * a factory that boots a desktop on demand (the nested backend) must not boot
+ * for an `automatic` call — that is the reconnect loop running on a timer,
+ * with no user or agent behind it, and a desktop window that respawns on a
+ * timer is a haunting rather than a recovery. Such a factory answers an
+ * automatic call for a desktop it will not boot with a `dormant`
+ * `ComputerBackendError`, which stands the reconnect loop down.
+ */
+export interface KWinDbusConnectContext {
+  readonly automatic: boolean;
+}
+
 export interface KWinComputerBackendOptions {
   readonly computerId?: string;
   readonly dbus?: KWinComputerDbus;
-  readonly dbusFactory?: () => Promise<KWinComputerDbus>;
+  readonly dbusFactory?: (context: KWinDbusConnectContext) => Promise<KWinComputerDbus>;
   /**
    * A private session bus carrying the compositor, set only by the nested
    * Tier 3 session. Absent, KWin is reached on the ambient session bus.
@@ -279,7 +292,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly idleTimeoutMs: number;
   private readonly humanActiveGuardMs: number;
   private readonly atspi: AtspiTreeReader;
-  private readonly dbusFactory: () => Promise<KWinComputerDbus>;
+  private readonly dbusFactory: (context: KWinDbusConnectContext) => Promise<KWinComputerDbus>;
   private readonly installedPluginIds: () => Promise<readonly string[]>;
   private readonly busNameHasOwner: (name: string) => Promise<boolean>;
   private readonly prebuiltRoot: () => string | undefined;
@@ -1017,21 +1030,22 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   private async ensurePlugin(
-    options: { readonly start?: boolean } = {},
+    options: { readonly start?: boolean; readonly automatic?: boolean } = {},
   ): Promise<KWinComputerPluginApi> {
-    const plugin = await this.ensureConnectedPlugin();
+    const plugin = await this.ensureConnectedPlugin(options.automatic === true);
     if (options.start !== false) await this.startPlugin(plugin);
     return plugin;
   }
 
-  private async ensureConnectedPlugin(): Promise<KWinComputerPluginApi> {
+  private async ensureConnectedPlugin(automatic: boolean): Promise<KWinComputerPluginApi> {
     if (this.disposed) throw new ComputerBackendError("KWin computer backend is disposed.");
     const connected = this.connectedPlugin();
     if (connected) return connected;
     if (this.connectPromise) return this.connectPromise;
-    this.connectPromise = this.connectWithBackoff()
+    this.connectPromise = this.connectWithBackoff(automatic)
       .catch((error) => {
-        if (!isMethodLevelDbusError(error)) this.scheduleReconnect();
+        if (isDormantBackendError(error)) this.standDownReconnect();
+        else if (!isMethodLevelDbusError(error)) this.scheduleReconnect();
         this.recordHealthFailure(error);
         this.publishHealth();
         throw error;
@@ -1083,14 +1097,16 @@ export class KWinComputerBackend implements ComputerBackend {
     return this.startPromise;
   }
 
-  private async connectWithBackoff(): Promise<KWinComputerPluginApi> {
+  private async connectWithBackoff(automatic: boolean): Promise<KWinComputerPluginApi> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        return await this.connectOnce();
+        return await this.connectOnce(automatic);
       } catch (error) {
         lastError = error;
-        if (isMethodLevelDbusError(error)) throw error;
+        // A dormant refusal is a decision, not a fault: retrying cannot boot
+        // the desktop this very call was told not to boot.
+        if (isMethodLevelDbusError(error) || isDormantBackendError(error)) throw error;
         this.invalidateConnection();
         if (attempt < 2) await this.sleep(KWIN_RECONNECT_BASE_DELAY_MS * 2 ** attempt);
       }
@@ -1101,8 +1117,8 @@ export class KWinComputerBackend implements ComputerBackend {
     );
   }
 
-  private async connectOnce(): Promise<KWinComputerPluginApi> {
-    const dbus = this.dbus ?? (this.dbus = await this.dbusFactory());
+  private async connectOnce(automatic: boolean): Promise<KWinComputerPluginApi> {
+    const dbus = this.dbus ?? (this.dbus = await this.dbusFactory({ automatic }));
     if (!this.disconnect) {
       this.disconnect = dbus.onDisconnect(() => {
         this.invalidateConnection();
@@ -1298,10 +1314,26 @@ export class KWinComputerBackend implements ComputerBackend {
     this.reconnecting = true;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      void this.ensurePlugin({ start: false }).catch(() => this.scheduleReconnect());
+      void this.ensurePlugin({ start: false, automatic: true }).catch((error: unknown) => {
+        if (!isDormantBackendError(error)) this.scheduleReconnect();
+      });
     }, delayMs);
     this.reconnectTimer.unref?.();
     this.publishHealth();
+  }
+
+  /**
+   * Ends the reconnect loop without a connection. Only a dormant refusal lands
+   * here: the factory said the desktop is deliberately not running and only a
+   * real use may boot it, so a pending retry would either lie about recovery
+   * or respawn a desktop window the human just closed. The next real use
+   * connects — and thereby boots — without any of this state in the way.
+   */
+  private standDownReconnect(): void {
+    if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    this.reconnectFailures = 0;
+    this.reconnecting = false;
   }
 
   private async readPluginState(plugin: KWinComputerPluginApi): Promise<KWinPluginState> {
@@ -1869,6 +1901,10 @@ const CONNECTION_DBUS_ERROR_TYPES = new Set([
   "org.freedesktop.DBus.Error.ServiceUnknown",
   "org.freedesktop.DBus.Error.NameHasNoOwner",
 ]);
+
+function isDormantBackendError(error: unknown): boolean {
+  return error instanceof ComputerBackendError && error.dormant;
+}
 
 function isMethodLevelDbusError(error: unknown): boolean {
   const type = dbusErrorType(error);

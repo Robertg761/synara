@@ -43,17 +43,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.synara.android.data.ModelOption
-import com.synara.android.data.ProjectItem
-import com.synara.android.data.ProjectKind
 import com.synara.android.data.InteractionMode
 import com.synara.android.data.Provider
 import com.synara.android.data.RuntimeMode
 import com.synara.android.data.SynaraUiState
 import com.synara.android.data.SynaraViewModel
-import com.synara.android.data.defaultThreadTarget
-import com.synara.android.data.orderedForPicking
-import com.synara.android.ui.components.PickerField
-import com.synara.android.ui.components.PickerSection
 import com.synara.android.ui.components.SynaraField
 import com.synara.android.ui.theme.SynaraTheme
 
@@ -99,36 +93,30 @@ fun CreateThreadDialog(state: SynaraUiState, viewModel: SynaraViewModel) {
     var selectedModel by remember(state.models) { mutableStateOf(state.models.firstOrNull()) }
     var runtimeMode by rememberSaveable { mutableStateOf(RuntimeMode.APPROVAL_REQUIRED) }
     var interactionMode by rememberSaveable { mutableStateOf(InteractionMode.DEFAULT) }
-    // Keyed on the workspace so a snapshot arriving mid-dialog cannot strand the selection on a
-    // project that no longer exists, while still leaving a deliberate choice alone.
-    var selectedProjectId by rememberSaveable(state.projects) {
-        mutableStateOf(state.projects.defaultThreadTarget(state.selectedProjectId)?.id)
-    }
-    val selectedProject = state.projects.firstOrNull { it.id == selectedProjectId }
+    val projectName = state.selectedProjectId
+        ?.let { id -> state.projects.firstOrNull { it.id == id }?.title }
+        ?: state.projects.firstOrNull()?.title
 
     FormDialog(
         title = "New thread",
         onDismiss = viewModel::closeCreateThread,
         confirmLabel = "Create thread",
-        confirmEnabled = selectedModel != null && selectedProject != null,
+        confirmEnabled = title.isNotBlank() && selectedModel != null,
         onConfirm = {
-            val project = selectedProject ?: return@FormDialog
-            selectedModel?.let {
-                viewModel.createThread(project, title, it, runtimeMode, interactionMode)
-            }
+            selectedModel?.let { viewModel.createThread(title, it, runtimeMode, interactionMode) }
         },
     ) {
+        Text(
+            "This thread will be created in ${projectName ?: "your project"}.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         SynaraField(
             label = "Thread title",
             value = title,
             onValueChange = { title = it },
             placeholder = "Fix the onboarding flow",
-            // Naming a thread before writing a word of it is work the desktop never asks for, and
-            // on a phone it meant summoning the keyboard just to unlock the button. Left blank the
-            // server names the thread from the first message, exactly as it does everywhere else.
-            supportingText = "Optional — named from your first message if you leave it blank.",
         )
-        ProjectPicker(state.projects, selectedProject) { selectedProjectId = it.id }
         ModelPicker(state.models, selectedModel) { selectedModel = it }
 
         Column(verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.sm)) {
@@ -290,76 +278,131 @@ private fun ModelPicker(
     selected: ModelOption?,
     onSelected: (ModelOption) -> Unit,
 ) {
-    PickerField(
-        label = "Model",
-        sections = groupedByProvider(models).map { (provider, providerModels) ->
-            PickerSection(Provider.labelFor(provider), providerModels)
-        },
-        selected = selected,
-        placeholder = "Choose a model",
-        emptyLabel = "No models discovered",
-        primaryText = { it.label },
-        // Nine providers can offer models with near-identical names, so the runtime a selection
-        // belongs to has to be visible without reopening the menu.
-        supportingText = { it.providerLabel },
-        itemSupportingText = { it.description },
-        isSelected = { it.slug == selected?.slug && it.provider == selected.provider },
-        onSelected = onSelected,
-    )
-}
+    var expanded by remember { mutableStateOf(false) }
+    val shape = MaterialTheme.shapes.medium
 
-/**
- * Lets the user say where the thread goes.
- *
- * This used to be a sentence stating the destination, which meant an unlucky default could not be
- * corrected from the phone at all — the reason threads landed in Studio.
- */
-@Composable
-private fun ProjectPicker(
-    projects: List<ProjectItem>,
-    selected: ProjectItem?,
-    onSelected: (ProjectItem) -> Unit,
-) {
-    val ordered = remember(projects) { projects.orderedForPicking() }
-    PickerField(
-        label = "Project",
-        sections = remember(ordered) {
-            ordered
-                .groupBy { it.kind.isSystem }
-                .toSortedMap()
-                .map { (isSystem, group) ->
-                    PickerSection(if (isSystem) "Built in" else "Your projects", group)
+    Column(verticalArrangement = Arrangement.spacedBy(SynaraTheme.spacing.xs)) {
+        Text(
+            "Model",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Box {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(SynaraTheme.accents.inputSurface, shape)
+                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+                    .clickable { expanded = true }
+                    .padding(horizontal = SynaraTheme.spacing.md, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        selected?.label ?: "Choose a model",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (selected == null) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    // Nine providers can offer models with near-identical names, so the runtime a
+                    // selection belongs to has to be visible without reopening the menu.
+                    selected?.let {
+                        Text(
+                            it.providerLabel,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
-        },
-        selected = selected,
-        placeholder = "Choose a project",
-        emptyLabel = "No projects yet",
-        primaryText = { it.title },
-        supportingText = { it.pickerSubtitle },
-        isSelected = { it.id == selected?.id },
-        onSelected = onSelected,
-    )
-}
-
-/**
- * What the destination actually is, in the terms that distinguish it from its neighbours.
- *
- * For a repository that is its path. For the server's own surfaces it is not: Home's root is the
- * bare home directory and Studio's is a folder named after the app, so a path there says nothing
- * about what picking it would do — and reads as a stray fragment ("home/robert") besides.
- */
-private val ProjectItem.pickerSubtitle: String
-    get() = when (kind) {
-        ProjectKind.CHAT -> "Chat outside any repository"
-        ProjectKind.STUDIO -> "Image generation workspace"
-        ProjectKind.PROJECT -> workspaceRootLabel
+                Icon(
+                    Icons.Outlined.UnfoldMore,
+                    contentDescription = "Choose model",
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                    .heightIn(max = 320.dp),
+            ) {
+                if (models.isEmpty()) {
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                "No models discovered",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        },
+                        onClick = { expanded = false },
+                    )
+                } else {
+                    groupedByProvider(models).forEach { (provider, providerModels) ->
+                        Text(
+                            Provider.labelFor(provider),
+                            modifier = Modifier.padding(
+                                start = SynaraTheme.spacing.md,
+                                end = SynaraTheme.spacing.md,
+                                top = SynaraTheme.spacing.sm,
+                                bottom = SynaraTheme.spacing.xxs,
+                            ),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        providerModels.forEach { model ->
+                            val isSelected = model.slug == selected?.slug &&
+                                model.provider == selected.provider
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(
+                                            model.label,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                        )
+                                        model.description?.let {
+                                            Text(
+                                                it,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                },
+                                trailingIcon = if (isSelected) {
+                                    {
+                                        Icon(
+                                            Icons.Outlined.Check,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                            tint = MaterialTheme.colorScheme.onSurface,
+                                        )
+                                    }
+                                } else {
+                                    null
+                                },
+                                onClick = {
+                                    onSelected(model)
+                                    expanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
-
-/** The tail of the workspace path — a phone has no room for the whole thing, and no need for it. */
-private val ProjectItem.workspaceRootLabel: String
-    get() = workspaceRoot.trimEnd('/').split('/').filter { it.isNotEmpty() }.takeLast(2)
-        .joinToString("/")
-        .ifEmpty { workspaceRoot }
+}
 
 /** Groups models by provider in `ProviderKind` declaration order rather than discovery order. */
 internal fun groupedByProvider(models: List<ModelOption>): List<Pair<String, List<ModelOption>>> =

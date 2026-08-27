@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { ComputerBackendEvent } from "./ComputerBackend.ts";
 import type { KWinComputerDbus } from "./kwinDbus.ts";
@@ -59,7 +59,11 @@ function fakeDbus(loaded: readonly string[] = [PLUGIN_ID]): KWinComputerDbus {
 interface Harness {
   readonly backend: NestedComputerBackend;
   readonly sessionStarts: NestedKWinSessionOptions[];
+  /** One entry per default-fixture session, with a way to end its processes. */
+  readonly startedSessions: Array<{ readonly busAddress: string; kill: (reason?: string) => void }>;
   readonly disposedSessions: string[];
+  /** One entry per connectDbus call, with a way to drop that connection. */
+  readonly dbusHandles: Array<ReturnType<typeof fakeDbusHandle>>;
   readonly installedPlans: SystemPackagePlan[];
   readonly pluginProvisions: number[];
   readonly events: ComputerBackendEvent[];
@@ -84,7 +88,9 @@ function makeHarness(
   } = {},
 ): Harness {
   const sessionStarts: NestedKWinSessionOptions[] = [];
+  const startedSessions: Harness["startedSessions"] = [];
   const disposedSessions: string[] = [];
+  const dbusHandles: Harness["dbusHandles"] = [];
   const installedPlans: SystemPackagePlan[] = [];
   const pluginProvisions: number[] = [];
   const events: ComputerBackendEvent[] = [];
@@ -95,12 +101,20 @@ function makeHarness(
     (async (sessionOptions: NestedKWinSessionOptions): Promise<NestedKWinSession> => {
       sessionStarts.push(sessionOptions);
       const busAddress = `unix:abstract=fake-${sessionStarts.length}`;
+      let exitReason: string | undefined;
+      startedSessions.push({
+        busAddress,
+        kill: (reason = "exit code 0, signal null") => {
+          exitReason = reason;
+        },
+      });
       return {
         busAddress,
         waylandDisplay: "synara-nested-test",
         size: { width: 1920, height: 1080 },
         pluginId: PLUGIN_ID,
         xDisplay: ":7",
+        exited: () => exitReason,
         dispose: async () => {
           disposedSessions.push(busAddress);
         },
@@ -112,7 +126,11 @@ function makeHarness(
     platform: options.platform ?? "linux",
     hostEnv: options.hostEnv ?? { WAYLAND_DISPLAY: "wayland-0", PATH: "/usr/bin" },
     startSession,
-    connectDbus: async () => fakeDbus([PLUGIN_ID]),
+    connectDbus: async () => {
+      const handle = fakeDbusHandle([PLUGIN_ID]);
+      dbusHandles.push(handle);
+      return handle.dbus;
+    },
     hasCommand: (command) => (command === "kwin_wayland" ? (options.kwinInstalled ?? true) : false),
     installedPluginPresent: () => state.installedPlugins.length > 0,
     installedPluginIds: async () => state.installedPlugins,
@@ -142,7 +160,9 @@ function makeHarness(
   const harness: Harness = {
     backend,
     sessionStarts,
+    startedSessions,
     disposedSessions,
+    dbusHandles,
     installedPlans,
     pluginProvisions,
     events,
@@ -297,6 +317,7 @@ describe("provision", () => {
           size: { width: 1920, height: 1080 },
           pluginId: PLUGIN_ID,
           xDisplay: undefined,
+          exited: () => undefined,
           dispose: async () => undefined,
         };
       },
@@ -372,7 +393,7 @@ describe("provision", () => {
     expect(installs).toBe(2);
   });
 
-  it("replaces a dead session only on another explicit Set up", async () => {
+  it("replaces a session that is alive but broken only on another explicit Set up", async () => {
     const sessions: string[] = [];
     const disposed: string[] = [];
     const deadBuses = new Set<string>();
@@ -393,6 +414,9 @@ describe("provision", () => {
           size: { width: 1920, height: 1080 },
           pluginId: PLUGIN_ID,
           xDisplay: undefined,
+          // Alive the whole time: this is the wedged compositor, not the
+          // closed window, so the exit check must not reap it.
+          exited: () => undefined,
           dispose: async () => {
             disposed.push(busAddress);
           },
@@ -408,9 +432,10 @@ describe("provision", () => {
     await backend.availability();
     expect(sessions).toHaveLength(1);
 
-    // The nested session dies: its bus stops answering and the live
-    // connection reports the disconnect. Nothing may boot a replacement
-    // behind the user's back — the establishing read stays failed.
+    // The session wedges: its processes still run, but its bus stops
+    // answering and the live connection reports the disconnect. A second
+    // compositor must not be booted next to a live one — the establishing
+    // read stays failed.
     deadBuses.add(sessions[0]!);
     handles.get(sessions[0]!)?.fireDisconnect();
     const failed = await backend.availability();
@@ -430,5 +455,50 @@ describe("provision", () => {
     await harness.backend.availability();
     await harness.backend.dispose();
     expect(harness.disposedSessions).toHaveLength(1);
+  });
+
+  it("reaps a session whose processes exited and boots a fresh one on the next real use", async () => {
+    const harness = makeHarness();
+    await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(harness.sessionStarts).toHaveLength(1);
+
+    // The human closes the nested window: the compositor exits and the live
+    // connection drops. The next real use must get a working desktop, not an
+    // eternity of reconnects to a bus address that can never answer again.
+    harness.startedSessions[0]?.kill();
+    harness.dbusHandles[0]?.fireDisconnect();
+
+    await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(harness.sessionStarts).toHaveLength(2);
+    expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
+    await harness.backend.dispose();
+  });
+
+  it("never lets the reconnect loop reopen a window the human closed", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeHarness();
+      await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+
+      harness.startedSessions[0]?.kill();
+      harness.dbusHandles[0]?.fireDisconnect();
+      // Give the reconnect loop every chance it would ever take: it must reap
+      // the dead session, report the desktop dormant, and stand down.
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(harness.sessionStarts).toHaveLength(1);
+      expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
+      expect(harness.backend.health()).toMatchObject({
+        status: "unavailable",
+        lastFailure: { message: expect.stringContaining("its window may have been closed") },
+      });
+
+      // Dormant, not dead: the next real use still boots a fresh desktop.
+      await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+      expect(harness.sessionStarts).toHaveLength(2);
+      await harness.backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

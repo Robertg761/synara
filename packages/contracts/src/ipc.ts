@@ -571,7 +571,7 @@ export interface DesktopCustomTitleBarState {
 export const DesktopAppIcon = Schema.Literals(["default", "icon", "dark"]);
 export type DesktopAppIcon = typeof DesktopAppIcon.Type;
 
-export type DesktopRemoteAccessUrlKind = "tunnel" | "tailscale" | "lan" | "other";
+export type DesktopRemoteAccessUrlKind = "tailscale" | "lan" | "other";
 
 export interface DesktopRemoteAccessUrl {
   readonly url: string;
@@ -584,13 +584,6 @@ export interface DesktopRemoteAccessState {
   readonly port: number;
   /** Set when the pinned port was taken and this session runs elsewhere. */
   readonly portFallback: number | null;
-  /** Whether the user asked for the Cloudflare quick tunnel ("connect from anywhere"). */
-  readonly tunnelEnabled: boolean;
-  /**
-   * Tunnel lifecycle detail for the settings row: why it has no URL yet (binary
-   * missing, cloudflared exiting, still starting) or `null` when nothing is wrong.
-   */
-  readonly tunnelDetail: string | null;
   readonly urls: ReadonlyArray<DesktopRemoteAccessUrl>;
   readonly status: "running" | "restarting";
 }
@@ -598,7 +591,6 @@ export interface DesktopRemoteAccessState {
 export interface DesktopRemoteAccessSetEnabledInput {
   readonly enabled: boolean;
   readonly port?: number;
-  readonly tunnel?: boolean;
 }
 
 export interface SynaraStorageSnapshot {

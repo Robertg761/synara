@@ -92,32 +92,8 @@ enum class InteractionMode(val wire: String, val label: String, val description:
     }
 }
 
-/**
- * Not every project in the workspace is a place the user filed work.
- *
- * The server creates `chat` ("Home") and `studio` ("Studio") for itself the first time it starts,
- * so they are always present — even on a workspace with no repositories added yet. Treating them as
- * ordinary projects is how a new thread silently ended up in Studio, which is the image-generation
- * surface rather than anywhere the user meant.
- */
-enum class ProjectKind(val wire: String, val label: String) {
-    PROJECT("project", "Project"),
-    CHAT("chat", "Chat"),
-    STUDIO("studio", "Studio"),
-    ;
-
-    /** Built by the server rather than added by the user, so never a silent default. */
-    val isSystem: Boolean get() = this != PROJECT
-
-    companion object {
-        /** An unknown kind reads as an ordinary project: a newer server must not hide work. */
-        fun fromWire(wire: String?): ProjectKind = entries.firstOrNull { it.wire == wire } ?: PROJECT
-    }
-}
-
 data class ProjectItem(
     val id: String,
-    val kind: ProjectKind,
     val title: String,
     val workspaceRoot: String,
     val isPinned: Boolean,
@@ -127,7 +103,6 @@ data class ProjectItem(
     companion object {
         fun fromJson(json: JSONObject, threadCount: Int = 0): ProjectItem = ProjectItem(
             id = json.stringOrNull("id") ?: json.stringOrNull("projectId") ?: "",
-            kind = ProjectKind.fromWire(json.stringOrNull("kind")),
             title = json.stringOrNull("title") ?: "Untitled project",
             workspaceRoot = json.stringOrNull("workspaceRoot") ?: "",
             isPinned = json.optBoolean("isPinned", false),
@@ -136,23 +111,6 @@ data class ProjectItem(
         )
     }
 }
-
-/**
- * Where a new thread goes when the user has not pointed at a project.
- *
- * Preference order is the user's own projects, then Home, then Studio. The server returns Studio
- * ahead of Home, so taking the first entry landed ad-hoc work in the image workspace; and a
- * workspace with no repositories yet has nothing *but* those two, so "no real project" has to
- * degrade to the general chat surface rather than to whichever happens to sort first.
- */
-fun List<ProjectItem>.defaultThreadTarget(selectedProjectId: String? = null): ProjectItem? =
-    selectedProjectId?.let { id -> firstOrNull { it.id == id } }
-        // `minByOrNull` keeps the first of equal ranks, so the server's own order still decides
-        // between two real projects.
-        ?: minByOrNull { it.kind.ordinal }
-
-/** Presentation order for pickers: real projects first, each group in the server's own order. */
-fun List<ProjectItem>.orderedForPicking(): List<ProjectItem> = sortedBy { it.kind.ordinal }
 
 data class LatestTurn(
     val id: String,
@@ -227,36 +185,6 @@ data class ThreadItem(
     }
 }
 
-/**
- * A file or image carried by a message.
- *
- * The descriptor is the server's own upload shape echoed back onto the transcript; `id` alone is
- * enough to fetch the bytes from the media route, the rest only feeds the UI label.
- */
-data class MessageAttachment(
-    val id: String,
-    val name: String,
-    val mimeType: String,
-    val sizeBytes: Int,
-    val type: String,
-) {
-    val isImage: Boolean
-        get() = type == "image" || mimeType.startsWith("image/", ignoreCase = true)
-
-    companion object {
-        fun fromJson(json: JSONObject): MessageAttachment? {
-            val id = json.stringOrNull("id") ?: json.stringOrNull("attachmentId") ?: return null
-            return MessageAttachment(
-                id = id,
-                name = json.stringOrNull("name") ?: "attachment",
-                mimeType = json.stringOrNull("mimeType") ?: "application/octet-stream",
-                sizeBytes = if (json.has("sizeBytes")) json.optInt("sizeBytes") else 0,
-                type = json.stringOrNull("type") ?: "file",
-            )
-        }
-    }
-}
-
 data class MessageItem(
     val id: String,
     val role: String,
@@ -264,7 +192,6 @@ data class MessageItem(
     val streaming: Boolean,
     val createdAt: String,
     val turnId: String?,
-    val attachments: List<MessageAttachment> = emptyList(),
 ) {
     val isUser: Boolean
         get() = role == "user"
@@ -277,9 +204,6 @@ data class MessageItem(
             streaming = json.optBoolean("streaming", false),
             createdAt = json.stringOrNull("createdAt") ?: "",
             turnId = json.stringOrNull("turnId"),
-            attachments = json.arrayOrEmpty("attachments")
-                .objects()
-                .mapNotNull(MessageAttachment::fromJson),
         )
     }
 }

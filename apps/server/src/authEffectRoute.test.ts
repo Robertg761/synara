@@ -593,28 +593,6 @@ describe("authEffectRouteLayer", () => {
     });
   });
 
-  it("answers a revoked credential with 401 on every mutation route", async () => {
-    // The mobile client drops its stored pairing on 401/403 and keeps retrying on anything else,
-    // so a route that answers a dead session with any other status leaves a phone reconnecting
-    // forever against a credential that will never work again.
-    const sideEffects = { count: 0 };
-    const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;
-    await withAuthEffectServer(config, makeServerAuth(sideEffects), async (serverOrigin) => {
-      for (const route of mutationRoutes) {
-        const response = await fetch(`${serverOrigin}${route.path}`, {
-          method: "POST",
-          headers: {
-            Authorization: "Bearer revoked-token",
-            ...(route.body === undefined ? {} : { "Content-Type": "application/json" }),
-          },
-          ...(route.body === undefined ? {} : { body: JSON.stringify(route.body) }),
-        });
-        expect(response.status, `${route.path} with a revoked bearer`).toBe(401);
-      }
-      expect(sideEffects.count).toBe(0);
-    });
-  });
-
   it("mints media credentials only for an authenticated session, and never caches them", async () => {
     const sideEffects = { count: 0 };
     const config = { host: "127.0.0.1", publicUrl: undefined } as ServerConfigShape;

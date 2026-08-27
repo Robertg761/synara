@@ -165,7 +165,12 @@ it.effect("rejects an invalid legacy token on a remotely exposed device frame so
     );
 
     const authorized = yield* authorizeDeviceFrameWebSocketUpgrade({
-      config: { host: "0.0.0.0", authToken: "remote-secret", publicUrl: undefined, mode: "web" },
+      config: {
+        host: "0.0.0.0",
+        authToken: "remote-secret",
+        publicUrl: undefined,
+        mode: "desktop",
+      },
       legacyToken: "wrong-secret",
       remoteAddress: "192.168.1.50",
       request: {

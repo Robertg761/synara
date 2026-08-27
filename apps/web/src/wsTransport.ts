@@ -218,38 +218,11 @@ export function getReconnectRetryDelayMs(attempt: number): number {
 }
 
 /**
- * A sleep with two exits. `signal` ends it by rejecting (the caller is being torn
- * down). `registerSkip`, when supplied, hands back a function that ends it early
- * and *successfully*, for when waiting out the rest of the delay has stopped
- * buying anything; it is handed `null` once the sleep is over.
+ * Minimum gap between two wake signals that are allowed to clear the reconnect backoff. Above the
+ * backoff cap, so a server that is simply down settles at the capped retry interval no matter how
+ * many connectivity signals the platform emits meanwhile.
  */
-function delayWithAbort(
-  ms: number,
-  signal: AbortSignal,
-  registerSkip?: (skip: (() => void) | null) => void,
-): Promise<void> {
-  if (signal.aborted) return Promise.reject(signal.reason);
-  return new Promise<void>((resolve, reject) => {
-    const timeoutId = window.setTimeout(() => {
-      cleanup();
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      cleanup();
-      reject(signal.reason);
-    };
-    const cleanup = () => {
-      window.clearTimeout(timeoutId);
-      signal.removeEventListener("abort", onAbort);
-      registerSkip?.(null);
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    registerSkip?.(() => {
-      cleanup();
-      resolve();
-    });
-  });
-}
+const WAKE_BACKOFF_RESET_THROTTLE_MS = 5_000;
 
 /**
  * Minimum gap between two wake signals that are allowed to clear the reconnect backoff. Above the
@@ -1000,7 +973,12 @@ export class WsTransport {
     this.disposed = true;
     // Abort before anything else: a pending negotiate must fail now rather
     // than resolve later and build a runtime this teardown will not see.
+    // Abort before anything else: a pending negotiate must fail now rather
+    // than resolve later and build a runtime this teardown will not see.
     this.lifetime.abort(new Error("Transport disposed"));
+    // Release a reconnect attempt sleeping its backoff so its timer does not
+    // outlive the transport; the attempt then observes `disposed` and throws.
+    this.skipReconnectBackoff?.();
     this.setState("disposed");
     this.resetAllStreamCapacityRetries();
     this.resetAllStreamCompletionRetries();
@@ -1417,9 +1395,33 @@ export class WsTransport {
       this.setState("connecting");
       const delayMs = getReconnectRetryDelayMs(this.reconnectFailures);
       this.reconnectFailures += 1;
-      await delayWithAbort(delayMs, this.lifetime.signal, (skip) => {
-        this.skipReconnectBackoff = skip;
+      await new Promise<void>((resolve, reject) => {
+        const signal = this.lifetime.signal;
+        const timeoutId = window.setTimeout(() => {
+          cleanup();
+          resolve();
+        }, delayMs);
+        const onAbort = () => {
+          cleanup();
+          reject(signal.reason);
+        };
+        const cleanup = () => {
+          window.clearTimeout(timeoutId);
+          signal.removeEventListener("abort", onAbort);
+          this.skipReconnectBackoff = null;
+        };
+        // wakeUp() and dispose() invoke this to end the backoff sleep now; a
+        // naturally fired timer or an abort leaves no stale hook behind.
+        this.skipReconnectBackoff = () => {
+          cleanup();
+          resolve();
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
       });
+      if (this.disposed) {
+        throw new Error("Transport disposed");
+      }
 
       const session = this.createSession();
       this.clientPromise = session.clientPromise;

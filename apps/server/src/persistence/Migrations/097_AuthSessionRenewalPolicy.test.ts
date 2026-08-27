@@ -43,7 +43,7 @@ describe("097_AuthSessionRenewalPolicy", () => {
   it.effect("backfills pre-existing rows from the lifetime they were issued with", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 89 });
+      yield* runMigrations({ toMigrationInclusive: 96 });
       // Issued with the default 30-day TTL: the population that must keep sliding.
       yield* insertLegacySession(sql, {
         sessionId: "default-ttl",
@@ -75,7 +75,7 @@ describe("097_AuthSessionRenewalPolicy", () => {
   it.effect("adds the column once and safely accepts a pre-existing one", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 89 });
+      yield* runMigrations({ toMigrationInclusive: 96 });
       yield* sql`
         ALTER TABLE auth_sessions
         ADD COLUMN renewal_policy TEXT NOT NULL DEFAULT 'sliding'
@@ -102,7 +102,7 @@ describe("097_AuthSessionRenewalPolicy", () => {
   it.effect("propagates schema failures and leaves migration 97 retryable", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 89 });
+      yield* runMigrations({ toMigrationInclusive: 96 });
       yield* sql`DROP TABLE auth_sessions`;
 
       const exit = yield* Effect.exit(runMigrations({ toMigrationInclusive: 97 }));

@@ -28,7 +28,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -60,16 +59,6 @@ fun SetupScreen(
     val canConnect = serverUrl.isNotBlank() && pairingInput.isNotBlank() && !state.isLoading
     val hasSavedConnection = state.hasStoredSession && state.connection != ConnectionState.CONNECTING
     val isInsecure = serverUrl.trim().startsWith("http://", ignoreCase = true)
-
-    // A scanned QR or the web app's "Open in app" button lands here with both
-    // fields resolved; typing them by hand stays possible but is no longer the
-    // expected path.
-    LaunchedEffect(state.pairingPrefill) {
-        state.pairingPrefill?.let { prefill ->
-            serverUrl = prefill.serverUrl
-            pairingInput = prefill.credential
-        }
-    }
 
     Surface(color = MaterialTheme.colorScheme.background) {
         Column(

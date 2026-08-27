@@ -391,52 +391,12 @@ const makeServerProgram = (input: CliInput) =>
       config.host && !isWildcardHost(config.host)
         ? `http://${formatHostForUrl(config.host)}:${config.port}`
         : localUrl;
-
-    // Anywhere access: a cloudflared quick tunnel gives this server a public
-    // HTTPS URL relayed through Cloudflare's edge. The server itself stays on
-    // its normal bind — the tunnel dials it from this machine — so enabling it
-    // changes nothing about the local security posture, and pairing links minted
-    // against the tunnel URL work from any network.
-    const cliEnv = yield* CliEnvConfig.asEffect();
-    const tunnelRequested = resolveBooleanConfig(input.tunnel, cliEnv.tunnel, false);
-    let tunnelHandle: QuickTunnelHandle | null = null;
-    let tunnelOrigin: string | null = null;
-    if (tunnelRequested) {
-      if (!resolveCloudflaredCommand()) {
-        yield* Effect.logWarning("Anywhere access requested but cloudflared is not installed", {
-          hint: "Install cloudflared (https://developers.cloudflare.com/cloudflare/one-page-docs/cloudflare-one/connections/connect-networks/downloads/) and start Synara with --tunnel again.",
-        });
-      } else {
-        // Bound to a const so the closure below keeps the non-null type: the
-        // mutable `tunnelHandle` loses its narrowing once it is captured.
-        const handle = startQuickTunnel({
-          targetUrl: localUrl,
-          log: (line) =>
-            Effect.runFork(Effect.logInfo(`[tunnel] ${line.replace(/\s+/g, " ").slice(0, 160)}`)),
-        });
-        tunnelHandle = handle;
-        const found = yield* Effect.promise(() => handle.waitForUrl(45_000));
-        if (found) {
-          tunnelOrigin = new URL(found).origin;
-          yield* Effect.logInfo("Anywhere access is up", {
-            url: tunnelOrigin,
-            hint: "Pairing links below work from any network. Stop with Ctrl+C; the tunnel closes with the server.",
-          });
-        } else {
-          yield* Effect.logWarning("Anywhere access tunnel did not come up", {
-            detail: handle.detail() ?? "timed out waiting for cloudflared",
-          });
-        }
-      }
-    }
-
-    const pairingBaseUrl = tunnelOrigin ?? config.publicUrl?.origin ?? bindUrl;
+    const pairingBaseUrl = config.publicUrl?.origin ?? bindUrl;
     // Desktop mode manages pairing links from the app's Remote access settings
     // instead: an auto-issued owner link would sit unclaimed in that list (and
     // in the logs) on every launch.
     const startupPairingUrl =
-      config.mode !== "desktop" &&
-      (config.publicUrl || !isLoopbackHost(config.host) || tunnelOrigin)
+      config.mode !== "desktop" && (config.publicUrl || !isLoopbackHost(config.host))
         ? yield* serverAuth.issueStartupPairingUrl(pairingBaseUrl).pipe(
             Effect.mapError(
               (cause) =>

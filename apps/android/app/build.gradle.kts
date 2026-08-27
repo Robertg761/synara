@@ -18,11 +18,7 @@ android {
 
     buildTypes {
         release {
-            // Shrinking is on even though the app is small: dead code and unused resources cost
-            // cold-start time on the low-end devices this app is most useful on. Obfuscation is
-            // deliberately off until stack traces can be re-mapped in crash reports.
-            isMinifyEnabled = true
-            isShrinkResources = true
+            isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -80,16 +76,8 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // Transcript attachments and generated images are served from the paired server's media
-    // route; Coil handles decode, downsampling and caching so a long thread does not hold every
-    // full-resolution bitmap it has ever shown.
-    implementation("io.coil-kt:coil-compose:2.7.0")
-
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
-    // The unit-test classpath ships a throwing org.json stub; this real implementation lets
-    // model-parsing tests exercise the exact same JSON code the app runs.
-    testImplementation("org.json:json:20240303")
 
     // Compose UI tests run on a device: the screens under test are rendered by the real
     // toolkit, so a JVM-only harness would not exercise the layout at all.

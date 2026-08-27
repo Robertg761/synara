@@ -366,7 +366,6 @@ let backendHttpUrl = "";
 let backendWsUrl = "";
 let remoteAccessConfig: PersistedDesktopRemoteAccessState = DISABLED_REMOTE_ACCESS_STATE;
 let remoteAccessStatus: DesktopRemoteAccessState["status"] = "running";
-let quickTunnel: QuickTunnelHandle | null = null;
 // Serializes toggle requests: a second toggle while the backend restarts must
 // wait for the first restart to finish rather than racing the spawn.
 let remoteAccessApplyInFlight: Promise<void> = Promise.resolve();
@@ -3841,55 +3840,15 @@ function startBackend(trigger: BackendStartTrigger = "lifecycle"): void {
 
 function currentRemoteAccessState(): DesktopRemoteAccessState {
   const enabled = remoteAccessConfig.enabled;
-  // The tunnel leads the list: when it is up it is the one address that works
-  // from anywhere, so it is also the one the QR code and copy actions default to.
-  const tunnelUrl = quickTunnel?.url() ?? null;
   return {
     enabled,
     port: remoteAccessConfig.port,
     portFallback: enabled && backendPort !== remoteAccessConfig.port ? backendPort : null,
-    tunnelEnabled: remoteAccessConfig.tunnel,
-    tunnelDetail: quickTunnel?.detail() ?? null,
-    urls: [
-      ...(tunnelUrl && remoteAccessConfig.tunnel
-        ? [{ url: tunnelUrl, kind: "tunnel" as const }]
-        : []),
-      ...(enabled
-        ? listRemoteAccessUrls({ interfaces: OS.networkInterfaces(), port: backendPort })
-        : []),
-    ],
+    urls: enabled
+      ? listRemoteAccessUrls({ interfaces: OS.networkInterfaces(), port: backendPort })
+      : [],
     status: remoteAccessStatus,
   };
-}
-
-/**
- * The managed cloudflared quick tunnel. Unlike the LAN bind, enabling it does
- * not restart the backend: the tunnel dials the loopback port from this machine,
- * so it can start and stop independently while agents keep running.
- */
-async function applyQuickTunnelState(enabled: boolean): Promise<void> {
-  if (!enabled) {
-    const handle = quickTunnel;
-    quickTunnel = null;
-    await handle?.stop();
-    broadcastRemoteAccessState();
-    return;
-  }
-  if (quickTunnel != null && quickTunnel.state() !== "error" && quickTunnel.state() !== "stopped") {
-    return;
-  }
-  quickTunnel = startQuickTunnel({
-    targetUrl: backendHttpUrl,
-    log: (line) => writeDesktopLogHeader(`cloudflared ${line.replace(/\s+/g, " ").slice(0, 160)}`),
-  });
-  broadcastRemoteAccessState();
-  const url = await quickTunnel.waitForUrl(45_000);
-  writeDesktopLogHeader(
-    url
-      ? `quick tunnel ready url=${url}`
-      : `quick tunnel unavailable detail=${quickTunnel.detail() ?? "timed out"}`,
-  );
-  broadcastRemoteAccessState();
 }
 
 function broadcastRemoteAccessState(): void {
@@ -3911,64 +3870,40 @@ async function applyRemoteAccessConfig(
 
   try {
     const next: PersistedDesktopRemoteAccessState = {
-      version: 2,
+      version: 1,
       enabled: input.enabled,
       port: input.port ?? remoteAccessConfig.port,
-      tunnel: input.tunnel ?? remoteAccessConfig.tunnel,
     };
-    if (
-      next.enabled === remoteAccessConfig.enabled &&
-      next.port === remoteAccessConfig.port &&
-      next.tunnel === remoteAccessConfig.tunnel
-    ) {
+    if (next.enabled === remoteAccessConfig.enabled && next.port === remoteAccessConfig.port) {
       return currentRemoteAccessState();
     }
 
-    // The tunnel is independent of the LAN bind: it dials the loopback port from
-    // this machine, so toggling it never needs the backend (and running agents)
-    // to restart.
-    const tunnelChanged = next.tunnel !== remoteAccessConfig.tunnel;
-    const backendRestartNeeded =
-      next.enabled !== remoteAccessConfig.enabled || next.port !== remoteAccessConfig.port;
-
-    const previousConfig = remoteAccessConfig;
     writeDesktopRemoteAccessState(DESKTOP_REMOTE_ACCESS_STATE_PATH, next);
     remoteAccessConfig = next;
-    if (backendRestartNeeded) {
-      remoteAccessStatus = "restarting";
-    }
+    remoteAccessStatus = "restarting";
     broadcastRemoteAccessState();
     writeDesktopLogHeader(
-      `remote access enabling=${next.enabled} port=${next.port} tunnel=${next.tunnel}`,
+      `remote access ${next.enabled ? `enabling port=${next.port}` : "disabling"} backend restart`,
     );
 
-    if (backendRestartNeeded) {
-      try {
-        await stopBackendAndWaitForExit();
-      } catch (error) {
-        // The old process is wedged; force-stop so the rebind cannot race it.
-        writeDesktopLogHeader(
-          `remote access graceful stop failed message=${formatErrorMessage(error)}`,
-        );
-        stopBackend();
-      }
-      await restartBackendAfterCrash("remote access configuration change", "lifecycle");
-      try {
-        await waitForBackendWindowReady(backendHttpUrl);
-      } catch (error) {
-        if (!isBackendReadinessAborted(error)) {
-          writeDesktopLogHeader(
-            `remote access readiness warning message=${formatErrorMessage(error)}`,
-          );
-        }
-      }
+    try {
+      await stopBackendAndWaitForExit();
+    } catch (error) {
+      // The old process is wedged; force-stop so the rebind cannot race it.
+      writeDesktopLogHeader(
+        `remote access graceful stop failed message=${formatErrorMessage(error)}`,
+      );
+      stopBackend();
     }
-    if (tunnelChanged) {
-      await applyQuickTunnelState(next.tunnel);
-    } else if (next.tunnel && quickTunnel == null) {
-      // A tunnel requested alongside a backend restart starts once the backend
-      // is confirmed reachable above.
-      void applyQuickTunnelState(true);
+    await restartBackendAfterCrash("remote access configuration change", "lifecycle");
+    try {
+      await waitForBackendWindowReady(backendHttpUrl);
+    } catch (error) {
+      if (!isBackendReadinessAborted(error)) {
+        writeDesktopLogHeader(
+          `remote access readiness warning message=${formatErrorMessage(error)}`,
+        );
+      }
     }
     remoteAccessStatus = "running";
     return currentRemoteAccessState();

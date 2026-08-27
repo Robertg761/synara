@@ -16,10 +16,13 @@
  * standing in for a windowed one would hand the operator an isolated desktop
  * that is nowhere on screen.
  *
- * The compositor is not restarted if it dies. A nested crash takes the whole
- * session with it, so it surfaces the way a real KWin crash does: KWin's bus
- * names vanish, the backend's reconnect loop cannot find them, and health
- * reports the outage instead of hiding it behind a fresh empty desktop.
+ * The compositor is never restarted behind anyone's back if it dies — in
+ * windowed mode the desktop is an ordinary window of the host session, so "it
+ * died" is usually "the human closed it", and a window that respawns on its
+ * own is a haunting. The session only *reports* that its processes have ended
+ * (`exited`); `NestedComputerBackend` reaps a dead session and boots a
+ * replacement the next time a user or agent actually uses the desktop,
+ * exactly like first use did.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -101,6 +104,13 @@ export interface NestedKWinSession {
    * this session. Undefined only if the compositor started without one.
    */
   readonly xDisplay: string | undefined;
+  /**
+   * How one of the session's own processes ended, or `undefined` while both
+   * still run. The session's bus address dies with them and never comes back,
+   * so a non-`undefined` answer means this session is gone for good — reap it
+   * and boot a new one; reconnecting to it can only fail.
+   */
+  readonly exited: () => string | undefined;
   readonly dispose: () => Promise<void>;
 }
 
@@ -177,7 +187,17 @@ export async function startNestedKWinSession(
     } finally {
       await dbus.close().catch(() => undefined);
     }
-    return { busAddress, waylandDisplay, size, pluginId, xDisplay, dispose };
+    return {
+      busAddress,
+      waylandDisplay,
+      size,
+      pluginId,
+      xDisplay,
+      // The compositor is what the human can close; the bus daemon only dies
+      // with the server or a crash. Either one ending ends the session.
+      exited: () => kwin.exitDiagnostic() ?? bus.exitDiagnostic(),
+      dispose,
+    };
   } catch (error) {
     await dispose();
     throw error instanceof ComputerBackendError

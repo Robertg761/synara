@@ -336,8 +336,8 @@ export function SingleChatSurface(props: {
     view: props.search.view,
     urlPaneId: props.search.pane,
   });
-  // The pane the user can actually see, in whichever shape this layout takes: the desktop
-  // dock's active tab, or the phone's pushed pane screen.
+  // The one answer to "what of this thread is actually on screen", which the floating
+  // browser card and the pushed phone screen both have to agree on.
   const visibleDockPane = resolveVisibleDockPane(dockVisibility, dockState);
   // The pushed screen renders off the URL, not off the store: persisted dock state must
   // never flash a full-screen pane on a cold load, and back must clear the screen on the
@@ -346,8 +346,6 @@ export function SingleChatSurface(props: {
   const floatingBrowserVisible = shouldRenderFloatingBrowserPanel({
     hostThreadId: props.threadId,
     floatingThreadId: floatingBrowserRequested ? props.threadId : null,
-    // Ask what is on screen, not what the store holds: on phone the browser lives in the
-    // pushed pane screen, and a floating card over it would be the same page twice.
     dockBrowserVisible: visibleDockPane?.kind === "browser",
   });
 
@@ -1292,8 +1290,8 @@ export function SingleChatSurface(props: {
                 : {
                     onToggleBrowser: handleToggleBrowser,
                     onToggleRightDock: handleToggleRightDock,
-                    onSplitSurface: handleSplitSurface,
                     ...(hasDeviceSupport ? { onToggleDevice: handleToggleDevice } : {}),
+                    onSplitSurface: handleSplitSurface,
                   })}
               viewModeAction={{
                 label: "Editor view",
@@ -1334,9 +1332,6 @@ export function SingleChatSurface(props: {
             addMenuKinds={availableDockPaneKinds}
             launcherItems={dockLauncherItems}
             motionKey={props.threadId}
-            // A browser that has been popped out to the floating card must not also run
-            // live in the dock: demote the dock copy to a preview so only one session drives
-            // the page.
             activePaneRuntimeMode={
               floatingBrowserVisible && activePane?.kind === "browser"
                 ? "preview"
@@ -1353,7 +1348,6 @@ export function SingleChatSurface(props: {
             renderPane={renderDockPane}
           />
         )}
-        {/* Not a dock surface: the palette is a global overlay either layout can raise. */}
         <WorkspaceSearchPalette
           open={searchPaletteOpen}
           mode={searchPaletteMode}

@@ -94,8 +94,6 @@ data class AutomationsState(
     val selectedId: String? = null,
     val busyId: String? = null,
     val createOpen: Boolean = false,
-    /** Persistent memory per automation, fetched lazily when a detail sheet opens. */
-    val memoryById: Map<String, String> = emptyMap(),
 )
 
 data class SourceControlState(
@@ -172,25 +170,6 @@ data class SynaraUiState(
     val machine: MachineState = MachineState(),
     /** Attachments staged for the next turn, in the order they were added. */
     val pendingAttachments: List<PendingAttachment> = emptyList(),
-    /**
-     * Whether a follow-up sent while the agent is running queues behind the turn or steers it.
-     * Queue is the safe default; steer redirects an in-flight turn, which deserves a deliberate
-     * toggle rather than being an accident of timing.
-     */
-    val followUpSteer: Boolean = false,
-    /**
-     * Draft text to put back into the composer after a failed send. The composer empties itself
-     * the moment a turn is dispatched; if the server rejects it, handing the words back beats
-     * making the user retype them from memory.
-     */
-    val draftRestoreText: String? = null,
-    /** Bumped whenever [draftRestoreText] changes, so the composer notices identical texts. */
-    val draftRestoreToken: Int = 0,
-    /**
-     * Server + credential arriving from a `synara://pair` deep link, ready to drop into the
-     * setup form. A token counter disambiguates repeated links with identical contents.
-     */
-    val pairingPrefill: PairingPrefill? = null,
 ) {
     val isConnected: Boolean
         get() = connection == ConnectionState.CONNECTED
@@ -199,13 +178,6 @@ data class SynaraUiState(
         get() = selectedThreadId?.let { id -> threads.firstOrNull { it.id == id } }
             ?: detail?.thread
 }
-
-/** A pairing link's parsed contents, delivered by a deep link. */
-data class PairingPrefill(
-    val serverUrl: String,
-    val credential: String,
-    val token: Int,
-)
 
 class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
     private val _ui = MutableStateFlow(
@@ -219,12 +191,6 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
     private var activeThreadStream: String? = null
     private var activeShellStream: String? = null
     private val liveStreams = mutableListOf<String>()
-
-    /** A notification tap that arrived while offline; opened once the connection is back. */
-    private var pendingOpenThreadId: String? = null
-
-    /** In-flight model discovery, so a reconnect supersedes the previous sweep instead of racing it. */
-    private var modelDiscoveryJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -240,8 +206,8 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         viewModelScope.launch {
             runCatching {
                 repository.connectWithPairing(serverUrl, pairingInput)
+                loadModels()
             }.onSuccess {
-                startModelDiscovery()
                 update { it.copy(isLoading = false, screen = AppScreen.WORKSPACE, hasStoredSession = true) }
             }.onFailure { error ->
                 repository.disconnect(clearCredentials = error is AuthRequiredException)
@@ -262,12 +228,9 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         viewModelScope.launch {
             runCatching {
                 repository.reconnectStored()
+                loadModels()
             }.onSuccess {
-                startModelDiscovery()
-                // Whatever screen the reader was on survives the reconnect: being dropped back
-                // to the workspace because the network blipped is exactly the kind of surprise
-                // that makes an app feel fragile.
-                update { it.copy(isLoading = false) }
+                update { it.copy(isLoading = false, screen = AppScreen.WORKSPACE) }
             }.onFailure { error ->
                 val needsPairing = error is AuthRequiredException
                 if (needsPairing) repository.disconnect(clearCredentials = true)
@@ -285,79 +248,8 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
 
     fun refreshOrReconnect() {
         if (_ui.value.connection == ConnectionState.CONNECTED) refresh()
-        else if (_ui.value.hasStoredSession) repository.wake(force = true)
+        else if (_ui.value.hasStoredSession) reconnectStored()
     }
-
-    /**
-     * Entry point for notification taps.
-     *
-     * While connected this is just [selectThread]. While offline the tap is remembered and the
-     * connection is driven up: dropping the user's intent because the socket happened to be down
-     * at tap time would make notifications feel broken precisely when they matter most.
-     */
-    fun openThreadFromNotification(threadId: String) {
-        if (_ui.value.connection == ConnectionState.CONNECTED) {
-            selectThread(threadId)
-        } else {
-            pendingOpenThreadId = threadId
-            repository.wake(force = true)
-        }
-    }
-
-    /**
-     * Rebuilds what a live session had before the socket dropped: the open thread's stream, any
-     * deferred notification destination, and the terminal feed when that screen was showing.
-     * Runs on every CONNECTED transition, which includes first pairing — where every branch is
-     * naturally a no-op.
-     */
-    private fun resumeAfterReconnect() {
-        val threadId = _ui.value.selectedThreadId
-        val hasDetail = _ui.value.detail != null
-        if (threadId != null && hasDetail && activeThreadStream == null) {
-            viewModelScope.launch {
-                // A fresh snapshot lands before the stream so anything missed while offline is
-                // on screen immediately; the cursor-based replay then covers the remainder.
-                runCatching { repository.loadThread(threadId) }
-                runCatching { repository.subscribeThread(threadId) }
-                    .onSuccess { activeThreadStream = it }
-            }
-        }
-        pendingOpenThreadId?.let {
-            pendingOpenThreadId = null
-            selectThread(it)
-        }
-        if (_ui.value.screen == AppScreen.TERMINAL && _ui.value.terminal.threadId != null) {
-            openTerminal()
-        }
-    }
-
-    fun setFollowUpSteer(steer: Boolean) {
-        update { it.copy(followUpSteer = steer) }
-    }
-
-    /** Hands a scanned pairing link's contents to the setup form. */
-    fun prefillPairing(serverUrl: String, credential: String) {
-        update { state ->
-            state.copy(
-                pairingPrefill = PairingPrefill(
-                    serverUrl = serverUrl,
-                    credential = credential,
-                    token = state.pairingPrefill?.token?.plus(1) ?: 1,
-                ),
-            )
-        }
-    }
-
-    /** Media-route URL for a transcript attachment, or null when unpaired. */
-    fun attachmentUrl(attachmentId: String): String? =
-        repository.attachmentUrl(attachmentId)?.toString()
-
-    /**
-     * Bearer credential for media requests. Returned as a header pair so the raw token never has
-     * to be compared or logged by UI code; it only ever rides inside an image request.
-     */
-    fun mediaAuthHeader(): Pair<String, String>? =
-        repository.currentBearerToken()?.let { "Authorization" to "Bearer $it" }
 
     fun openWorkspace() {
         update { it.copy(screen = AppScreen.WORKSPACE, selectedThreadId = null, detail = null) }
@@ -366,13 +258,7 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
 
     fun openSettings() {
         update { it.copy(screen = AppScreen.SETTINGS) }
-        // Keyed off settings alone this never ran, because the live subscription already fills
-        // `settings` on connect — while leaving `statuses` empty, since the server only probes
-        // providers when asked. The Providers list was therefore unknown on every visit.
-        val server = _ui.value.serverSettings
-        if (server.settings == null || (server.statuses.isEmpty() && !providerProbeAttempted)) {
-            loadServerSettings()
-        }
+        if (_ui.value.serverSettings.settings == null) loadServerSettings()
         loadMachineState()
     }
 
@@ -453,13 +339,6 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
      * concurrently and each failure is contained: a provider whose usage endpoint is down should
      * not stop the settings screen from rendering the toggles.
      */
-    /**
-     * Whether this session has already asked the server to probe its provider CLIs. Probing spawns
-     * nine binaries, so it is worth once per session even when it comes back with nothing — and not
-     * worth repeating on every trip to Settings.
-     */
-    private var providerProbeAttempted = false
-
     fun loadServerSettings(refresh: Boolean = false) {
         if (_ui.value.connection != ConnectionState.CONNECTED) return
         update { it.copy(serverSettings = it.serverSettings.copy(isLoading = true, error = null)) }
@@ -470,34 +349,14 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
             val settingsResult = settings.await()
             val statusesResult = statuses.await()
             val usageResult = usage.await()
-            // The server answers a plain read with its last *stable* provider snapshot, and that
-            // snapshot stays empty until something asks it to probe. A phone that only ever reads
-            // therefore renders nine providers as "Status unknown" forever, with the remedy hidden
-            // behind a "Refresh" link the reader has no reason to suspect. The desktop probes
-            // shortly after it connects; this is the same move, paid once per settings visit that
-            // finds nothing cached.
-            val probeProviders = !refresh &&
-                !providerProbeAttempted &&
-                statusesResult.getOrNull().isNullOrEmpty()
-            if (probeProviders) providerProbeAttempted = true
             update { state ->
                 state.copy(
                     serverSettings = state.serverSettings.copy(
                         settings = settingsResult.getOrNull() ?: state.serverSettings.settings,
                         statuses = statusesResult.getOrNull() ?: state.serverSettings.statuses,
                         usage = usageResult.getOrNull() ?: state.serverSettings.usage,
-                        isLoading = probeProviders,
-                        error = settingsResult.exceptionOrNull()?.let(::readableError),
-                    ),
-                )
-            }
-            if (!probeProviders) return@launch
-            val probed = runCatching { repository.providerStatuses(refresh = true) }.getOrNull()
-            update { state ->
-                state.copy(
-                    serverSettings = state.serverSettings.copy(
-                        statuses = probed ?: state.serverSettings.statuses,
                         isLoading = false,
+                        error = settingsResult.exceptionOrNull()?.let(::readableError),
                     ),
                 )
             }
@@ -674,25 +533,11 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         }
         viewModelScope.launch {
             runCatching {
-                repository.sendMessage(
-                    thread,
-                    cleanText,
-                    messageId,
-                    attachments.map { it.descriptor },
-                    dispatchMode = if (_ui.value.followUpSteer) "steer" else "queue",
-                )
+                repository.sendMessage(thread, cleanText, messageId, attachments.map { it.descriptor })
             }
                 .onSuccess { update { it.copy(isSending = false) } }
                 .onFailure { error ->
-                    update {
-                        it.copy(
-                            isSending = false,
-                            error = readableError(error),
-                            pendingAttachments = attachments,
-                            draftRestoreText = cleanText,
-                            draftRestoreToken = it.draftRestoreToken + 1,
-                        )
-                    }
+                    update { it.copy(isSending = false, error = readableError(error)) }
                     repository.loadThread(thread.id)
                 }
         }
@@ -747,11 +592,8 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         }
     }
 
-    /**
-     * The dialog derives its own default destination from the active filter, so opening it no
-     * longer reaches back and moves that filter as a side effect.
-     */
-    fun openCreateThread() {
+    fun openCreateThread(projectId: String? = _ui.value.selectedProjectId) {
+        if (projectId != null) update { it.copy(selectedProjectId = projectId) }
         update { it.copy(createThreadOpen = true) }
     }
 
@@ -759,23 +601,22 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         update { it.copy(createThreadOpen = false) }
     }
 
-    /**
-     * The caller names the project. It used to be inferred here, which quietly filed threads into
-     * whichever project the server happened to list first — Studio, on a fresh workspace.
-     */
     fun createThread(
-        project: ProjectItem,
         title: String,
         model: ModelOption,
         runtimeMode: RuntimeMode,
         interactionMode: InteractionMode = InteractionMode.DEFAULT,
     ) {
+        val project = _ui.value.selectedProjectId?.let { id -> _ui.value.projects.firstOrNull { it.id == id } }
+            ?: _ui.value.projects.firstOrNull()
+            ?: return
+        if (title.isBlank()) return
         update { it.copy(createThreadOpen = false, isLoading = true, error = null) }
         viewModelScope.launch {
             runCatching {
                 repository.createThread(
                     project,
-                    title.trim().ifBlank { UNTITLED_THREAD_TITLE },
+                    title.trim(),
                     model,
                     runtimeMode.wire,
                     interactionMode.wire,
@@ -1378,28 +1219,6 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
 
     fun selectAutomation(id: String?) {
         update { it.copy(automations = it.automations.copy(selectedId = id)) }
-        id?.let(::loadAutomationMemory)
-    }
-
-    /**
-     * Fetches an automation's persistent memory the first time its sheet opens and caches it.
-     * The memory is what lets a dedicated automation's runs build on each other, so it is the
-     * one part of the detail view that cannot be reconstructed from the run list.
-     */
-    private fun loadAutomationMemory(id: String) {
-        if (_ui.value.automations.memoryById.containsKey(id)) return
-        viewModelScope.launch {
-            runCatching { repository.getAutomationMemory(id) }
-                .onSuccess { memory ->
-                    update { state ->
-                        state.copy(
-                            automations = state.automations.copy(
-                                memoryById = state.automations.memoryById + (id to memory.orEmpty()),
-                            ),
-                        )
-                    }
-                }
-        }
     }
 
     fun setAutomationCreateOpen(open: Boolean) {
@@ -1457,8 +1276,7 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         runtimeMode: RuntimeMode,
         maxIterations: Int?,
     ) {
-        // Same rule as a new thread: never let the server's list order decide the destination.
-        val projectId = _ui.value.projects.defaultThreadTarget(_ui.value.selectedProjectId)?.id ?: return
+        val projectId = _ui.value.selectedProjectId ?: _ui.value.projects.firstOrNull()?.id ?: return
         update { it.copy(automations = it.automations.copy(createOpen = false, busyId = "new")) }
         viewModelScope.launch {
             runCatching {
@@ -1698,18 +1516,6 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         }
     }
 
-    /**
-     * Discovers models in the background rather than as part of connecting.
-     *
-     * Nine providers are queried and the slower ones spawn a CLI to answer, so awaiting the whole
-     * catalogue before leaving the loading state held the entire app behind the slowest provider on
-     * every launch. The picker fills in when the answers land.
-     */
-    private fun startModelDiscovery() {
-        modelDiscoveryJob?.cancel()
-        modelDiscoveryJob = viewModelScope.launch { loadModels() }
-    }
-
     private suspend fun loadModels() {
         // Every provider is queried, not just Codex, so the model picker reflects what the
         // workspace can actually run.
@@ -1728,13 +1534,8 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
                 }
                 if (event.state == ConnectionState.CONNECTED) {
                     openLiveSubscriptions()
-                    resumeAfterReconnect()
                 } else {
-                    // Stream ids from the previous socket are meaningless on the next one. The
-                    // thread cursors live in the repository, so resubscribing still resumes from
-                    // where this client actually was rather than re-reading history.
-                    activeThreadStream = null
-                    terminalStream = null
+                    // Stream ids from the previous socket are meaningless on the next one.
                     liveStreams.clear()
                 }
             }
@@ -1939,22 +1740,9 @@ class SynaraViewModel(private val repository: SynaraRepository) : ViewModel() {
         _ui.value = transform(_ui.value)
     }
 
-    /**
-     * Socket failures carry operating-system prose — "Software caused connection abort", "Failed to
-     * connect to /10.0.2.2:3799" — and passing those straight to a toast puts an implementation
-     * detail in front of someone who only wants to know whether their phone can reach their
-     * desktop. Every case here answers that question instead; anything Synara itself worded is
-     * still passed through untouched, because the server knows more than this mapping does.
-     */
     private fun readableError(error: Throwable): String = when (error) {
         is AuthRequiredException -> error.message ?: "Pair this phone with Synara again."
-        is java.util.concurrent.TimeoutException,
-        is java.net.SocketTimeoutException,
-        -> "Your Synara server took too long to respond."
-        is java.net.UnknownHostException -> "Can't find your Synara server at that address."
-        is java.net.ConnectException -> "Can't reach your Synara server. Check that it is running."
-        is javax.net.ssl.SSLException -> "The secure connection to your Synara server failed."
-        is java.net.SocketException -> "The connection to your Synara server dropped."
+        is java.util.concurrent.TimeoutException -> "The server took too long to respond."
         else -> error.message?.takeIf { it.isNotBlank() } ?: "Something went wrong."
     }
 

@@ -59,7 +59,6 @@ import com.synara.android.data.ModelOption
 import com.synara.android.data.PendingAttachment
 import com.synara.android.data.PendingInteraction
 import com.synara.android.data.ProjectItem
-import com.synara.android.data.ProjectKind
 import com.synara.android.data.SynaraRepository
 import com.synara.android.data.SynaraUiState
 import com.synara.android.data.SynaraViewModel
@@ -186,22 +185,8 @@ private object Fixtures {
     )
 
     private val projects = listOf(
-        ProjectItem(
-            "p1", ProjectKind.PROJECT, "synara", "/home/me/projects/synara",
-            isPinned = true, spaceId = null, threadCount = 3,
-        ),
-        ProjectItem(
-            "p2", ProjectKind.PROJECT, "orbit-api", "/home/me/projects/orbit-api",
-            isPinned = false, spaceId = null, threadCount = 1,
-        ),
-        ProjectItem(
-            "p3", ProjectKind.CHAT, "Home", "/home/me/Documents/Synara",
-            isPinned = false, spaceId = null, threadCount = 2,
-        ),
-        ProjectItem(
-            "p4", ProjectKind.STUDIO, "Studio", "/home/me/Documents/Synara/Studio",
-            isPinned = false, spaceId = null, threadCount = 0,
-        ),
+        ProjectItem("p1", "synara", "/home/me/projects/synara", isPinned = true, spaceId = null, threadCount = 3),
+        ProjectItem("p2", "orbit-api", "/home/me/projects/orbit-api", isPinned = false, spaceId = null, threadCount = 1),
     )
 
     private fun thread(
