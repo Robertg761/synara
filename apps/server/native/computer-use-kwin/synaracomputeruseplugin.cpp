@@ -473,7 +473,8 @@ static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &na
  * second seat and becomes a device on the first one. Events enter KWin's normal
  * input stack, which means focus follows clicks, global shortcuts fire, Xwayland
  * forwards to X11 clients, and Chromium's single seat is the seat being driven.
- * KWin draws the cursor, so there is no ghost cursor here and none is wanted.
+ * The agent's drawn cursor stands in for KWin's own while a session runs, so
+ * the pointer looks the same here as on every other backend.
  */
 class SynaraVirtualInputDevice : public InputDevice
 {
@@ -640,7 +641,9 @@ static bool renderCapturePart(WorkspaceScene *scene,
     // cursor shown on a native layer on screen still paints into the capture.
     // The one cursor that must not leak in is the human's: on the shared-desktop
     // backend the scene cursor is theirs, so it is claimed by an exclusive view
-    // that is deliberately never painted.
+    // that is deliberately never painted. An agent-owned compositor needs no
+    // exclusion: its native cursor is hidden while a session runs, and the ghost
+    // item stands in for it.
     std::unique_ptr<ItemTreeView> humanCursorExclusion;
     if (!sceneCursorIsAgents) {
         if (Item *cursorItem = scene->cursorItem()) {
@@ -947,8 +950,6 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
         ensureInputDevice();
     } else {
         ensureSeat();
-        ensureCursorItem();
-        setCursorVisible(false);
         // Only on the human's own compositor. In a compositor the agent owns,
         // the agent's own virtual device feeds this very pipeline, so the spy
         // would report the agent as the human and the guard would deadlock it.
@@ -957,6 +958,8 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
             input()->installInputEventSpy(m_humanInputSpy.get());
         }
     }
+    ensureCursorItem();
+    setCursorVisible(false);
 
     if (effects) {
         for (LogicalOutput *output : effects->screens()) {
@@ -977,6 +980,9 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
 SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
 {
     m_idleTimer.stop();
+    // The compositor outlives the plugin, so the hide owed on its cursor must
+    // not: a mid-session unload would otherwise leave the desktop cursorless.
+    setNativeCursorHidden(false);
     // Before anything else touches input: ~InputEventSpy uninstalls itself from
     // InputRedirection, and that has to happen while InputRedirection is still
     // the one this was installed into.
@@ -1433,7 +1439,8 @@ bool SynaraComputerUsePlugin::movePointer(double x, double y)
     m_pos = confinedPoint(QPointF(x, y));
     if (m_ownsCompositor) {
         // KWin owns the cursor and the focus that follows it, so the move is the
-        // whole action: no ghost cursor to reposition, no focus to maintain.
+        // whole action: the drawn cursor follows Cursor::posChanged once the
+        // motion lands, and there is no focus to maintain.
         m_inputDevice->sendMotionAbsolute(m_pos);
         return true;
     }
@@ -2067,17 +2074,33 @@ void SynaraComputerUsePlugin::ensureSeat()
 
 void SynaraComputerUsePlugin::ensureCursorItem()
 {
-    // The ghost cursor exists to be a second cursor beside the human's. In a
-    // compositor the agent owns there is only one cursor and KWin draws it, so a
-    // ghost would be a duplicate drawn on top of the real one.
-    if (m_ownsCompositor || m_cursorItem || !effects || !effects->scene()) {
+    // The agent's cursor is this drawn item on every backend, so a session looks
+    // the same on every machine. On the human's compositor it is a second cursor
+    // beside theirs; on a compositor the agent owns it stands in for KWin's own,
+    // which depends on a cursor theme the host distro may not ship and on
+    // clients not hiding or replacing it — the two ways the agent's cursor used
+    // to vanish mid-session.
+    if (m_cursorItem || !effects || !effects->scene()) {
         return;
     }
 
     m_cursorItem = std::make_unique<SynaraAgentCursorItem>(effects->scene()->overlayItem());
     m_cursorItem->setZ(1000);
     m_cursorItem->setAgentName(m_agentName);
-    m_cursorItem->setHotspot(m_pos);
+    if (m_ownsCompositor) {
+        // The one seat's cursor position is authoritative here — clients can
+        // warp it and the human can drive it through the host window's pointer
+        // grab — so the item follows the compositor's cursor rather than the
+        // plugin's last injected point.
+        if (Cursor *cursor = Cursors::self() ? Cursors::self()->mouse() : nullptr) {
+            connect(cursor, &Cursor::posChanged, m_cursorItem.get(), [item = m_cursorItem.get()](const QPointF &pos) {
+                item->setHotspot(pos);
+            });
+            m_cursorItem->setHotspot(cursor->pos());
+        }
+    } else {
+        m_cursorItem->setHotspot(m_pos);
+    }
     m_cursorItem->setVisible(m_running);
 }
 
@@ -2086,6 +2109,26 @@ void SynaraComputerUsePlugin::setCursorVisible(bool visible)
     ensureCursorItem();
     if (m_cursorItem) {
         m_cursorItem->setVisible(visible);
+        // In a compositor the agent owns, the drawn item replaces KWin's cursor
+        // instead of joining it: two arrows over one seat would read as two
+        // pointers. The native cursor comes back when the session ends, so a
+        // human grabbing the nested window's pointer still sees one.
+        if (m_ownsCompositor) {
+            setNativeCursorHidden(visible);
+        }
+    }
+}
+
+void SynaraComputerUsePlugin::setNativeCursorHidden(bool hidden)
+{
+    if (m_nativeCursorHidden == hidden || !Cursors::self()) {
+        return;
+    }
+    m_nativeCursorHidden = hidden;
+    if (hidden) {
+        Cursors::self()->hideCursor();
+    } else {
+        Cursors::self()->showCursor();
     }
 }
 
