@@ -136,6 +136,11 @@ export class NestedComputerBackend extends KWinComputerBackend {
       // The private bus is born owned by a compositor this process started;
       // the ambient session bus knows nothing about it.
       busNameHasOwner: async () => true,
+      // The compositor here is spawned with the plugin root already on its
+      // QT_PLUGIN_PATH, so a fresh install loads without anyone logging out;
+      // the default check reads the server's session environment and would
+      // tell the user to relogin a session this plugin never loads into.
+      compositorSeesPluginRoot: () => true,
       dbusFactory: () => requireBackend(ref).connectToNestedSession(),
       spawnProcess: (app, args) => nestedSpawnProcess(runningSessionEnv(ref))(app, args),
       runClipboardCommand: (spec) => nestedClipboardRunner(runningSessionEnv(ref))(spec),

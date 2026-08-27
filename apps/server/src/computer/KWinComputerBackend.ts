@@ -247,6 +247,14 @@ export interface KWinComputerBackendOptions {
   readonly provisionPlugin?: (options: {
     readonly allowPrebuilt: boolean;
   }) => Promise<ProvisionResult>;
+  /**
+   * Whether the compositor that will load the plugin can already see the
+   * install root, forwarded to provisioning. The nested backend answers `true`:
+   * it spawns its compositor with the root injected, so the default test
+   * against the server's session environment would wrongly tell its user to
+   * log out.
+   */
+  readonly compositorSeesPluginRoot?: () => boolean;
 }
 
 /**
@@ -392,6 +400,9 @@ export class KWinComputerBackend implements ComputerBackend {
           // installed will load, so there is nothing current by construction.
           isCurrent: async () => false,
           stampPath: options.installStampPath ?? defaultInstallStampPath(),
+          ...(options.compositorSeesPluginRoot
+            ? { compositorSeesPluginRoot: options.compositorSeesPluginRoot }
+            : {}),
         }));
     this.healthState = new ComputerHealthState({
       readStatus: () => ({
