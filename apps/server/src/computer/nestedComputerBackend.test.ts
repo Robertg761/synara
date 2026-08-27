@@ -1,0 +1,434 @@
+import { describe, expect, it } from "vitest";
+
+import type { ComputerBackendEvent } from "./ComputerBackend.ts";
+import type { KWinComputerDbus } from "./kwinDbus.ts";
+import {
+  NestedComputerBackend,
+  type NestedComputerBackendOptions,
+} from "./nestedComputerBackend.ts";
+import type { NestedKWinSession, NestedKWinSessionOptions } from "./nestedKWinSession.ts";
+import type { SystemPackagePlan } from "./provisioning/systemPackages.ts";
+
+const PLUGIN_ID = "SynaraComputerUsePluginV3";
+
+const PACMAN_PLAN: SystemPackagePlan = {
+  manager: "pacman",
+  args: ["-S", "--needed", "--noconfirm"],
+  packages: ["kwin", "cmake"],
+};
+
+/** The narrow slice of the D-Bus surface the connect path exercises. */
+function fakeDbusHandle(loaded: readonly string[] = [PLUGIN_ID]): {
+  readonly dbus: KWinComputerDbus;
+  readonly fireDisconnect: () => void;
+} {
+  const plugin = {
+    healthJson: async () =>
+      JSON.stringify({ ok: true, running: false, capture: true, kwinVersion: "6.7.3" }),
+    stop: async () => true,
+  };
+  let disconnectListener: (() => void) | undefined;
+  const dbus = {
+    loaded: [...loaded],
+    listLoadedPluginIds: async () => dbus.loaded,
+    loadPlugin: async (id: string) => {
+      dbus.loaded = [id];
+      return true;
+    },
+    unloadPlugin: async (id: string) => {
+      dbus.loaded = dbus.loaded.filter((candidate) => candidate !== id);
+      return true;
+    },
+    connectPlugin: async () => plugin,
+    onDisconnect: (listener: () => void) => {
+      disconnectListener = listener;
+      return () => undefined;
+    },
+    close: async () => undefined,
+  };
+  return {
+    dbus: dbus as unknown as KWinComputerDbus,
+    fireDisconnect: () => disconnectListener?.(),
+  };
+}
+
+function fakeDbus(loaded: readonly string[] = [PLUGIN_ID]): KWinComputerDbus {
+  return fakeDbusHandle(loaded).dbus;
+}
+
+interface Harness {
+  readonly backend: NestedComputerBackend;
+  readonly sessionStarts: NestedKWinSessionOptions[];
+  readonly disposedSessions: string[];
+  readonly installedPlans: SystemPackagePlan[];
+  readonly pluginProvisions: number[];
+  readonly events: ComputerBackendEvent[];
+  installedPlugins: string[];
+}
+
+function makeHarness(
+  options: {
+    readonly mode?: "window" | "virtual";
+    readonly platform?: string;
+    readonly hostEnv?: NodeJS.ProcessEnv;
+    readonly kwinInstalled?: boolean;
+    readonly pluginInstalled?: boolean;
+    readonly buildToolingPresent?: boolean;
+    readonly prebuiltRoot?: string | undefined;
+    readonly plan?: SystemPackagePlan | undefined;
+    readonly startSession?: (
+      sessionOptions: NestedKWinSessionOptions,
+    ) => Promise<NestedKWinSession>;
+    readonly installPackages?: (plan: SystemPackagePlan) => Promise<string>;
+    readonly onPluginProvision?: () => void;
+  } = {},
+): Harness {
+  const sessionStarts: NestedKWinSessionOptions[] = [];
+  const disposedSessions: string[] = [];
+  const installedPlans: SystemPackagePlan[] = [];
+  const pluginProvisions: number[] = [];
+  const events: ComputerBackendEvent[] = [];
+  const state = { installedPlugins: options.pluginInstalled === false ? [] : [PLUGIN_ID] };
+
+  const startSession =
+    options.startSession ??
+    (async (sessionOptions: NestedKWinSessionOptions): Promise<NestedKWinSession> => {
+      sessionStarts.push(sessionOptions);
+      const busAddress = `unix:abstract=fake-${sessionStarts.length}`;
+      return {
+        busAddress,
+        waylandDisplay: "synara-nested-test",
+        size: { width: 1920, height: 1080 },
+        pluginId: PLUGIN_ID,
+        xDisplay: ":7",
+        dispose: async () => {
+          disposedSessions.push(busAddress);
+        },
+      };
+    });
+
+  const backendOptions: NestedComputerBackendOptions = {
+    mode: options.mode ?? "window",
+    platform: options.platform ?? "linux",
+    hostEnv: options.hostEnv ?? { WAYLAND_DISPLAY: "wayland-0", PATH: "/usr/bin" },
+    startSession,
+    connectDbus: async () => fakeDbus([PLUGIN_ID]),
+    hasCommand: (command) => (command === "kwin_wayland" ? (options.kwinInstalled ?? true) : false),
+    installedPluginPresent: () => state.installedPlugins.length > 0,
+    installedPluginIds: async () => state.installedPlugins,
+    buildToolingPresent: () => options.buildToolingPresent ?? true,
+    prebuiltRoot: () => options.prebuiltRoot,
+    planPackages: () => ("plan" in options ? options.plan : PACMAN_PLAN),
+    installPackages:
+      options.installPackages ??
+      (async (plan) => {
+        installedPlans.push(plan);
+        return `Installed ${plan.packages.join(", ")} with ${plan.manager}.`;
+      }),
+    provisionPlugin: async () => {
+      options.onPluginProvision?.();
+      pluginProvisions.push(1);
+      state.installedPlugins = [PLUGIN_ID];
+      return {
+        action: "installed-from-source",
+        pluginId: PLUGIN_ID,
+        requiresRelogin: false,
+        summary: "Compiled and installed the Synara KWin plugin.",
+      };
+    },
+  };
+  const backend = new NestedComputerBackend(backendOptions);
+  backend.onEvent?.((event) => events.push(event));
+  const harness: Harness = {
+    backend,
+    sessionStarts,
+    disposedSessions,
+    installedPlans,
+    pluginProvisions,
+    events,
+    get installedPlugins() {
+      return state.installedPlugins;
+    },
+    set installedPlugins(value: string[]) {
+      state.installedPlugins = value;
+    },
+  };
+  return harness;
+}
+
+describe("probeAvailability", () => {
+  it("is passive and optimistic: available without booting anything", async () => {
+    const harness = makeHarness({ kwinInstalled: false, pluginInstalled: false });
+    await expect(harness.backend.probeAvailability()).resolves.toEqual({
+      kind: "available",
+      backend: "nested-kwin",
+    });
+    expect(harness.sessionStarts).toHaveLength(0);
+    expect(harness.installedPlans).toHaveLength(0);
+  });
+
+  it("refuses a windowed session with no Wayland host to nest into", async () => {
+    const harness = makeHarness({ hostEnv: { PATH: "/usr/bin" } });
+    const availability = await harness.backend.probeAvailability();
+    expect(availability).toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("WAYLAND_DISPLAY"),
+    });
+    expect(harness.sessionStarts).toHaveLength(0);
+  });
+
+  it("keeps the virtual mode independent of the host display", async () => {
+    const harness = makeHarness({ mode: "virtual", hostEnv: { PATH: "/usr/bin" } });
+    await expect(harness.backend.probeAvailability()).resolves.toMatchObject({
+      kind: "available",
+    });
+  });
+
+  it("refuses a non-Linux platform", async () => {
+    const harness = makeHarness({ platform: "darwin" });
+    await expect(harness.backend.probeAvailability()).resolves.toEqual({
+      kind: "unsupported-platform",
+      platform: "darwin",
+    });
+  });
+});
+
+describe("capabilities", () => {
+  it("reports nothing before setup, so the settings card offers Set up", () => {
+    const harness = makeHarness({ kwinInstalled: false, pluginInstalled: false });
+    const capabilities = harness.backend.capabilities();
+    expect(capabilities.input).toBe(false);
+    expect(capabilities.capture).toBe(false);
+  });
+
+  it("reports the full set once the compositor and plugin are installed", () => {
+    const harness = makeHarness();
+    const capabilities = harness.backend.capabilities();
+    expect(capabilities.input).toBe(true);
+    expect(capabilities.capture).toBe(true);
+    expect(capabilities.sharedSeat).toBe(false);
+    expect(capabilities.visibleDesktop).toBe(false);
+  });
+
+  it("needs both artifacts, not either", () => {
+    expect(makeHarness({ kwinInstalled: false }).backend.capabilities().input).toBe(false);
+    expect(makeHarness({ pluginInstalled: false }).backend.capabilities().input).toBe(false);
+  });
+});
+
+describe("lazy session boot", () => {
+  it("boots the nested session on the first establishing read, not before", async () => {
+    const harness = makeHarness();
+    expect(harness.sessionStarts).toHaveLength(0);
+    await expect(harness.backend.availability()).resolves.toEqual({
+      kind: "available",
+      backend: "nested-kwin",
+    });
+    expect(harness.sessionStarts).toHaveLength(1);
+    expect(harness.sessionStarts[0]?.mode).toBe("window");
+  });
+
+  it("boots once and reuses the session across reads", async () => {
+    const harness = makeHarness();
+    await harness.backend.availability();
+    await harness.backend.availability();
+    expect(harness.sessionStarts).toHaveLength(1);
+  });
+
+  it("announces the capability change the boot causes", async () => {
+    const harness = makeHarness({ kwinInstalled: false, pluginInstalled: false });
+    // Pre-boot the panel was told "nothing"; the running session must push the
+    // correction rather than waiting to be asked.
+    harness.installedPlugins = [PLUGIN_ID];
+    await harness.backend.availability();
+    const change = harness.events.find((event) => event.type === "capabilities-changed");
+    expect(change).toBeDefined();
+    expect(change?.type === "capabilities-changed" && change.capabilities.input).toBe(true);
+  });
+
+  it("installs the plugin in user space before booting when it is missing", async () => {
+    const harness = makeHarness({ pluginInstalled: false });
+    await harness.backend.availability();
+    expect(harness.pluginProvisions).toHaveLength(1);
+    expect(harness.sessionStarts).toHaveLength(1);
+    // Never the polkit path: booting must not raise an authorization dialog.
+    expect(harness.installedPlans).toHaveLength(0);
+  });
+
+  it("points a failed silent install at the Set up button", async () => {
+    const failing = new NestedComputerBackend({
+      mode: "window",
+      platform: "linux",
+      hostEnv: { WAYLAND_DISPLAY: "wayland-0", PATH: "/usr/bin" },
+      startSession: async () => {
+        throw new Error("must not boot");
+      },
+      connectDbus: async () => fakeDbus(),
+      installedPluginIds: async () => [],
+      provisionPlugin: async () => {
+        throw new Error("cmake is not installed");
+      },
+    });
+    const availability = await failing.availability();
+    expect(availability).toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringMatching(/cmake is not installed.*Set up/s),
+    });
+    await failing.dispose();
+  });
+});
+
+describe("provision", () => {
+  it("installs packages, provisions the plugin, and boots, in that order", async () => {
+    const order: string[] = [];
+    const harness = makeHarness({
+      kwinInstalled: false,
+      pluginInstalled: false,
+      installPackages: async (plan) => {
+        order.push("packages");
+        return `Installed ${plan.packages.join(", ")} with ${plan.manager}.`;
+      },
+      onPluginProvision: () => order.push("plugin"),
+      startSession: async () => {
+        order.push("boot");
+        return {
+          busAddress: "unix:abstract=fake",
+          waylandDisplay: "synara-nested-test",
+          size: { width: 1920, height: 1080 },
+          pluginId: PLUGIN_ID,
+          xDisplay: undefined,
+          dispose: async () => undefined,
+        };
+      },
+    });
+    const summary = await harness.backend.provision();
+    expect(order).toEqual(["packages", "plugin", "boot"]);
+    expect(summary).toContain("Installed kwin, cmake with pacman.");
+    expect(summary).toContain("Compiled and installed the Synara KWin plugin.");
+    expect(summary).toContain("The agent's isolated desktop is running.");
+  });
+
+  it("skips the privileged step when nothing privileged is missing", async () => {
+    const harness = makeHarness();
+    const summary = await harness.backend.provision();
+    expect(harness.installedPlans).toHaveLength(0);
+    expect(harness.pluginProvisions).toHaveLength(0);
+    expect(summary).toBe("The agent's isolated desktop is running.");
+  });
+
+  it("asks for packages when the plugin must be built and nothing can build it", async () => {
+    const harness = makeHarness({
+      kwinInstalled: true,
+      pluginInstalled: false,
+      buildToolingPresent: false,
+      prebuiltRoot: undefined,
+    });
+    await harness.backend.provision();
+    expect(harness.installedPlans).toHaveLength(1);
+  });
+
+  it("trusts a shipped prebuilt instead of installing a toolchain", async () => {
+    const harness = makeHarness({
+      kwinInstalled: true,
+      pluginInstalled: false,
+      buildToolingPresent: false,
+      prebuiltRoot: "/opt/synara/prebuilt",
+    });
+    await harness.backend.provision();
+    expect(harness.installedPlans).toHaveLength(0);
+    expect(harness.pluginProvisions).toHaveLength(1);
+  });
+
+  it("names the gap on a distribution with no known package manager", async () => {
+    const harness = makeHarness({ kwinInstalled: false, plan: undefined });
+    await expect(harness.backend.provision()).rejects.toThrow(
+      /No supported package manager.*kwin/s,
+    );
+  });
+
+  it("is single-flight while running and retryable after a failure", async () => {
+    let installs = 0;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const harness = makeHarness({
+      kwinInstalled: false,
+      pluginInstalled: false,
+      installPackages: async () => {
+        installs += 1;
+        await gate;
+        throw new Error("the authorization dialog was dismissed");
+      },
+    });
+    const first = harness.backend.provision();
+    const second = harness.backend.provision();
+    release?.();
+    await expect(first).rejects.toThrow("dismissed");
+    await expect(second).rejects.toThrow("dismissed");
+    expect(installs).toBe(1);
+    // The failed run cleared the flight, so the user's retry actually retries.
+    await expect(harness.backend.provision()).rejects.toThrow("dismissed");
+    expect(installs).toBe(2);
+  });
+
+  it("replaces a dead session only on another explicit Set up", async () => {
+    const sessions: string[] = [];
+    const disposed: string[] = [];
+    const deadBuses = new Set<string>();
+    const handles = new Map<string, ReturnType<typeof fakeDbusHandle>>();
+    const backend = new NestedComputerBackend({
+      mode: "window",
+      platform: "linux",
+      hostEnv: { WAYLAND_DISPLAY: "wayland-0", PATH: "/usr/bin" },
+      hasCommand: () => true,
+      installedPluginPresent: () => true,
+      installedPluginIds: async () => [PLUGIN_ID],
+      startSession: async () => {
+        const busAddress = `unix:abstract=fake-${sessions.length + 1}`;
+        sessions.push(busAddress);
+        return {
+          busAddress,
+          waylandDisplay: "synara-nested-test",
+          size: { width: 1920, height: 1080 },
+          pluginId: PLUGIN_ID,
+          xDisplay: undefined,
+          dispose: async () => {
+            disposed.push(busAddress);
+          },
+        };
+      },
+      connectDbus: async (busAddress) => {
+        if (deadBuses.has(busAddress)) throw new Error("dbus connection refused");
+        const handle = fakeDbusHandle();
+        handles.set(busAddress, handle);
+        return handle.dbus;
+      },
+    });
+    await backend.availability();
+    expect(sessions).toHaveLength(1);
+
+    // The nested session dies: its bus stops answering and the live
+    // connection reports the disconnect. Nothing may boot a replacement
+    // behind the user's back — the establishing read stays failed.
+    deadBuses.add(sessions[0]!);
+    handles.get(sessions[0]!)?.fireDisconnect();
+    const failed = await backend.availability();
+    expect(failed.kind).toBe("backend-unavailable");
+    expect(sessions).toHaveLength(1);
+
+    // Set up is the explicit request that may replace it.
+    const summary = await backend.provision();
+    expect(sessions).toHaveLength(2);
+    expect(disposed).toContain(sessions[0]);
+    expect(summary).toContain("The agent's isolated desktop is running.");
+    await backend.dispose();
+  });
+
+  it("disposes the session with the backend", async () => {
+    const harness = makeHarness();
+    await harness.backend.availability();
+    await harness.backend.dispose();
+    expect(harness.disposedSessions).toHaveLength(1);
+  });
+});

@@ -31,6 +31,7 @@ import {
 
 const BACKEND_DISPLAY_NAMES: Record<string, string> = {
   kwin: "KWin plugin (KDE)",
+  "nested-kwin": "Isolated agent desktop (nested KWin)",
   portal: "Desktop portals (GNOME / wlroots)",
   fake: "Test backend",
 };
@@ -109,7 +110,7 @@ export function ComputerSettingsPanel({
       ? `The agent drives its own seat, so your cursor and focus stay untouched. Press ${COMPUTER_RELEASE_CONTROL_HOTKEY} at any time to stop it from acting on the desktop, and press it again to let it resume.`
       : "The agent drives its own seat, so your cursor and focus stay untouched.";
   const setupNote = setupMutation.isPending
-    ? "Installing the desktop helper. On a machine without a prebuilt binary this compiles one, which takes a few seconds."
+    ? "Setting up the agent's desktop. This may open your system's authorization dialog to install packages, and can take a few minutes if the plugin compiles from source."
     : setupMutation.isError
       ? `Setting up failed. ${
           setupMutation.error instanceof Error && setupMutation.error.message
@@ -152,10 +153,10 @@ export function ComputerSettingsPanel({
         title="Desktop backend"
         action={
           <div className="flex items-center gap-2">
-            {/* Offered whenever the desktop is not ready. Setting up is
-                installing or compiling Synara's own helper into the user's
-                data directory — the thing that used to require finding
-                build.sh in a checkout. */}
+            {/* Offered whenever the desktop is not ready. Setting up installs
+                whatever this backend still needs — distribution packages
+                through the system's own authorization dialog, Synara's KWin
+                plugin into the user's home — and boots the agent's desktop. */}
             {needsSetup && !statusQuery.isError ? (
               <Button
                 size="xs"

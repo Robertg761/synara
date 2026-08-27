@@ -11,15 +11,8 @@ import {
   type LinuxBackendSelection,
 } from "../linuxBackendSelection.ts";
 import { sessionBusNameHasOwner } from "../sessionBusNames.ts";
-import {
-  nestedAtspiMode,
-  nestedKWinBackendOptions,
-  nestedModeLabel,
-  parseNestedSizeEnv,
-  startNestedKWinSession,
-  type NestedKWinSession,
-  type NestedSessionMode,
-} from "../nestedKWinSession.ts";
+import { NestedComputerBackend } from "../nestedComputerBackend.ts";
+import { nestedAtspiMode, parseNestedSizeEnv } from "../nestedKWinSession.ts";
 import { ComputerService, type ComputerServiceShape } from "../Services/ComputerService.ts";
 import type { ComputerBackend } from "../ComputerBackend.ts";
 
@@ -32,7 +25,6 @@ export interface ComputerServiceLiveOptions {
 
 interface LinuxBackend {
   readonly backend: ComputerBackend;
-  readonly dispose?: () => Promise<void>;
 }
 
 export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {}) {
@@ -44,13 +36,6 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
           ? yield* Effect.promise(() => makeLinuxBackend())
           : undefined;
       const backend = options.backend ?? linux?.backend ?? new FakeComputerBackend();
-      // Registered before the manager's finalizer because a scope runs
-      // finalizers in reverse: the backend is disposed first, so nothing is
-      // still talking to the nested compositor when it is killed.
-      const nestedDispose = linux?.dispose;
-      if (nestedDispose) {
-        yield* Effect.addFinalizer(() => Effect.promise(() => nestedDispose()));
-      }
       const manager = new ComputerManager({ backend });
       yield* Effect.addFinalizer(() => Effect.promise(() => manager.dispose()));
       let availability: ComputerAvailability;
@@ -106,38 +91,24 @@ async function makeLinuxBackend(): Promise<LinuxBackend> {
     case "kwin":
       return { backend: new KWinComputerBackend() };
     case "nested":
-    case "nested-window":
-      return await makeNestedBackend(nestedModeForChoice(selection.choice) ?? "virtual");
+    case "nested-window": {
+      // Constructed, not booted: the nested compositor is expensive and — in
+      // window mode — visible, so nothing may appear because a server started.
+      // The backend boots its session on first real use, and its `provision()`
+      // is the settings panel's one-click setup. The geometry comes from
+      // `SYNARA_COMPUTER_NESTED_SIZE=WxH`. A session that fails to boot stays
+      // failed: falling back to the real desktop would hand an agent the
+      // human's screen right after an operator asked for an isolated one.
+      const size = parseNestedSizeEnv(process.env.SYNARA_COMPUTER_NESTED_SIZE);
+      return {
+        backend: new NestedComputerBackend({
+          mode: nestedModeForChoice(selection.choice) ?? "virtual",
+          ...(size ? { size } : {}),
+          atspiMode: nestedAtspiMode(),
+        }),
+      };
+    }
   }
-}
-
-/**
- * A private compositor this process owns, with the geometry from
- * `SYNARA_COMPUTER_NESTED_SIZE=WxH`. One that fails to boot stays failed:
- * falling back to the real desktop would hand an agent the human's screen right
- * after an operator asked for an isolated one.
- */
-async function makeNestedBackend(mode: NestedSessionMode): Promise<LinuxBackend> {
-  const size = parseNestedSizeEnv(process.env.SYNARA_COMPUTER_NESTED_SIZE);
-  let session: NestedKWinSession;
-  try {
-    session = await startNestedKWinSession(size ? { mode, size } : { mode });
-  } catch (error) {
-    // The mode is part of the message: the two boot different things and fail
-    // for different reasons — a missing kwin_wayland, an uninstalled plugin, a
-    // bus that never answered, no host display to nest into.
-    return {
-      backend: new UnavailableComputerBackend(
-        `The ${nestedModeLabel(mode)} nested KWin session did not start: ${describeError(error)}`,
-      ),
-    };
-  }
-  return {
-    backend: new KWinComputerBackend(
-      nestedKWinBackendOptions(session, { atspiMode: nestedAtspiMode() }),
-    ),
-    dispose: () => session.dispose(),
-  };
 }
 
 function describeError(error: unknown): string {
