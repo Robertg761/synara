@@ -90,6 +90,7 @@ describe("nested session environment", () => {
       size: { width: 1_920, height: 1_080 },
       pluginId: "SynaraComputerUsePluginV3",
       xDisplay: undefined,
+      exited: () => undefined,
       dispose: async () => undefined,
     };
     const options = nestedKWinBackendOptions(session);
@@ -179,6 +180,24 @@ describe("startNestedKWinSession", () => {
 
     await session.dispose();
     expect(harness.spawns.map((spawn) => spawn.child.signal)).toEqual(["SIGTERM", "SIGTERM"]);
+  });
+
+  it("reports through exited() when either of its processes ends", async () => {
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(harness.options());
+    expect(session.exited()).toBeUndefined();
+
+    // The compositor is the process a human can end by closing the nested
+    // window, and a clean exit is exactly what that looks like.
+    harness.spawns[1]?.child.emit("exit", 0, null);
+    expect(session.exited()).toBe("exit code 0, signal null");
+    await session.dispose();
+
+    const busHarness = new NestedHarness();
+    const busSession = await startNestedKWinSession(busHarness.options());
+    busHarness.spawns[0]?.child.emit("exit", 1, null);
+    expect(busSession.exited()).toBe("exit code 1, signal null");
+    await busSession.dispose();
   });
 
   it("keeps a virtual compositor off the host display", async () => {

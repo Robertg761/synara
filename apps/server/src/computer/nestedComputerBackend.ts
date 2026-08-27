@@ -23,10 +23,12 @@
  *   session so the card can say the desktop is running.
  *
  * A nested compositor that dies is not restarted behind anyone's back — the
- * reconnect loop keeps failing against the dead bus and health reports the
- * outage, exactly like a real KWin crash. The one sanctioned restart is
- * another explicit `provision()`: the user asked, so a dead session is
- * replaced with a fresh one.
+ * desktop is an ordinary window of the host session, so "it died" is usually
+ * "the human closed it", and a window that respawns on a supervision timer is
+ * a haunting. Instead the dead session is reaped, the reconnect loop is told
+ * the desktop is dormant and stands down, and the next *real* use — an agent
+ * action, a pane attach, the settings panel's Refresh or Set up — boots a
+ * fresh session, exactly like first use did.
  */
 import type { ComputerAvailability, ComputerCapabilities } from "@synara/contracts";
 import { COMPUTER_NESTED_KWIN_BACKEND } from "@synara/contracts";
@@ -41,6 +43,7 @@ import {
   prebuiltPluginRoot,
   scanInstalledPluginIds,
   type KWinComputerBackendOptions,
+  type KWinDbusConnectContext,
 } from "./KWinComputerBackend.ts";
 import { createSessionKWinComputerDbus, type KWinComputerDbus } from "./kwinDbus.ts";
 import {
@@ -64,6 +67,9 @@ import {
 
 const KWIN_COMMAND = "kwin_wayland";
 const INSTALLED_PLUGIN_FILE = /^SynaraComputerUsePluginV\d+\.so$/;
+const DESKTOP_DORMANT_MESSAGE =
+  "The agent's isolated desktop is not running — its window may have been closed. " +
+  "It starts again the next time an agent uses the computer, or click Refresh to start it now.";
 const NO_WAYLAND_HOST_MESSAGE =
   "The agent's isolated desktop runs as a window of your Wayland session, and WAYLAND_DISPLAY " +
   "is not set for this server. Start Synara from inside the desktop session, or set " +
@@ -141,7 +147,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
       // the default check reads the server's session environment and would
       // tell the user to relogin a session this plugin never loads into.
       compositorSeesPluginRoot: () => true,
-      dbusFactory: () => requireBackend(ref).connectToNestedSession(),
+      dbusFactory: (context) => requireBackend(ref).connectToNestedSession(context),
       spawnProcess: (app, args) => nestedSpawnProcess(runningSessionEnv(ref))(app, args),
       runClipboardCommand: (spec) => nestedClipboardRunner(runningSessionEnv(ref))(spec),
       atspi: nestedAtspi(options.atspiMode ?? "off", ref),
@@ -244,8 +250,10 @@ export class NestedComputerBackend extends KWinComputerBackend {
     }
     let availability = await this.availability();
     if (availability.kind !== "available" && this.ref.session) {
-      // The user explicitly asked for a working desktop, which is the one
-      // sanctioned way a dead nested session gets replaced by a fresh one.
+      // A session whose processes exited was already reaped and replaced on
+      // the way into availability(); reaching here with a session still cached
+      // means it is alive but broken — a wedged compositor, a refused plugin.
+      // The user explicitly asked for a working desktop, so replace it too.
       const dead = this.ref.session;
       this.ref.session = undefined;
       await dead.dispose().catch(() => undefined);
@@ -290,14 +298,31 @@ export class NestedComputerBackend extends KWinComputerBackend {
   }
 
   /** What the base class's lazy `dbusFactory` resolves to: session, then bus. */
-  private async connectToNestedSession(): Promise<KWinComputerDbus> {
-    const session = await this.ensureSession();
+  private async connectToNestedSession(context: KWinDbusConnectContext): Promise<KWinComputerDbus> {
+    const session = await this.ensureSession(context.automatic);
     return await this.connectDbus(session.busAddress);
   }
 
-  private async ensureSession(): Promise<NestedKWinSession> {
-    if (this.ref.session) return this.ref.session;
-    this.sessionStart ??= this.bootSession().finally(() => {
+  private async ensureSession(automatic: boolean): Promise<NestedKWinSession> {
+    const current = this.ref.session;
+    if (current) {
+      if (current.exited() === undefined) return current;
+      // The desktop is an ordinary window of the host session, so a dead
+      // compositor is usually a window the human closed. Its bus address never
+      // comes back; reap the session so it stops pinning dead pipes and so the
+      // next boot is not mistaken for a duplicate of a live one.
+      this.ref.session = undefined;
+      await current.dispose().catch(() => undefined);
+    }
+    if (this.sessionStart) return await this.sessionStart;
+    if (automatic) {
+      // The reconnect loop is asking, with no user or agent behind it. Booting
+      // here would respawn the desktop window seconds after the human closed
+      // it, so report dormancy — which stands the loop down — and leave the
+      // boot to the next real use.
+      throw new ComputerBackendError(DESKTOP_DORMANT_MESSAGE, { dormant: true, retryable: true });
+    }
+    this.sessionStart = this.bootSession().finally(() => {
       this.sessionStart = undefined;
     });
     return await this.sessionStart;

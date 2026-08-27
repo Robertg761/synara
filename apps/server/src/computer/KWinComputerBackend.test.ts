@@ -16,7 +16,11 @@ import {
   resolveInstallScriptPath,
   type KWinComputerBackendOptions,
 } from "./KWinComputerBackend.ts";
-import { MAX_COMPUTER_CLIPBOARD_BYTES, type ComputerResolvedTarget } from "./ComputerBackend.ts";
+import {
+  ComputerBackendError,
+  MAX_COMPUTER_CLIPBOARD_BYTES,
+  type ComputerResolvedTarget,
+} from "./ComputerBackend.ts";
 import type { ClipboardCommandResult, ClipboardCommandSpec } from "./wlClipboard.ts";
 import type { AtspiTextWrite, AtspiTreeReader } from "./atspiClient.ts";
 import {
@@ -2324,6 +2328,46 @@ describe("KWinComputerBackend KWin crash recovery", () => {
     ]);
 
     await backend.dispose();
+  });
+});
+
+describe("KWinComputerBackend dormant desktop", () => {
+  it("stands the reconnect loop down when the factory refuses to boot for it", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      dbus.loaded = ["SynaraComputerUsePluginV10"];
+      let factoryCalls = 0;
+      const backend = makeBackend(dbus, {
+        // What the nested backend's factory does once its compositor process
+        // has exited and the caller is the reconnect loop, not a real use.
+        dbusFactory: async () => {
+          factoryCalls += 1;
+          throw new ComputerBackendError("The desktop is not running.", {
+            dormant: true,
+            retryable: true,
+          });
+        },
+      });
+
+      await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(factoryCalls).toBe(1);
+      expect(backend.health()).toMatchObject({
+        status: "unavailable",
+        lastFailure: { message: "The desktop is not running." },
+      });
+
+      // Stood down for good: no amount of waiting produces another attempt.
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(factoryCalls).toBe(1);
+
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
