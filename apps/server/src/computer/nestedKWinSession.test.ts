@@ -215,9 +215,6 @@ describe("startNestedKWinSession", () => {
     expect(harness.spawns[1]?.env.WAYLAND_DISPLAY).toBe("wayland-0");
     expect(harness.spawns[1]?.env.DISPLAY).toBeUndefined();
     expect(harness.spawns[1]?.env.DBUS_SESSION_BUS_ADDRESS).toBe(BUS_ADDRESS);
-    // The windowed backend otherwise puts the cursor on a host subsurface the
-    // plugin's captures cannot see.
-    expect(harness.spawns[1]?.env.KWIN_FORCE_SW_CURSOR).toBe("1");
 
     await session.dispose();
   });

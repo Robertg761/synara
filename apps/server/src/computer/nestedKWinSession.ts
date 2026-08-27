@@ -448,12 +448,6 @@ function compositorEnv(
     // are not Plasma, so the same root has to ride the environment here or the
     // freshly installed plugin is invisible to the very KWin booted to load it.
     QT_PLUGIN_PATH: prependQtPluginRoot(hostEnv.QT_PLUGIN_PATH),
-    // Without this, KWin puts its cursor on a native layer — the windowed
-    // backend shows it as a subsurface of the host window — where the plugin's
-    // capture path cannot composite it, so the agent's own screenshots show a
-    // desktop with no pointer. Software cursor keeps the cursor in the scene,
-    // making the pixels on the visible window and in captures the same.
-    KWIN_FORCE_SW_CURSOR: "1",
   };
   if (mode === "virtual") delete env.WAYLAND_DISPLAY;
   delete env.DISPLAY;

@@ -582,7 +582,7 @@ static bool renderCapturePart(WorkspaceScene *scene,
                               const RectF &viewport,
                               Window *selectedWindow,
                               bool windowCapture,
-                              Item *agentCursorItem,
+                              bool sceneCursorIsAgents,
                               QImage *image,
                               QString *error)
 {
@@ -630,17 +630,23 @@ static bool renderCapturePart(WorkspaceScene *scene,
         return windowCapture && window != selectedWindow;
     });
 
-    std::unique_ptr<ItemTreeView> cursorView;
-    if (Item *cursorItem = scene->cursorItem()) {
-        cursorView = std::make_unique<ItemTreeView>(&view, cursorItem, output, backendOutput, &layer);
-        // setExclusive(true) already registers with the SceneView; registering again
-        // would leave a dangling entry after ~ItemTreeView's single removeOne.
-        cursorView->setExclusive(true);
-    }
-    std::unique_ptr<ItemTreeView> agentCursorView;
-    if (agentCursorItem) {
-        agentCursorView = std::make_unique<ItemTreeView>(&view, agentCursorItem, output, backendOutput, &layer);
-        agentCursorView->setExclusive(true);
+    // A fresh SceneView has no exclusive views, so paint() covers the whole
+    // overlay tree — the compositor's cursor and the agent's ghost cursor
+    // included. That is the only way a cursor reaches this capture at all:
+    // ItemTreeView::setExclusive(true) *removes* an item from the parent view's
+    // rendering (each exclusive view is a layer the compositor presents
+    // separately, and nothing presents one here). The output's own cursor layer
+    // registers its exclusivity with the output's SceneView, not this one, so a
+    // cursor shown on a native layer on screen still paints into the capture.
+    // The one cursor that must not leak in is the human's: on the shared-desktop
+    // backend the scene cursor is theirs, so it is claimed by an exclusive view
+    // that is deliberately never painted.
+    std::unique_ptr<ItemTreeView> humanCursorExclusion;
+    if (!sceneCursorIsAgents) {
+        if (Item *cursorItem = scene->cursorItem()) {
+            humanCursorExclusion = std::make_unique<ItemTreeView>(&view, cursorItem, output, backendOutput, &layer);
+            humanCursorExclusion->setExclusive(true);
+        }
     }
 
     view.prePaint();
@@ -1915,7 +1921,7 @@ void SynaraComputerUsePlugin::captureAtRenderOpportunity(std::shared_ptr<Capture
                                output.viewport,
                                selectedWindow,
                                request->windowCapture,
-                               m_cursorItem.get(),
+                               m_ownsCompositor,
                                &image,
                                &error)) {
             failCapture(request, error);
