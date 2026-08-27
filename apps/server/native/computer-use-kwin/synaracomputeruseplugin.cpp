@@ -389,7 +389,7 @@ static bool isWindowVisibleForCapture(const Window *window)
         && !window->isHiddenByShowDesktop();
 }
 
-static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &nativeSize, qreal effectiveScale, uint maxDimension, QString *error)
+static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &nativeSize, qreal effectiveScale, uint maxDimension, bool opaqueBackground, QString *error)
 {
     if (parts.isEmpty() || !nativeSize.isValid()) {
         *error = QStringLiteral("capture produced no pixels");
@@ -401,10 +401,18 @@ static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &na
         *error = QStringLiteral("capture image allocation failed");
         return {};
     }
-    image.fill(Qt::transparent);
+    // A screen is opaque by definition, but the scene's background clear is
+    // transparent black, which the pixels keep on the offscreen readback path.
+    // On a desktop with no maximized window that encodes as a mostly (or, on an
+    // empty nested desktop, entirely) transparent PNG that viewers and models
+    // flatten to white — nothing like the black the visible output shows. Only
+    // a single-window capture keeps alpha: there the surround genuinely is
+    // "not this window" rather than screen the compositor painted black.
+    image.fill(opaqueBackground ? QColor(Qt::black) : QColor(Qt::transparent));
 
     QPainter painter(&image);
-    painter.setCompositionMode(QPainter::CompositionMode_Source);
+    painter.setCompositionMode(opaqueBackground ? QPainter::CompositionMode_SourceOver
+                                                : QPainter::CompositionMode_Source);
     for (const CapturePart &part : parts) {
         if (part.image.isNull() || !part.destination.isValid()) {
             continue;
@@ -1921,9 +1929,9 @@ void SynaraComputerUsePlugin::captureAtRenderOpportunity(std::shared_ptr<Capture
     m_captureRenderWatchdog.stop();
     m_captureEncodeWatchdog.start(s_captureEncodeDeadlineMilliseconds);
     m_encodePool.start(new CaptureEncodeTask(
-        [receiver, request, parts = std::move(parts), nativeSize = *nativeSize, effectiveScale, maxDimension]() mutable {
+        [receiver, request, parts = std::move(parts), nativeSize = *nativeSize, effectiveScale, maxDimension, opaqueBackground = !request->windowCapture]() mutable {
             QString error;
-            const QByteArray png = encodeCapture(parts, nativeSize, effectiveScale, maxDimension, &error);
+            const QByteArray png = encodeCapture(parts, nativeSize, effectiveScale, maxDimension, opaqueBackground, &error);
             if (!receiver) {
                 return;
             }
