@@ -42,11 +42,12 @@ class SurfaceInterface;
 class Window;
 
 /**
- * The ghost cursor: a second pointer drawn beside the human's own.
+ * The ghost cursor: the agent's drawn pointer, identical on every backend.
  *
- * Both the arrow and the name badge are children of this item, which is what
- * keeps them out of the plugin's screenshots - captures exclude this whole
- * subtree by rendering it into its own exclusive ItemTreeView.
+ * On the human's compositor it is a second pointer beside theirs; on a
+ * compositor the agent owns it stands in for KWin's native cursor, which is
+ * hidden while a session runs. Captures paint it, so the agent sees its own
+ * pointer the way a person sees theirs.
  */
 class SynaraAgentCursorItem : public Item
 {
@@ -154,6 +155,7 @@ private:
     void detachInputDevice();
     void ensureCursorItem();
     void setCursorVisible(bool visible);
+    void setNativeCursorHidden(bool hidden);
     QPointF confinedPoint(const QPointF &point) const;
     Window *windowAt(const QPointF &point, InputKind kind) const;
     Window *findWindowById(const QString &windowId) const;
@@ -273,6 +275,9 @@ private:
     double m_directAxisRemainderH = 0;
     double m_directAxisRemainderV = 0;
     std::unique_ptr<SynaraAgentCursorItem> m_cursorItem;
+    // Cursors::hideCursor() is refcounted, so an unbalanced call would blank the
+    // compositor's cursor forever; this tracks the one hide this plugin may owe.
+    bool m_nativeCursorHidden = false;
     // Held here and not only on the cursor item, because the server names the
     // session before the first start() and the item is built lazily.
     QString m_agentName;

@@ -1,7 +1,7 @@
 # Synara KWin computer-use plugin
 
 A binary KWin plugin that gives Synara native compositor integration for computer
-use on Linux/KDE. It paints a separate visible agent cursor (`synara-agent`),
+use on Linux/KDE. It paints the agent's own visible cursor (`synara-agent`),
 routes synthetic pointer and keyboard events through KWin's compositor seat so
 real Wayland clients receive them, and exposes a small D-Bus control API.
 
@@ -23,13 +23,18 @@ the macOS comparison.
   their own theme is indistinguishable from theirs, and telling the two apart is
   the whole point. It is a violet silhouette with a light rim and a dark outer
   stroke, so it reads against any wallpaper, sized from the human's own
-  `themeSize` so both cursors are the same physical size.
+  `themeSize` so both cursors are the same physical size. On a compositor the
+  agent owns (a nested session) the same drawn item stands in for KWin's native
+  cursor, which is hidden while a session runs: the native arrow depends on a
+  cursor theme the host distro may not ship and on clients not hiding or
+  replacing it, and the drawn item makes the agent's pointer look identical on
+  every machine. It follows the seat's `Cursor::posChanged` there, since clients
+  can warp the pointer and the human can drive it through the host window's
+  pointer grab.
 - A name badge — a pill naming the driving thread — is a second `ImageItem`
   child of the cursor item, offset below-right of the hotspot so it never covers
   the click point. It is fully opaque while the agent acts and fades out two
-  seconds after the last action. Being a child of the cursor item is what keeps
-  it out of `captureWindow`/`captureRegion`, which exclude that whole subtree by
-  rendering it into its own exclusive `ItemTreeView`.
+  seconds after the last action.
 - Both images are rasterized at the scale of the output the hotspot is on and
   redrawn when the cursor crosses onto an output with a different scale, when
   the human's cursor theme changes, or when the outputs change.
@@ -148,8 +153,10 @@ states.
 Capture requests are rendered at the next safe compositor render opportunity.
 `maxDimension = 0` keeps native pixels; otherwise the PNG is downscaled so its
 largest dimension is at most `maxDimension`. The plugin reads back the native
-resolution first, then applies `maxDimension` during PNG encoding. Both the
-workspace cursor and the Synara agent cursor are excluded from the pixels.
+resolution first, then applies `maxDimension` during PNG encoding. The agent's
+own cursor is painted into the pixels, so the agent sees its pointer the way a
+person sees theirs; the human's cursor never is — on the shared desktop it is
+claimed by an exclusive `ItemTreeView` that is deliberately never painted.
 
 Only one capture may be in flight. A second concurrent call fails with
 `org.synara.ComputerUse.Error.CaptureFailed` and the reason `capture already in
