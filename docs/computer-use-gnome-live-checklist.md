@@ -1,5 +1,10 @@
 # Computer use: GNOME live checklist
 
+> **On hold as of 2026-08-26:** the seat policy (design doc, "Current capabilities") disabled the
+> shared-seat portal backend this checklist exercises — `SYNARA_COMPUTER_BACKEND=portal` is now
+> refused. Running this checklist would require temporarily re-wiring the portal choice in
+> `linuxBackendSelection.ts`. Kept for if the portal work is ever revived (e.g. upstream).
+
 Everything GNOME in Tier 2 phase B3 was built against an in-process fake of the portal bus, on a
 Fedora KDE box with no GNOME session available. The fake proves our client code follows the portal's
 Request/Response convention, latches denials, and dies when the session dies. It proves nothing about

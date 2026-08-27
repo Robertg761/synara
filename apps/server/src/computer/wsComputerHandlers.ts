@@ -47,7 +47,7 @@ import type { ComputerServiceShape } from "./Services/ComputerService.ts";
  */
 const UNSUPPORTED_MESSAGE =
   "Linux computer control requires a Wayland session this server can reach: either KDE with the Synara KWin plugin, " +
-  "another Wayland desktop with xdg-desktop-portal, or SYNARA_COMPUTER_NESTED=window for an isolated agent desktop.";
+  "or the kwin package installed so Synara can run the agent's own isolated nested desktop.";
 
 function unsupported<A>(): Effect.Effect<A, WsRpcError> {
   return Effect.fail(new WsRpcError({ message: UNSUPPORTED_MESSAGE }));

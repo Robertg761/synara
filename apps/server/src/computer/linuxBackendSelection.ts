@@ -1,13 +1,23 @@
 /**
  * Which computer backend this Linux host gets, decided once at startup.
  *
- * An explicit ordered resolution with **no fallback in any direction**. Falling
- * back from a nested session to the real desktop would hand an agent the human's
- * screen right after an operator asked for an isolated one; falling the other
- * way would hide a broken desktop behind a session nobody can see; and falling
- * from Tier 1 to Tier 2 would silently downgrade a KDE user from a dedicated
- * seat to the shared one without saying so. A tier that fails stays failed, and
- * the backend it produces explains why.
+ * One rule outranks everything here: **the agent never drives the seat the
+ * human is sitting at.** Every backend this module can resolve gives the agent
+ * a seat of its own — the KWin plugin's dedicated seat on a KDE session, or a
+ * private nested compositor everywhere else. The shared-seat portal backend
+ * still exists in the tree (`portal/`), but it attaches virtual devices to the
+ * human's own `wl_seat` and moves their real cursor, so nothing resolves to
+ * it: it has no auto-detection path, and naming it in the override is refused
+ * with the reason rather than honored.
+ *
+ * Beyond that rule, an explicit ordered resolution with **no fallback in any
+ * direction**. Falling back from a nested session to the real desktop would
+ * hand an agent the human's screen right after an operator asked for an
+ * isolated one; falling the other way would hide a broken desktop behind a
+ * session nobody can see. A tier that fails stays failed, and the backend it
+ * produces explains why — on a host without `kwin_wayland`, the nested
+ * backend's failure names the package to install rather than quietly picking
+ * something that would touch the human's seat.
  *
  * The auto-detection asks the session bus who owns `org.kde.KWin` rather than
  * reading `XDG_CURRENT_DESKTOP`. The compositor is the thing that decides
@@ -19,7 +29,7 @@ import { KWIN_SERVICE } from "./kwinDbus.ts";
 import { nestedSessionMode, type NestedSessionMode } from "./nestedKWinSession.ts";
 
 /** Every backend `SYNARA_COMPUTER_BACKEND` can name, in the plan's spelling. */
-export const LINUX_BACKEND_CHOICES = ["kwin", "nested", "nested-window", "portal"] as const;
+export const LINUX_BACKEND_CHOICES = ["kwin", "nested", "nested-window"] as const;
 export type LinuxBackendChoice = (typeof LINUX_BACKEND_CHOICES)[number];
 
 export interface LinuxBackendSelection {
@@ -46,6 +56,23 @@ export class InvalidComputerBackendOverrideError extends Error {
 }
 
 /**
+ * `portal` is spelled correctly and refused anyway. The distinction matters in
+ * the availability card: a typo gets "no such backend", but this one names the
+ * policy, because an operator who typed `portal` found a backend that exists in
+ * the tree and deserves to know it is unreachable on purpose, not missing.
+ */
+export class SharedSeatBackendDisabledError extends Error {
+  constructor() {
+    super(
+      "SYNARA_COMPUTER_BACKEND=portal names the shared-seat portal backend, which is disabled: " +
+        "it drives the pointer and keyboard of the seat the human is sitting at. Computer use " +
+        `only runs on a seat of its own. Use one of: ${LINUX_BACKEND_CHOICES.join(", ")}.`,
+    );
+    this.name = "SharedSeatBackendDisabledError";
+  }
+}
+
+/**
  * The override, or `undefined` when none is set.
  *
  * A typo throws instead of being ignored. Every other env var here degrades to
@@ -58,7 +85,9 @@ export function parseComputerBackendOverride(
 ): LinuxBackendChoice | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
-  const match = LINUX_BACKEND_CHOICES.find((choice) => choice === trimmed.toLowerCase());
+  const lowered = trimmed.toLowerCase();
+  if (lowered === "portal") throw new SharedSeatBackendDisabledError();
+  const match = LINUX_BACKEND_CHOICES.find((choice) => choice === lowered);
   if (!match) throw new InvalidComputerBackendOverrideError(trimmed);
   return match;
 }
@@ -80,8 +109,8 @@ export interface LinuxBackendSelectionDependencies {
 }
 
 /**
- * Resolves the backend in the plan's order: override, nested opt-in, KWin
- * presence, Tier 2.
+ * Resolves the backend in order: override, nested opt-in, KWin presence, and
+ * the windowed nested compositor for every other desktop.
  */
 export async function selectLinuxBackend(
   dependencies: LinuxBackendSelectionDependencies,
@@ -119,7 +148,7 @@ export async function selectLinuxBackend(
     // evidence that nothing here can work. Keeping the KWin path means its
     // availability check reports the bus failure in its own words, which is
     // both the pre-existing behavior on such a host and the more actionable
-    // message; routing to Tier 2 would blame the wrong tier for a dead bus.
+    // message; booting a nested compositor would blame it for a dead bus.
     return {
       choice: "kwin",
       forced: false,
@@ -128,8 +157,10 @@ export async function selectLinuxBackend(
   }
 
   return {
-    choice: "portal",
+    choice: "nested-window",
     forced: false,
-    reason: `No process owns ${KWIN_SERVICE}, so this is not a KWin session and Tier 2 applies.`,
+    reason:
+      `No process owns ${KWIN_SERVICE}, so this desktop has no seat to dedicate to the agent; ` +
+      "the windowed nested compositor gives it one of its own instead of sharing the human's.",
   };
 }
