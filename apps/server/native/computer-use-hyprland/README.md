@@ -21,9 +21,13 @@ mirror — the compositor's seat state is never touched), and the capture
 pipeline (offscreen GPU render of a window snapshot or each monitor's full
 scene, read back and composited in cairo with the ghost cursor overlaid, so
 captures show the agent's pointer exactly where the human sees it; the human's
-cursor is never in the offscreen scene). What remains is server-side wiring:
-a `hyprland` backend tier with auto-detection and `hyprctl plugin load`
-provisioning.
+cursor is never in the offscreen scene). The server side is wired too: a live
+Hyprland session (instance signature with a live socket) auto-selects the
+`hyprland` backend tier, which reuses the whole KWin backend engine through a
+`hyprctl`-backed plugin host (`apps/server/src/computer/hyprlandPluginHost.ts`)
+and provisions with `scripts/install-and-load.sh` — prebuilt when one matches
+the exact running Hyprland, otherwise built from source, loaded live by
+absolute path with no relogin ever.
 
 Development testing runs in a disposable nested Hyprland (nested inside a
 headless `kwin_wayland --virtual` parent — Hyprland cannot boot headless on a

@@ -1,6 +1,6 @@
 import {
-  COMPUTER_KWIN_BACKEND,
   COMPUTER_RELEASE_CONTROL_HOTKEY,
+  COMPUTER_RELEASE_HOTKEY_BACKENDS,
   type ComputerAvailability,
   type ComputerFrameHeader,
   type ComputerHealth,
@@ -97,7 +97,7 @@ export function resolveComputerAvailabilityView(
     return {
       kind: "blocked",
       title: "Computer control is unavailable",
-      description: `This server is running on ${availability.platform}. Linux computer control needs Wayland, KWin, and the Synara plugin.`,
+      description: `This server is running on ${availability.platform}. Linux computer control needs a Wayland compositor Synara has a plugin for (KWin or Hyprland), or its own nested desktop.`,
     };
   }
   return {
@@ -180,7 +180,8 @@ export function computerReleaseControlHint(input: {
   const availability = input.availability;
   if (
     availability?.kind !== "available" ||
-    availability.backend !== COMPUTER_KWIN_BACKEND ||
+    availability.backend === undefined ||
+    !COMPUTER_RELEASE_HOTKEY_BACKENDS.includes(availability.backend) ||
     !input.visibleDesktop
   ) {
     return null;

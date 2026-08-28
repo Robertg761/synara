@@ -4,8 +4,8 @@
 // Exports: ComputerSettingsPanel
 
 import {
-  COMPUTER_KWIN_BACKEND,
   COMPUTER_RELEASE_CONTROL_HOTKEY,
+  COMPUTER_RELEASE_HOTKEY_BACKENDS,
   type ComputerCapabilities,
 } from "@synara/contracts";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -31,6 +31,7 @@ import {
 
 const BACKEND_DISPLAY_NAMES: Record<string, string> = {
   kwin: "KWin plugin (KDE)",
+  hyprland: "Hyprland plugin",
   "nested-kwin": "Isolated agent desktop (nested KWin)",
   portal: "Desktop portals (GNOME / wlroots)",
   fake: "Test backend",
@@ -102,11 +103,14 @@ export function ComputerSettingsPanel({
   const backend =
     status?.availability.kind === "available" ? (status.availability.backend ?? null) : null;
   const health = status?.health;
-  // The emergency release is a shortcut the KWin plugin registers with the
-  // compositor. No other backend binds it, and a nested offscreen session never
-  // hears the human's keys, so only the visible KWin desktop may promise it.
+  // The emergency release is a shortcut the compositor plugin (KWin or
+  // Hyprland) registers with the compositor. No other backend binds it, and a
+  // nested offscreen session never hears the human's keys, so only a visible
+  // plugin-backed desktop may promise it.
   const dedicatedSeatDescription =
-    backend === COMPUTER_KWIN_BACKEND && status?.capabilities.visibleDesktop === true
+    backend !== null &&
+    COMPUTER_RELEASE_HOTKEY_BACKENDS.includes(backend) &&
+    status?.capabilities.visibleDesktop === true
       ? `The agent drives its own seat, so your cursor and focus stay untouched. Press ${COMPUTER_RELEASE_CONTROL_HOTKEY} at any time to stop it from acting on the desktop, and press it again to let it resume.`
       : "The agent drives its own seat, so your cursor and focus stay untouched.";
   const setupNote = setupMutation.isPending
