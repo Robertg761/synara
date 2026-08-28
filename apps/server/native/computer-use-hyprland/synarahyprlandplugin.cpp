@@ -24,6 +24,7 @@
 // like the KWin plugin's QDBus slots.
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/plugins/PluginSystem.hpp>
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/SharedDefs.hpp>
 #include <hyprland/src/event/EventBus.hpp>
@@ -1135,6 +1136,13 @@ bool requireRunning() {
     return true;
 }
 
+std::string modulePath() {
+    if (!g_pPluginSystem || !PHANDLE)
+        return "";
+    const auto* plugin = g_pPluginSystem->getPluginByHandle(PHANDLE);
+    return plugin ? plugin->m_path : "";
+}
+
 // ---------------------------------------------------------------------------
 // D-Bus methods
 // ---------------------------------------------------------------------------
@@ -1154,6 +1162,10 @@ std::string healthJson() {
         .str("buildTimestamp", SYNARA_CU_BUILD_TS)
         .str("compositor", "hyprland")
         .str("hyprlandVersion", g.hyprlandVersion)
+        // The .so this instance was loaded from. `hyprctl plugin list` reports
+        // only plugin names while load/unload address paths, so this is how the
+        // server learns which installed build is the one answering the bus.
+        .str("modulePath", modulePath())
         // Always the human's live compositor, so always the KWin plugin's
         // shared-desktop shape: no real agent seat, direct per-client
         // injection, ghost cursor drawn by the plugin.
