@@ -31,6 +31,10 @@
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Texture.hpp>
 #include <hyprland/src/render/pass/TexPassElement.hpp>
+#include <hyprland/src/render/pass/ClearPassElement.hpp>
+#include <hyprland/src/render/Framebuffer.hpp>
+#include <hyprland/src/render/gl/GLFramebuffer.hpp>
+#include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/ViewState.hpp>
@@ -1161,8 +1165,7 @@ std::string healthJson() {
         .boolean("workspace", static_cast<bool>(Desktop::windowState()))
         .str("xDisplay", std::getenv("DISPLAY") ? std::getenv("DISPLAY") : "")
         .boolean("effects", true)
-        // Flips when the capture pipeline lands.
-        .boolean("capture", false)
+        .boolean("capture", g_pHyprRenderer != nullptr && Render::GL::g_pHyprOpenGL != nullptr)
         .num("idleTimeoutMs", g.idleTimeoutMs)
         .boolean("releasedByUser", g.releasedByUser)
         .str("releaseShortcut", RELEASE_SHORTCUT_LABEL)
@@ -1513,12 +1516,320 @@ bool injectKey(uint32_t keyCode, bool pressed) {
     return true;
 }
 
-std::vector<uint8_t> captureWindow(const std::string& /*windowId*/, uint32_t /*maxDimension*/) {
-    throw sdbus::Error(sdbus::Error::Name{ERR_CAPTURE}, "capture is not implemented on hyprland yet");
+// ---------------------------------------------------------------------------
+// Capture pipeline. The GL side is minimal — render offscreen at the
+// monitor's own resolution, read the pixels back — and everything else
+// (stitching monitors into a region, cropping a window, the ghost cursor
+// overlay, downscaling, PNG) happens in cairo. Drawing the ghost in cairo
+// instead of queueing its pass elements into the fake render keeps the
+// capture path independent of the live render-stage hooks.
+//
+// The human's cursor never appears in a capture: Hyprland renders cursors
+// outside renderAllClientsForWorkspace (hardware plane or a separate software
+// pass), so an offscreen render simply doesn't contain it — the same
+// exclusion the KWin plugin needs an explicit exclusive view for.
+// ---------------------------------------------------------------------------
+
+// Same limits as the KWin plugin, against absurd offscreen allocations.
+constexpr int     CAPTURE_MAX_NATIVE_SIDE   = 16384;
+constexpr int64_t CAPTURE_MAX_NATIVE_PIXELS = 64LL * 1024 * 1024;
+
+using Render::GL::g_pHyprOpenGL;
+
+// renderAllClientsForWorkspace is protected, reachable in core only by friend
+// classes (screencopy, screenshare). A plugin is not on that list, but an
+// explicit template instantiation is exempt from access control ([temp.spec]
+// p12), which makes this the one standard-blessed way to take the member
+// pointer — no #define private, no layout assumptions.
+using RenderAllClientsFn = void (Render::IHyprRenderer::*)(PHLMONITOR, PHLWORKSPACE, const Time::steady_tp&, const Vector2D&, const float&);
+RenderAllClientsFn renderAllClientsForWorkspacePtr();
+template <RenderAllClientsFn P> struct SRenderAllClientsGrab {
+    friend RenderAllClientsFn renderAllClientsForWorkspacePtr() {
+        return P;
+    }
+};
+template struct SRenderAllClientsGrab<&Render::IHyprRenderer::renderAllClientsForWorkspace>;
+
+[[noreturn]] void captureFailed(const std::string& message) {
+    throw sdbus::Error(sdbus::Error::Name{ERR_CAPTURE}, message);
 }
 
-std::vector<uint8_t> captureRegion(int32_t /*x*/, int32_t /*y*/, uint32_t /*width*/, uint32_t /*height*/, uint32_t /*maxDimension*/) {
-    throw sdbus::Error(sdbus::Error::Name{ERR_CAPTURE}, "capture is not implemented on hyprland yet");
+struct SCapturePixels {
+    std::vector<uint8_t> rgba; // tightly packed RGBA8, premultiplied
+    int                  w = 0;
+    int                  h = 0;
+};
+
+SCapturePixels readFramebufferPixels(const SP<Render::IFramebuffer>& fb) {
+    SCapturePixels img;
+    img.w = static_cast<int>(fb->m_size.x);
+    img.h = static_cast<int>(fb->m_size.y);
+    if (img.w <= 0 || img.h <= 0)
+        captureFailed("offscreen framebuffer has no pixels");
+    img.rgba.resize(size_t(img.w) * size_t(img.h) * 4);
+    // glReadPixels reads GL_READ_FRAMEBUFFER; IFramebuffer::bind() only binds
+    // the draw side, so bind the read side explicitly like core readPixels does.
+    const auto glFb = dynamic_cast<Render::GL::CGLFramebuffer*>(fb.get());
+    if (!glFb)
+        captureFailed("capture requires the GL renderer");
+    g_pHyprOpenGL->makeEGLCurrent();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, glFb->getFBID());
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, img.w, img.h, GL_RGBA, GL_UNSIGNED_BYTE, img.rgba.data());
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    return img;
+}
+
+// Premultiplied RGBA8 rows into a cairo ARGB32 (native-endian) surface. The
+// caller owns the returned surface.
+cairo_surface_t* pixelsToCairo(const SCapturePixels& img) {
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, img.w, img.h);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surface);
+        captureFailed("capture image allocation failed");
+    }
+    unsigned char* data   = cairo_image_surface_get_data(surface);
+    const int      stride = cairo_image_surface_get_stride(surface);
+    for (int y = 0; y < img.h; ++y) {
+        const uint8_t* src = img.rgba.data() + size_t(y) * img.w * 4;
+        auto*          dst = reinterpret_cast<uint32_t*>(data + size_t(y) * stride);
+        for (int x = 0; x < img.w; ++x, src += 4)
+            dst[x] = (uint32_t(src[3]) << 24) | (uint32_t(src[0]) << 16) | (uint32_t(src[1]) << 8) | uint32_t(src[2]);
+    }
+    cairo_surface_mark_dirty(surface);
+    return surface;
+}
+
+// Everything a monitor is showing — background, layers, windows, popups —
+// rendered offscreen at the monitor's own resolution. Mirrors what
+// makeSnapshotFB does for one window, with an opaque clear because a screen
+// is opaque by definition (the KWin plugin's region captures do the same).
+SCapturePixels renderMonitorPixels(const PHLMONITOR& monitor) {
+    CRegion    fakeDamage{0, 0, monitor->m_transformedSize.x, monitor->m_transformedSize.y};
+    const auto fb = g_pHyprRenderer->createFB("synara capture");
+    fb->alloc(monitor->m_pixelSize.x, monitor->m_pixelSize.y, DRM_FORMAT_ABGR8888);
+    fb->setImageDescription(monitor->workBufferImageDescription());
+    if (!g_pHyprRenderer->beginFullFakeRender(monitor, fakeDamage, fb))
+        captureFailed("offscreen render begin failed");
+    g_pHyprRenderer->m_bRenderingSnapshot = true;
+    g_pHyprRenderer->draw(CClearPassElement::SClearData{CHyprColor(0, 0, 0, 1)});
+    g_pHyprRenderer->startRenderPass();
+    (g_pHyprRenderer.get()->*renderAllClientsForWorkspacePtr())(monitor, monitor->m_activeWorkspace, Time::steadyNow(), Vector2D{0, 0}, 1.f);
+    g_pHyprRenderer->endRender();
+    g_pHyprRenderer->m_bRenderingSnapshot = false;
+    return readFramebufferPixels(fb);
+}
+
+// The ghost cursor and badge, composited over a capture the same way the
+// render pass composites them over the screen, so a capture shows the agent's
+// pointer exactly where the human sees it. `region` is the captured rect in
+// global logical coordinates, `scale` the capture's device pixels per logical
+// unit. No-op when no session is running — a capture of a released desktop
+// has no ghost on screen either.
+void drawGhostCursorOverlay(cairo_t* cr, const CBox& region, double scale) {
+    if (!g.running || !g.cursorVisible)
+        return;
+    const double size   = agentCursorSize();
+    const double margin = strokeMargin(size);
+    const double alpha  = badgeAlpha();
+
+    cairo_save(cr);
+    cairo_identity_matrix(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+    if (alpha > 0) {
+        SRenderedImage badge = renderBadgeImage(g.agentName.empty() ? AGENT_FALLBACK_NAME : g.agentName, size, scale);
+        const double   bx    = (g.pos.x + std::round(size * 0.55) - margin - region.x) * scale;
+        const double   by    = (g.pos.y + std::round(size * 0.90) - margin - region.y) * scale;
+        cairo_set_source_surface(cr, badge.surface, bx, by);
+        cairo_paint_with_alpha(cr, alpha);
+        cairo_surface_destroy(badge.surface);
+    }
+
+    SRenderedImage arrow = renderCursorImage(size, scale);
+    const double   ax    = (g.pos.x - margin - region.x) * scale;
+    const double   ay    = (g.pos.y - margin - region.y) * scale;
+    cairo_set_source_surface(cr, arrow.surface, ax, ay);
+    cairo_paint(cr);
+    cairo_surface_destroy(arrow.surface);
+
+    cairo_restore(cr);
+}
+
+std::vector<uint8_t> encodePng(cairo_surface_t* surface) {
+    std::vector<uint8_t>       png;
+    const cairo_status_t status = cairo_surface_write_to_png_stream(
+        surface,
+        [](void* closure, const unsigned char* data, unsigned int length) {
+            auto* out = static_cast<std::vector<uint8_t>*>(closure);
+            out->insert(out->end(), data, data + length);
+            return CAIRO_STATUS_SUCCESS;
+        },
+        &png);
+    if (status != CAIRO_STATUS_SUCCESS || png.empty())
+        captureFailed("PNG encoding failed");
+    return png;
+}
+
+// Downscales so the longest side fits maxDimension (0 = uncapped), then
+// encodes. Consumes the surface.
+std::vector<uint8_t> finishCapture(cairo_surface_t* surface, uint32_t maxDimension) {
+    const int w       = cairo_image_surface_get_width(surface);
+    const int h       = cairo_image_surface_get_height(surface);
+    const int largest = std::max(w, h);
+    if (maxDimension > 0 && largest > static_cast<int>(maxDimension)) {
+        const double     factor = double(maxDimension) / largest;
+        const int        sw     = std::max(1, static_cast<int>(std::lround(w * factor)));
+        const int        sh     = std::max(1, static_cast<int>(std::lround(h * factor)));
+        cairo_surface_t* scaled = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, sw, sh);
+        cairo_t*         cr     = cairo_create(scaled);
+        cairo_scale(cr, double(sw) / w, double(sh) / h);
+        cairo_set_source_surface(cr, surface, 0, 0);
+        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+        cairo_surface_flush(scaled);
+        cairo_surface_destroy(surface);
+        surface = scaled;
+    }
+    std::vector<uint8_t> png;
+    try {
+        png = encodePng(surface);
+    } catch (...) {
+        cairo_surface_destroy(surface);
+        throw;
+    }
+    cairo_surface_destroy(surface);
+    return png;
+}
+
+// The capture target: `region` in global logical coordinates at `scale`
+// device pixels per logical unit, within the same limits the KWin plugin
+// enforces.
+cairo_surface_t* captureTarget(const CBox& region, double scale, int& nativeW, int& nativeH) {
+    nativeW = static_cast<int>(std::ceil(region.w * scale));
+    nativeH = static_cast<int>(std::ceil(region.h * scale));
+    if (nativeW < 1 || nativeH < 1)
+        captureFailed("capture dimensions are invalid");
+    if (nativeW > CAPTURE_MAX_NATIVE_SIDE || nativeH > CAPTURE_MAX_NATIVE_SIDE || int64_t(nativeW) * nativeH > CAPTURE_MAX_NATIVE_PIXELS)
+        captureFailed("capture dimensions are too large");
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, nativeW, nativeH);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surface);
+        captureFailed("capture image allocation failed");
+    }
+    return surface;
+}
+
+std::optional<CBox> intersectBoxes(const CBox& a, const CBox& b) {
+    const double x1 = std::max(a.x, b.x);
+    const double y1 = std::max(a.y, b.y);
+    const double x2 = std::min(a.x + a.w, b.x + b.w);
+    const double y2 = std::min(a.y + a.h, b.y + b.h);
+    if (x2 <= x1 || y2 <= y1)
+        return std::nullopt;
+    return CBox{x1, y1, x2 - x1, y2 - y1};
+}
+
+std::vector<uint8_t> captureWindow(const std::string& windowId, uint32_t maxDimension) {
+    if (g.running)
+        noteActivity();
+    if (!g_pHyprRenderer || !g_pHyprOpenGL)
+        captureFailed("render unavailable");
+    const auto window = findWindowById(windowId);
+    if (!window)
+        captureFailed("unknown window");
+    const auto monitor = window->m_monitor.lock();
+    if (!monitor)
+        captureFailed("window has no monitor");
+    const auto region = intersectBoxes(windowBounds(window), workspaceGeometry());
+    if (!region)
+        captureFailed("window has nothing on screen to capture");
+
+    // Hyprland's own single-window offscreen render: the window with its
+    // decorations and popups at its real position on a transparent monitor-
+    // sized canvas. The surround keeps its alpha in the encoded PNG — there
+    // the "background" genuinely is "not this window".
+    const auto fb = g_pHyprRenderer->makeSnapshotFB(window);
+    if (!fb)
+        captureFailed("window is not visible for capture");
+    const SCapturePixels pixels     = readFramebufferPixels(fb);
+    cairo_surface_t*     windowSurf = pixelsToCairo(pixels);
+
+    const CBox monitorBox = monitor->logicalBox();
+    const double scale    = monitor->m_scale;
+    int          nativeW = 0, nativeH = 0;
+    cairo_surface_t* target = captureTarget(*region, scale, nativeW, nativeH);
+    cairo_t*         cr     = cairo_create(target);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_surface(cr, windowSurf, -(region->x - monitorBox.x) * scale, -(region->y - monitorBox.y) * scale);
+    cairo_paint(cr);
+    drawGhostCursorOverlay(cr, *region, scale);
+    cairo_destroy(cr);
+    cairo_surface_flush(target);
+    cairo_surface_destroy(windowSurf);
+    return finishCapture(target, maxDimension);
+}
+
+std::vector<uint8_t> captureRegion(int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t maxDimension) {
+    if (g.running)
+        noteActivity();
+    if (!g_pHyprRenderer || !g_pHyprOpenGL)
+        captureFailed("render unavailable");
+    const auto region = intersectBoxes(CBox{double(x), double(y), double(width), double(height)}, workspaceGeometry());
+    if (!region)
+        captureFailed("region is outside the workspace");
+
+    // Render every intersecting monitor at its own scale; stitch at the
+    // sharpest one so no monitor's pixels get thrown away.
+    std::vector<PHLMONITOR> monitors;
+    double                  scale = 1;
+    for (const auto& mon : State::monitorState()->monitors()) {
+        if (!mon || !mon->m_output)
+            continue;
+        if (!intersectBoxes(mon->logicalBox(), *region))
+            continue;
+        monitors.push_back(mon);
+        scale = std::max(scale, double(mon->m_scale));
+    }
+    if (monitors.empty())
+        captureFailed("no monitor covers the region");
+
+    int              nativeW = 0, nativeH = 0;
+    cairo_surface_t* target = captureTarget(*region, scale, nativeW, nativeH);
+    cairo_t*         cr     = cairo_create(target);
+    // A screen is opaque: black under any monitor gap or transparent pixels,
+    // like the KWin plugin's region captures.
+    cairo_set_source_rgba(cr, 0, 0, 0, 1);
+    cairo_paint(cr);
+    for (const auto& mon : monitors) {
+        SCapturePixels   pixels;
+        try {
+            pixels = renderMonitorPixels(mon);
+        } catch (...) {
+            cairo_destroy(cr);
+            cairo_surface_destroy(target);
+            throw;
+        }
+        cairo_surface_t* monSurf    = pixelsToCairo(pixels);
+        const CBox       monitorBox = mon->logicalBox();
+        cairo_save(cr);
+        cairo_translate(cr, (monitorBox.x - region->x) * scale, (monitorBox.y - region->y) * scale);
+        // Monitor pixels to target pixels; only exact on untransformed
+        // outputs — a rotated monitor's capture is not yet unrotated.
+        cairo_scale(cr, scale / mon->m_scale, scale / mon->m_scale);
+        cairo_set_source_surface(cr, monSurf, 0, 0);
+        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+        cairo_paint(cr);
+        cairo_restore(cr);
+        cairo_surface_destroy(monSurf);
+    }
+    drawGhostCursorOverlay(cr, *region, scale);
+    cairo_destroy(cr);
+    cairo_surface_flush(target);
+    return finishCapture(target, maxDimension);
 }
 
 // ---------------------------------------------------------------------------

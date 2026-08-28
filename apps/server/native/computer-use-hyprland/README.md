@@ -12,13 +12,18 @@ Build with `make` against the installed Hyprland's headers (`pkg-config
 hyprland`). The plugin ABI churns per Hyprland release, so builds are
 per-version, like the KWin plugin's prebuilts.
 
-Status: window enumeration, session lifecycle (idle timeout, Meta+Shift+Esc
-release/resume chord), the ghost cursor (arrow + name badge, scale-aware,
-hold-then-fade), and direct per-client input injection (raw wire events on the
-target client's own `wl_pointer`/`wl_keyboard` resources, seat-manager serials,
-xkb modifier mirror — the compositor's seat state is never touched) are
-implemented. The capture pipeline is the remaining milestone; until it lands,
-captures raise `org.synara.ComputerUse.Error.CaptureFailed`.
+Status: the plugin itself is feature-complete — window enumeration, session
+lifecycle (idle timeout, Meta+Shift+Esc release/resume chord), the ghost cursor
+(arrow + name badge, scale-aware, hold-then-fade), direct per-client input
+injection (raw wire events on the target client's own
+`wl_pointer`/`wl_keyboard` resources, seat-manager serials, xkb modifier
+mirror — the compositor's seat state is never touched), and the capture
+pipeline (offscreen GPU render of a window snapshot or each monitor's full
+scene, read back and composited in cairo with the ghost cursor overlaid, so
+captures show the agent's pointer exactly where the human sees it; the human's
+cursor is never in the offscreen scene). What remains is server-side wiring:
+a `hyprland` backend tier with auto-detection and `hyprctl plugin load`
+provisioning.
 
 Development testing runs in a disposable nested Hyprland (nested inside a
 headless `kwin_wayland --virtual` parent — Hyprland cannot boot headless on a
