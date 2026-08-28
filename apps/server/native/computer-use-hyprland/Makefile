@@ -10,13 +10,13 @@ GIT_HASH       := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown
 BUILD_TS       := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 CXX            ?= g++
-PKGS           := hyprland pixman-1 libdrm sdbus-c++ cairo
+PKGS           := hyprland pixman-1 libdrm sdbus-c++ cairo xkbcommon
 CXXFLAGS       += -shared -fPIC --no-gnu-unique -std=c++26 -O2 -g \
                   $(shell pkg-config --cflags $(PKGS)) \
                   -DSYNARA_CU_BUILD_ID='"hyprland-$(HYPR_VERSION)"' \
                   -DSYNARA_CU_GIT_HASH='"$(GIT_HASH)"' \
                   -DSYNARA_CU_BUILD_TS='"$(BUILD_TS)"'
-LDLIBS         := $(shell pkg-config --libs sdbus-c++ cairo)
+LDLIBS         := $(shell pkg-config --libs sdbus-c++ cairo xkbcommon)
 
 OUT            := SynaraComputerUseHyprland.so
 

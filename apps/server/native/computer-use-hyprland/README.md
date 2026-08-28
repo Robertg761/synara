@@ -13,11 +13,12 @@ hyprland`). The plugin ABI churns per Hyprland release, so builds are
 per-version, like the KWin plugin's prebuilts.
 
 Status: window enumeration, session lifecycle (idle timeout, Meta+Shift+Esc
-release/resume chord), and the ghost cursor (arrow + name badge, scale-aware,
-hold-then-fade) are implemented. Direct per-client input injection and the
-capture pipeline are the next milestones; until they land, `button`/`axis`/
-`key` return `false` and captures raise
-`org.synara.ComputerUse.Error.CaptureFailed`.
+release/resume chord), the ghost cursor (arrow + name badge, scale-aware,
+hold-then-fade), and direct per-client input injection (raw wire events on the
+target client's own `wl_pointer`/`wl_keyboard` resources, seat-manager serials,
+xkb modifier mirror — the compositor's seat state is never touched) are
+implemented. The capture pipeline is the remaining milestone; until it lands,
+captures raise `org.synara.ComputerUse.Error.CaptureFailed`.
 
 Development testing runs in a disposable nested Hyprland (nested inside a
 headless `kwin_wayland --virtual` parent — Hyprland cannot boot headless on a

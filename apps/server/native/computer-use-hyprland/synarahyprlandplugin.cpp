@@ -41,10 +41,16 @@
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/devices/IKeyboard.hpp>
+#include <hyprland/src/protocols/core/Seat.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
 
 #include <cairo/cairo.h>
 #include <sdbus-c++/sdbus-c++.h>
 #include <wayland-server-core.h>
+#include <wayland-server-protocol.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include <algorithm>
 #include <chrono>
@@ -52,6 +58,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -85,8 +92,8 @@ constexpr const char* INTERFACE_NAME = "org.synara.ComputerUse1";
 
 constexpr const char* ERR_CAPTURE          = "org.synara.ComputerUse.Error.CaptureFailed";
 constexpr const char* ERR_RELEASED         = "org.synara.ComputerUse.Error.ControlReleased";
-[[maybe_unused]] constexpr const char* ERR_SEAT_UNSUPPORTED = "org.synara.ComputerUse.Error.SeatUnsupported";
-[[maybe_unused]] constexpr const char* ERR_HUMAN_ACTIVE     = "org.synara.ComputerUse.Error.HumanActive";
+constexpr const char* ERR_SEAT_UNSUPPORTED = "org.synara.ComputerUse.Error.SeatUnsupported";
+constexpr const char* ERR_HUMAN_ACTIVE     = "org.synara.ComputerUse.Error.HumanActive";
 
 constexpr uint32_t MIN_IDLE_TIMEOUT_MS     = 1000;
 constexpr uint32_t MAX_IDLE_TIMEOUT_MS     = 60 * 60 * 1000;
@@ -290,6 +297,23 @@ struct SState {
     // window dies, and the agent still needs to know it asked for that window
     // so the input path can refuse rather than retarget.
     bool targetRequested = false;
+
+    // Direct injection state: the surfaces the agent has told about its pointer
+    // and keyboard (its enter/leave bookkeeping, independent of the seat's),
+    // and everything it is currently holding down there.
+    WP<CWLSurfaceResource> directPointerSurface;
+    WP<CWLSurfaceResource> directKeyboardSurface;
+    std::set<uint32_t>     pressedButtons;
+    // Ordered, because wl_keyboard.enter carries the held keys as an array and
+    // the press order is the honest one to replay.
+    std::vector<uint32_t> pressedKeys;
+    // Sub-notch scroll owed to clients too old for axis_value120.
+    double axisRemainderH = 0;
+    double axisRemainderV = 0;
+    // The agent's own xkb modifier state, built from the seat keyboard's keymap
+    // and fed only the agent's keys, so its Ctrl is never the human's Ctrl.
+    xkb_state*  xkbState       = nullptr;
+    xkb_keymap* xkbStateKeymap = nullptr;
 
     // Physical keycodes currently held on the human's keyboard, kept only to
     // recognize the release chord.
@@ -694,6 +718,357 @@ int64_t humanInputAgeMilliseconds() {
     return nowMs() - g.lastHumanInputMs;
 }
 
+// ---------------------------------------------------------------------------
+// Direct per-client input injection.
+//
+// The KWin plugin's direct path, on Hyprland: events are written straight to
+// the target client's own wl_pointer/wl_keyboard resources, never through the
+// compositor's input pipeline. The human's seat state is untouched — Hyprland's
+// CSeatManager and CWLPointerResource focus bookkeeping never see these events,
+// which is exactly the point: the compositor keeps routing the human's devices
+// as if the agent did not exist. The only compositor state used is the serial
+// counter, so that a client quoting an agent click's serial back (for a popup
+// grab or a drag) passes Hyprland's serial validation.
+// ---------------------------------------------------------------------------
+
+std::vector<wl_resource*> clientInputResources(wl_client* client, const char* interfaceName) {
+    struct SFilter {
+        const char*               name;
+        std::vector<wl_resource*> out;
+    } filter{interfaceName, {}};
+    wl_client_for_each_resource(
+        client,
+        [](wl_resource* resource, void* data) {
+            auto* f = static_cast<SFilter*>(data);
+            if (std::string_view{wl_resource_get_class(resource)} == f->name)
+                f->out.push_back(resource);
+            return WL_ITERATOR_CONTINUE;
+        },
+        &filter);
+    return filter.out;
+}
+
+SP<CWLSurfaceResource> windowMainSurface(const PHLWINDOW& w) {
+    return w ? w->resource() : nullptr;
+}
+
+uint32_t directTimestampMs() {
+    // Same steady clock as the compositor's own input timestamps, so deltas
+    // (double-click detection, kinetic scroll) stay meaningful across the two.
+    return static_cast<uint32_t>(nowMs());
+}
+
+// A serial the client can quote back: allocated through the seat manager so it
+// lands in the client's seat-resource serial list that Hyprland validates
+// grab/drag requests against. The display counter is only a fallback for a
+// client that somehow holds input resources without a seat resource.
+uint32_t directSerial(const SP<CWLSurfaceResource>& surface, bool enter = false) {
+    if (surface && g_pSeatManager) {
+        if (const auto seatResource = g_pSeatManager->seatResourceForClient(surface->client()))
+            return g_pSeatManager->nextSerial(seatResource, enter);
+    }
+    return wl_display_next_serial(g_pCompositor->m_wlDisplay);
+}
+
+void directPointerButtonEvent(const SP<CWLSurfaceResource>& surface, uint32_t code, bool pressed) {
+    const auto seatResource = g_pSeatManager ? g_pSeatManager->seatResourceForClient(surface->client()) : nullptr;
+    if (!pressed && seatResource)
+        g_pSeatManager->clearPointerButtonSerials(seatResource, surface, code);
+    const uint32_t serial = seatResource ? g_pSeatManager->nextSerial(seatResource) : wl_display_next_serial(g_pCompositor->m_wlDisplay);
+    if (pressed && seatResource)
+        g_pSeatManager->recordPointerButtonSerial(seatResource, serial, surface, code);
+    const uint32_t time = directTimestampMs();
+    for (wl_resource* resource : clientInputResources(surface->client(), "wl_pointer")) {
+        wl_pointer_send_button(resource, serial, time, code, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
+        if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION)
+            wl_pointer_send_frame(resource);
+    }
+}
+
+// Everything still held is released on the surface that saw the press, because
+// nothing else will ever release it: a button left down while the pointer
+// migrates stays down in the client being left forever.
+void releasePressedButtons() {
+    if (const auto surface = g.directPointerSurface.lock()) {
+        for (const uint32_t code : std::vector<uint32_t>(g.pressedButtons.begin(), g.pressedButtons.end()))
+            directPointerButtonEvent(surface, code, false);
+    }
+    g.pressedButtons.clear();
+}
+
+void directPointerLeave() {
+    const auto surface = g.directPointerSurface.lock();
+    g.directPointerSurface.reset();
+    // Owed sub-notch clicks belong to the surface that was being scrolled.
+    g.axisRemainderH = 0;
+    g.axisRemainderV = 0;
+    if (!surface)
+        return;
+    // Never revoke a focus the human is holding: if their pointer sits on this
+    // surface, the enter the client believes in is the seat's, not ours.
+    if (g_pSeatManager && g_pSeatManager->m_state.pointerFocus.lock() == surface)
+        return;
+    const uint32_t serial = directSerial(surface);
+    for (wl_resource* resource : clientInputResources(surface->client(), "wl_pointer")) {
+        wl_pointer_send_leave(resource, serial, surface->getResource()->resource());
+        if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION)
+            wl_pointer_send_frame(resource);
+    }
+}
+
+// Enter-if-needed plus motion, aimed by the ghost cursor's position. The hit
+// test descends into the window's popups and subsurfaces, so an open dropdown
+// of the target receives the events meant for the pixel it covers.
+void directPointerMotion(const PHLWINDOW& window) {
+    Vector2D   local;
+    const auto surface = Desktop::viewState()->hitTest().windowSurfaceAt(g.pos, window, local);
+    if (!surface) {
+        releasePressedButtons();
+        directPointerLeave();
+        return;
+    }
+    if (!g.directPointerSurface.expired() && g.directPointerSurface.lock() != surface) {
+        releasePressedButtons();
+        directPointerLeave();
+    }
+    const auto resources = clientInputResources(surface->client(), "wl_pointer");
+    if (resources.empty()) {
+        // A client holding no wl_pointer cannot be told about an enter, and
+        // claiming the surface as entered anyway would swallow the enter it
+        // still needs if it binds a pointer later (a client binds one the
+        // moment the seat first advertises the capability). Left unclaimed,
+        // the next motion retries the enter against whatever it holds then.
+        releasePressedButtons();
+        directPointerLeave();
+        return;
+    }
+    const bool reenter    = g.directPointerSurface.lock() != surface;
+    g.directPointerSurface = surface;
+    const uint32_t time   = directTimestampMs();
+    const uint32_t serial = reenter ? directSerial(surface, true) : 0;
+    for (wl_resource* resource : resources) {
+        if (reenter)
+            wl_pointer_send_enter(resource, serial, surface->getResource()->resource(), wl_fixed_from_double(local.x), wl_fixed_from_double(local.y));
+        wl_pointer_send_motion(resource, time, wl_fixed_from_double(local.x), wl_fixed_from_double(local.y));
+        if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION)
+            wl_pointer_send_frame(resource);
+    }
+}
+
+void clearPointerDelivery() {
+    releasePressedButtons();
+    directPointerLeave();
+    g.pointerWindow.reset();
+}
+
+// Maintains the pointer's enter/leave state to match the ghost cursor, and
+// says whether there is a surface to deliver to. An explicit target owns the
+// pointer: a point it does not claim is refused rather than delivered to
+// whatever covers it, because the caller can recover from a refusal and cannot
+// recover from a click it never made.
+bool updatePointerFocus() {
+    PHLWINDOW window;
+    if (g.targetRequested) {
+        const auto target = g.targetWindow.lock();
+        if (!usableWindow(target)) {
+            clearPointerDelivery();
+            return false;
+        }
+        window = target;
+    } else {
+        window = windowAtPoint(g.pos);
+    }
+    if (!usableWindow(window)) {
+        clearPointerDelivery();
+        return false;
+    }
+    g.pointerWindow = window;
+    directPointerMotion(window);
+    return !g.directPointerSurface.expired();
+}
+
+void ensureXkbState() {
+    xkb_keymap* keymap = nullptr;
+    if (g_pSeatManager) {
+        if (const auto keyboard = g_pSeatManager->m_keyboard.lock())
+            keymap = keyboard->m_xkbKeymap;
+    }
+    if (g.xkbState && g.xkbStateKeymap == keymap)
+        return;
+    if (g.xkbState) {
+        xkb_state_unref(g.xkbState);
+        g.xkbState = nullptr;
+    }
+    g.xkbStateKeymap = keymap;
+    if (keymap)
+        g.xkbState = xkb_state_new(keymap);
+}
+
+void directKeyboardModifiers() {
+    const auto surface = g.directKeyboardSurface.lock();
+    if (!surface || !g.xkbState)
+        return;
+    const uint32_t serial    = directSerial(surface);
+    const uint32_t depressed = xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_DEPRESSED);
+    const uint32_t latched   = xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_LATCHED);
+    const uint32_t locked    = xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_LOCKED);
+    const uint32_t group     = xkb_state_serialize_layout(g.xkbState, XKB_STATE_LAYOUT_EFFECTIVE);
+    for (wl_resource* resource : clientInputResources(surface->client(), "wl_keyboard"))
+        wl_keyboard_send_modifiers(resource, serial, depressed, latched, locked, group);
+}
+
+// The enter re-stamp. A wl_keyboard.key event names no surface: the client
+// routes it to whatever its keyboard last entered, and that keyboard object is
+// shared with the human's seat — the human clicking another window mid-type
+// would carry the agent's remaining keystrokes with it. Re-stamping the enter
+// on the agent's target before every key reclaims focus for that key, whatever
+// the human just did. No keymap is sent with it: the client bound the real
+// seat and already has that seat's keymap, the same layout the agent's xkb
+// state mirrors. The keys array carries the held state as it is *before* the
+// event this re-stamp precedes, so a chord's modifiers survive it.
+void sendKeyboardEnterEvent(const SP<CWLSurfaceResource>& surface) {
+    wl_array keys;
+    wl_array_init(&keys);
+    for (const uint32_t key : g.pressedKeys) {
+        if (auto* slot = static_cast<uint32_t*>(wl_array_add(&keys, sizeof(uint32_t))))
+            *slot = key;
+    }
+    const uint32_t serial = directSerial(surface, true);
+    for (wl_resource* resource : clientInputResources(surface->client(), "wl_keyboard"))
+        wl_keyboard_send_enter(resource, serial, surface->getResource()->resource(), &keys);
+    wl_array_release(&keys);
+    directKeyboardModifiers();
+}
+
+void directKeyboardKeyEvent(const SP<CWLSurfaceResource>& surface, uint32_t keyCode, bool pressed) {
+    const uint32_t serial = directSerial(surface);
+    const uint32_t time   = directTimestampMs();
+    for (wl_resource* resource : clientInputResources(surface->client(), "wl_keyboard"))
+        wl_keyboard_send_key(resource, serial, time, keyCode, pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
+}
+
+// Same shape as the pointer's: releases land on the surface that saw the
+// press, and the agent's xkb state unwinds with them so a half-finished chord
+// cannot leak a held Ctrl into the next window.
+void releasePressedKeys() {
+    if (const auto surface = g.directKeyboardSurface.lock()) {
+        for (const uint32_t key : std::vector<uint32_t>(g.pressedKeys))
+            directKeyboardKeyEvent(surface, key, false);
+    }
+    if (g.xkbState) {
+        for (const uint32_t key : g.pressedKeys)
+            xkb_state_update_key(g.xkbState, key + 8, XKB_KEY_UP);
+    }
+    g.pressedKeys.clear();
+    directKeyboardModifiers();
+}
+
+void directKeyboardLeave() {
+    const auto surface = g.directKeyboardSurface.lock();
+    g.directKeyboardSurface.reset();
+    if (!surface)
+        return;
+    // As with the pointer: if the human's keyboard focus is here, the enter the
+    // client believes in is the seat's, and it is not ours to revoke.
+    if (g_pSeatManager && g_pSeatManager->m_state.keyboardFocus.lock() == surface)
+        return;
+    const uint32_t serial = directSerial(surface);
+    for (wl_resource* resource : clientInputResources(surface->client(), "wl_keyboard"))
+        wl_keyboard_send_leave(resource, serial, surface->getResource()->resource());
+}
+
+void clearKeyboardDelivery() {
+    releasePressedKeys();
+    directKeyboardLeave();
+    g.keyboardWindow.reset();
+}
+
+// Target if one was asked for — a target that has gone away fails loudly,
+// because a Ctrl+Q aimed at a closing window must not quit whatever sits under
+// the ghost cursor instead — else the window the pointer is in.
+bool updateKeyboardFocus() {
+    PHLWINDOW window;
+    if (g.targetRequested) {
+        const auto target = g.targetWindow.lock();
+        if (!usableWindow(target)) {
+            clearKeyboardDelivery();
+            return false;
+        }
+        window = target;
+    } else if (const auto pointerWindow = g.pointerWindow.lock(); usableWindow(pointerWindow)) {
+        window = pointerWindow;
+    } else {
+        window = windowAtPoint(g.pos);
+    }
+    if (!usableWindow(window)) {
+        clearKeyboardDelivery();
+        return false;
+    }
+    const auto surface = windowMainSurface(window);
+    if (!surface) {
+        clearKeyboardDelivery();
+        return false;
+    }
+    if (g.directKeyboardSurface.lock() != surface) {
+        clearKeyboardDelivery();
+        g.keyboardWindow       = window;
+        g.directKeyboardSurface = surface;
+        sendKeyboardEnterEvent(surface);
+    } else {
+        g.keyboardWindow = window;
+    }
+    return true;
+}
+
+// Refuse, out loud, rather than inject into a client that cannot hear us:
+// Wayland delivers input per resource, and an event aimed at a client holding
+// no matching resource is dropped silently at every layer while the caller
+// believes it acted.
+void requireReachableClient(const PHLWINDOW& window, const char* interfaceName) {
+    const auto surface = windowMainSurface(window);
+    if (!surface)
+        return;
+    if (!clientInputResources(surface->client(), interfaceName).empty())
+        return;
+    std::string name = window->m_class.empty() ? window->m_title : window->m_class;
+    if (name.empty())
+        name = "This window";
+    throw sdbus::Error(sdbus::Error::Name{ERR_SEAT_UNSUPPORTED},
+                       name + " holds no " + (std::string_view{interfaceName} == "wl_pointer" ? "pointer" : "keyboard") +
+                           " on any seat, so input to it is dropped silently and the action would have no "
+                           "effect. Nothing aimed at this window will work until it asks its seat for input.");
+}
+
+// Give way to the person at the keyboard, on their own window: while their
+// devices were active within the guard window, the window holding their focus
+// is off the table and every other window stays available. Refused rather than
+// delayed, because a click queued until they pause would land in a window
+// whose state has moved on. Their input never needs disentangling from the
+// agent's here: injected events go straight to client resources and never pass
+// the input spy, so everything it saw is the human's by construction.
+void refuseIfHumanActive(const PHLWINDOW& window) {
+    if (g.humanActiveGuardMs == 0 || !window)
+        return;
+    const int64_t age = humanInputAgeMilliseconds();
+    if (age < 0 || age > int64_t(g.humanActiveGuardMs))
+        return;
+    const auto human = Desktop::focusState()->window();
+    // Only window-to-window identity is compared: a Wayland popup is a surface
+    // of the window that opened it, so a menu the human has open already *is*
+    // their focused window as far as this comparison goes.
+    if (!human || window != human)
+        return;
+    std::string title = human->m_title.empty() ? human->m_class : human->m_title;
+    if (title.empty())
+        title = "the focused window";
+    throw sdbus::Error(sdbus::Error::Name{ERR_HUMAN_ACTIVE},
+                       std::format("The human is using {} right now - their keyboard focus is on it and their own "
+                                   "devices were active {} ms ago - so nothing was sent to it. Every other window "
+                                   "is still available, and this action can be retried once they have been idle "
+                                   "for {} ms.",
+                                   title, age, g.humanActiveGuardMs));
+}
+
 void setCursorVisible(bool visible) {
     if (g.cursorVisible == visible)
         return;
@@ -718,6 +1093,11 @@ void stopSession(StopReason reason) {
 
     g.running = false;
     setCursorVisible(false);
+    // Nothing stays held past the session: a stop that stranded a pressed
+    // button or a half-typed chord would leave some client waiting for a
+    // release only the agent could have sent.
+    clearKeyboardDelivery();
+    clearPointerDelivery();
     g.pointerWindow.reset();
     g.keyboardWindow.reset();
     g.targetWindow.reset();
@@ -758,9 +1138,9 @@ bool requireRunning() {
 std::string healthJson() {
     JsonObj health;
     health
-        // Milestone gate: flips to the real input-path readiness check when
-        // direct injection lands.
-        .boolean("ok", true)
+        // Direct injection needs nothing prepared beyond the seat manager the
+        // serials come from, so readiness is its presence.
+        .boolean("ok", g_pSeatManager != nullptr)
         .boolean("running", g.running)
         .str("service", SERVICE_NAME)
         .str("path", OBJECT_PATH)
@@ -803,8 +1183,8 @@ std::string stateJson() {
         // independently.
         .raw("humanPosition", pointJson(g_pInputManager ? g_pInputManager->getMouseCoordsInternal() : Vector2D{}))
         .str("agentName", g.agentName.empty() ? AGENT_FALLBACK_NAME : g.agentName)
-        .num("pressedButtonCount", 0)
-        .num("pressedKeyCount", 0)
+        .num("pressedButtonCount", double(g.pressedButtons.size()))
+        .num("pressedKeyCount", double(g.pressedKeys.size()))
         .num("idleTimeoutMs", g.idleTimeoutMs)
         .num("idleMs", double(idleMilliseconds()))
         .boolean("releasedByUser", g.releasedByUser)
@@ -876,8 +1256,7 @@ std::string windowsJson() {
             .num("pid", double(w->getPID()))
             .raw("bounds", rectJson(bounds))
             .boolean("visible", visible)
-            // Refined to the real no-focus rule when the keyboard path lands.
-            .boolean("focusable", true)
+            .boolean("focusable", !(w->m_ruleApplicator && w->m_ruleApplicator->noFocus().valueOrDefault()) && !w->m_X11ShouldntFocus)
             .boolean("normal", true)
             .boolean("desktop", false)
             .boolean("dock", false)
@@ -981,22 +1360,157 @@ bool movePointer(double x, double y) {
     damageCursorArea();
     g.pos = next;
     damageCursorArea();
-    g.pointerWindow = windowAtPoint(g.pos);
+    // The move is the whole action even over empty desktop; focus maintenance
+    // rides along so the surface under the ghost tracks it live.
+    updatePointerFocus();
     return true;
 }
 
-// Input injection lands in the next milestone; until then these refuse rather
-// than pretend, so the server's probe reports input honestly.
-bool injectButton(uint32_t /*button*/, bool /*pressed*/) {
-    return false;
+bool injectButton(uint32_t button, bool pressed) {
+    if (!requireRunning())
+        return false;
+    // The reachability refusal outranks the plain focus failure: a pointer-less
+    // client leaves updatePointerFocus without a surface too, and the caller
+    // deserves the loud error, not a silent false.
+    const bool focused = updatePointerFocus();
+    const auto window  = g.pointerWindow.lock();
+    if (window)
+        requireReachableClient(window, "wl_pointer");
+    if (!focused)
+        return false;
+    // The release half of a press the agent already delivered is never
+    // refused: the client is holding that button down because of us, and
+    // leaving it held is worse than the press was.
+    const bool completingPress = !pressed && g.pressedButtons.contains(button);
+    if (!completingPress)
+        refuseIfHumanActive(window);
+    // A click aims the keyboard too, the way a human's click does.
+    updateKeyboardFocus();
+
+    if (const auto surface = g.directPointerSurface.lock()) {
+        if (pressed)
+            g.pressedButtons.insert(button);
+        else
+            g.pressedButtons.erase(button);
+        directPointerButtonEvent(surface, button, pressed);
+    }
+    return true;
 }
 
-bool injectAxis(double /*horizontal*/, double /*vertical*/) {
-    return false;
+// Whole wheel clicks owed to a client too old for wl_pointer.axis_value120:
+// that event carries only whole clicks, so any delta under one click truncates
+// to zero and a small scroll becomes a no-op there. The sub-click part is
+// carried in the remainder so repeated small deltas still add up to a click.
+int takeDiscreteSteps(double& remainder, double delta120) {
+    if (delta120 == 0)
+        return 0;
+    remainder += delta120;
+    const double steps = std::trunc(remainder / 120.0);
+    remainder -= steps * 120.0;
+    return static_cast<int>(steps);
 }
 
-bool injectKey(uint32_t /*keyCode*/, bool /*pressed*/) {
-    return false;
+// Pixels per wheel notch. The whole stack speaks pixels — the tool surface,
+// the computer pane, and the `axis` D-Bus method — while a wheel speaks
+// notches, so the conversion lives at the one place the two meet. Keep in sync
+// with the KWin plugin and SCROLL_STEP_PX in computer-desktop-helper.
+constexpr double SCROLL_PIXELS_PER_NOTCH = 15.0;
+
+int scrollValue120(double pixels) {
+    if (!std::isfinite(pixels))
+        return 0;
+    const double units = std::round(pixels * 120.0 / SCROLL_PIXELS_PER_NOTCH);
+    return static_cast<int>(std::clamp(units, double(std::numeric_limits<int>::min()), double(std::numeric_limits<int>::max())));
+}
+
+// Scrolls by desktop pixels, not wheel notches; positive is right and down,
+// matching wl_pointer's axis directions.
+bool injectAxis(double horizontal, double vertical) {
+    if (!requireRunning())
+        return false;
+    const bool focused = updatePointerFocus();
+    const auto window  = g.pointerWindow.lock();
+    if (window)
+        requireReachableClient(window, "wl_pointer");
+    if (!focused)
+        return false;
+    refuseIfHumanActive(window);
+
+    const auto surface = g.directPointerSurface.lock();
+    if (!surface)
+        return false;
+    const uint32_t time          = directTimestampMs();
+    const auto     resources     = clientInputResources(surface->client(), "wl_pointer");
+    const int      horizontalV120 = scrollValue120(horizontal);
+    const int      verticalV120   = scrollValue120(vertical);
+
+    // The remainder is only spent on resources that cannot be told about a
+    // fraction of a click, so it is only taken when the client has one.
+    const bool needsDiscrete = std::any_of(resources.cbegin(), resources.cend(), [](wl_resource* resource) {
+        const int version = wl_resource_get_version(resource);
+        return version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && version < WL_POINTER_AXIS_VALUE120_SINCE_VERSION;
+    });
+    const int horizontalSteps = needsDiscrete ? takeDiscreteSteps(g.axisRemainderH, horizontalV120) : 0;
+    const int verticalSteps   = needsDiscrete ? takeDiscreteSteps(g.axisRemainderV, verticalV120) : 0;
+
+    for (wl_resource* resource : resources) {
+        const int version = wl_resource_get_version(resource);
+        if (version >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
+            wl_pointer_send_axis_source(resource, WL_POINTER_AXIS_SOURCE_WHEEL);
+        if (horizontal != 0) {
+            wl_pointer_send_axis(resource, time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_double(horizontal));
+            // value120 supersedes axis_discrete for the clients that have it,
+            // and the two must not both be sent for one scroll.
+            if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+                wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, horizontalV120);
+            else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && horizontalSteps != 0)
+                wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, horizontalSteps);
+        }
+        if (vertical != 0) {
+            wl_pointer_send_axis(resource, time, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(vertical));
+            if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+                wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, verticalV120);
+            else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && verticalSteps != 0)
+                wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, verticalSteps);
+        }
+        if (version >= WL_POINTER_FRAME_SINCE_VERSION)
+            wl_pointer_send_frame(resource);
+    }
+    return true;
+}
+
+bool injectKey(uint32_t keyCode, bool pressed) {
+    if (!requireRunning())
+        return false;
+    if (!updateKeyboardFocus())
+        return false;
+    const auto window = g.keyboardWindow.lock();
+    requireReachableClient(window, "wl_keyboard");
+    // Same exemption the pointer makes, and it matters more here: refusing the
+    // release of a held Ctrl leaves the client believing a modifier is down.
+    const bool completingPress = !pressed && std::ranges::find(g.pressedKeys, keyCode) != g.pressedKeys.end();
+    if (!completingPress)
+        refuseIfHumanActive(window);
+
+    const auto surface = g.directKeyboardSurface.lock();
+    if (!surface)
+        return false;
+    // The re-stamp, with the held-key state as it is before this event.
+    sendKeyboardEnterEvent(surface);
+    if (pressed) {
+        if (std::ranges::find(g.pressedKeys, keyCode) == g.pressedKeys.end())
+            g.pressedKeys.push_back(keyCode);
+    } else {
+        std::erase(g.pressedKeys, keyCode);
+    }
+    directKeyboardKeyEvent(surface, keyCode, pressed);
+    ensureXkbState();
+    if (g.xkbState) {
+        // evdev keycode -> xkb keycode offset is 8.
+        xkb_state_update_key(g.xkbState, keyCode + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+        directKeyboardModifiers();
+    }
+    return true;
 }
 
 std::vector<uint8_t> captureWindow(const std::string& /*windowId*/, uint32_t /*maxDimension*/) {
@@ -1127,6 +1641,11 @@ void teardown() {
     g.dbus.reset();
     g.cursorTex.reset();
     g.badgeTex.reset();
+    if (g.xkbState) {
+        xkb_state_unref(g.xkbState);
+        g.xkbState       = nullptr;
+        g.xkbStateKeymap = nullptr;
+    }
 }
 
 } // namespace
