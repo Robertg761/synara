@@ -85,13 +85,14 @@ describe("ComputerServiceLive", () => {
   });
 
   /**
-   * Off Linux there is no backend to build, and the pre-fix fallback was the
-   * fake — which answers "available" and succeeds at every action against a
-   * phantom desktop. An agent on macOS must see a refused surface, not a
-   * fabricated one, so the platform verdict has to reach the pane's blocked
-   * state untouched.
+   * On a platform with no backend at all there is nothing to build, and the
+   * pre-fix fallback was the fake — which answers "available" and succeeds at
+   * every action against a phantom desktop. An agent there must see a refused
+   * surface, not a fabricated one, so the platform verdict has to reach the
+   * pane's blocked state untouched. Windows is the case with no backend now
+   * that macOS has one.
    */
-  it("reports an unsupported platform instead of a fake desktop off Linux", async () => {
+  it("reports an unsupported platform instead of a fake desktop with no backend", async () => {
     await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -99,10 +100,33 @@ describe("ComputerServiceLive", () => {
           expect(service.supported).toBe(false);
           expect(service.availability).toEqual({
             kind: "unsupported-platform",
-            platform: "darwin",
+            platform: "win32",
           });
+          const state = yield* Effect.promise(() => service.manager.getThreadState("thread-win"));
+          expect(state.availability).toEqual({ kind: "unsupported-platform", platform: "win32" });
+        }).pipe(Effect.provide(makeComputerServiceLayer({ platform: "win32" }))),
+      ),
+    );
+  });
+
+  /**
+   * macOS now builds a real backend — the Codex-style native helper — rather
+   * than the unsupported-platform refusal it used to get. The backend decides
+   * its own availability (Xcode present, TCC grants, capture path), which may
+   * be `available` or `backend-unavailable` depending on the host, but it is
+   * routed through the manager and stays `supported` so a helper built after
+   * boot appears without a server restart — never the frozen unsupported
+   * verdict, and never a fabricated fake desktop.
+   */
+  it("routes macOS to a real backend rather than an unsupported-platform refusal", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const service = yield* ComputerService;
+          expect(service.supported).toBe(true);
+          expect(service.availability.kind).not.toBe("unsupported-platform");
           const state = yield* Effect.promise(() => service.manager.getThreadState("thread-macos"));
-          expect(state.availability).toEqual({ kind: "unsupported-platform", platform: "darwin" });
+          expect(state.availability.kind).not.toBe("unsupported-platform");
         }).pipe(Effect.provide(makeComputerServiceLayer({ platform: "darwin" }))),
       ),
     );

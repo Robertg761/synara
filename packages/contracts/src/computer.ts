@@ -109,6 +109,19 @@ export const COMPUTER_NESTED_KWIN_BACKEND = "nested-kwin";
 export const COMPUTER_HYPRLAND_BACKEND = "hyprland";
 
 /**
+ * The backend name reported by the macOS backend: a native helper that drives
+ * the human's real Mac desktop the way Codex's computer use does — a
+ * "Software Cursor" overlay drawn by the helper, input posted to the target
+ * process (never the shared HID stream, so the real pointer never warps), and
+ * AX-first perception. Its own name because the Linux release hotkey does not
+ * apply — the macOS release affordance is not a compositor global — and because
+ * the settings panel names the integration differently. `visibleDesktop` is
+ * true: like the KWin plugin, the agent drives the display the human is already
+ * looking at, only through a picture of a cursor rather than a second seat.
+ */
+export const COMPUTER_MAC_BACKEND = "mac";
+
+/**
  * The human's emergency release: it takes the desktop back from the agent and
  * latches until it is pressed again, which hands control back.
  *

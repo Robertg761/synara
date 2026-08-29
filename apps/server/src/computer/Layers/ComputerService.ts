@@ -4,6 +4,7 @@ import type { ComputerAvailability } from "@synara/contracts";
 import { ComputerManager } from "../ComputerManager.ts";
 import { HyprlandComputerBackend } from "../HyprlandComputerBackend.ts";
 import { KWinComputerBackend } from "../KWinComputerBackend.ts";
+import { MacComputerBackend } from "../MacComputerBackend.ts";
 import { UnavailableComputerBackend } from "../UnavailableComputerBackend.ts";
 import {
   nestedModeForChoice,
@@ -34,20 +35,26 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
     ComputerService,
     Effect.gen(function* () {
       const platform = options.platform ?? process.platform;
-      const linux =
-        options.backend === undefined && platform === "linux"
-          ? yield* Effect.promise(() => makeLinuxBackend())
+      // A host-specific real backend on the two platforms that have one: the
+      // KWin/Hyprland/nested tiers on Linux, the Codex-style native helper on
+      // macOS. Both boot side-effect-free (construction touches no desktop) and
+      // decide their own availability, so the layer only picks which one.
+      const native =
+        options.backend === undefined && (platform === "linux" || platform === "darwin")
+          ? platform === "linux"
+            ? (yield* Effect.promise(() => makeLinuxBackend())).backend
+            : new MacComputerBackend({ platform })
           : undefined;
-      // Off Linux there is no backend to fall back to — and the fake would be
-      // worse than none: it answers "available" and every tool call succeeds
-      // against a phantom desktop, so an agent could report success at clicks
-      // that never happened. The unavailable backend refuses instead, with the
-      // verdict kind the pane's blocked state is keyed off.
+      // On a platform with no backend at all there is nothing to fall back to —
+      // and the fake would be worse than none: it answers "available" and every
+      // tool call succeeds against a phantom desktop, so an agent could report
+      // success at clicks that never happened. The unavailable backend refuses
+      // instead, with the verdict kind the pane's blocked state is keyed off.
       const backend =
         options.backend ??
-        linux?.backend ??
+        native ??
         new UnavailableComputerBackend(
-          `Computer control requires a Linux host; this server runs on ${platform}.`,
+          `Computer control requires a Linux or macOS host; this server runs on ${platform}.`,
           { availability: { kind: "unsupported-platform", platform } },
         );
       const manager = new ComputerManager({ backend });

@@ -33,6 +33,7 @@ const BACKEND_DISPLAY_NAMES: Record<string, string> = {
   kwin: "KWin plugin (KDE)",
   hyprland: "Hyprland plugin",
   "nested-kwin": "Isolated agent desktop (nested KWin)",
+  mac: "macOS desktop",
   fake: "Test backend",
 };
 
