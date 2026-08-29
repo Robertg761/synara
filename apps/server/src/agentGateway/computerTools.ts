@@ -3,6 +3,7 @@ import { Effect } from "effect";
 
 import type {
   ComputerActionResult,
+  ComputerRect,
   ComputerScreenshot,
   ComputerTarget,
   ComputerState,
@@ -17,6 +18,12 @@ import {
   type ComputerCaptureRequest,
 } from "../computer/ComputerBackend.ts";
 import { ComputerLeaseError, ComputerManager } from "../computer/ComputerManager.ts";
+import {
+  ScreenshotFrameRegistry,
+  screenshotDeltaToDesktop,
+  screenshotPointToDesktop,
+  screenshotRectToDesktop,
+} from "../computer/screenshotFrames.ts";
 import { mcpToolResultError, mcpToolResultJson, type McpToolCallResult } from "./protocol.ts";
 import {
   ToolInputError,
@@ -86,11 +93,16 @@ export interface AgentGatewayComputerToolsOptions {
 }
 
 /**
- * One wording for the screenshot mapping, shared by every tool that returns an
- * image, so the model transfers the same skill between them.
+ * One wording for how the model points at things, shared by every tool that
+ * returns an image: it points into the picture it was given, in that picture's
+ * own pixels, and the server does the geometry (see screenshotFrames.ts). The
+ * model is never asked to turn a screenshot pixel into a desktop coordinate —
+ * the harnesses behind the Codex app and Anthropic's computer tool do not ask
+ * either, and the arithmetic that did (region + pixel / scale across offset,
+ * downscaled captures) was where clicks went astray.
  */
-const SCREENSHOT_MAPPING_NOTE =
-  "convert a screenshot pixel to a desktop point with region.x + screenshot_x / scale and region.y + screenshot_y / scale, using the screenshot region and scale returned alongside it";
+const SCREENSHOT_FRAME_NOTE =
+  "Every screenshot comes back with a screenshotId and its width and height in pixels; to point at something in it, pass x/y as pixel coordinates in that image, measured from its top-left corner, and the server maps them onto the desktop";
 
 /**
  * Both clipboard tools must say the same thing about ownership: the desktop has
@@ -100,7 +112,7 @@ const SHARED_CLIPBOARD_NOTE =
   "The desktop has a single clipboard shared with the human user, not a private one for the agent.";
 
 const POINTER_COORDINATE_NOTE =
-  "Coordinates are global desktop coordinates in logical pixels, the same space as window bounds and the screenshot region mapping. On multi-monitor layouts some coordinate ranges fall outside every monitor, and the display server moves the pointer to the nearest monitor edge instead.";
+  "x/y are pixel coordinates in a screenshot you received — by default the most recent one this conversation was given, otherwise the one named by screenshot_id — measured from that image's top-left corner. Never convert screenshot pixels into desktop coordinates yourself; the server does that. Point at what you can see: if you have not looked at the desktop yet, or a window has moved or resized since your last screenshot, take a new screenshot first.";
 
 /**
  * Every mutating action carries its own after-screenshot so the model can act
@@ -112,7 +124,7 @@ const POINTER_COORDINATE_NOTE =
  * agent that cannot read a label in it must know the answer is one
  * `computer_screenshot` away rather than that the label is unreadable.
  */
-const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected (or the whole workspace when no window has focus), capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side so a typical application window comes back at full resolution; ${SCREENSHOT_MAPPING_NOTE}. Read the next state from that screenshot instead of making a separate screenshot call, and call computer_screenshot only when this one is too small to read the detail you need. When the new capture is identical to the one the previous action returned, the result reports screenshotUnchanged instead of repeating the image: the screen has not changed since your previous screenshot, so keep reading that one. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
+const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected (or the whole workspace when no window has focus), capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side so a typical application window comes back at full resolution. It becomes the screenshot your next x/y are measured in: read the next state from it and aim your next action at its pixels instead of making a separate screenshot call, and call computer_screenshot only when this one is too small to read the detail you need. When the new capture is identical to the one the previous action returned, the result reports screenshotUnchanged instead of repeating the image: the screen has not changed since your previous screenshot, so keep reading that one — it remains the screenshot your coordinates refer to. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
 
 const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
   include_screenshot: {
@@ -148,15 +160,32 @@ function withActionScreenshotSchema(schema: Record<string, unknown>): Record<str
   };
 }
 
+const SCREENSHOT_ID_PROPERTY = {
+  screenshot_id: {
+    type: "string",
+    description:
+      "screenshotId of the screenshot that x/y (and any region) are measured in. Defaults to the most recent screenshot this conversation received. Pass it only when pointing into an earlier screenshot that is still valid, such as a workspace overview taken just before a zoomed window capture.",
+  },
+} as const;
+
 const TARGET_PROPERTIES = {
-  x: { type: "number", description: "Global desktop x coordinate in logical pixels." },
-  y: { type: "number", description: "Global desktop y coordinate in logical pixels." },
+  x: {
+    type: "number",
+    description:
+      "X pixel coordinate in the screenshot (the most recent one, or the one named by screenshot_id), measured from its left edge.",
+  },
+  y: {
+    type: "number",
+    description:
+      "Y pixel coordinate in the screenshot (the most recent one, or the one named by screenshot_id), measured from its top edge.",
+  },
+  ...SCREENSHOT_ID_PROPERTY,
   label: { type: "string", description: "Accessible label to resolve from a fresh UI snapshot." },
   role: { type: "string", description: "Optional accessible role used to disambiguate a label." },
   window_id: {
     type: "string",
     description:
-      "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the coordinate is outside the window.",
+      "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the point to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the point falls outside the window.",
   },
 } as const;
 
@@ -200,10 +229,6 @@ function targetErrorResult(error: ComputerTargetError): McpToolCallResult {
   };
 }
 
-function readTarget(args: Record<string, unknown>): ComputerTarget {
-  return readTargetRecord(args);
-}
-
 /**
  * Whether a target was actually given, decided by what survived reading rather
  * than by which keys the model happened to emit. Models routinely spell an
@@ -221,25 +246,40 @@ function readWindowIdArg(args: Record<string, unknown>): string | undefined {
   return readStringArg(args, "window_id") ?? readStringArg(args, "windowId");
 }
 
-function readTargetRecord(args: Record<string, unknown>): ComputerTarget {
+function readScreenshotIdArg(args: Record<string, unknown>): string | undefined {
+  return readStringArg(args, "screenshot_id") ?? readStringArg(args, "screenshotId");
+}
+
+/**
+ * A target as the model wrote it: x/y still in screenshot pixels, plus the
+ * screenshot they belong to. It becomes a `ComputerTarget` only once the
+ * frame registry has turned the pixels into a desktop point.
+ */
+interface ScreenshotTarget extends ComputerTarget {
+  readonly screenshotId?: string;
+}
+
+function readScreenshotTarget(args: Record<string, unknown>): ScreenshotTarget {
   const x = readNumberArg(args, "x");
   const y = readNumberArg(args, "y");
+  const screenshotId = readScreenshotIdArg(args);
   const label = readStringArg(args, "label");
   const role = readStringArg(args, "role");
   const windowId = readWindowIdArg(args);
   return {
     ...(x !== undefined ? { x } : {}),
     ...(y !== undefined ? { y } : {}),
+    ...(screenshotId !== undefined ? { screenshotId } : {}),
     ...(label !== undefined ? { label } : {}),
     ...(role !== undefined ? { role } : {}),
     ...(windowId !== undefined ? { windowId } : {}),
   };
 }
 
-function readNestedTarget(args: Record<string, unknown>, name: string): ComputerTarget {
+function readNestedScreenshotTarget(args: Record<string, unknown>, name: string): ScreenshotTarget {
   const value = readRecordArg(args, name);
   if (!value) throw new ToolInputError(`Missing required argument "${name}".`);
-  return readTargetRecord(value);
+  return readScreenshotTarget(value);
 }
 
 function readDelta(args: Record<string, unknown>, name: string): number {
@@ -288,43 +328,6 @@ function readClipboardText(args: Record<string, unknown>): string {
   return value;
 }
 
-/**
- * PNG bytes travel as MCP image content, and the mapping metadata travels as
- * the text part, so a model reading either tool's result maps pixels back to
- * desktop coordinates the same way.
- */
-function screenshotResult(payload: unknown, bytesBase64: string): McpToolCallResult {
-  return {
-    content: [
-      { type: "text", text: JSON.stringify(payload, null, 2) },
-      { type: "image", data: bytesBase64, mimeType: "image/png" },
-    ],
-  };
-}
-
-function imageStateResult(state: ComputerState): McpToolCallResult {
-  const screenshot = state.screenshot;
-  if (!screenshot) return mcpToolResultJson(state);
-  const { bytesBase64, ...metadata } = screenshot;
-  return screenshotResult({ ...state, screenshot: metadata }, bytesBase64);
-}
-
-function capturedScreenshotResult(
-  computerId: string,
-  request: ComputerCaptureRequest,
-  screenshot: ComputerScreenshot,
-): McpToolCallResult {
-  const { bytesBase64, ...metadata } = screenshot;
-  return screenshotResult(
-    {
-      computerId,
-      ...(request.kind === "window" ? { windowId: request.windowId } : {}),
-      screenshot: metadata,
-    },
-    bytesBase64,
-  );
-}
-
 const CAPTURE_REGION_KEYS = ["x", "y", "width", "height"] as const;
 
 /**
@@ -339,9 +342,15 @@ type ScreenshotRequest =
 /**
  * The window and rect request forms are mutually exclusive on purpose: a
  * window id and a loose rect disagree about what "the region" is, and silently
- * preferring one would hand the model a screenshot it cannot map.
+ * preferring one would hand the model a screenshot of the wrong thing.
+ *
+ * A rect arrives in the pixels of the screenshot the model is zooming into;
+ * `mapRegion` turns it into the desktop rect the backend captures.
  */
-function readCaptureRequest(args: Record<string, unknown>): ScreenshotRequest {
+function readCaptureRequest(
+  args: Record<string, unknown>,
+  mapRegion: (region: ComputerRect) => ComputerRect,
+): ScreenshotRequest {
   const windowId = readWindowIdArg(args);
   const present = CAPTURE_REGION_KEYS.filter(
     (key) => args[key] !== undefined && args[key] !== null,
@@ -375,7 +384,7 @@ function readCaptureRequest(args: Record<string, unknown>): ScreenshotRequest {
   if (region.width <= 0 || region.height <= 0) {
     throw new ToolInputError('Arguments "width" and "height" must be greater than zero.');
   }
-  return { kind: "region", region, ...limit };
+  return { kind: "region", region: mapRegion(region), ...limit };
 }
 
 function readCaptureMaxDimension(args: Record<string, unknown>): number | undefined {
@@ -397,6 +406,91 @@ export function makeAgentGatewayComputerTools(
   options: AgentGatewayComputerToolsOptions,
 ): ReadonlyArray<ToolEntry> {
   const { manager } = options;
+  /**
+   * The screenshots each thread has been shown, so its x/y can be read as
+   * pixels in one of them. Lives with the tools rather than the manager
+   * because it is the tool surface's contract with the model: the manager
+   * and the pane keep speaking desktop coordinates.
+   */
+  const frames = new ScreenshotFrameRegistry();
+
+  /**
+   * PNG bytes travel as MCP image content and the metadata as the text part.
+   * Delivering is also remembering: the screenshot becomes the frame the
+   * thread's next x/y are measured in, and the metadata carries the id that
+   * lets the model name it later.
+   */
+  const deliverScreenshot = (
+    threadId: string,
+    payload: Record<string, unknown>,
+    screenshot: ComputerScreenshot,
+    windowId?: string,
+  ): McpToolCallResult => {
+    const { bytesBase64, ...metadata } = screenshot;
+    const frame = frames.record(threadId, screenshot, windowId);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ...payload,
+              screenshot: {
+                ...(frame ? { screenshotId: frame.id } : {}),
+                ...(windowId !== undefined ? { windowId } : {}),
+                ...metadata,
+              },
+            },
+            null,
+            2,
+          ),
+        },
+        { type: "image", data: bytesBase64, mimeType: "image/png" },
+      ],
+    };
+  };
+
+  const imageStateResult = (threadId: string, state: ComputerState): McpToolCallResult => {
+    const { screenshot, ...rest } = state;
+    if (!screenshot) return mcpToolResultJson(state);
+    return deliverScreenshot(threadId, rest, screenshot);
+  };
+
+  const capturedScreenshotResult = (
+    threadId: string,
+    request: ComputerCaptureRequest,
+    screenshot: ComputerScreenshot,
+  ): McpToolCallResult =>
+    deliverScreenshot(
+      threadId,
+      { computerId: manager.computerId },
+      screenshot,
+      request.kind === "window" ? request.windowId : undefined,
+    );
+
+  /**
+   * The model's target as the manager understands it: screenshot pixels
+   * become a desktop point through the frame they were measured in. A target
+   * with no coordinates (a label, or nothing) passes through untouched, and a
+   * half coordinate is left for the manager to refuse with its usual message.
+   */
+  const resolveTarget = (target: ScreenshotTarget, threadId: string): ComputerTarget => {
+    const { screenshotId, ...rest } = target;
+    if (typeof target.x !== "number" || typeof target.y !== "number") return rest;
+    const frame = frames.resolve(threadId, screenshotId);
+    return { ...rest, ...screenshotPointToDesktop(frame, target.x, target.y) };
+  };
+
+  const readTarget = (args: Record<string, unknown>, context: ToolContext): ComputerTarget =>
+    resolveTarget(readScreenshotTarget(args), context.callerThreadId);
+
+  const readNestedTarget = (
+    args: Record<string, unknown>,
+    name: string,
+    context: ToolContext,
+  ): ComputerTarget =>
+    resolveTarget(readNestedScreenshotTarget(args, name), context.callerThreadId);
+
   const handle =
     (
       name: string,
@@ -459,6 +553,7 @@ export function makeAgentGatewayComputerTools(
    */
   const actionResultWithScreenshot = async (
     args: Record<string, unknown>,
+    context: ToolContext,
     result: ComputerActionResult,
   ): Promise<unknown> => {
     if (readBooleanArg(args, "include_screenshot") === false) return result;
@@ -478,17 +573,7 @@ export function makeAgentGatewayComputerTools(
         note: "The screen has not changed since your previous screenshot, pixel for pixel, so the identical image was not sent again. Keep reading the previous one. If you expected this action to change something, it did not land — check the window is focused and not covered, or that the control is where you aimed.",
       };
     }
-    const { bytesBase64, ...metadata } = capture.screenshot;
-    return screenshotResult(
-      {
-        ...result,
-        screenshot: {
-          ...(capture.windowId !== undefined ? { windowId: capture.windowId } : {}),
-          ...metadata,
-        },
-      },
-      bytesBase64,
-    );
+    return deliverScreenshot(context.callerThreadId, result, capture.screenshot, capture.windowId);
   };
 
   /**
@@ -510,7 +595,7 @@ export function makeAgentGatewayComputerTools(
       title,
       `${description} ${ACTION_SCREENSHOT_NOTE}`,
       withActionScreenshotSchema(inputSchema),
-      async (args, context) => actionResultWithScreenshot(args, await run(args, context)),
+      async (args, context) => actionResultWithScreenshot(args, context, await run(args, context)),
     );
 
   const targetSchema = {
@@ -537,7 +622,7 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_get_state",
-        description: `Read the current desktop state. The screenshot covers the entire desktop workspace across every monitor, scaled down: ${SCREENSHOT_MAPPING_NOTE}. Window bounds and cursor positions in the JSON are already desktop coordinates. Use computer_screenshot when workspace detail is too small to read. Request a screenshot or accessibility text only when needed because both increase payload size.`,
+        description: `Read the current desktop state. The screenshot covers the entire desktop workspace across every monitor, scaled down. ${SCREENSHOT_FRAME_NOTE}. Window bounds and cursor positions in the JSON are desktop coordinates, useful for telling windows apart but not for aiming: aim with screenshot pixels. Use computer_screenshot when workspace detail is too small to read. Request a screenshot or accessibility text only when needed because both increase payload size.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -548,8 +633,9 @@ export function makeAgentGatewayComputerTools(
         },
         annotations: { title: "Get computer state", ...READ_ONLY_TOOL_ANNOTATIONS },
       },
-      handler: handle("computer_get_state", async (args) =>
+      handler: handle("computer_get_state", async (args, context) =>
         imageStateResult(
+          context.callerThreadId,
           await manager.getState({
             includeScreenshot: readBooleanArg(args, "include_screenshot") ?? false,
             includeText: readBooleanArg(args, "include_text") ?? false,
@@ -562,7 +648,7 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_screenshot",
-        description: `Zoom into one part of the desktop when detail is too small to read in the downscaled computer_get_state screenshot. With no arguments it captures the window that currently has focus, which is usually the one to look at. Otherwise capture a single window by "window_id" from computer_list_windows, or a rectangle given as "x", "y", "width" and "height" in global desktop logical pixels; never pass both forms. The same mapping applies as in computer_get_state: ${SCREENSHOT_MAPPING_NOTE}. The capture is clipped to the desktop workspace, so read the returned region rather than assuming it matches the request.`,
+        description: `Zoom into one part of the desktop when detail is too small to read in a screenshot you have. With no arguments it captures the window that currently has focus, which is usually the one to look at. Otherwise capture a single window by "window_id" from computer_list_windows, or a rectangle given as "x", "y", "width" and "height" in pixels of the screenshot you are zooming into (the most recent one, or the one named by screenshot_id); never pass both forms. ${SCREENSHOT_FRAME_NOTE}. The capture is clipped to the desktop workspace, so it may cover less than requested.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -573,11 +659,22 @@ export function makeAgentGatewayComputerTools(
             },
             x: {
               type: "number",
-              description: "Region left edge in global desktop logical pixels.",
+              description:
+                "Region left edge, in pixels of the screenshot being zoomed into (the most recent one, or the one named by screenshot_id).",
             },
-            y: { type: "number", description: "Region top edge in global desktop logical pixels." },
-            width: { type: "number", description: "Region width in logical pixels." },
-            height: { type: "number", description: "Region height in logical pixels." },
+            y: {
+              type: "number",
+              description: "Region top edge, in pixels of the same screenshot.",
+            },
+            width: {
+              type: "number",
+              description: "Region width in pixels of the same screenshot.",
+            },
+            height: {
+              type: "number",
+              description: "Region height in pixels of the same screenshot.",
+            },
+            ...SCREENSHOT_ID_PROPERTY,
             max_dimension: {
               type: "integer",
               minimum: 1,
@@ -589,22 +686,22 @@ export function makeAgentGatewayComputerTools(
         },
         annotations: { title: "Capture computer screenshot", ...READ_ONLY_TOOL_ANNOTATIONS },
       },
-      handler: handle("computer_screenshot", async (args) => {
-        const request = readCaptureRequest(args);
+      handler: handle("computer_screenshot", async (args, context) => {
+        const threadId = context.callerThreadId;
+        const request = readCaptureRequest(args, (region) =>
+          screenshotRectToDesktop(frames.resolve(threadId, readScreenshotIdArg(args)), region),
+        );
         if (request.kind === "focused") {
           const capture = await manager.captureFocusedWindow(request.maxDimension);
-          const { bytesBase64, ...metadata } = capture.screenshot;
-          return screenshotResult(
-            {
-              computerId: manager.computerId,
-              ...(capture.windowId !== undefined ? { windowId: capture.windowId } : {}),
-              screenshot: metadata,
-            },
-            bytesBase64,
+          return deliverScreenshot(
+            threadId,
+            { computerId: manager.computerId },
+            capture.screenshot,
+            capture.windowId,
           );
         }
         return capturedScreenshotResult(
-          manager.computerId,
+          threadId,
           request,
           await manager.captureScreenshot(request),
         );
@@ -615,7 +712,8 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_get_screen_size",
-        description: "Read the logical screen dimensions used for coordinate targeting.",
+        description:
+          "Read the logical screen dimensions of the desktop workspace. Informational only: pointer tools take pixel coordinates in a screenshot, not screen coordinates.",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         annotations: { title: "Get screen size", ...READ_ONLY_TOOL_ANNOTATIONS },
       },
@@ -669,28 +767,31 @@ export function makeAgentGatewayComputerTools(
       "Click",
       `Click a coordinate or a uniquely labelled visible control. Ambiguous and off-screen targets are refused. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
-      async (args, context) => manager.click(context.callerThreadId, readTarget(args)),
+      async (args, context) => manager.click(context.callerThreadId, readTarget(args, context)),
     ),
     observedActionEntry(
       "computer_double_click",
       "Double click",
       `Double-click a coordinate or a uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
-      async (args, context) => manager.doubleClick(context.callerThreadId, readTarget(args)),
+      async (args, context) =>
+        manager.doubleClick(context.callerThreadId, readTarget(args, context)),
     ),
     observedActionEntry(
       "computer_right_click",
       "Right click",
       `Right-click a coordinate or a uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
-      async (args, context) => manager.rightClick(context.callerThreadId, readTarget(args)),
+      async (args, context) =>
+        manager.rightClick(context.callerThreadId, readTarget(args, context)),
     ),
     observedActionEntry(
       "computer_move_cursor",
       "Move cursor",
       `Move the dedicated computer-use cursor to a coordinate or uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
-      async (args, context) => manager.moveCursor(context.callerThreadId, readTarget(args)),
+      async (args, context) =>
+        manager.moveCursor(context.callerThreadId, readTarget(args, context)),
     ),
     observedActionEntry(
       "computer_drag",
@@ -709,15 +810,15 @@ export function makeAgentGatewayComputerTools(
       async (args, context) =>
         manager.drag(
           context.callerThreadId,
-          readNestedTarget(args, "from"),
-          readNestedTarget(args, "to"),
+          readNestedTarget(args, "from", context),
+          readNestedTarget(args, "to", context),
           readDragDurationMs(args),
         ),
     ),
     observedActionEntry(
       "computer_scroll",
       "Scroll",
-      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in logical pixels, the same unit as coordinates and window bounds — roughly 80 pixels per notch of a physical wheel. To page through content, scroll by about half the window's height so each observation overlaps the last; larger steps skip content, and a wheel cannot scroll past the top or bottom, so a scroll that changes nothing means the end was already reached. ${POINTER_COORDINATE_NOTE}`,
+      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in pixels of the same screenshot the coordinates are in — roughly 80 pixels per notch of a physical wheel in a full-resolution window capture. To page through content, scroll by about half the window's height as it appears in the screenshot so each observation overlaps the last; larger steps skip content, and a wheel cannot scroll past the top or bottom, so a scroll that changes nothing means the end was already reached. ${POINTER_COORDINATE_NOTE}`,
       {
         type: "object",
         properties: {
@@ -725,24 +826,33 @@ export function makeAgentGatewayComputerTools(
           delta_x: {
             type: "number",
             description:
-              "Horizontal scroll distance in logical pixels; positive scrolls toward the right of the content.",
+              "Horizontal scroll distance in screenshot pixels; positive scrolls toward the right of the content.",
           },
           delta_y: {
             type: "number",
             description:
-              "Vertical scroll distance in logical pixels; positive scrolls toward the end of the content, the way a wheel notch pulled downward does.",
+              "Vertical scroll distance in screenshot pixels; positive scrolls toward the end of the content, the way a wheel notch pulled downward does.",
           },
         },
         required: ["delta_x", "delta_y"],
         additionalProperties: false,
       },
       async (args, context) => {
-        const target = readTarget(args);
-        return manager.scroll(
-          context.callerThreadId,
-          hasTargetFields(target) ? target : null,
+        const threadId = context.callerThreadId;
+        const raw = readScreenshotTarget(args);
+        const target = resolveTarget(raw, threadId);
+        // The distance is in the same picture's pixels as the point, so a
+        // scroll needs a frame even when it names no point at all.
+        const delta = screenshotDeltaToDesktop(
+          frames.resolve(threadId, raw.screenshotId),
           readDelta(args, "delta_x"),
           readDelta(args, "delta_y"),
+        );
+        return manager.scroll(
+          threadId,
+          hasTargetFields(target) ? target : null,
+          delta.deltaX,
+          delta.deltaY,
         );
       },
     ),
@@ -825,7 +935,7 @@ export function makeAgentGatewayComputerTools(
       async (args, context) =>
         manager.setValue(
           context.callerThreadId,
-          readTarget(args),
+          readTarget(args, context),
           readRawRequiredString(args, "value"),
         ),
     ),
@@ -842,7 +952,7 @@ export function makeAgentGatewayComputerTools(
       async (args, context) =>
         manager.performAction(
           context.callerThreadId,
-          readTarget(args),
+          readTarget(args, context),
           readStringArg(args, "action", { required: true })!,
         ),
     ),
