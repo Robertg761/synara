@@ -199,9 +199,9 @@ describe("PortalSession", () => {
         body: [expect.any(String), {}, EVDEV_BUTTON_CODES.left, 1],
       },
       { member: "NotifyKeyboardKeycode", body: [expect.any(String), {}, 30, 0] },
-      // 150 logical px at 50 px per notch: the portal wire speaks whole wheel
+      // 150 logical px at 80 px per notch: the portal wire speaks whole wheel
       // notches, so one scroll means the same thing here as on kwin/wlroots.
-      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, -3] },
+      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, -1] },
     ]);
     await session.dispose();
   });
@@ -213,19 +213,19 @@ describe("PortalSession", () => {
     });
     const { session } = sessionFor(portal);
 
-    // 30 px is under one 50 px notch: nothing goes on the wire, nothing is lost.
-    await session.scroll(0, 30);
+    // 50 px is under one 80 px notch: nothing goes on the wire, nothing is lost.
+    await session.scroll(0, 50);
     expect(portal.notifications).toEqual([]);
 
-    // The carried 30 px plus 30 px crosses the notch; 10 px stays owed.
-    await session.scroll(0, 30);
+    // The carried 50 px plus 50 px crosses the notch; 20 px stays owed.
+    await session.scroll(0, 50);
     expect(portal.notifications).toEqual([
       { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, 1] },
     ]);
 
-    // Each axis carries its own remainder: 60 px horizontal is 1 notch + 10 px,
-    // unaffected by the vertical axis's 10 px debt.
-    await session.scroll(60, 0);
+    // Each axis carries its own remainder: 100 px horizontal is 1 notch + 20 px,
+    // unaffected by the vertical axis's 20 px debt.
+    await session.scroll(100, 0);
     expect(portal.notifications.at(-1)).toEqual({
       member: "NotifyPointerAxisDiscrete",
       body: [expect.any(String), {}, 1, 1],

@@ -14,12 +14,14 @@
  * Pixels per wheel notch.
  *
  * The pixels are *content* pixels: what a page actually moves when a physical
- * wheel clicks once. That is a toolkit decision, not a protocol one — Chromium
- * scrolls 53 px per notch on Linux, Firefox three lines (about 57 px), Qt and
- * terminals three lines too — so this is a nominal figure in the middle of
- * them, and the tool surface promises "roughly" this much. It also matches
- * what a browser reports as `deltaY` for one notch, so a human notch on the
- * computer pane arrives on the desktop as about one notch.
+ * wheel clicks once. That is a toolkit decision, not a protocol one. Measured
+ * on Hyprland, Firefox moves 85.5 px per notch (GDK's 1.5 units × three lines
+ * of 19 px); Chromium's Wayland path works out to about 80 (1.5 × its 53 px
+ * wheel delta); Qt and terminals do three lines, nearer 60. This is a nominal
+ * figure close to the browsers, which is where the agent scrolls most, and the
+ * tool surface promises "roughly" this much. It is also about what a browser
+ * reports as `deltaY` for one notch, so a human notch on the computer pane
+ * arrives on the desktop as about one notch.
  *
  * It is deliberately not libinput's 15 wire units per notch. Those are what a
  * compositor hands a client in `wl_pointer.axis` — degrees of wheel rotation,
@@ -36,7 +38,7 @@
  * `SCROLL_PIXELS_PER_NOTCH` in
  * apps/server/native/computer-use-hyprland/synarahyprlandplugin.cpp.
  */
-export const SCROLL_STEP_PX = 50;
+export const SCROLL_STEP_PX = 80;
 
 /**
  * Whole notches owed for a pixel delta that can only be delivered as notches.

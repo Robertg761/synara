@@ -33,12 +33,12 @@
 #define CAPTURE_BUDGET_MS 10000
 /* Pixels per wheel notch. The tool surface speaks pixels; a wheel speaks
  * notches, and toolkits ignore a wheel event that carries neither. These are
- * content pixels, what a page moves per click (Chromium 53, Firefox about 57),
- * not the 15 wire units libinput reports per click: those are degrees, which
- * every toolkit scales up, and taking them for pixels made each scroll several
- * times longer than asked. Keep in sync with SCROLL_STEP_PX in
+ * content pixels, what a page moves per click (about 86 in Firefox on Wayland,
+ * 80 in Chromium), not the 15 wire units libinput reports per click: those are
+ * degrees, which every toolkit scales up, and taking them for pixels made each
+ * scroll several times longer than asked. Keep in sync with SCROLL_STEP_PX in
  * apps/server/src/computer/scrollUnits.ts, which carries the full rationale. */
-#define SCROLL_STEP_PX 50.0
+#define SCROLL_STEP_PX 80.0
 /* What one notch is worth on the continuous axis: libinput's wheel unit is
  * degrees of rotation, 15 per click, and that is the scale every client
  * expects in wl_pointer.axis. */
