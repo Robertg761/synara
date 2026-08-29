@@ -75,7 +75,24 @@ async function setup(backend = new FakeComputerBackend()) {
     if (!tool) throw new Error(`no such tool: ${name}`);
     return await Effect.runPromise(tool.handler(args, makeContext(provider, threadId, label)));
   };
-  return { backend, manager, tools, byName, call };
+  /**
+   * Look at the desktop the way the model does before it points: a workspace
+   * screenshot. The fake workspace is 1920×1080 captured at scale 1 from
+   * (0, 0), so pixels in this frame are desktop points — every coordinate a
+   * test passes after `see()` reaches the backend unchanged.
+   */
+  const see = async (threadId = THREAD, label: string | null = null) => {
+    const state = await call(
+      "computer_get_state",
+      { include_screenshot: true },
+      undefined,
+      threadId,
+      label,
+    );
+    expect(state.isError).not.toBe(true);
+    return (resultJson(state) as { screenshot: { screenshotId: string } }).screenshot;
+  };
+  return { backend, manager, tools, byName, call, see };
 }
 
 describe("agent gateway computer tools", () => {
@@ -88,7 +105,8 @@ describe("agent gateway computer tools", () => {
         names.push(name);
       },
     });
-    const { call } = await setup(backend);
+    const { call, see } = await setup(backend);
+    await see(THREAD, "Luna");
 
     await call("computer_click", { x: 4, y: 4 }, "claudeAgent", THREAD, "Luna");
     expect(names).toEqual(["Luna"]);
@@ -181,24 +199,31 @@ describe("agent gateway computer tools", () => {
     expect(state.content.find((entry) => entry.type === "image")).toMatchObject({
       mimeType: "image/png",
     });
-    // The model can only turn screenshot pixels into pointer coordinates when
-    // the region and scale travel with the image.
+    // The id is how the model names this picture later; the size is the space
+    // its coordinates are in. Region and scale still travel for the pane and
+    // for debugging, but the model is never asked to do arithmetic with them.
     const text = state.content.find((entry) => entry.type === "text");
     expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
-      screenshot: { region: { x: 0, y: 0, width: 1_920, height: 1_080 }, scale: 1 },
+      screenshot: {
+        screenshotId: "shot-1",
+        width: 1_920,
+        height: 1_080,
+        region: { x: 0, y: 0, width: 1_920, height: 1_080 },
+        scale: 1,
+      },
     });
   });
 
-  it("describes the screenshot-to-desktop coordinate mapping for the model", async () => {
+  it("tells the model to point in screenshot pixels and never to convert them", async () => {
     const { byName } = await setup();
-    expect(byName.get("computer_get_state")?.definition.description).toContain(
-      "region.x + screenshot_x / scale",
-    );
-    // Both perception tools must spell the mapping out identically so the model
-    // carries the same skill from the workspace shot to the zoomed one.
-    expect(byName.get("computer_screenshot")?.definition.description).toContain(
-      "region.x + screenshot_x / scale",
-    );
+    // Both perception tools spell the same contract out, so the model carries
+    // one skill from the workspace shot to the zoomed one.
+    for (const name of ["computer_get_state", "computer_screenshot"]) {
+      const description = byName.get(name)?.definition.description ?? "";
+      expect(description).toContain("screenshotId");
+      expect(description).toContain("pass x/y as pixel coordinates in that image");
+      expect(description).not.toContain("region.x");
+    }
     for (const name of [
       "computer_click",
       "computer_double_click",
@@ -207,8 +232,16 @@ describe("agent gateway computer tools", () => {
       "computer_drag",
       "computer_scroll",
     ]) {
-      expect(byName.get(name)?.definition.description).toContain("global desktop coordinates");
+      const description = byName.get(name)?.definition.description ?? "";
+      expect(description).toContain("pixel coordinates in a screenshot you received");
+      expect(description).toContain("Never convert screenshot pixels into desktop coordinates");
+      expect(description).not.toContain("global desktop coordinates");
+      // The optional id lives beside x/y on every pointer tool.
+      expect(JSON.stringify(byName.get(name)?.definition.inputSchema)).toContain("screenshot_id");
     }
+    expect(byName.get("computer_get_screen_size")?.definition.description).toContain(
+      "Informational only",
+    );
   });
 
   it("tells the model how to click a window another window covers", async () => {
@@ -226,8 +259,8 @@ describe("agent gateway computer tools", () => {
     }
   });
 
-  it("zooms into a window and maps the capture back to desktop coordinates", async () => {
-    const { backend, call } = await setup();
+  it("zooms into a window and reads the next coordinates in that window's pixels", async () => {
+    const { backend, call, see } = await setup();
     const result = await call("computer_screenshot", { window_id: "fake-calculator" });
 
     expect(result.isError).not.toBe(true);
@@ -239,8 +272,9 @@ describe("agent gateway computer tools", () => {
     // which fits the default budget, so the capture is not downscaled.
     const text = result.content.find((entry) => entry.type === "text");
     expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
-      windowId: "fake-calculator",
       screenshot: {
+        screenshotId: "shot-1",
+        windowId: "fake-calculator",
         mimeType: "image/png",
         width: 420,
         height: 620,
@@ -252,10 +286,87 @@ describe("agent gateway computer tools", () => {
       kind: "window",
       windowId: "fake-calculator",
     });
+
+    // Pixel (5, 5) of that picture is the calculator's top-left corner plus
+    // five: the server adds the window offset, the model never does. (The
+    // clicks here skip their observation so the zoom stays the frame; an
+    // observation would become the next frame, as the observation test pins.)
+    await call("computer_click", { x: 5, y: 5, include_screenshot: false });
+    expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 1_055, y: 125 });
+
+    // A point past the picture's edge is refused rather than landing on
+    // whatever the desktop has next to the window.
+    const outside = await call("computer_click", { x: 500, y: 10, include_screenshot: false });
+    expect(outside.isError).toBe(true);
+    expect(resultJson(outside)).toMatchObject({
+      error: {
+        code: "computer_target_offscreen",
+        message: expect.stringContaining("420x620 screenshot shot-1"),
+      },
+    });
+    expect(backend.callsFor("click")).toHaveLength(1);
+
+    // Naming an earlier screenshot reads the coordinates in that one instead.
+    const workspace = await see();
+    expect(workspace.screenshotId).toBe("shot-2");
+    await call("computer_click", {
+      x: 5,
+      y: 5,
+      screenshot_id: "shot-1",
+      include_screenshot: false,
+    });
+    expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 1_055, y: 125 });
+    await call("computer_click", { x: 5, y: 5, include_screenshot: false });
+    expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 5, y: 5 });
+
+    // An id this conversation was never given is refused, naming the ones it has.
+    const unknown = await call("computer_click", { x: 5, y: 5, screenshot_id: "shot-9" });
+    expect(resultJson(unknown)).toMatchObject({
+      error: {
+        code: "computer_target_not_found",
+        message: expect.stringContaining("shot-1, shot-2"),
+      },
+    });
   });
 
-  it("zooms into a region and reports the downscaled pixel mapping", async () => {
+  it("refuses to point before the conversation has seen a screenshot", async () => {
     const { backend, call } = await setup();
+
+    const blind = await call("computer_click", { x: 4, y: 4 });
+    expect(blind.isError).toBe(true);
+    expect(resultJson(blind)).toMatchObject({
+      error: {
+        code: "computer_target_invalid",
+        message: expect.stringContaining("computer_screenshot"),
+      },
+    });
+    // A scroll distance is in screenshot pixels too, so it needs a frame even
+    // without a point.
+    const scroll = await call("computer_scroll", { delta_x: 0, delta_y: 100 });
+    expect(scroll.isError).toBe(true);
+    expect(backend.callsFor("click")).toHaveLength(0);
+    expect(backend.callsFor("scroll")).toHaveLength(0);
+
+    // A label needs no picture: it is resolved from the accessibility tree.
+    const byLabel = await call("computer_click", { label: "Calculate", role: "button" });
+    expect(byLabel.isError).not.toBe(true);
+    expect(backend.callsFor("click")).toHaveLength(1);
+  });
+
+  it("keeps each conversation's screenshots apart", async () => {
+    const { call, see } = await setup();
+    await see("thread-a");
+
+    // Thread B never looked, so thread A's picture is not its frame.
+    const blind = await call("computer_click", { x: 1, y: 1 }, undefined, "thread-b");
+    expect(resultJson(blind)).toMatchObject({ error: { code: "computer_target_invalid" } });
+  });
+
+  it("zooms into a region and maps points and scroll distances through its scale", async () => {
+    const { backend, call, see } = await setup();
+    await see();
+    // The rect is in the workspace screenshot's pixels, which here are desktop
+    // points one for one.
     const result = await call("computer_screenshot", {
       x: 1_050,
       y: 120,
@@ -278,12 +389,31 @@ describe("agent gateway computer tools", () => {
       },
     });
     expect(payload.windowId).toBeUndefined();
-    const { region, scale } = payload.screenshot;
-    expect([region.x + 100 / scale, region.y + 100 / scale]).toEqual([1_250, 320]);
     expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
       kind: "region",
       region: { x: 1_050, y: 120, width: 400, height: 800 },
       maxDimension: 400,
+    });
+
+    // The server owns the arithmetic the model used to be asked for. (Each
+    // action skips its observation so the zoom stays the frame under test.)
+    const skip = { include_screenshot: false };
+    await call("computer_click", { x: 100, y: 100, ...skip });
+    expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 1_250, y: 320 });
+    // A scroll distance is in the same pixels as the point, so 40 pixels of a
+    // half-scale picture is 80 pixels of content.
+    await call("computer_scroll", { x: 100, y: 100, delta_x: 0, delta_y: 40, ...skip });
+    expect(backend.callsFor("scroll").at(-1)?.args).toEqual([{ x: 1_250, y: 320 }, 0, 80]);
+    await call("computer_drag", { from: { x: 0, y: 0 }, to: { x: 100, y: 100 }, ...skip });
+    expect(backend.callsFor("drag").at(-1)?.args.slice(0, 2)).toEqual([
+      { x: 1_050, y: 120 },
+      { x: 1_250, y: 320 },
+    ]);
+    // Zooming again is measured in the zoomed picture, and clipped to it.
+    await call("computer_screenshot", { x: 100, y: 300, width: 200, height: 200 });
+    expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+      kind: "region",
+      region: { x: 1_250, y: 720, width: 200, height: 200 },
     });
   });
 
@@ -315,8 +445,11 @@ describe("agent gateway computer tools", () => {
     // it and says so, mapping the same way an explicit window capture does.
     const text = result.content.find((entry) => entry.type === "text");
     expect(JSON.parse(text?.type === "text" ? text.text : "{}")).toMatchObject({
-      windowId: "fake-terminal",
-      screenshot: { region: { x: 40, y: 40, width: 960, height: 720 } },
+      screenshot: {
+        screenshotId: "shot-1",
+        windowId: "fake-terminal",
+        region: { x: 40, y: 40, width: 960, height: 720 },
+      },
     });
     expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
       kind: "window",
@@ -357,7 +490,8 @@ describe("agent gateway computer tools", () => {
   it("passes a clamped pointer landing point back to the caller", async () => {
     const backend = new FakeComputerBackend();
     backend.click = async (point) => ({ point, clampedTo: { x: point.x, y: 1_080 } });
-    const { call } = await setup(backend);
+    const { call, see } = await setup(backend);
+    await see();
 
     const result = await call("computer_click", { x: 44, y: 44 });
     expect(result.isError).not.toBe(true);
@@ -369,7 +503,8 @@ describe("agent gateway computer tools", () => {
   });
 
   it("attaches a post-action screenshot of the focused window to action results", async () => {
-    const { backend, call } = await setup();
+    const { backend, call, see } = await setup();
+    await see();
     const result = await call("computer_click", { x: 10, y: 10 });
 
     expect(result.isError).not.toBe(true);
@@ -381,6 +516,7 @@ describe("agent gateway computer tools", () => {
       action: "computer_click",
       point: { x: 10, y: 10 },
       screenshot: {
+        screenshotId: "shot-2",
         windowId: "fake-terminal",
         region: { x: 40, y: 40, width: 960, height: 720 },
         scale: 1,
@@ -392,10 +528,22 @@ describe("agent gateway computer tools", () => {
       // Action observations spend a smaller pixel budget than perception ones.
       maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
     });
+
+    // The observation is the picture the model reads next, so it is also the
+    // one its next coordinates are in: (5, 5) of the terminal is desktop (45, 45).
+    await call("computer_click", { x: 5, y: 5 });
+    expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 45, y: 45 });
+    // The identical capture comes back as screenshotUnchanged, and the model is
+    // told to keep reading the previous picture — so that stays the frame.
+    const repeat = await call("computer_click", { x: 5, y: 5 });
+    expect(resultJson(repeat)).toMatchObject({ screenshotUnchanged: true });
+    await call("computer_click", { x: 6, y: 6 });
+    expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 46, y: 46 });
   });
 
   it("captures the window a scoped action named rather than the focused one", async () => {
-    const { backend, call } = await setup();
+    const { backend, call, see } = await setup();
+    await see();
     const result = await call("computer_click", {
       x: 1_100,
       y: 200,
@@ -422,7 +570,8 @@ describe("agent gateway computer tools", () => {
       backend.emitWindowsChanged([]);
       return result;
     };
-    const { call } = await setup(backend);
+    const { call, see } = await setup(backend);
+    await see();
 
     const result = await call("computer_click", {
       x: 1_100,
@@ -610,7 +759,8 @@ describe("agent gateway computer tools", () => {
         children: [],
       },
     });
-    const { call } = await setup(backend);
+    const { call, see } = await setup(backend);
+    await see();
 
     const result = await call("computer_scroll", {
       windowId: "w1",
@@ -699,7 +849,8 @@ describe("agent gateway computer tools", () => {
   });
 
   it("refuses a second thread's actions with a retryable error and keeps its perception", async () => {
-    const { backend, call, manager } = await setup();
+    const { backend, call, manager, see } = await setup();
+    await see("thread-a");
 
     // The first action to land owns the desktop; nothing asks for it explicitly.
     const owned = await call("computer_click", { x: 10, y: 10 }, undefined, "thread-a");
@@ -718,7 +869,8 @@ describe("agent gateway computer tools", () => {
     expect(backend.callsFor("typeText")).toHaveLength(0);
 
     // Reading the desktop is never arbitrated: the blocked thread can keep
-    // watching, which is what makes "try again later" actionable advice.
+    // watching, which is what makes "try again later" actionable advice. (The
+    // state call gives the zoom that follows it a screenshot to point into.)
     for (const [name, args] of [
       ["computer_list_windows", {}],
       ["computer_get_state", { include_screenshot: true }],
@@ -747,7 +899,8 @@ describe("agent gateway computer tools", () => {
    * wherever the pointer is".
    */
   it("reads an explicitly null scroll target as no target", async () => {
-    const { backend, call } = await setup();
+    const { backend, call, see } = await setup();
+    await see();
 
     const result = await call("computer_scroll", {
       x: null,
@@ -763,7 +916,8 @@ describe("agent gateway computer tools", () => {
   });
 
   it("still resolves a scroll target when one is actually given", async () => {
-    const { backend, call } = await setup();
+    const { backend, call, see } = await setup();
+    await see();
 
     await call("computer_scroll", { x: 12, y: 34, delta_x: 0, delta_y: -50 });
 
@@ -778,7 +932,8 @@ describe("agent gateway computer tools", () => {
    * button — and the exclusive desktop lease — for eleven days.
    */
   it("clamps a drag duration to the bound its schema advertises", async () => {
-    const { backend, byName, call } = await setup();
+    const { backend, byName, call, see } = await setup();
+    await see();
 
     await call("computer_drag", {
       from: { x: 1, y: 1 },
