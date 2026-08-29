@@ -4,11 +4,10 @@
  * One rule outranks everything here: **the agent never drives the seat the
  * human is sitting at.** Every backend this module can resolve gives the agent
  * a seat of its own — a compositor plugin's dedicated seat on a KDE or
- * Hyprland session, or a private nested compositor everywhere else. The shared-seat portal backend
- * still exists in the tree (`portal/`), but it attaches virtual devices to the
- * human's own `wl_seat` and moves their real cursor, so nothing resolves to
- * it: it has no auto-detection path, and naming it in the override is refused
- * with the reason rather than honored.
+ * Hyprland session, or a private nested compositor everywhere else. There is
+ * no shared-seat backend: anything that attached virtual devices to the
+ * human's own `wl_seat` would move their real cursor, so no such backend
+ * exists in the tree to be selected, forced, or fallen back to.
  *
  * Beyond that rule, an explicit ordered resolution with **no fallback in any
  * direction**. Falling back from a nested session to the real desktop would
@@ -57,23 +56,6 @@ export class InvalidComputerBackendOverrideError extends Error {
 }
 
 /**
- * `portal` is spelled correctly and refused anyway. The distinction matters in
- * the availability card: a typo gets "no such backend", but this one names the
- * policy, because an operator who typed `portal` found a backend that exists in
- * the tree and deserves to know it is unreachable on purpose, not missing.
- */
-export class SharedSeatBackendDisabledError extends Error {
-  constructor() {
-    super(
-      "SYNARA_COMPUTER_BACKEND=portal names the shared-seat portal backend, which is disabled: " +
-        "it drives the pointer and keyboard of the seat the human is sitting at. Computer use " +
-        `only runs on a seat of its own. Use one of: ${LINUX_BACKEND_CHOICES.join(", ")}.`,
-    );
-    this.name = "SharedSeatBackendDisabledError";
-  }
-}
-
-/**
  * The override, or `undefined` when none is set.
  *
  * A typo throws instead of being ignored. Every other env var here degrades to
@@ -87,7 +69,6 @@ export function parseComputerBackendOverride(
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
   const lowered = trimmed.toLowerCase();
-  if (lowered === "portal") throw new SharedSeatBackendDisabledError();
   const match = LINUX_BACKEND_CHOICES.find((choice) => choice === lowered);
   if (!match) throw new InvalidComputerBackendOverrideError(trimmed);
   return match;

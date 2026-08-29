@@ -22,7 +22,6 @@ import {
   type ComputerPressKeyInput,
   type ComputerProvisionInput,
   type ComputerProvisionResult,
-  type ComputerResetConsentInput,
   type ComputerRightClickInput,
   type ComputerScrollInput,
   type ComputerSetValueInput,
@@ -74,9 +73,6 @@ export interface WsComputerHandlers {
   readonly [COMPUTER_WS_METHODS.provision]: (
     input: ComputerProvisionInput,
   ) => Effect.Effect<ComputerProvisionResult, WsRpcError>;
-  readonly [COMPUTER_WS_METHODS.resetConsent]: (
-    input: ComputerResetConsentInput,
-  ) => Effect.Effect<ComputerStatusResult, WsRpcError>;
   readonly [COMPUTER_WS_METHODS.listWindows]: (
     input: ComputerListWindowsInput,
   ) => Effect.Effect<ComputerListWindowsResult, WsRpcError>;
@@ -175,9 +171,6 @@ export function makeWsComputerHandlers(
     return {
       [COMPUTER_WS_METHODS.getStatus]: () => Effect.succeed(unsupportedStatus),
       [COMPUTER_WS_METHODS.provision]: () => unsupported(),
-      // Nothing was ever asked, so there is no denial to clear; answering with
-      // the same status a getStatus would keeps the reset harmless everywhere.
-      [COMPUTER_WS_METHODS.resetConsent]: () => Effect.succeed(unsupportedStatus),
       [COMPUTER_WS_METHODS.listWindows]: () => unsupported(),
       [COMPUTER_WS_METHODS.getState]: () => unsupported(),
       [COMPUTER_WS_METHODS.getScreenSize]: () => unsupported(),
@@ -206,8 +199,6 @@ export function makeWsComputerHandlers(
       attempt(() => manager.getStatus(), "Failed to read computer status"),
     [COMPUTER_WS_METHODS.provision]: () =>
       attempt(() => manager.provision(), "Failed to set up computer control"),
-    [COMPUTER_WS_METHODS.resetConsent]: () =>
-      attempt(() => manager.resetConsent(), "Failed to reset computer consent"),
     [COMPUTER_WS_METHODS.listWindows]: () =>
       attempt(() => manager.listWindows(), "Failed to list computer windows"),
     [COMPUTER_WS_METHODS.getState]: (input) =>

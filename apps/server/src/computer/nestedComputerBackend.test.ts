@@ -231,7 +231,6 @@ describe("capabilities", () => {
     const capabilities = harness.backend.capabilities();
     expect(capabilities.input).toBe(true);
     expect(capabilities.capture).toBe(true);
-    expect(capabilities.sharedSeat).toBe(false);
     expect(capabilities.visibleDesktop).toBe(false);
   });
 

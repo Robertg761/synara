@@ -42,8 +42,7 @@ export interface AtspiTextWrite {
  * window that closed while its tree was being walked, an unknown method on an
  * older helper build. Killing the process over one turns every routine
  * semantic-target miss into a respawn and ratchets the reconnect backoff to five
- * seconds, so the next few perception requests are slow for no reason. The
- * portal's desktopHelperClient draws the same line for the same reason.
+ * seconds, so the next few perception requests are slow for no reason.
  */
 class AtspiHelperMethodError extends Error {
   readonly code: number | undefined;

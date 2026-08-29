@@ -96,8 +96,8 @@ static const QString s_humanActiveErrorName = QStringLiteral("org.synara.Compute
 static constexpr uint s_defaultIdleTimeoutMs = 5 * 60 * 1000;
 static constexpr uint s_minIdleTimeoutMs = 1000;
 static constexpr uint s_maxIdleTimeoutMs = 60 * 60 * 1000;
-// Matches DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS in sharedSeatArbiter.ts, so Tier 1
-// and Tier 2 hand back the same refusal after the same quiet period. The server
+// Matches DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS in humanActivity.ts, so the plugin
+// and the server hand back the same refusal after the same quiet period. The server
 // pushes its own value after every start(); this is what an unconfigured plugin
 // uses on its own.
 static constexpr uint s_defaultHumanActiveGuardMs = 2000;

@@ -181,8 +181,7 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 /**
  * Reads a manifest, dropping any entry that could not be acted on anyway.
  *
- * The same guard `desktopHelperInstall` applies: a `file` is a name inside the
- * prebuilt root and nothing else, so a path escape or an empty checksum is a
+ * A `file` is a name inside the prebuilt root and nothing else, so a path escape or an empty checksum is a
  * malformed entry rather than something to resolve or install.
  */
 export async function readPrebuiltManifest(path: string): Promise<PrebuiltManifest | undefined> {

@@ -417,18 +417,6 @@ export class ComputerManager {
     return { summary, status: await this.getStatus() };
   }
 
-  /**
-   * Human-driven recovery from a dismissed permission dialog: clears the
-   * backend's denied-consent latch, when it has one, and answers with fresh
-   * status so the caller's panel shows the recovered state without a second
-   * round trip. Counted as engagement — the user just asked for the desktop.
-   */
-  async resetConsent(): Promise<ComputerStatusResult> {
-    this.engageBackend();
-    this.backend.resetConsent?.();
-    return await this.getStatus();
-  }
-
   async listWindows(): Promise<ComputerListWindowsResult> {
     this.engageBackend();
     const [availability, windows] = await Promise.all([
@@ -647,8 +635,9 @@ export class ComputerManager {
   /**
    * The window an untargeted capture should cover: the agent seat's focus
    * target first, then the window the compositor reports active, then the
-   * topmost visible one. Windows without bounds cannot be captured — wlroots
-   * exposes no geometry — so they are skipped rather than attempted.
+   * topmost visible one. Windows without bounds cannot be captured — a
+   * backend without `windowBounds` has no geometry — so they are skipped
+   * rather than attempted.
    * `agentFocusOnly` stops after the first step: action observation must not
    * drift to the human's active window when the agent's focus is nowhere.
    */
@@ -1906,11 +1895,6 @@ export class ComputerManager {
    * still trying to get it back. Only a claim of `available` is overridden:
    * anything already blocked carries its own, better explanation — the platform
    * it is running on, or the plugin it could not load.
-   *
-   * `awaiting-consent` is deliberately not an override either. The backend is
-   * installed and reachable and nothing has failed; the desktop's own permission
-   * dialog is simply unanswered. Reporting that as unavailable would hide the
-   * one thing the user can act on behind a badge that says to give up.
    */
   private correctedAvailability(availability: ComputerAvailability): ComputerAvailability {
     // A backend nobody has asked to connect is not disconnected, it is idle, and
@@ -1918,11 +1902,7 @@ export class ComputerManager {
     // real use would report every KDE desktop as broken until someone clicked
     // something — the exact opposite of what the probe is there to say.
     if (!this.backendEngaged) return availability;
-    if (
-      this.backendHealth.status === "connected" ||
-      this.backendHealth.status === "awaiting-consent" ||
-      availability.kind !== "available"
-    ) {
+    if (this.backendHealth.status === "connected" || availability.kind !== "available") {
       return availability;
     }
     return { kind: "backend-unavailable", message: healthUnavailableMessage(this.backendHealth) };
@@ -2007,10 +1987,7 @@ function healthUnavailableMessage(health: ComputerHealth): string {
   const reason =
     health.status === "reconnecting"
       ? "Reconnecting to the desktop."
-      : health.status === "consent-denied"
-        ? "The desktop's permission dialog was dismissed, so Synara has no remote-control grant. " +
-          'Use "Ask for permission again" in the Computer panel to be asked once more.'
-        : "The desktop backend is not connected.";
+      : "The desktop backend is not connected.";
   return clampComputerMessage(
     health.lastFailure ? `${reason} Last failure: ${health.lastFailure.message}` : reason,
     reason,

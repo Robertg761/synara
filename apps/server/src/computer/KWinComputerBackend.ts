@@ -64,7 +64,7 @@ import {
   workspaceRectFromWindows,
 } from "./computerGeometry.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
-import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./sharedSeatArbiter.ts";
+import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./humanActivity.ts";
 import {
   COMPUTER_SERVICE,
   createSessionKWinComputerDbus,
@@ -121,9 +121,9 @@ const SEAT_UNSUPPORTED_ERROR_TYPE = "org.synara.ComputerUse.Error.SeatUnsupporte
 /**
  * The plugin declining to act on the window the human is working in.
  *
- * Tier 2's arbiter refuses the same situation from the server side with the same
- * `computer_human_active` token (`sharedSeatArbiter.ts`), because the caller
- * that matters — the tool surface, and the panel copy explaining why the agent
+ * The server-side guard refuses the same situation with the same
+ * `computer_human_active` token (`humanActivity.ts`), because the caller that
+ * matters — the tool surface, and the panel copy explaining why the agent
  * paused — treats both identically: wait, then try again.
  */
 const HUMAN_ACTIVE_ERROR_TYPE = "org.synara.ComputerUse.Error.HumanActive";
@@ -263,8 +263,8 @@ export interface KWinComputerBackendOptions {
   /**
    * How recently the human's own seat must have been active for a mutating
    * action aimed at their focused window to be refused. `0` disables the guard.
-   * Falls back to `SYNARA_COMPUTER_HUMAN_ACTIVE_MS`, then to the threshold Tier
-   * 2's arbiter uses.
+   * Falls back to `SYNARA_COMPUTER_HUMAN_ACTIVE_MS`, then to
+   * `DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS`.
    */
   readonly humanActiveGuardMs?: number;
   /**
@@ -490,8 +490,6 @@ export class KWinComputerBackend implements ComputerBackend {
    * the compositor, which is what makes every one of these true at once:
    * enumeration with real `frameGeometry`, a stacking order and its occlusion,
    * focus and raise, and a second pointer drawn without touching the human's.
-   * `sharedSeat` is false for exactly that reason, and the panel's shared-control
-   * warning keys off it.
    */
   capabilities(): ComputerCapabilities {
     return {
@@ -503,7 +501,6 @@ export class KWinComputerBackend implements ComputerBackend {
       clipboard: true,
       activation: true,
       ghostCursor: true,
-      sharedSeat: false,
       visibleDesktop: this.visibleDesktop,
     };
   }
@@ -1853,9 +1850,8 @@ export class KWinComputerBackend implements ComputerBackend {
     if (dbusErrorType(error) === SEAT_UNSUPPORTED_ERROR_TYPE) {
       return new ComputerBackendError(dbusErrorText(error), { cause: error });
     }
-    // Retryable, and carrying the token both tiers refuse with. Nothing was
-    // injected, so the caller's move is to wait and try again — the same answer
-    // the shared-seat arbiter gives on a portal backend.
+    // Retryable, and carrying the token the server-side guard refuses with.
+    // Nothing was injected, so the caller's move is to wait and try again.
     if (dbusErrorType(error) === HUMAN_ACTIVE_ERROR_TYPE) {
       return this.humanActiveError(dbusErrorText(error), error);
     }

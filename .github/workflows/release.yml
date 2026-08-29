@@ -165,15 +165,9 @@ jobs:
       contents: read
     uses: ./.github/workflows/kwin-plugin-prebuilds.yml
 
-  desktop_helper_prebuilds:
-    name: Desktop helper prebuilds
-    permissions:
-      contents: read
-    uses: ./.github/workflows/desktop-helper-prebuilds.yml
-
   build:
     name: Build ${{ matrix.label }}
-    needs: [preflight, kwin_plugin_prebuilds, desktop_helper_prebuilds]
+    needs: [preflight, kwin_plugin_prebuilds]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -229,12 +223,6 @@ jobs:
         with:
           name: kwin-plugin-prebuilt
           path: apps/server/native/computer-use-kwin/prebuilt
-
-      - name: Stage desktop helper prebuilts
-        uses: actions/download-artifact@v8
-        with:
-          name: desktop-helper-prebuilt
-          path: apps/server/native/computer-desktop-helper/prebuilt
 
       - id: build_artifact
         name: Build desktop artifact
@@ -413,7 +401,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           # desktop-app-*, not desktop-*: the release job's download glob must
-          # not also sweep in the desktop-helper-* prebuild artifacts.
+          # not also sweep in the kwin-plugin-* prebuild artifacts.
           name: desktop-app-${{ matrix.platform }}-${{ matrix.arch }}
           path: release-publish/*
           if-no-files-found: error
@@ -421,7 +409,7 @@ jobs:
   publish_cli:
     name: Publish CLI to npm
     if: ${{ needs.preflight.outputs.publish_release == 'true' && vars.SYNARA_PUBLISH_CLI == '1' }}
-    needs: [preflight, build, kwin_plugin_prebuilds, desktop_helper_prebuilds]
+    needs: [preflight, build, kwin_plugin_prebuilds]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -455,12 +443,6 @@ jobs:
           name: kwin-plugin-prebuilt
           path: apps/server/native/computer-use-kwin/prebuilt
 
-      - name: Stage desktop helper prebuilts
-        uses: actions/download-artifact@v8
-        with:
-          name: desktop-helper-prebuilt
-          path: apps/server/native/computer-desktop-helper/prebuilt
-
       - name: Build CLI package
         run: bun run build --filter=@synara/web --filter=@synara/cli
 
@@ -470,7 +452,7 @@ jobs:
   build_server_tarball:
     name: Build server tarball
     if: ${{ needs.preflight.outputs.publish_release == 'true' }}
-    needs: [preflight, build, kwin_plugin_prebuilds, desktop_helper_prebuilds]
+    needs: [preflight, build, kwin_plugin_prebuilds]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -501,12 +483,6 @@ jobs:
         with:
           name: kwin-plugin-prebuilt
           path: apps/server/native/computer-use-kwin/prebuilt
-
-      - name: Stage desktop helper prebuilts
-        uses: actions/download-artifact@v8
-        with:
-          name: desktop-helper-prebuilt
-          path: apps/server/native/computer-desktop-helper/prebuilt
 
       - name: Build server package
         run: bun run build --filter=@synara/web --filter=@synara/cli

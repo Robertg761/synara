@@ -48,7 +48,6 @@ function state(overrides: Partial<ThreadComputerState> = {}): ThreadComputerStat
       clipboard: true,
       activation: true,
       ghostCursor: true,
-      sharedSeat: false,
       visibleDesktop: true,
     },
     windows: [],
@@ -170,30 +169,6 @@ describe("computer panel state helpers", () => {
     ).toMatchObject({ label: "Desktop unavailable", tone: "danger", pulse: false });
   });
 
-  it("offers to ask for permission again when the dialog was declined", () => {
-    // A declined dialog blocks with the reason, and the one blocker whose
-    // remedy is a user decision carries an action instead of a dead end.
-    expect(
-      resolveComputerAvailabilityView(
-        { kind: "backend-unavailable", message: "You dismissed the dialog." },
-        { ...connectedHealth(), status: "consent-denied" },
-      ),
-    ).toMatchObject({
-      kind: "blocked",
-      title: "Desktop permission was declined",
-      description: "You dismissed the dialog.",
-      action: "ask-consent-again",
-    });
-    // Any other blocker keeps the plain dead-end view.
-    expect(
-      resolveComputerAvailabilityView({ kind: "backend-unavailable", message: "KWin is off" }),
-    ).not.toHaveProperty("action");
-
-    expect(
-      resolveComputerHealthBadge({ ...connectedHealth(), status: "consent-denied" }),
-    ).toMatchObject({ label: "Desktop permission declined", tone: "warning", pulse: false });
-  });
-
   it("subscribes only for a visible live available thread", () => {
     expect(
       shouldSubscribeToComputerStream({
@@ -244,7 +219,7 @@ describe("computer panel state helpers", () => {
     ).toBeNull();
     expect(
       computerReleaseControlHint({
-        availability: { kind: "available", backend: "portal" },
+        availability: { kind: "available", backend: "nested-kwin" },
         visibleDesktop: true,
         agentActive: true,
       }),

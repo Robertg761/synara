@@ -977,7 +977,6 @@ describe("ComputerManager and FakeComputerBackend", () => {
         clipboard: false,
         activation: false,
         ghostCursor: false,
-        sharedSeat: true,
         visibleDesktop: false,
       },
     });

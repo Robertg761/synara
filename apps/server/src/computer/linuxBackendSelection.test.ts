@@ -7,7 +7,6 @@ import {
   nestedModeForChoice,
   parseComputerBackendOverride,
   selectLinuxBackend,
-  SharedSeatBackendDisabledError,
 } from "./linuxBackendSelection.ts";
 
 /** A host that owns the given bus names, or one whose bus cannot be reached. */
@@ -40,12 +39,11 @@ describe("parseComputerBackendOverride", () => {
     expect(() => parseComputerBackendOverride("protal")).toThrow("nested-window");
   });
 
-  it("refuses the shared-seat portal backend with the policy, not a typo error", () => {
-    // The portal backend exists in the tree, so "no such backend" would be a
-    // lie; the refusal has to say it is unreachable on purpose and why.
-    expect(() => parseComputerBackendOverride("portal")).toThrow(SharedSeatBackendDisabledError);
-    expect(() => parseComputerBackendOverride("PORTAL")).toThrow(
-      /seat the human is sitting at.*seat of its own/s,
+  it("has no shared-seat backend to name", () => {
+    // Nothing in the tree drives the human's own seat, so the old portal name
+    // is simply not a backend Synara has — the same refusal as any typo.
+    expect(() => parseComputerBackendOverride("portal")).toThrow(
+      InvalidComputerBackendOverrideError,
     );
   });
 });
@@ -97,7 +95,7 @@ describe("selectLinuxBackend", () => {
   it("refuses SYNARA_COMPUTER_BACKEND=portal rather than sharing the human's seat", async () => {
     await expect(
       selectLinuxBackend({ env: { SYNARA_COMPUTER_BACKEND: "portal" }, busNameHasOwner: KDE_HOST }),
-    ).rejects.toThrow(SharedSeatBackendDisabledError);
+    ).rejects.toThrow(InvalidComputerBackendOverrideError);
   });
 
   it("does not consult the bus at all when an override is set", async () => {

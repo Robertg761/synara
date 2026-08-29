@@ -152,10 +152,10 @@ const buildCmd = Command.make(
       yield* fs.chmod(path.join(deviceHelperTarget, "build.sh"), 0o755);
       yield* Effect.log("[cli] Bundled iOS Simulator helper sources into dist/device-helper");
 
-      // Same reasoning for the two Linux computer-use natives: the KWin plugin
+      // Same reasoning for the Linux computer-use plugins: the KWin plugin
       // needs its sources and installer for the source-build fallback plus any
-      // CI prebuilts, and the wlroots desktop helper likewise; both are
-      // resolved relative to the packaged module directory at runtime.
+      // CI prebuilts, resolved relative to the packaged module directory at
+      // runtime.
       const kwinPluginSource = path.join(serverDir, "native/computer-use-kwin");
       const kwinPluginTarget = path.join(serverDir, "dist/computer-use-kwin");
       yield* fs.copy(kwinPluginSource, kwinPluginTarget);
@@ -171,12 +171,6 @@ const buildCmd = Command.make(
       yield* Effect.log(
         "[cli] Bundled Hyprland computer-use plugin into dist/computer-use-hyprland",
       );
-
-      const desktopHelperSource = path.join(serverDir, "native/computer-desktop-helper");
-      const desktopHelperTarget = path.join(serverDir, "dist/computer-desktop-helper");
-      yield* fs.copy(desktopHelperSource, desktopHelperTarget);
-      yield* fs.chmod(path.join(desktopHelperTarget, "build.sh"), 0o755);
-      yield* Effect.log("[cli] Bundled desktop helper sources into dist/computer-desktop-helper");
 
       const webDist = path.join(repoRoot, "apps/web/dist");
       const clientTarget = path.join(serverDir, "dist/client");

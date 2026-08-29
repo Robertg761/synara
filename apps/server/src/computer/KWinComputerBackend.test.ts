@@ -843,11 +843,10 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
-  it("reports Tier 1's whole capability set, without a dedicated seat being shared", () => {
+  it("reports Tier 1's whole capability set", () => {
     // The dedicated agent seat inside the compositor is what makes all of these
-    // true at once, and `sharedSeat: false` is the same fact stated the other
-    // way round. This set is what Tier 2 is measured against, so a silent
-    // change here would move the baseline the portal backend is compared to.
+    // true at once. This set is what every other backend is measured against,
+    // so a silent change here would move that baseline.
     expect(makeBackend(new FakeDbus()).capabilities()).toEqual({
       windows: true,
       windowBounds: true,
@@ -857,7 +856,6 @@ describe("KWinComputerBackend", () => {
       clipboard: true,
       activation: true,
       ghostCursor: true,
-      sharedSeat: false,
       visibleDesktop: true,
     });
   });

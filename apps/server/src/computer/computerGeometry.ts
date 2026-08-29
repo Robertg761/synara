@@ -9,8 +9,8 @@
  *
  * The payload helpers live here because `parseWindows` is the reason they
  * exist: window JSON arrives either as a plain string or wrapped in a D-Bus
- * variant, depending on which transport carried it, and the KWin plugin and the
- * GNOME Shell extension emit the identical document. The variant unwrapping
+ * variant, depending on which transport carried it, and the KWin and Hyprland
+ * plugins emit the identical document. The variant unwrapping
  * itself is `dbusPlumbing.ts`, shared with the callers that never touch
  * geometry, and re-exported here because this is the import every parser
  * already reaches for.
@@ -114,8 +114,8 @@ function asWindowIds(value: unknown): readonly ComputerWindow["id"][] | undefine
 
 /**
  * The window list emitted by a compositor-side enumerator: the KWin plugin
- * today, a GNOME Shell extension next, both producing the same document on
- * purpose so this stays one parser.
+ * and its Hyprland twin, both producing the same document on purpose so this
+ * stays one parser.
  *
  * An entry without an id or without a parseable rect is dropped rather than
  * reported bounds-less. `ComputerWindow.bounds` being optional describes a
@@ -282,8 +282,8 @@ export function workspaceRectFromWindows(
 /**
  * A window's rect, or a refusal that names why there is none.
  *
- * Absent bounds are a property of the display server, not of the window: under
- * wlroots' foreign-toplevel protocol no client can ask where a window is. Every
+ * Absent bounds are a property of the backend, not of the window: a Wayland
+ * client cannot ask where a window is, only an in-compositor plugin can. Every
  * caller here needs a rect to do arithmetic on, and the alternatives are both
  * lies — treating the origin as the window's position puts a click on the wrong
  * monitor, and returning an empty capture tells a model the window is blank. So

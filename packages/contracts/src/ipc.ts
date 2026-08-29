@@ -171,7 +171,6 @@ import type {
   ComputerGetScreenSizeInput,
   ComputerGetScreenSizeResult,
   ComputerGetStatusInput,
-  ComputerResetConsentInput,
   ComputerInputClickInput,
   ComputerInputKeyInput,
   ComputerInputScrollInput,
@@ -984,8 +983,6 @@ export interface NativeApi {
     getStatus: (input: ComputerGetStatusInput) => Promise<ComputerStatusResult>;
     /** Install or compile whatever this desktop is missing, on user request. */
     provision: (input: ComputerProvisionInput) => Promise<ComputerProvisionResult>;
-    /** Clears a denied portal-consent latch so the next action may ask again. */
-    resetConsent: (input: ComputerResetConsentInput) => Promise<ComputerStatusResult>;
     getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
     listWindows: (input: ComputerListWindowsInput) => Promise<ComputerListWindowsResult>;
     getScreenSize: (input: ComputerGetScreenSizeInput) => Promise<ComputerGetScreenSizeResult>;

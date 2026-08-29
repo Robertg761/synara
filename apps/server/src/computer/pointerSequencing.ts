@@ -10,8 +10,8 @@
  * down. Getting any of it wrong strands a modifier held on the user's real
  * keyboard, which is the worst failure mode this feature has.
  *
- * The transport is a sink the caller supplies, so the KWin plugin's D-Bus calls
- * and a libei or wlroots virtual device go through the same sequencing.
+ * The transport is a sink the caller supplies, so the KWin and Hyprland
+ * plugins' D-Bus calls go through the same sequencing.
  */
 import type { ComputerPoint } from "@synara/contracts";
 
@@ -179,9 +179,8 @@ export async function pressKeyStroke(options: {
  * order. The release list is built as the presses land, so a chord that fails
  * on its third key still releases the two that did go down — and only those.
  *
- * Every release is attempted even after one refuses: the releases are one D-Bus
- * notify each on the portal path, and a transient refusal on the first would
- * otherwise strand every modifier behind it on the human's keyboard until the
+ * Every release is attempted even after one refuses: each release is its own
+ * D-Bus call, and a transient refusal on the first would otherwise strand every modifier behind it on the human's keyboard until the
  * backend is disposed. The first refusal is what surfaces, but only when the
  * presses themselves had not already failed — that error is the one worth
  * acting on.

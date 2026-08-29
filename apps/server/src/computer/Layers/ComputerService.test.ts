@@ -58,7 +58,7 @@ describe("ComputerServiceLive", () => {
     const backend = new FakeComputerBackend();
     backend.setAvailability({
       kind: "backend-unavailable",
-      message: "The native desktop helper is not built yet.",
+      message: "The compositor plugin is not built yet.",
     });
 
     await withComputerService(backend, async (service) => {

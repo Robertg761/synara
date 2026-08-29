@@ -139,7 +139,6 @@ export const NO_COMPUTER_CAPABILITIES: ComputerCapabilities = {
   clipboard: false,
   activation: false,
   ghostCursor: false,
-  sharedSeat: false,
   visibleDesktop: false,
 };
 
@@ -199,13 +198,6 @@ export interface ComputerBackend {
    * `capabilities-changed`, so a caller may cache this until that event fires.
    */
   capabilities(): ComputerCapabilities;
-  /**
-   * Clears a denied consent latch so the next action may ask the desktop's
-   * permission dialog once more. Human-driven only — the agent tool surface
-   * never exposes it. Returns whether a denial was actually cleared. Absent on
-   * backends whose transport needs no consent.
-   */
-  resetConsent?(): boolean;
   listWindows(): Promise<readonly ComputerWindow[]>;
   getScreenSize(): Promise<ComputerScreenSize>;
   getState(options: {

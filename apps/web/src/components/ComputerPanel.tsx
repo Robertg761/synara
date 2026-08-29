@@ -111,22 +111,6 @@ export default function ComputerPanel(props: {
     agentActive: threadState?.agentActive ?? false,
   });
 
-  const upsertThreadState = useComputerStateStore((store) => store.upsertThreadState);
-  // Clears a denied permission latch and re-seeds this thread's snapshot, so
-  // the blocked view gives way without waiting for the next push.
-  const askConsentAgain = useCallback(() => {
-    const api = ensureNativeApi().computer;
-    if (!api) return;
-    void api
-      .resetConsent({})
-      .then(() => api.getThreadState({ threadId }))
-      .then((state) => upsertThreadState(state))
-      .catch(() => {
-        // The next state push or pane reopen reports where consent stands; a
-        // failed reset changes nothing the panel needs to explain.
-      });
-  }, [threadId, upsertThreadState]);
-
   // ── User input ─────────────────────────────────────────────────────
   //
   // Input is opt-in: a pane that forwarded clicks while it was merely being
@@ -370,11 +354,6 @@ export default function ComputerPanel(props: {
           <ComputerAvailabilityMessage
             title={availabilityView.title}
             description={availabilityView.description}
-            action={
-              availabilityView.kind === "blocked" && availabilityView.action === "ask-consent-again"
-                ? { label: "Ask for permission again", onClick: askConsentAgain }
-                : undefined
-            }
           />
         ) : runtimeMode === "preview" ? (
           <button
@@ -466,25 +445,12 @@ export default function ComputerPanel(props: {
   );
 }
 
-function ComputerAvailabilityMessage(props: {
-  title: string;
-  description: string;
-  action?: { label: string; onClick: () => void } | undefined;
-}) {
+function ComputerAvailabilityMessage(props: { title: string; description: string }) {
   return (
     <div className="max-w-sm px-6 text-center text-white/80" role="status">
       <MonitorIcon className="mx-auto mb-3 size-8 text-white/45" />
       <p className="font-medium text-sm text-white">{props.title}</p>
       <p className="mt-1 text-xs leading-5 text-white/60">{props.description}</p>
-      {props.action ? (
-        <button
-          type="button"
-          className="mt-3 rounded-full bg-white/95 px-3 py-1.5 font-medium text-[10px] text-black shadow-sm"
-          onClick={props.action.onClick}
-        >
-          {props.action.label}
-        </button>
-      ) : null}
     </div>
   );
 }

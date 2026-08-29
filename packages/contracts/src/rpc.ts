@@ -74,7 +74,6 @@ import {
   ComputerGetScreenSizeResult,
   ComputerGetStateInput,
   ComputerGetStatusInput,
-  ComputerResetConsentInput,
   ComputerHotkeyInput,
   ComputerInputClickInput,
   ComputerInputKeyInput,
@@ -796,14 +795,6 @@ export const WsComputerPerformActionRpc = Rpc.make(COMPUTER_WS_METHODS.performAc
   error: WsRpcError,
 });
 
-// Human-pane only: the agent gateway never surfaces this method, so an agent
-// cannot re-open a permission dialog the user dismissed.
-export const WsComputerResetConsentRpc = Rpc.make(COMPUTER_WS_METHODS.resetConsent, {
-  payload: ComputerResetConsentInput,
-  success: ComputerStatusResult,
-  error: WsRpcError,
-});
-
 export const WsComputerGetThreadStateRpc = Rpc.make(COMPUTER_WS_METHODS.getThreadState, {
   payload: ComputerThreadInput,
   success: ThreadComputerState,
@@ -855,7 +846,6 @@ export const WsComputerRpcGroup = RpcGroup.make(
   WsComputerSetValueRpc,
   WsComputerPerformActionRpc,
   WsComputerGetThreadStateRpc,
-  WsComputerResetConsentRpc,
   WsComputerInputClickRpc,
   WsComputerInputScrollRpc,
   WsComputerInputKeyRpc,

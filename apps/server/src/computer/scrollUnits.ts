@@ -1,13 +1,12 @@
 /**
- * The pixel↔notch boundary for backends whose wheel speaks whole notches.
+ * The pixel↔notch boundary for anything whose wheel speaks whole notches.
  *
  * Everything above the backends — the tool surface, the pane, every `scroll`
- * call — speaks logical pixels. KWin takes pixels directly and converts at the
- * last moment (value120 in the plugin); the wlroots helper converts pixels to
- * notches on the C side (`take_discrete_steps` in wayland.c). GNOME's
- * `NotifyPointerAxisDiscrete` is the one wire that reaches this codebase still
- * speaking notches, so it converts here — with the same constant and the same
- * remainder semantics, because one scroll must mean one thing on every desktop.
+ * call — speaks logical pixels. The compositor plugins take pixels directly
+ * and convert at the last moment (value120 in KWin, discrete steps in
+ * Hyprland). This module holds the constant they convert with and the
+ * truncate-and-carry semantics for any path that has to convert on this side,
+ * because one scroll must mean one thing on every desktop.
  */
 
 /**
@@ -31,9 +30,7 @@
  * injectors convert pixels to notches with this constant and emit the
  * continuous axis value as notches × 15 on their own.
  *
- * Keep in sync with `SCROLL_STEP_PX` in
- * apps/server/native/computer-desktop-helper/src/wayland.c,
- * `s_scrollPixelsPerNotch` in
+ * Keep in sync with `s_scrollPixelsPerNotch` in
  * apps/server/native/computer-use-kwin/synaracomputeruseplugin.cpp and
  * `SCROLL_PIXELS_PER_NOTCH` in
  * apps/server/native/computer-use-hyprland/synarahyprlandplugin.cpp.
@@ -47,8 +44,7 @@ export const SCROLL_STEP_PX = 80;
  * turn a 2 px trackpad nudge into a full notch and a pixel-speaking stack
  * would scroll further than it was asked to. The sub-notch part comes back as
  * `remainder`, so repeated small deltas add up to a notch across calls and
- * nothing is invented; carry it per axis. Same shape as `take_discrete_steps`
- * in wayland.c, deliberately.
+ * nothing is invented; carry it per axis.
  *
  * Returns `{ steps, remainder }`; feed `remainder` back in with the next delta.
  */

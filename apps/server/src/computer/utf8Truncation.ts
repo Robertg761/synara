@@ -4,7 +4,7 @@
  * byte count can land inside one of those sequences; decoding the remainder
  * then yields a trailing U+FFFD replacement character that was never in the
  * source text. Every place that enforces a byte ceiling on text — the clipboard
- * in both directions, a portal pipe read that stops at a limit — cuts through
+ * in both directions, a helper pipe read that stops at a limit — cuts through
  * here so the tail is a whole character or nothing.
  */
 

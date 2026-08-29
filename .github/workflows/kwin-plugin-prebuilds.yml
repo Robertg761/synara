@@ -242,8 +242,7 @@ jobs:
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           # In a release run this workflow shares its artifact namespace with the
-          # caller and the desktop helper prebuilds; the pattern keeps their
-          # uploads out.
+          # caller; the pattern keeps its uploads out.
           pattern: kwin-plugin-*
           path: downloaded
           merge-multiple: true

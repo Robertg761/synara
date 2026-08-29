@@ -1,9 +1,8 @@
 /**
  * A supervised child process whose failures explain themselves.
  *
- * Every helper this feature boots — the nested compositor and its private bus
- * today, the wlroots/PipeWire desktop helper next — fails in the same three
- * ways: it never starts, it exits early, or it starts and then says nothing.
+ * Every helper this feature boots — the nested compositor and its private bus,
+ * the AT-SPI perception helper — fails in the same three ways: it never starts, it exits early, or it starts and then says nothing.
  * All three are only diagnosable from the process's own stderr, and none of
  * them should be waited out to a deadline when the process is already gone. So
  * a spawn error or an early exit is recorded rather than thrown, every wait
@@ -65,9 +64,9 @@ export class SupervisedProcess {
   }
 
   /**
-   * A pipe past stderr — fd 3 is the desktop helper's binary frame channel,
-   * which exists so a full-desktop PNG never has to be base64'd through the
-   * JSON-RPC line protocol.
+   * A pipe past stderr, for a helper that carries a binary frame channel on
+   * fd 3 so a full-desktop PNG never has to be base64'd through a JSON-RPC
+   * line protocol.
    */
   extraStream(fd: number): Readable | Writable | null {
     const stream = this.child.stdio[fd];
@@ -194,7 +193,7 @@ export function startSupervisedProcess(options: {
   readonly command: string;
   readonly args: readonly string[];
   readonly env: NodeJS.ProcessEnv;
-  /** Non-default pipe layout, e.g. the desktop helper's stdin and fd 3 channel. */
+  /** Non-default pipe layout, e.g. a helper with an extra fd 3 frame channel. */
   readonly stdio?: StdioOptions;
   readonly spawnProcess?: SupervisedSpawn;
 }): SupervisedProcess {

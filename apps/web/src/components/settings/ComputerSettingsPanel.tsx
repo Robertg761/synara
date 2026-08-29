@@ -33,15 +33,10 @@ const BACKEND_DISPLAY_NAMES: Record<string, string> = {
   kwin: "KWin plugin (KDE)",
   hyprland: "Hyprland plugin",
   "nested-kwin": "Isolated agent desktop (nested KWin)",
-  portal: "Desktop portals (GNOME / wlroots)",
   fake: "Test backend",
 };
 
-/**
- * Ordered to read as a sentence of abilities, most consequential first. The
- * shared-seat flag is deliberately not in this list: it is a warning about how
- * input happens, not an ability, and gets its own line.
- */
+/** Ordered to read as a sentence of abilities, most consequential first. */
 const CAPABILITY_LABELS: ReadonlyArray<{
   readonly key: keyof ComputerCapabilities;
   readonly label: string;
@@ -138,14 +133,6 @@ export function ComputerSettingsPanel({
   const needsSetup =
     status !== undefined && (!status.capabilities.input || !status.capabilities.capture);
   const healthNotes = [
-    ...(health?.status === "awaiting-consent"
-      ? ["Waiting for you to answer the desktop's permission dialog."]
-      : []),
-    ...(health?.status === "consent-denied"
-      ? [
-          'The desktop\'s permission dialog was declined. Use "Ask for permission again" in the Computer panel to be asked once more.',
-        ]
-      : []),
     ...(health && health.reconnects > 0
       ? [
           `Reconnected ${health.reconnects === 1 ? "once" : `${health.reconnects} times`} since startup.`,
@@ -222,11 +209,7 @@ export function ComputerSettingsPanel({
           {status && availabilityView.kind === "ready" ? (
             <SettingsRow
               title="Capabilities"
-              description={
-                status.capabilities.sharedSeat
-                  ? "The agent shares your seat: the real cursor moves and real focus follows, and it yields whenever you touch the mouse or keyboard."
-                  : dedicatedSeatDescription
-              }
+              description={dedicatedSeatDescription}
               status={capabilitySummary(status.capabilities)}
             />
           ) : null}
