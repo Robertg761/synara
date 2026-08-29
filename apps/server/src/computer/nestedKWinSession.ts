@@ -2,10 +2,10 @@
  * A private KWin this server owns, in one of two modes.
  *
  * A nested session is a dedicated session bus plus a `kwin_wayland` on it.
- * `virtual` is Tier 3: a headless compositor with no display of its own, for CI
- * and headless hosts. `window` is Tier 2 Phase A: the same compositor running as
- * an ordinary Wayland client of the host, so the isolated desktop is a window on
- * a desktop KWin does not otherwise run. Nothing about the desktop backend
+ * `virtual` is the default: a headless compositor with no display of its own,
+ * with the Computer pane as its only screen. `window` is a debugging opt-in:
+ * the same compositor running as an ordinary Wayland client of the host, so
+ * the isolated desktop is a window on a desktop KWin does not otherwise run. Nothing about the desktop backend
  * changes in either mode: the same KWin plugin loads into the private
  * compositor, and `KWinComputerBackend` reaches it through the same D-Bus
  * surface, only pointed at the private bus.

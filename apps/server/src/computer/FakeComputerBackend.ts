@@ -69,8 +69,8 @@ export interface FakeComputerBackendOptions {
   readonly health?: ComputerHealth;
   /**
    * Overrides what the fake claims to be able to do, so a test can drive the
-   * capability-gated refusals a bounds-less or shared-seat backend produces
-   * without standing up a real display server.
+   * capability-gated refusals a less capable backend produces without
+   * standing up a real display server.
    */
   readonly capabilities?: ComputerCapabilities;
   readonly screenSize?: ComputerScreenSize;

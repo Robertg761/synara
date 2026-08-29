@@ -2855,12 +2855,11 @@ bool SynaraComputerUsePlugin::requireReachableClient(const Window *window, bool 
  * wrong. So one window is off the table while its owner is in it, and every
  * other window on the desktop stays available.
  *
- * There is deliberately **no attribution epsilon** here, unlike the shared-seat
- * arbiter that does the same job for Tier 2. That module has to subtract the
- * agent's own input from what it observes, because on a portal backend the agent
- * drives seat0 itself. On this desktop the agent's events never enter seat0 (the
- * dedicated seat is a second `SeatInterface`, and direct injection writes to
- * client resources without a seat), so every event the spy saw is the human's by
+ * There is deliberately **no attribution epsilon** here. A guard that drove
+ * seat0 itself would have to subtract the agent's own input from what it
+ * observes; on this desktop the agent's events never enter seat0 (the dedicated
+ * seat is a second `SeatInterface`, and direct injection writes to client
+ * resources without a seat), so every event the spy saw is the human's by
  * construction, and there is nothing to subtract.
  *
  * Refused rather than delayed: the caller can retry, and a compositor that

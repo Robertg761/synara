@@ -50,8 +50,8 @@ describe("parseComputerBackendOverride", () => {
 
 describe("selectLinuxBackend", () => {
   it("picks the KWin backend on a KDE host with no environment variables set", async () => {
-    // The hard regression guard for Tier 2: a KDE user who sets nothing must
-    // land on exactly the backend they had before Tier 2 existed.
+    // The hard regression guard: a KDE user who sets nothing must land on
+    // exactly the backend they had before any other backend existed.
     await expect(selectLinuxBackend({ env: {}, busNameHasOwner: KDE_HOST })).resolves.toMatchObject(
       {
         choice: "kwin",
@@ -92,7 +92,7 @@ describe("selectLinuxBackend", () => {
     expect(selection.reason).toContain("no other backend is tried");
   });
 
-  it("refuses SYNARA_COMPUTER_BACKEND=portal rather than sharing the human's seat", async () => {
+  it("rejects SYNARA_COMPUTER_BACKEND=portal like any other unknown backend", async () => {
     await expect(
       selectLinuxBackend({ env: { SYNARA_COMPUTER_BACKEND: "portal" }, busNameHasOwner: KDE_HOST }),
     ).rejects.toThrow(InvalidComputerBackendOverrideError);
@@ -178,7 +178,7 @@ describe("selectLinuxBackend", () => {
 
   it("keeps the KWin path when the session bus cannot answer at all", async () => {
     // An unreachable bus is not evidence that KWin is absent, and routing to
-    // Tier 2 would blame the wrong tier for a dead bus.
+    // the nested desktop would blame the wrong backend for a dead bus.
     const selection = await selectLinuxBackend({
       env: {},
       busNameHasOwner: host({ busError: "connect ENOENT /run/user/1000/bus" }),

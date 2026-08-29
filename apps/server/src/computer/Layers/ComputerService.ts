@@ -90,13 +90,12 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
 
 /**
  * Builds whichever backend `selectLinuxBackend` resolved, with no fallback in
- * any direction: a tier that fails stays failed and its backend carries the
- * reason. See `linuxBackendSelection.ts` for the order and why it probes the
+ * any direction: a backend that fails stays failed and carries the reason. See `linuxBackendSelection.ts` for the order and why it probes the
  * session bus rather than reading `XDG_CURRENT_DESKTOP`.
  *
  * On a KDE host with none of these environment variables set, this is still a
  * bare `new KWinComputerBackend()` — the same object, with the same defaults,
- * as before Tier 2 existed.
+ * as before any other backend existed.
  */
 async function makeLinuxBackend(): Promise<LinuxBackend> {
   let selection: LinuxBackendSelection;

@@ -212,9 +212,9 @@ function isText(value: unknown): value is string {
 }
 
 /**
- * Re-exported rather than reimplemented: the check is identical for the Tier 2
- * helper, and one definition of "is this the binary that was built" is the
- * point. See `provisioning/prebuiltVerification.ts`.
+ * Re-exported rather than reimplemented: the check is identical for every
+ * shipped native binary, and one definition of "is this the binary that was
+ * built" is the point. See `provisioning/prebuiltVerification.ts`.
  */
 export { verifyPrebuilt };
 

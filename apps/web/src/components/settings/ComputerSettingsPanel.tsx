@@ -67,7 +67,7 @@ export function ComputerSettingsPanel({
   const statusQuery = useQuery({
     ...computerStatusQueryOptions(),
     enabled: active,
-    // Health can flip (reconnecting, consent granted) while the panel is open.
+    // Health can flip (reconnecting, recovered) while the panel is open.
     refetchInterval: active ? COMPUTER_STATUS_VISIBLE_REFETCH_INTERVAL_MS : false,
   });
 

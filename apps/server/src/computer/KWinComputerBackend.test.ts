@@ -2599,7 +2599,7 @@ describe("KWinComputerBackend clipboard", () => {
     } as const;
   }
 
-  it("reads text from the shared seat clipboard without touching the plugin", async () => {
+  it("reads text from the desktop clipboard without touching the plugin", async () => {
     const { backend, dbus, specs } = clipboardBackend(() =>
       exited(0, { stdout: "  copied\ntext  " }),
     );

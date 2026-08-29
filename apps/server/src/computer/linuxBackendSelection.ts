@@ -144,7 +144,7 @@ export async function selectLinuxBackend(
       return {
         choice: "kwin",
         forced: false,
-        reason: `${KWIN_SERVICE} is owned on the session bus, so this is a KWin session and Tier 1 applies.`,
+        reason: `${KWIN_SERVICE} is owned on the session bus, so this is a KWin session and the KWin plugin applies.`,
       };
     }
   } catch (error) {

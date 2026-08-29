@@ -140,10 +140,10 @@ function readNumber(record: Record<string, unknown>, key: string, fallback: numb
 /**
  * The helper's length-prefixed frame records, in this module's error type.
  *
- * The splitting itself is shared with the Linux desktop helper, which frames its
- * capture payloads identically; only the failure type differs, because a
- * desynced stream here is a `DeviceHelperError` the transport already knows how
- * to drop a socket on.
+ * The splitting itself lives in `@synara/shared/lengthPrefixedRecords` so any
+ * other helper framing payloads the same way reuses it; only the failure type
+ * is this module's, because a desynced stream here is a `DeviceHelperError`
+ * the transport already knows how to drop a socket on.
  */
 export class DeviceFramePrefixParser {
   private readonly parser = new LengthPrefixedRecordParser();
