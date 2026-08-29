@@ -717,7 +717,7 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_scroll",
       "Scroll",
-      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in logical pixels, the same unit as coordinates and window bounds — roughly 100 pixels per notch of a physical wheel. ${POINTER_COORDINATE_NOTE}`,
+      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in logical pixels, the same unit as coordinates and window bounds — roughly 50 pixels per notch of a physical wheel. To page through content, scroll by about half the window's height so each observation overlaps the last; larger steps skip content, and a wheel cannot scroll past the top or bottom, so a scroll that changes nothing means the end was already reached. ${POINTER_COORDINATE_NOTE}`,
       {
         type: "object",
         properties: {

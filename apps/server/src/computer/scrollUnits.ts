@@ -13,12 +13,30 @@
 /**
  * Pixels per wheel notch.
  *
+ * The pixels are *content* pixels: what a page actually moves when a physical
+ * wheel clicks once. That is a toolkit decision, not a protocol one — Chromium
+ * scrolls 53 px per notch on Linux, Firefox three lines (about 57 px), Qt and
+ * terminals three lines too — so this is a nominal figure in the middle of
+ * them, and the tool surface promises "roughly" this much. It also matches
+ * what a browser reports as `deltaY` for one notch, so a human notch on the
+ * computer pane arrives on the desktop as about one notch.
+ *
+ * It is deliberately not libinput's 15 wire units per notch. Those are what a
+ * compositor hands a client in `wl_pointer.axis` — degrees of wheel rotation,
+ * which toolkits then scale up by a factor of three to seven — so treating
+ * them as pixels made every scroll several times longer than it was asked to
+ * be, and a 900 px request threw a page all the way to its bottom. The native
+ * injectors convert pixels to notches with this constant and emit the
+ * continuous axis value as notches × 15 on their own.
+ *
  * Keep in sync with `SCROLL_STEP_PX` in
- * apps/server/native/computer-desktop-helper/src/wayland.c and
+ * apps/server/native/computer-desktop-helper/src/wayland.c,
  * `s_scrollPixelsPerNotch` in
- * apps/server/native/computer-use-kwin/synaracomputeruseplugin.cpp.
+ * apps/server/native/computer-use-kwin/synaracomputeruseplugin.cpp and
+ * `SCROLL_PIXELS_PER_NOTCH` in
+ * apps/server/native/computer-use-hyprland/synarahyprlandplugin.cpp.
  */
-export const SCROLL_STEP_PX = 15;
+export const SCROLL_STEP_PX = 50;
 
 /**
  * Whole notches owed for a pixel delta that can only be delivered as notches.

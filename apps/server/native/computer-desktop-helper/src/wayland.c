@@ -32,8 +32,17 @@
  */
 #define CAPTURE_BUDGET_MS 10000
 /* Pixels per wheel notch. The tool surface speaks pixels; a wheel speaks
- * notches, and toolkits ignore a wheel event that carries neither. */
-#define SCROLL_STEP_PX 15.0
+ * notches, and toolkits ignore a wheel event that carries neither. These are
+ * content pixels, what a page moves per click (Chromium 53, Firefox about 57),
+ * not the 15 wire units libinput reports per click: those are degrees, which
+ * every toolkit scales up, and taking them for pixels made each scroll several
+ * times longer than asked. Keep in sync with SCROLL_STEP_PX in
+ * apps/server/src/computer/scrollUnits.ts, which carries the full rationale. */
+#define SCROLL_STEP_PX 50.0
+/* What one notch is worth on the continuous axis: libinput's wheel unit is
+ * degrees of rotation, 15 per click, and that is the scale every client
+ * expects in wl_pointer.axis. */
+#define AXIS_UNITS_PER_NOTCH 15.0
 /* The furthest one scroll request may travel. wl_fixed_from_double is only
  * defined for what an int32 of 1/256ths holds, and no human gesture is a
  * thousand notches long. */
@@ -1232,13 +1241,16 @@ static void send_axis(helper_wayland *state, uint32_t axis, double delta, double
 	 * half goes out first and the discrete half extends it. A compositor that
 	 * takes the pixel delta only from `axis` sees nothing at all otherwise.
 	 * They are not additive: both carry the same delta, and the discrete
-	 * request names the notch count that delta amounts to.
+	 * request names the notch count that delta amounts to. The continuous
+	 * value is in the wheel's own units, not pixels: a client reads it at
+	 * libinput's scale of 15 per notch and multiplies up from there.
 	 */
+	double axis_value = delta * AXIS_UNITS_PER_NOTCH / SCROLL_STEP_PX;
 	zwlr_virtual_pointer_v1_axis(state->pointer, now_ms(state), axis,
-	                             wl_fixed_from_double(delta));
+	                             wl_fixed_from_double(axis_value));
 	if (steps != 0) {
 		zwlr_virtual_pointer_v1_axis_discrete(state->pointer, now_ms(state), axis,
-		                                      wl_fixed_from_double(delta), steps);
+		                                      wl_fixed_from_double(axis_value), steps);
 	}
 }
 

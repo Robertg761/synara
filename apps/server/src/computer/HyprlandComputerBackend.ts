@@ -23,9 +23,8 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-import { COMPUTER_HYPRLAND_BACKEND } from "@synara/contracts";
+import { COMPUTER_HYPRLAND_BACKEND, type ComputerAvailability } from "@synara/contracts";
 
-import type { ComputerAvailability } from "./ComputerBackend.ts";
 import {
   detectRunningHyprlandVersion,
   hyprlandSessionPresent,

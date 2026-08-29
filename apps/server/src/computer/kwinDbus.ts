@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import type { EventEmitter } from "node:events";
 
 import type dbusModule from "dbus-next";
+import type { ProxyObject as DbusProxyObject } from "dbus-next";
 
 import { unwrapDbusValue, withDbusTimeout } from "./dbusPlumbing.ts";
 
@@ -97,7 +98,7 @@ export interface KWinComputerDbusOptions {
  */
 export interface ComputerSessionBus {
   /** Resolves a proxy object, with the shared connection-level timeout. */
-  readonly getProxyObject: (service: string, path: string) => Promise<dbusModule.ProxyObject>;
+  readonly getProxyObject: (service: string, path: string) => Promise<DbusProxyObject>;
   readonly connectPlugin: () => Promise<KWinComputerPluginApi>;
   readonly onDisconnect: (listener: () => void) => () => void;
   readonly close: () => Promise<void>;
