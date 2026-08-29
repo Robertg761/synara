@@ -23,6 +23,7 @@ import {
   uiTreeActivationPoint,
   type UiTreeTargetSpec,
 } from "@synara/shared/uiTreeTargeting";
+import { clampTextToLength } from "./utf8Truncation.ts";
 
 export interface ComputerTargetCandidate {
   readonly label: string;
@@ -125,6 +126,29 @@ export function resolveComputerSemanticTarget(
 }
 
 /**
+ * A bare window id names the window itself rather than a control in it — the
+ * shape "scroll this window" arrives as. The match is the window's own node:
+ * the first node carrying that id in document order, which is the window's
+ * root. Returns undefined when the tree does not describe the window at all,
+ * so the caller can fall back to the window list's geometry.
+ */
+export function resolveComputerWindowTarget(
+  root: ComputerUiNode,
+  windowId: string,
+): ComputerTargetMatch | undefined {
+  const node = flattenUiTree(root, childrenOf).find((candidate) => candidate.windowId === windowId);
+  if (node === undefined) return undefined;
+  if (!node.onScreen) {
+    throw new ComputerTargetError({
+      code: "computer_target_offscreen",
+      message: `Computer window ${JSON.stringify(windowId)} is off-screen; refusing to guess a scroll point.`,
+      candidates: candidateDescriptions([node]),
+    });
+  }
+  return { node, point: activationPointForNode(node) };
+}
+
+/**
  * The desktop's half of the shared resolver.
  *
  * Three of these deliberately differ from the iOS family rather than having
@@ -178,6 +202,107 @@ export function candidateDescriptions(
 
 export function computerTargetCandidates(root: ComputerUiNode): readonly ComputerTargetCandidate[] {
   return candidateDescriptions(flattenUiTree(root, childrenOf));
+}
+
+// ── Actionable-element digest ───────────────────────────────────────
+
+/**
+ * The roles that can be acted on semantically, across the two vocabularies the
+ * desktop family speaks (AT-SPI's lowercase role names and macOS AX spellings).
+ * Static text is deliberately absent: it fills the digest with lines nothing
+ * can be done with.
+ */
+const ACTIONABLE_ROLES = new Set([
+  // Buttons.
+  "push button",
+  "button",
+  "toggle button",
+  // Text entry.
+  "entry",
+  "text field",
+  "text-field",
+  "search field",
+  // Stateful controls.
+  "check box",
+  "radio button",
+  "combo box",
+  "list box",
+  "switch",
+  "slider",
+  "spin button",
+  // Navigation.
+  "link",
+  "page tab",
+  "menu item",
+  "check menu item",
+  "radio menu item",
+]);
+
+/** Longest element list one digest may carry before it reports incompleteness. */
+const ELEMENT_DIGEST_MAX_LENGTH = 60;
+/** Longest label or value one element may carry. */
+const ELEMENT_TEXT_MAX_LENGTH = 80;
+
+export interface ComputerActionableElement {
+  readonly role: string;
+  readonly label: string;
+  /** Current contents of an editable control, truncated. Absent otherwise. */
+  readonly value?: string;
+  readonly windowId: string | null;
+}
+
+export interface ComputerActionableElements {
+  readonly items: readonly ComputerActionableElement[];
+  /**
+   * False when the tree carried more actionable elements than fit. The caller
+   * should say so — an element missing from a truncated digest still exists.
+   */
+  readonly complete: boolean;
+}
+
+/**
+ * The labeled, on-screen, actionable elements of a UI tree — what a model
+ * grounds on instead of estimating pixel coordinates from a screenshot.
+ *
+ * Only labeled elements are listed, because targeting is by label: an
+ * unlabeled control cannot be addressed semantically, and listing it would
+ * push the caller back toward coordinates. Off-screen elements are excluded
+ * too — semantic resolution refuses off-screen targets, so naming them would
+ * invite a refused action; scrolling brings them on screen and they appear in
+ * the next digest. Duplicate labels are kept: two same-labeled controls is
+ * real ambiguity the caller should see rather than have silently resolved.
+ */
+export function actionableElements(root: ComputerUiNode): ComputerActionableElements {
+  const items: ComputerActionableElement[] = [];
+  let overflow = false;
+  const walk = (node: ComputerUiNode): void => {
+    if (overflow) return;
+    const collectible =
+      ACTIONABLE_ROLES.has(node.role) &&
+      node.onScreen &&
+      node.windowId !== null &&
+      matchableLabel(node) !== "";
+    if (collectible && items.length < ELEMENT_DIGEST_MAX_LENGTH) {
+      const label = clampTextToLength(matchableLabel(node), ELEMENT_TEXT_MAX_LENGTH);
+      items.push({
+        role: node.role,
+        label,
+        // An entry's empty value is real information — "this field is blank" —
+        // so presence, not truthiness, decides.
+        ...(node.value !== null && node.value !== undefined
+          ? { value: clampTextToLength(node.value, 40) }
+          : {}),
+        windowId: node.windowId,
+      });
+    } else if (collectible && items.length >= ELEMENT_DIGEST_MAX_LENGTH) {
+      // The list is full and something actionable did not fit: that has to be
+      // said out loud, or the caller reads a truncated digest as the truth.
+      overflow = true;
+    }
+    for (const child of node.children) walk(child);
+  };
+  walk(root);
+  return { items, complete: !overflow };
 }
 
 export function describeTarget(target: ComputerTarget): string {

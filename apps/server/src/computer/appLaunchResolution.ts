@@ -335,11 +335,14 @@ function dedupe(values: readonly string[]): readonly string[] {
 }
 
 function notFoundError(requested: string, env: AppLaunchEnvironment): AppLaunchResolutionError {
-  const searched = [
-    "$PATH",
-    ...flatpakBinDirectories(env),
-    ...applicationDirectories(env).map((directory) => join(directory, `${requested}.desktop`)),
-  ];
+  // Kinds, not paths: the searched directories include the user's home, and
+  // echoing absolute paths into a model-facing error leaks the filesystem
+  // layout to whoever reads the tool result.
+  const searched = dedupe([
+    "the PATH",
+    ...(flatpakBinDirectories(env).length > 0 ? ["installed flatpak apps"] : []),
+    ...(applicationDirectories(env).length > 0 ? [".desktop entries"] : []),
+  ]);
   return new AppLaunchResolutionError(
     `computer_launch_app found nothing named ${JSON.stringify(requested)}. Searched ` +
       `${searched.join(", ")}. Retry with an absolute path to the executable, a command on $PATH, ` +

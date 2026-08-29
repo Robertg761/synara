@@ -77,6 +77,14 @@ export interface KWinComputerDbus {
   readonly loadPlugin: (pluginId: string) => Promise<boolean>;
   /** `false` only when KWin reports the id was not loaded to begin with. */
   readonly unloadPlugin: (pluginId: string) => Promise<boolean>;
+  /**
+   * The unique bus name of whoever owns `name`, or `undefined` when nothing
+   * does. This is how a well-known name is pinned to the process that answered
+   * it *now*: talking to whichever process holds `org.synara.ComputerUse`
+   * without checking means a stale duplicate instance silently receives every
+   * pointer, key, and capture call.
+   */
+  readonly nameOwner: (name: string) => Promise<string | undefined>;
   readonly connectPlugin: () => Promise<KWinComputerPluginApi>;
   readonly onDisconnect: (listener: () => void) => () => void;
   readonly close: () => Promise<void>;
@@ -89,6 +97,8 @@ export interface KWinComputerDbusOptions {
    * which is the only bus a real desktop's KWin is reachable on.
    */
   readonly busAddress?: string;
+  /** Tests inject a fake here; production resolves the real dbus-next. */
+  readonly dbusModule?: Pick<typeof dbusModule, "sessionBus">;
 }
 
 /**
@@ -99,6 +109,12 @@ export interface KWinComputerDbusOptions {
 export interface ComputerSessionBus {
   /** Resolves a proxy object, with the shared connection-level timeout. */
   readonly getProxyObject: (service: string, path: string) => Promise<DbusProxyObject>;
+  /** The unique bus name owning `name`, or undefined when nobody does. */
+  readonly nameOwner: (name: string) => Promise<string | undefined>;
+  /**
+   * Connects to the Synara plugin by its owner's *unique* name, never the
+   * well-known one; requires the service to be owned right now.
+   */
   readonly connectPlugin: () => Promise<KWinComputerPluginApi>;
   readonly onDisconnect: (listener: () => void) => () => void;
   readonly close: () => Promise<void>;
@@ -116,7 +132,7 @@ export async function openComputerSessionBus(
   // Keep the optional Linux runtime out of test imports. The production path
   // resolves it only when the backend has passed the Linux/Wayland gate.
   const require = createRequire(import.meta.url);
-  const dbus = require("dbus-next") as typeof dbusModule;
+  const dbus = options.dbusModule ?? (require("dbus-next") as typeof dbusModule);
   const bus = options.busAddress
     ? dbus.sessionBus({ busAddress: options.busAddress })
     : dbus.sessionBus();
@@ -128,6 +144,33 @@ export async function openComputerSessionBus(
   const eventBus = bus as unknown as EventEmitter;
   eventBus.on("disconnect", onDisconnectEvent);
   eventBus.on("error", onDisconnectEvent);
+  let busDaemon: DbusProxyObject;
+  try {
+    busDaemon = await withTimeout(
+      Promise.resolve(bus.getProxyObject(DBUS_SERVICE, DBUS_OBJECT_PATH)),
+      KWIN_DBUS_DEFAULT_TIMEOUT_MS,
+      "getProxyObject",
+    );
+  } catch (error) {
+    eventBus.off("disconnect", onDisconnectEvent);
+    eventBus.off("error", onDisconnectEvent);
+    bus.disconnect();
+    throw error;
+  }
+  const daemon = busDaemon.getInterface(DBUS_INTERFACE);
+  const resolveNameOwner = async (name: string): Promise<string | undefined> => {
+    try {
+      const owner = await invoke(daemon, "GetNameOwner", name);
+      return typeof unwrapDbusValue(owner) === "string"
+        ? (unwrapDbusValue(owner) as string)
+        : undefined;
+    } catch (error) {
+      // "Nobody owns it" is an answer, not a failure: the caller is the
+      // one deciding whether an owner was required.
+      if (isUnownedNameError(error)) return undefined;
+      throw error;
+    }
+  };
   return {
     getProxyObject: (service, path) =>
       withTimeout(
@@ -135,9 +178,24 @@ export async function openComputerSessionBus(
         KWIN_DBUS_DEFAULT_TIMEOUT_MS,
         "getProxyObject",
       ),
+    nameOwner: resolveNameOwner,
     connectPlugin: async () => {
+      // Address the proxy by the owner's *unique* name, not the well-known
+      // one. dbus-next routes every later call by the proxy's destination, so
+      // a proxy addressed as `org.synara.ComputerUse` follows the name to
+      // whoever owns it next — a stale generation or a same-session squatter
+      // taking the name after the backend's ownership check would silently
+      // receive every pointer, key, and capture call. Pinned to the unique
+      // name, a replaced owner makes calls fail loudly instead, and the
+      // reconnect path re-resolves the fresh owner from scratch.
+      const owner = await resolveNameOwner(COMPUTER_SERVICE);
+      if (owner === undefined) {
+        throw new Error(
+          `Nothing on the session bus owns ${COMPUTER_SERVICE}, so the plugin cannot be connected.`,
+        );
+      }
       const object = await withTimeout(
-        Promise.resolve(bus.getProxyObject(COMPUTER_SERVICE, COMPUTER_OBJECT_PATH)),
+        Promise.resolve(bus.getProxyObject(owner, COMPUTER_OBJECT_PATH)),
         KWIN_DBUS_DEFAULT_TIMEOUT_MS,
         "getProxyObject",
       );
@@ -179,6 +237,7 @@ export async function createSessionKWinComputerDbus(
       properties = undefined;
     }
     return {
+      nameOwner: session.nameOwner,
       listLoadedPluginIds: async () => {
         const result = properties
           ? await invoke(properties, "Get", KWIN_PLUGINS_INTERFACE, "LoadedPlugins")
@@ -254,6 +313,11 @@ export async function waitForSessionBusName(options: {
     eventBus.off("disconnect", onError);
     bus.disconnect();
   }
+}
+
+function isUnownedNameError(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.includes("NameHasNoOwner") || text.includes("ServiceUnknown");
 }
 
 function makePluginApi(iface: unknown): KWinComputerPluginApi {

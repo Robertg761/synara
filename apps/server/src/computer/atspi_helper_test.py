@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -245,6 +246,71 @@ class AtspiSemanticWriteTest(unittest.TestCase):
 
         self.assertTrue(HELPER.supports_editable_text(probed))
         self.assertFalse(HELPER.supports_editable_text(self.label))
+
+
+class AtspiReplySizeTest(unittest.TestCase):
+    def setUp(self):
+        HELPER.Atspi = FakeAtspi
+        self.frame = FakeAccessible("frame", "Terminal", 42, 640, 480)
+        self.application = FakeAccessible("application", "Terminal", 42, 0, 0, [self.frame])
+        FakeAtspi.desktop = FakeAccessible("desktop", children=[self.application])
+        self.requested = {
+            "id": "window-1",
+            "title": "Terminal",
+            "pid": 42,
+            "bounds": {"width": 648, "height": 518},
+        }
+
+    def tearDown(self):
+        FakeAtspi.desktop = None
+
+    def test_clamps_oversized_accessible_names_before_serialization(self):
+        # A megabyte-scale name: a dense Chromium tree can produce these, and
+        # before the clamp one of them failed the client's frame cap and took
+        # perception for the whole application down with it.
+        self.frame.name = "x" * (2 * 1024 * 1024)
+
+        trees = HELPER.read_tree({"windows": [self.requested]})["trees"]
+
+        label = trees[0]["root"]["label"]
+        self.assertEqual(len(label), HELPER.MAX_TEXT_CHARS)
+        # The reply stays well inside what the newline-framed transport accepts.
+        self.assertLess(
+            len(json.dumps(trees, separators=(",", ":")).encode()), HELPER.SAFE_REPLY_BYTES
+        )
+
+    def test_drops_node_text_when_the_whole_reply_would_still_exceed_the_cap(self):
+        # Enough nodes that even clamped text sums past the safety threshold:
+        # the fallback keeps role, geometry, and shape, dropping free text.
+        many = [
+            FakeAccessible(f"n{i}", "y" * HELPER.MAX_TEXT_CHARS, width=10, height=10)
+            for i in range(2048)
+        ]
+        self.frame.children = many
+        # A threshold the bare node shapes fit under but one clamped label per
+        # node blows straight through.
+        limit = 512 * 1024
+        HELPER.SAFE_REPLY_BYTES = limit
+        try:
+            result = HELPER.read_tree({"windows": [self.requested]})
+        finally:
+            HELPER.SAFE_REPLY_BYTES = 6 * 1024 * 1024
+
+        root = result["trees"][0]["root"]
+        encoded = json.dumps(result, separators=(",", ":")).encode()
+        self.assertLessEqual(len(encoded), limit)
+        # The window node kept its identity; leaf nodes lost their text.
+        self.assertEqual(root["label"], "Terminal")
+        self.assertIsNone(root["children"][0]["label"])
+
+    def test_raises_when_even_the_strip_cannot_fit(self):
+        HELPER.SAFE_REPLY_BYTES = 16
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                HELPER.read_tree({"windows": [self.requested]})
+        finally:
+            HELPER.SAFE_REPLY_BYTES = 6 * 1024 * 1024
+        self.assertIn("transport limit", str(caught.exception))
 
 
 if __name__ == "__main__":

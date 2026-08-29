@@ -5,6 +5,7 @@ import type { ComputerUiNode, ComputerWindowId } from "@synara/contracts";
 import {
   ComputerTargetError,
   activationPointForNode,
+  actionableElements,
   computerTargetCandidates,
   resolveComputerPoint,
   resolveComputerSemanticTarget,
@@ -171,5 +172,130 @@ describe("naming the candidates", () => {
     expect(computerTargetCandidates(desktop)).toHaveLength(16);
     const error = thrown(() => resolveComputerSemanticTarget(desktop, { label: "Nope" }));
     expect(error.candidates).toHaveLength(16);
+  });
+});
+
+/**
+ * The digest is what makes labels discoverable to the model: without it the
+ * only grounding is pixel estimation from a downscaled screenshot, which is
+ * exactly the clunkiness this exists to remove.
+ */
+describe("actionableElements", () => {
+  it("lists labeled on-screen actionable elements in tree order", () => {
+    const desktop = node({
+      role: "desktop",
+      children: [
+        node({
+          role: "push button",
+          label: "Reload",
+          windowId: windowId("browser"),
+          children: [
+            node({ role: "entry", label: "Email", value: "", windowId: windowId("browser") }),
+          ],
+        }),
+        node({ role: "heading", label: "Settings", windowId: windowId("browser") }),
+      ],
+    });
+
+    expect(actionableElements(desktop)).toEqual({
+      complete: true,
+      items: [
+        { role: "push button", label: "Reload", windowId: windowId("browser") },
+        { role: "entry", label: "Email", value: "", windowId: windowId("browser") },
+      ],
+    });
+  });
+
+  it("drops unlabeled controls, static text, and off-screen elements", () => {
+    const desktop = node({
+      role: "desktop",
+      children: [
+        node({ role: "push button", windowId: windowId("w") }),
+        node({ role: "text", label: "A paragraph of static text", windowId: windowId("w") }),
+        node({
+          role: "check box",
+          label: "Off screen",
+          onScreen: false,
+          windowId: windowId("w"),
+        }),
+        node({ role: "check box", label: "Subscribed", windowId: windowId("w") }),
+      ],
+    });
+
+    expect(actionableElements(desktop).items).toEqual([
+      { role: "check box", label: "Subscribed", windowId: windowId("w") },
+    ]);
+  });
+
+  it("falls back to the description when there is no label, matching targeting", () => {
+    const desktop = node({
+      role: "desktop",
+      children: [
+        node({
+          role: "slider",
+          description: "Volume",
+          windowId: windowId("player"),
+        }),
+      ],
+    });
+
+    // Targeting matches on `label ?? description`, so the digest must name the
+    // element by the same words or the model could not act on it by label.
+    expect(actionableElements(desktop).items).toEqual([
+      { role: "slider", label: "Volume", windowId: windowId("player") },
+    ]);
+  });
+
+  it("keeps duplicate labels — real ambiguity — but separates windows", () => {
+    const desktop = node({
+      role: "desktop",
+      children: [
+        node({ role: "push button", label: "Save", windowId: windowId("editor") }),
+        node({ role: "push button", label: "Save", windowId: windowId("editor") }),
+        node({ role: "menu item", label: "Save", windowId: windowId("browser") }),
+      ],
+    });
+
+    const elements = actionableElements(desktop);
+    expect(elements.complete).toBe(true);
+    expect(elements.items).toHaveLength(3);
+    expect(elements.items[0]?.windowId).toBe(windowId("editor"));
+    expect(elements.items.at(-1)?.windowId).toBe(windowId("browser"));
+  });
+
+  it("truncates long labels and values on whole characters", () => {
+    const desktop = node({
+      role: "desktop",
+      children: [
+        node({
+          role: "entry",
+          label: `x`.repeat(300),
+          value: "v".repeat(200),
+          windowId: windowId("editor"),
+        }),
+      ],
+    });
+
+    const [element] = actionableElements(desktop).items;
+    expect(element?.label.length).toBeLessThanOrEqual(80);
+    expect(element?.value?.length).toBeLessThanOrEqual(40);
+  });
+
+  it("caps the list and reports when it had to cut elements off", () => {
+    const desktop = node({
+      role: "desktop",
+      children: Array.from({ length: 80 }, (_unused, index) =>
+        node({
+          role: "push button",
+          label: `Button ${index}`,
+          windowId: windowId("panel"),
+          children: [node({ role: "link", label: "child link", windowId: windowId("panel") })],
+        }),
+      ),
+    });
+
+    const elements = actionableElements(desktop);
+    expect(elements.items).toHaveLength(60);
+    expect(elements.complete).toBe(false);
   });
 });

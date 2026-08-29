@@ -139,7 +139,6 @@ export const NO_COMPUTER_CAPABILITIES: ComputerCapabilities = {
   clipboard: false,
   activation: false,
   ghostCursor: false,
-  sharedSeat: false,
   visibleDesktop: false,
 };
 

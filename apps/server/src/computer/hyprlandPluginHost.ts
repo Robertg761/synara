@@ -89,6 +89,7 @@ export async function createSessionHyprlandComputerDbus(
     loadedPaths.get(pluginId) ?? join(options.pluginDirectory, `${pluginId}.so`);
 
   return {
+    nameOwner: session.nameOwner,
     listLoadedPluginIds: async () => {
       const plugins = await listLoadedHyprlandPlugins(run);
       const ids: string[] = [];

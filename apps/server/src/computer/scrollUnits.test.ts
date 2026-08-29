@@ -4,10 +4,9 @@ import { SCROLL_STEP_PX, takeDiscreteSteps } from "./scrollUnits.ts";
 
 /**
  * The invariant these pins buy: one scroll means one thing on every desktop.
- * KWin converts pixels at the plugin boundary (value120), the wlroots helper
- * converts them in C (`take_discrete_steps` in wayland.c, same algorithm), and
- * GNOME's portal wire converts here. All three share SCROLL_STEP_PX = 80 and
- * the truncate-and-carry semantics asserted below.
+ * KWin converts pixels at the plugin boundary (value120) and Hyprland in its
+ * own plugin; both share SCROLL_STEP_PX = 80 and the truncate-and-carry
+ * semantics asserted below.
  */
 describe("takeDiscreteSteps", () => {
   it("converts exact multiples of a notch exactly", () => {

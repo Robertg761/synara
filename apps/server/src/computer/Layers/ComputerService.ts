@@ -2,7 +2,6 @@ import { Effect, Layer } from "effect";
 import type { ComputerAvailability } from "@synara/contracts";
 
 import { ComputerManager } from "../ComputerManager.ts";
-import { FakeComputerBackend } from "../FakeComputerBackend.ts";
 import { HyprlandComputerBackend } from "../HyprlandComputerBackend.ts";
 import { KWinComputerBackend } from "../KWinComputerBackend.ts";
 import { UnavailableComputerBackend } from "../UnavailableComputerBackend.ts";
@@ -22,6 +21,8 @@ export interface ComputerServiceLiveOptions {
   readonly backend?: ComputerBackend;
   /** Test/embedding override for the final availability decision. */
   readonly supported?: boolean;
+  /** Test override for the host platform; defaults to `process.platform`. */
+  readonly platform?: NodeJS.Platform;
 }
 
 interface LinuxBackend {
@@ -32,11 +33,23 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
   return Layer.effect(
     ComputerService,
     Effect.gen(function* () {
+      const platform = options.platform ?? process.platform;
       const linux =
-        options.backend === undefined && process.platform === "linux"
+        options.backend === undefined && platform === "linux"
           ? yield* Effect.promise(() => makeLinuxBackend())
           : undefined;
-      const backend = options.backend ?? linux?.backend ?? new FakeComputerBackend();
+      // Off Linux there is no backend to fall back to — and the fake would be
+      // worse than none: it answers "available" and every tool call succeeds
+      // against a phantom desktop, so an agent could report success at clicks
+      // that never happened. The unavailable backend refuses instead, with the
+      // verdict kind the pane's blocked state is keyed off.
+      const backend =
+        options.backend ??
+        linux?.backend ??
+        new UnavailableComputerBackend(
+          `Computer control requires a Linux host; this server runs on ${platform}.`,
+          { availability: { kind: "unsupported-platform", platform } },
+        );
       const manager = new ComputerManager({ backend });
       yield* Effect.addFinalizer(() => Effect.promise(() => manager.dispose()));
       let availability: ComputerAvailability;
@@ -57,10 +70,17 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
         };
       }
       return {
-        // The backend performs the complete Linux gate: Linux, Wayland, a
-        // reachable KWin user bus, and a plugin that is loaded, installed,
-        // shipped for this KWin, or buildable here.
-        supported: options.supported ?? availability?.kind === "available",
+        // Supported means "this host could ever drive a desktop", not "the
+        // desktop works right now". A real backend keeps every handler and the
+        // agent gateway routed through the manager, whose availability reads
+        // let a helper installed or a plugin loaded after boot appear without
+        // a server restart; freezing the boot probe's verdict here would cache
+        // `unsupported` for the process's lifetime — the exact restart the
+        // backend's re-probe exists to avoid. Only a host that can never
+        // qualify — off Linux, or a configuration the backend selection
+        // refused — stays unsupported, and the boot `availability` beside it
+        // is the frozen answer those handlers serve.
+        supported: options.supported ?? !(backend instanceof UnavailableComputerBackend),
         availability,
         manager,
       } satisfies ComputerServiceShape;
@@ -70,13 +90,12 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
 
 /**
  * Builds whichever backend `selectLinuxBackend` resolved, with no fallback in
- * any direction: a tier that fails stays failed and its backend carries the
- * reason. See `linuxBackendSelection.ts` for the order and why it probes the
+ * any direction: a backend that fails stays failed and carries the reason. See `linuxBackendSelection.ts` for the order and why it probes the
  * session bus rather than reading `XDG_CURRENT_DESKTOP`.
  *
  * On a KDE host with none of these environment variables set, this is still a
  * bare `new KWinComputerBackend()` — the same object, with the same defaults,
- * as before Tier 2 existed.
+ * as before any other backend existed.
  */
 async function makeLinuxBackend(): Promise<LinuxBackend> {
   let selection: LinuxBackendSelection;

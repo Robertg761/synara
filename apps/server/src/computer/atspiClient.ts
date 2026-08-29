@@ -17,6 +17,8 @@ const HELPER_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const HELPER_REQUEST_TIMEOUT_MS = 10_000;
 const HELPER_RECONNECT_BASE_DELAY_MS = 250;
 const HELPER_RECONNECT_MAX_DELAY_MS = 5_000;
+/** How long a SIGTERM'd helper has to exit before dispose escalates to SIGKILL. */
+const ATSPI_KILL_GRACE_MS = 1_000;
 
 /**
  * A semantic text write addressed the same way the tree was read: the window
@@ -40,8 +42,7 @@ export interface AtspiTextWrite {
  * window that closed while its tree was being walked, an unknown method on an
  * older helper build. Killing the process over one turns every routine
  * semantic-target miss into a respawn and ratchets the reconnect backoff to five
- * seconds, so the next few perception requests are slow for no reason. The
- * portal's desktopHelperClient draws the same line for the same reason.
+ * seconds, so the next few perception requests are slow for no reason.
  */
 class AtspiHelperMethodError extends Error {
   readonly code: number | undefined;
@@ -129,6 +130,14 @@ export class AtspiHelperClient implements AtspiTreeReader {
     this.registry = null;
     process?.stdin.end();
     process?.kill("SIGTERM");
+    // SIGTERM is a request; a helper wedged in an uninterruptible read would
+    // ignore it and linger attached to the compositor. A short grace, then the
+    // kill that cannot be declined.
+    if (process) {
+      const survivor = setTimeout(() => process.kill("SIGKILL"), ATSPI_KILL_GRACE_MS);
+      survivor.unref?.();
+      void process.once("exit", () => clearTimeout(survivor));
+    }
     await this.startPromise?.catch(() => undefined);
     this.startPromise = null;
   }
@@ -172,7 +181,14 @@ export class AtspiHelperClient implements AtspiTreeReader {
             HELPER_RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectFailures,
           );
     const wait =
-      delay === 0 ? Promise.resolve() : new Promise<void>((resolve) => setTimeout(resolve, delay));
+      delay === 0
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, delay);
+            // A pending reconnect is not work the process should be kept
+            // alive for; the next request re-arms it.
+            timer.unref?.();
+          });
     this.startPromise = wait
       .then(() => {
         if (this.disposed) return;

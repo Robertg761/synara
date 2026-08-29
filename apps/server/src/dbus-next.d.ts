@@ -2,12 +2,9 @@ declare module "dbus-next" {
   export interface DbusBus {
     getProxyObject(service: string, path: string): Promise<DbusProxyObject>;
     /**
-     * Send a message and wait for its reply.
-     *
-     * The portal client needs this rather than the proxy API: the portal's
-     * Request/Response convention requires subscribing to a signal on a path
-     * predicted before the call, because the Response can arrive ahead of the
-     * method reply, and a proxy cannot express that ordering.
+     * Send a message and wait for its reply, for callers that need to subscribe
+     * to a signal before the call goes out — an ordering the proxy API cannot
+     * express.
      */
     call(message: Message): Promise<Message | null>;
     on(event: "error" | "disconnect", listener: (...args: readonly unknown[]) => void): void;

@@ -573,7 +573,12 @@ export function createWsNativeApi(): NativeApi {
       searchContent: (input) => transport.request(WS_METHODS.projectsSearchContent, input),
       prewarmSearchIndex: (input) =>
         transport.request(WS_METHODS.projectsPrewarmSearchIndex, input),
-      readFile: (input) => transport.request(WS_METHODS.projectsReadFile, input),
+      readFile: (input, options) =>
+        options?.signal
+          ? transport.request(WS_METHODS.projectsReadFile, input, { signal: options.signal })
+          : transport.request(WS_METHODS.projectsReadFile, input),
+      resolveWorkspaceFileReferences: (input) =>
+        transport.request(WS_METHODS.projectsResolveWorkspaceFileReferences, input),
       resolveOutOfRootFileReference: (input) =>
         transport.request(WS_METHODS.projectsResolveOutOfRootFileReference, input),
       createLocalFilePreviewGrant: (input) =>
@@ -893,8 +898,8 @@ export function createWsNativeApi(): NativeApi {
     },
     computer: {
       getStatus: (input) => transport.request(COMPUTER_WS_METHODS.getStatus, input),
-      // No client timeout: a cold machine compiles the desktop helper here, and
-      // the server's own build timeout is the one that should decide.
+      // No client timeout: a cold machine compiles the compositor plugin here,
+      // and the server's own build timeout is the one that should decide.
       provision: (input) =>
         transport.request(COMPUTER_WS_METHODS.provision, input, { timeoutMs: null }),
       getThreadState: (input) => transport.request(COMPUTER_WS_METHODS.getThreadState, input),

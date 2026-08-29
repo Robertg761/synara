@@ -9,10 +9,10 @@
  * promise that never settles and a session that never recovers.
  *
  * The timeout deliberately does not decide what a timeout *is*. Each caller's
- * error type carries its own recovery: a KWin timeout is connection-level and
- * drives a reconnect, a portal timeout is a portal failure with a D-Bus error
- * name attached, and the GNOME extension's is a plain error. Those are not
- * cosmetic differences, so the mechanism is shared and the meaning is not.
+ * error type carries its own recovery: a plugin timeout is connection-level and
+ * drives a reconnect, while a probe's timeout is a plain answer of "not here".
+ * Those are not cosmetic differences, so the mechanism is shared and the
+ * meaning is not.
  *
  * @module computer/dbusPlumbing
  */

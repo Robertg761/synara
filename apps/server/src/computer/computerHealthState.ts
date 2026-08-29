@@ -13,7 +13,6 @@ import type {
   ComputerHealth,
   ComputerHealthFailure,
   ComputerHealthStatus,
-  ComputerSeatHealth,
 } from "@synara/contracts";
 
 import { clampComputerMessage } from "./ComputerBackend.ts";
@@ -22,11 +21,6 @@ import { clampComputerMessage } from "./ComputerBackend.ts";
 export interface ComputerHealthStatusReading {
   readonly status: ComputerHealthStatus;
   readonly captureAvailable: boolean;
-  /**
-   * How the shared seat is being shared, on a backend that shares one. Absent
-   * on every backend with a seat of its own, which is most of them.
-   */
-  readonly seat?: ComputerSeatHealth;
 }
 
 export interface ComputerHealthStateOptions {
@@ -86,7 +80,6 @@ export class ComputerHealthState {
       reconnects: this.reconnectsCount,
       ...(this.lastFailure ? { lastFailure: this.lastFailure } : {}),
       captureAvailable: reading.captureAvailable,
-      ...(reading.seat ? { seat: reading.seat } : {}),
     };
   }
 
@@ -138,9 +131,6 @@ export function sameComputerHealth(left: ComputerHealth, right: ComputerHealth):
     left.reconnects === right.reconnects &&
     left.captureAvailable === right.captureAvailable &&
     left.lastFailure?.at === right.lastFailure?.at &&
-    left.lastFailure?.message === right.lastFailure?.message &&
-    left.seat?.observing === right.seat?.observing &&
-    left.seat?.reason === right.seat?.reason &&
-    left.seat?.lastYieldAt === right.seat?.lastYieldAt
+    left.lastFailure?.message === right.lastFailure?.message
   );
 }

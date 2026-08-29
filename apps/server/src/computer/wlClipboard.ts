@@ -192,7 +192,16 @@ export function spawnClipboardCommand(
       // they are released here rather than waited on.
       child.stdout.destroy();
       child.stderr.destroy();
-      resolve({ outcome, code, stdout: stdout.text(), stderr: stderr.text() });
+      // An output-limit run has no usable stdout — the buffer refuses to
+      // pretend its truncated prefix is the real thing.
+      const readStdout = () => {
+        try {
+          return stdout.text();
+        } catch {
+          return "";
+        }
+      };
+      resolve({ outcome, code, stdout: readStdout(), stderr: stderr.text() });
     };
 
     child.on("error", (error) => {
@@ -222,18 +231,32 @@ export function spawnClipboardCommand(
 class ChunkBuffer {
   private readonly chunks: Buffer[] = [];
   private bytes = 0;
+  private overflowed = false;
 
   constructor(private readonly limit: number) {}
 
   /** `false` once the limit is passed, and the chunk is dropped. */
   push(chunk: Buffer): boolean {
-    if (this.bytes + chunk.byteLength > this.limit) return false;
+    if (this.overflowed || this.bytes + chunk.byteLength > this.limit) {
+      this.overflowed = true;
+      return false;
+    }
     this.bytes += chunk.byteLength;
     this.chunks.push(chunk);
     return true;
   }
 
+  /**
+   * Throws after an overflow rather than returning the arbitrary prefix that
+   * survived: a truncated read must be recognizable as one, never mistaken for
+   * the clipboard's actual contents.
+   */
   text(): string {
+    if (this.overflowed) {
+      throw new ComputerBackendError(
+        `The stream exceeded its ${this.limit} byte limit, so no usable text was captured.`,
+      );
+    }
     return Buffer.concat(this.chunks).toString("utf8");
   }
 }

@@ -25,6 +25,9 @@ BUILD_DIR="${SYNARA_KWIN_BUILD_DIR:-$CACHE_ROOT/build}"
 STAMP_FILE="$STATE_ROOT/install.stamp"
 LOCK_FILE="$STATE_ROOT/install.lock"
 BUILD_LOCK_FILE="$STATE_ROOT/build.lock"
+# Must match s_service in synaracomputeruseplugin.cpp and COMPUTER_SERVICE in
+# the server's kwinDbus.ts: it is the name the health check pins an owner for.
+SERVICE_NAME="org.synara.ComputerUse"
 
 FORCE=0
 NONINTERACTIVE=0
@@ -51,6 +54,10 @@ EOF
 
 log() {
     printf '[synara-kwin-plugin] %s\n' "$*"
+}
+
+warn() {
+    printf '[synara-kwin-plugin] WARNING: %s\n' "$*" >&2
 }
 
 die() {
@@ -352,9 +359,18 @@ if (( FORCE == 0 )) && [[ "$installed_signature" == "$current_signature" ]] && v
     log "signature is unchanged; reusing installed $plugin_id"
 fi
 
+expected_build_id=""
 if (( needs_install )); then
     build_plugin
     built_plugin="$BUILD_DIR/$BUILT_PLUGIN_RELATIVE"
+    # The compiled-in build id, read from the same generated header the build
+    # just compiled. The health check below compares the running plugin's
+    # reported id against it, which is the only proof the compositor is serving
+    # the binary this run produced rather than an older generation that still
+    # holds the service name. Only a fresh build carries this guarantee - a
+    # reused install may legitimately predate the checkout's HEAD.
+    expected_build_id="$(sed -n 's/^#define SYNARA_COMPUTER_USE_BUILD_ID "\(.*\)"$/\1/p' \
+        "$BUILD_DIR/synaracomputerusebuildinfo.h" 2>/dev/null || true)"
 
     plugin_id="$(next_plugin_id)"
     destination="$PLUGIN_DIR/$plugin_id.so"
@@ -399,6 +415,16 @@ if [[ -n "$old_plugin_ids" ]]; then
     done <<< "$old_plugin_ids"
 fi
 
+# Whoever owns the well-known service name owns healthJson and every later
+# call, so the unique owner is pinned across the LoadPlugin boundary: a load
+# that left the previous registration in place - an unload race, or another
+# process holding the name - would make this script's own health check run
+# against the wrong build.
+service_owner_before=""
+if owner_response="$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s "$SERVICE_NAME" 2>/dev/null)"; then
+    service_owner_before="$owner_response"
+fi
+
 load_response=""
 if ! load_response="$(busctl --user call org.kde.KWin /Plugins org.kde.KWin.Plugins LoadPlugin s "$plugin_id" 2>&1)"; then
     die "KWin D-Bus LoadPlugin failed for $plugin_id: $load_response"
@@ -407,11 +433,38 @@ if [[ "$load_response" != *"b true"* ]]; then
     die "KWin refused $plugin_id: $load_response. This usually means the plugin has a mismatching plugin version. Rebuild on this host against its installed kwin-devel package and inspect: journalctl --user -b -g 'mismatching plugin version'"
 fi
 
+service_owner_now=""
+for _ in 1 2 3; do
+    if owner_response="$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s "$SERVICE_NAME" 2>/dev/null)"; then
+        service_owner_now="$owner_response"
+        break
+    fi
+    sleep 0.1
+done
+if [[ -z "$service_owner_now" ]]; then
+    die "$plugin_id loaded, but nothing owns $SERVICE_NAME on the session bus, so the plugin did not register its service."
+fi
+if [[ -n "$service_owner_before" && "$service_owner_before" == "$service_owner_now" ]]; then
+    die "$SERVICE_NAME is still owned by $service_owner_now from before $plugin_id was loaded, so the health check below would answer from the wrong process."
+fi
+
 health_response=""
 if ! health_response="$(busctl --user call org.synara.ComputerUse /org/synara/ComputerUse org.synara.ComputerUse1 healthJson 2>&1)"; then
     die "plugin $plugin_id loaded, but healthJson failed: $health_response"
 fi
 printf '%s\n' "$health_response"
+
+if [[ -n "$expected_build_id" ]]; then
+    # busctl prints the JSON as an escaped string, so the quotes arrive as \".
+    reported_build_id="$(printf '%s' "$health_response" | sed -n 's/.*\\"build\\":\\"\([^\\]*\)\\".*/\1/p')"
+    if [[ -z "$reported_build_id" ]]; then
+        log "healthJson reports no build id (older plugin interface); skipping the build identity check"
+    elif [[ "$reported_build_id" != "$expected_build_id" ]]; then
+        die "the compositor is serving build $reported_build_id, not the $expected_build_id this run just installed as $plugin_id - another plugin generation still owns $SERVICE_NAME"
+    else
+        log "the running plugin is the build this run installed ($reported_build_id)"
+    fi
+fi
 
 # Superseded builds are deleted, not merely unloaded. KWin auto-loads any plugin
 # in this directory whose metadata does not opt out, so an old build silently
@@ -420,7 +473,7 @@ printf '%s\n' "$health_response"
 # build that was just installed and makes an explicit LoadPlugin answer false.
 # Only the id that just passed its health check may stay on disk.
 prune_old_plugins() {
-    local path name removed=0
+    local path name removed=0 failed=0
     local plugin_files=()
 
     shopt -s nullglob
@@ -436,10 +489,19 @@ prune_old_plugins() {
         unload_plugin "$name"
         if remove_plugin "$path"; then
             removed=$((removed + 1))
+        else
+            # A stale .so left behind wins the bus name on the next compositor
+            # start (oldest registrant), shadowing the build this run installed
+            # — never report that silently.
+            warn "could not remove superseded plugin build $path; it will shadow $plugin_id on the next KWin start. Remove it manually."
+            failed=$((failed + 1))
         fi
     done
     if (( removed )); then
         log "removed $removed superseded plugin build(s)"
+    fi
+    if (( failed )); then
+        warn "$failed superseded plugin build(s) are still on disk"
     fi
 }
 

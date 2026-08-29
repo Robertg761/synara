@@ -21,9 +21,36 @@ MAX_DEPTH = 64
 WINDOW_ROLE_NAMES = {"frame", "window", "dialog"}
 EDITABLE_TEXT_INTERFACE = "editabletext"
 
+# Accessible names are whatever the application put there — dense Chromium or
+# Electron trees carry paragraph-sized labels — and this helper's reply is one
+# newline-framed line that the client caps (HELPER_MAX_FRAME_BYTES in
+# atspiClient.ts, 8 MiB). A line past the cap is a transport error, a process
+# reset, and silent perception loss for that application, so the truncation
+# happens here, before serialization, rather than after the bytes crossed the
+# wire.
+MAX_TEXT_CHARS = 1024
+MAX_ROLE_CHARS = 64
+# Headroom under the client cap for the envelope and framing itself. If even
+# the stripped fallback below cannot fit, failing the one request loudly beats
+# desyncing the transport for everything behind it.
+SAFE_REPLY_BYTES = 6 * 1024 * 1024
+
+
+def clamp_text(value, limit):
+    """Cut to `limit` characters without splitting a surrogate pair.
+
+    Python strings are sequences of code points, so plain slicing never lands
+    inside a surrogate pair — the hazard the TypeScript side guards against does
+    not exist here. `None` passes through untouched.
+    """
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[:limit]
+
 
 def emit(message):
-    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+    encoded = json.dumps(message, separators=(",", ":"))
+    sys.stdout.write(encoded + "\n")
     sys.stdout.flush()
 
 
@@ -106,10 +133,10 @@ def node_for(accessible, depth, budget, path=()):
         pass
 
     return {
-        "role": role,
-        "label": label,
-        "value": value,
-        "description": description,
+        "role": clamp_text(role, MAX_ROLE_CHARS),
+        "label": clamp_text(label, MAX_TEXT_CHARS),
+        "value": clamp_text(value, MAX_TEXT_CHARS),
+        "description": clamp_text(description, MAX_TEXT_CHARS),
         "frame": rect_for(accessible),
         "activationPoint": None,
         # The real child indices, not the emitted ones: a skipped or budgeted-out
@@ -255,7 +282,45 @@ def read_tree(params):
                 "root": root,
             }
         )
-    return {"trees": trees}
+    return fit_reply({"trees": trees})
+
+
+def serialized_bytes(result):
+    return len(json.dumps(result, separators=(",", ":")).encode("utf-8", errors="replace"))
+
+
+def strip_node_text(node, keep_label=False):
+    """Drop a node's free text in place, keeping role, geometry, and shape.
+
+    A stripped tree still says which windows exist and where they are; only
+    per-widget text is gone. The window root keeps even its label, because a
+    tree that no longer names its own window is half useless.
+    """
+    node["label"] = None if not keep_label else node["label"]
+    node["value"] = None
+    node["description"] = None
+    for child in node["children"]:
+        strip_node_text(child)
+
+
+def fit_reply(result):
+    """Keep a read-tree reply inside what the transport can carry.
+
+    Per-field clamps make an oversized line implausible; this is the guard that
+    turns the implausible into one structured error instead of a frame that the
+    client must drop and a helper it must reset.
+    """
+    if serialized_bytes(result) <= SAFE_REPLY_BYTES:
+        return result
+    stripped = {"trees": [dict(tree) for tree in result["trees"]]}
+    for tree in stripped["trees"]:
+        tree["root"] = json.loads(json.dumps(tree["root"]))
+        strip_node_text(tree["root"], keep_label=True)
+    if serialized_bytes(stripped) > SAFE_REPLY_BYTES:
+        raise RuntimeError(
+            "The accessibility tree stayed over the transport limit even with all text dropped"
+        )
+    return stripped
 
 
 def node_at_path(window, path):

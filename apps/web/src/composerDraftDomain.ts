@@ -538,9 +538,10 @@ export function createEmptyThreadDraft(): ComposerThreadDraftState {
     activeProvider: null,
     runtimeMode: null,
     interactionMode: null,
-    // Tri-state: undefined means "no explicit choice", so the chat defaults on
-    // whenever the desktop backend is available (governed by the machine-wide
-    // allowComputerControlInNewChats opt-out) until the user flips the switch.
+    // Tri-state: undefined means "no explicit choice", so the chat follows the
+    // machine-wide allowComputerControlInNewChats setting (off by default)
+    // whenever the desktop backend is available, until the user flips the
+    // switch.
     enableComputerControl: undefined,
   };
 }

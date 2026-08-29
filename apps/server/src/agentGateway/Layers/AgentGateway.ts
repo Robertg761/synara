@@ -755,8 +755,10 @@ export const makeAgentGateway = Effect.gen(function* () {
     if (denial.requiredCapability !== COMPUTER_CONTROL_CAPABILITY) return Effect.void;
     const dedupeKey = `${denial.callerThreadId}:${denial.callerTurnId ?? "no-turn"}`;
     if (surfacedComputerControlDenials.has(dedupeKey)) return Effect.void;
-    if (surfacedComputerControlDenials.size >= SURFACED_DENIALS_MAX) {
-      surfacedComputerControlDenials.clear();
+    // FIFO eviction, not a wholesale clear: clearing forgets every live turn's
+    // dedupe key at once and would let each of them surface a duplicate card.
+    while (surfacedComputerControlDenials.size >= SURFACED_DENIALS_MAX) {
+      surfacedComputerControlDenials.delete(surfacedComputerControlDenials.keys().next().value!);
     }
     surfacedComputerControlDenials.add(dedupeKey);
     const marker = stableGatewayDigest({

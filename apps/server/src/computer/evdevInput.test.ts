@@ -31,4 +31,21 @@ describe("qwertyKeyStroke", () => {
   it("refuses text no US-QWERTY table can express instead of typing something else", () => {
     expect(() => qwertyTextKeyStrokes("é")).toThrow(UnsupportedQwertyKeyError);
   });
+
+  it("inverts letter shifts under a latched CapsLock, punctuation untouched", () => {
+    // The host's CapsLock applies to letters only: `Hello` must not become
+    // `hELLO`, and `!` keeps its Shift regardless.
+    expect(qwertyKeyStroke("H", { capsLock: true })).toEqual({
+      code: EVDEV_KEY_CODES.H,
+      shift: false,
+    });
+    expect(qwertyKeyStroke("i", { capsLock: true })).toEqual({
+      code: EVDEV_KEY_CODES.I,
+      shift: true,
+    });
+    expect(qwertyKeyStroke("!", { capsLock: true })).toEqual({
+      code: EVDEV_KEY_CODES.Digit1,
+      shift: true,
+    });
+  });
 });

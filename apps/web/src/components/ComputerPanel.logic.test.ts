@@ -48,7 +48,6 @@ function state(overrides: Partial<ThreadComputerState> = {}): ThreadComputerStat
       clipboard: true,
       activation: true,
       ghostCursor: true,
-      sharedSeat: false,
       visibleDesktop: true,
     },
     windows: [],
@@ -220,7 +219,7 @@ describe("computer panel state helpers", () => {
     ).toBeNull();
     expect(
       computerReleaseControlHint({
-        availability: { kind: "available", backend: "portal" },
+        availability: { kind: "available", backend: "nested-kwin" },
         visibleDesktop: true,
         agentActive: true,
       }),

@@ -110,7 +110,6 @@ import {
   CHAT_MAIN_CONTENT_SURFACE_CLASS_NAME,
   CHAT_MAIN_VIEWPORT_SHELL_CLASS_NAME,
 } from "./composerPickerStyles";
-import { routeSingleBrowserPanelOpenRequest } from "./browserPanelOpenRequest";
 import { routeSingleDockPaneOpenRequest } from "./dockPaneOpenRequest";
 import {
   selectFloatingBrowserRequested,
@@ -732,12 +731,12 @@ export function SingleChatSurface(props: {
       toggleSingletonPane(props.threadId, { kind: "browser" });
     },
     onOpen: (requestedThreadId) => {
-      routeSingleBrowserPanelOpenRequest({
+      routeSingleDockPaneOpenRequest({
         currentThreadId: props.threadId,
         requestedThreadId,
-        requestImmediateBrowserHydration: () => requestImmediateDockHydration("browser"),
-        showFloatingBrowser: requestFloatingBrowser,
-        rememberFloatingBrowser: requestFloatingBrowser,
+        requestImmediateHydration: () => requestImmediateDockHydration("browser"),
+        openPane: requestFloatingBrowser,
+        crossThread: { kind: "remember", remember: requestFloatingBrowser },
       });
     },
   });
@@ -750,7 +749,7 @@ export function SingleChatSurface(props: {
             requestedThreadId: event.threadId,
             requestImmediateHydration: () => requestImmediateDockHydration("device"),
             openPane: (threadId) => openPane(threadId, { kind: "device" }),
-            navigateToThread: navigateToThreadInPlace,
+            crossThread: { kind: "navigate", navigateToThread: navigateToThreadInPlace },
           });
         }
       : null,
@@ -763,7 +762,7 @@ export function SingleChatSurface(props: {
             requestedThreadId: event.threadId,
             requestImmediateHydration: () => requestImmediateDockHydration("computer"),
             openPane: (threadId) => openPane(threadId, { kind: "computer" }),
-            navigateToThread: navigateToThreadInPlace,
+            crossThread: { kind: "navigate", navigateToThread: navigateToThreadInPlace },
           });
         }
       : null,

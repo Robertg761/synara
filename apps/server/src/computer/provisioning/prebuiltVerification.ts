@@ -1,12 +1,10 @@
 /**
- * The checksum both tiers verify a shipped binary with.
+ * The checksum every shipped native binary is verified with.
  *
- * Tier 1 loads its `.so` into the user's compositor process and Tier 2 execs
- * its helper against the user's Wayland socket, so both are about as trusted as
- * code gets on a desktop and both are verified the same way. This lived in
- * `kwinPluginProvisioning.ts` and was imported across from the portal tier,
- * which made a KDE-specific module a dependency of every wlroots desktop; it is
- * tier-agnostic, so it lives on its own.
+ * A compositor plugin is loaded into the user's compositor process, which is
+ * about as trusted as code gets on a desktop, so every prebuilt is verified the
+ * same way before it is installed. Backend-agnostic, so it lives on its own
+ * rather than inside one backend's provisioning module.
  */
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";

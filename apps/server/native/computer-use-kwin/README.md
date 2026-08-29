@@ -64,8 +64,7 @@ reason `request`, `idle-timeout`, or `user-release`.
 `axis(d horizontal, d vertical) -> b` takes desktop pixels, not wheel notches,
 which is the unit the whole computer-use stack speaks; positive is right and
 down. The plugin converts to the wheel's own units on the way out, at 80 content
-pixels per notch — the same constant the wlroots helper and the Hyprland plugin
-use — so a client that reads only the discrete half of a wheel event still
+pixels per notch — the same constant the Hyprland plugin uses — so a client that reads only the discrete half of a wheel event still
 moves, and the continuous half goes out at libinput's 15 units per notch.
 
 `setAgentName(name)` sets the text on the cursor's name badge and always returns
@@ -235,8 +234,8 @@ you work. One window is still off the table: the one you are typing in. A
 focus on, while seat0 has seen input inside the guard window, is refused with
 `org.synara.ComputerUse.Error.HumanActive`. Nothing is injected, the error names
 the window and the age of your last input, and the server turns it into a
-retryable refusal carrying `computer_human_active` — the same token Tier 2's
-shared-seat arbiter uses, so a caller never has to know which desktop refused.
+retryable refusal carrying `computer_human_active` — the same token the
+server's own guard uses, so a caller never has to know which side refused.
 
 - Recency comes from a `KWin::InputEventSpy`, not from
   `SeatInterface::timestamp()`. A spy is called from `InputRedirection` before
@@ -244,8 +243,7 @@ shared-seat arbiter uses, so a caller never has to know which desktop refused.
   agent path can produce one, because the dedicated seat is a second
   `SeatInterface` outside that pipeline and direct injection writes to client
   resources without a seat at all. There is therefore **no attribution epsilon**
-  here, unlike the Tier 2 arbiter that has to subtract the agent's own input from
-  what it observes.
+  here: nothing the agent does has to be subtracted from what the spy observes.
 - Exempt: `movePointer` (a ghost cursor gliding over your window disturbs
   nothing — the refusal belongs on the action, same reasoning as
   `SeatUnsupported`), all perception, the clipboard, `focusWindow` and

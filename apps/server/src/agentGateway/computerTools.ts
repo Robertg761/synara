@@ -1,15 +1,15 @@
 /** Agent-facing Linux computer perception and control tools. */
 import { Effect } from "effect";
 
-import type {
-  ComputerActionResult,
-  ComputerRect,
-  ComputerScreenshot,
-  ComputerTarget,
-  ComputerState,
+import {
+  COMPUTER_TEXT_MAX_LENGTH,
+  type ComputerActionResult,
+  type ComputerRect,
+  type ComputerScreenshot,
+  type ComputerTarget,
 } from "@synara/contracts";
 
-import { ComputerTargetError } from "../computer/uiTreeTargeting.ts";
+import { actionableElements, ComputerTargetError } from "../computer/uiTreeTargeting.ts";
 import {
   COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
@@ -17,7 +17,11 @@ import {
   MAX_COMPUTER_CLIPBOARD_BYTES,
   type ComputerCaptureRequest,
 } from "../computer/ComputerBackend.ts";
-import { ComputerLeaseError, ComputerManager } from "../computer/ComputerManager.ts";
+import {
+  ComputerLeaseError,
+  ComputerManager,
+  type ComputerActionObservation,
+} from "../computer/ComputerManager.ts";
 import {
   ScreenshotFrameRegistry,
   screenshotDeltaToDesktop,
@@ -43,7 +47,7 @@ import {
 
 export const COMPUTER_CONTROL_CAPABILITY = "computer:control" as const;
 
-const PROVIDERS_WITHOUT_APPROVAL_GATE = new Set(["antigravity"]);
+export const PROVIDERS_WITHOUT_APPROVAL_GATE = new Set(["antigravity"]);
 
 export const COMPUTER_APPROVAL_REQUIRED_TOOLS = new Set([
   // The one read in this set on purpose: the clipboard is the human's, and it
@@ -93,6 +97,19 @@ export interface AgentGatewayComputerToolsOptions {
 }
 
 /**
+ * What an observed action hands back: the result alone, for the actions the
+ * gateway photographs afterwards, or a result that already carries its own
+ * observation. `result` is the discriminator — a `ComputerActionResult` has no
+ * such field.
+ */
+type ObservedActionOutcome =
+  | ComputerActionResult
+  | {
+      readonly result: ComputerActionResult;
+      readonly observation?: ComputerActionObservation;
+    };
+
+/**
  * One wording for how the model points at things, shared by every tool that
  * returns an image: it points into the picture it was given, in that picture's
  * own pixels, and the server does the geometry (see screenshotFrames.ts). The
@@ -115,6 +132,14 @@ const POINTER_COORDINATE_NOTE =
   "x/y are pixel coordinates in a screenshot you received — by default the most recent one this conversation was given, otherwise the one named by screenshot_id — measured from that image's top-left corner. Never convert screenshot pixels into desktop coordinates yourself; the server does that. Point at what you can see: if you have not looked at the desktop yet, or a window has moved or resized since your last screenshot, take a new screenshot first.";
 
 /**
+ * The parity lever for visual grounding: when the model knows a control's
+ * label from get_state, label-targeting resolves to that exact control, while
+ * a pixel estimate from a downscaled screenshot can land a few points off.
+ */
+const SEMANTIC_TARGETING_NOTE =
+  'Prefer "label" (plus optional "role") from the latest computer_get_state elements list over raw x/y whenever the control appears there.';
+
+/**
  * Every mutating action carries its own after-screenshot so the model can act
  * on the result directly instead of spending a separate perception round trip
  * — the see-act loop is one model turn per action, not two.
@@ -124,7 +149,7 @@ const POINTER_COORDINATE_NOTE =
  * agent that cannot read a label in it must know the answer is one
  * `computer_screenshot` away rather than that the label is unreadable.
  */
-const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected (or the whole workspace when no window has focus), capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side so a typical application window comes back at full resolution. It becomes the screenshot your next x/y are measured in: read the next state from it and aim your next action at its pixels instead of making a separate screenshot call, and call computer_screenshot only when this one is too small to read the detail you need. When the new capture is identical to the one the previous action returned, the result reports screenshotUnchanged instead of repeating the image: the screen has not changed since your previous screenshot, so keep reading that one — it remains the screenshot your coordinates refer to. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
+const ACTION_SCREENSHOT_NOTE = `The result includes a screenshot taken after the action settled, zoomed to the window the action affected — the window it named, or the window under its coordinates — falling back to the whole workspace when neither identifies one, capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side so a typical application window comes back at full resolution. It becomes the screenshot your next x/y are measured in: read the next state from it and aim your next action at its pixels instead of making a separate screenshot call, and call computer_screenshot only when this one is too small to read the detail you need. When the new capture is identical to the one the previous action returned, the result reports screenshotUnchanged instead of repeating the image: the screen has not changed since your previous screenshot, so keep reading that one — it remains the screenshot your coordinates refer to. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
 
 const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
   include_screenshot: {
@@ -180,12 +205,16 @@ const TARGET_PROPERTIES = {
       "Y pixel coordinate in the screenshot (the most recent one, or the one named by screenshot_id), measured from its top edge.",
   },
   ...SCREENSHOT_ID_PROPERTY,
-  label: { type: "string", description: "Accessible label to resolve from a fresh UI snapshot." },
+  label: {
+    type: "string",
+    description:
+      "Accessible label to resolve from a fresh UI snapshot — use the exact label from computer_get_state's elements list.",
+  },
   role: { type: "string", description: "Optional accessible role used to disambiguate a label." },
   window_id: {
     type: "string",
     description:
-      "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the point to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the point falls outside the window.",
+      "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the coordinate is outside the window. For computer_scroll it is also a target on its own, scrolling the window itself.",
   },
 } as const;
 
@@ -313,7 +342,61 @@ function readRawRequiredString(args: Record<string, unknown>, name: string): str
 
 function readRequiredText(args: Record<string, unknown>): string {
   const value = readRawRequiredString(args, "text");
-  if (value.length > 16 * 1024) throw new ToolInputError('Argument "text" is too long.');
+  if (value.length > COMPUTER_TEXT_MAX_LENGTH)
+    throw new ToolInputError('Argument "text" is too long.');
+  return value;
+}
+
+/**
+ * The `computer_set_value` payload. Bounded like `readRequiredText` because
+ * MCP arguments are never validated against the tool's JSON Schema: an
+ * unbounded value that falls back to typed keystrokes would hold the exclusive
+ * desktop lease — and the turn — for hours typing it out.
+ */
+function readSetValueValue(args: Record<string, unknown>): string {
+  const value = readRawRequiredString(args, "value");
+  if (value.length > COMPUTER_TEXT_MAX_LENGTH)
+    throw new ToolInputError('Argument "value" is too long.');
+  return value;
+}
+
+/** Mirrors `ComputerHotkeyInput`: at most 16 keys, each a name of 128 characters. */
+const HOTKEY_KEYS_MAX_ITEMS = 16;
+const HOTKEY_KEY_MAX_LENGTH = 128;
+
+/**
+ * The hotkey chord. Every key becomes a press/release pair holding the seat,
+ * so thousands of keys would hold it indefinitely; the bound is enforced here
+ * rather than trusted to the JSON Schema for the same reason as above.
+ */
+function readHotkeyKeys(args: Record<string, unknown>): readonly string[] {
+  const keys =
+    readStringArrayArg(args, "keys") ??
+    (() => {
+      throw new ToolInputError('Missing required argument "keys".');
+    })();
+  if (keys.length > HOTKEY_KEYS_MAX_ITEMS) {
+    throw new ToolInputError(`Argument "keys" accepts at most ${HOTKEY_KEYS_MAX_ITEMS} keys.`);
+  }
+  const oversized = keys.find((key) => key.length > HOTKEY_KEY_MAX_LENGTH);
+  if (oversized !== undefined) {
+    throw new ToolInputError(
+      `Each key in "keys" is at most ${HOTKEY_KEY_MAX_LENGTH} characters; got one of ${oversized.length}.`,
+    );
+  }
+  return keys;
+}
+
+/** Mirrors the contract's action-name bound on semantic actions. */
+const ACTION_NAME_MAX_LENGTH = 256;
+
+function readActionName(args: Record<string, unknown>): string {
+  const value = readStringArg(args, "action", { required: true })!;
+  if (value.length > ACTION_NAME_MAX_LENGTH) {
+    throw new ToolInputError(
+      `Argument "action" is longer than ${ACTION_NAME_MAX_LENGTH} characters.`,
+    );
+  }
   return value;
 }
 
@@ -450,12 +533,6 @@ export function makeAgentGatewayComputerTools(
     };
   };
 
-  const imageStateResult = (threadId: string, state: ComputerState): McpToolCallResult => {
-    const { screenshot, ...rest } = state;
-    if (!screenshot) return mcpToolResultJson(state);
-    return deliverScreenshot(threadId, rest, screenshot);
-  };
-
   const capturedScreenshotResult = (
     threadId: string,
     request: ComputerCaptureRequest,
@@ -546,18 +623,18 @@ export function makeAgentGatewayComputerTools(
   });
 
   /**
-   * The action result with its after-screenshot attached. Capture is
-   * best-effort — the action already happened, so a perception failure must
-   * not convert its success into an error result — and the manager returns
-   * undefined in that case, which degrades to the plain JSON result.
+   * One wording and one shape for a post-action observation, whoever captured
+   * it: the generic path here, and the scroll path, which takes its own
+   * before/after captures and hands the after one back already taken.
+   * Observation is best-effort — the action already happened, so a perception
+   * failure must not convert its success into an error result — and no
+   * observation degrades to the plain JSON result.
    */
-  const actionResultWithScreenshot = async (
-    args: Record<string, unknown>,
+  const withObservation = (
     context: ToolContext,
     result: ComputerActionResult,
-  ): Promise<unknown> => {
-    if (readBooleanArg(args, "include_screenshot") === false) return result;
-    const capture = await manager.captureActionScreenshot(result.windowId);
+    capture: ComputerActionObservation | undefined,
+  ): unknown => {
     if (!capture) return result;
     if ("targetWindowClosed" in capture) {
       return {
@@ -577,25 +654,59 @@ export function makeAgentGatewayComputerTools(
   };
 
   /**
+   * The generic path: the action ran, now go and look at it. Reads
+   * `include_screenshot` itself, because an action that took no observation
+   * must not pay for one here either.
+   */
+  const observeAfterAction = async (
+    args: Record<string, unknown>,
+    result: ComputerActionResult,
+    context: ToolContext,
+  ): Promise<unknown> => {
+    if (readBooleanArg(args, "include_screenshot") === false) return result;
+    // The clamped point when the display server moved the pointer, because the
+    // window under where the action actually landed is the one it affected.
+    return withObservation(
+      context,
+      result,
+      await manager.captureActionScreenshot(
+        result.windowId,
+        result.clampedTo ?? result.point,
+        context.callerThreadId,
+      ),
+    );
+  };
+
+  /**
    * An action whose visible outcome matters: every pointer, keyboard, and
    * semantic action goes through here so its result carries the screenshot.
    * Launching an app does not — its window appears seconds later, so a capture
    * taken now would only show the desktop from before the launch — and neither
    * does writing the clipboard, which changes nothing on screen.
+   *
+   * An action that already observed itself returns its own capture alongside
+   * the result and is not photographed a second time: scrolling has to capture
+   * before and after to measure its travel, and the after capture is the same
+   * picture this would otherwise take.
    */
   const observedActionEntry = (
     name: string,
     title: string,
     description: string,
     inputSchema: Record<string, unknown>,
-    run: (args: Record<string, unknown>, context: ToolContext) => Promise<ComputerActionResult>,
+    run: (args: Record<string, unknown>, context: ToolContext) => Promise<ObservedActionOutcome>,
   ): ToolEntry =>
     actionEntry(
       name,
       title,
       `${description} ${ACTION_SCREENSHOT_NOTE}`,
       withActionScreenshotSchema(inputSchema),
-      async (args, context) => actionResultWithScreenshot(args, context, await run(args, context)),
+      async (args, context) => {
+        const outcome = await run(args, context);
+        return "result" in outcome
+          ? withObservation(context, outcome.result, outcome.observation)
+          : observeAfterAction(args, outcome, context);
+      },
     );
 
   const targetSchema = {
@@ -622,7 +733,7 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_get_state",
-        description: `Read the current desktop state. The screenshot covers the entire desktop workspace across every monitor, scaled down. ${SCREENSHOT_FRAME_NOTE}. Window bounds and cursor positions in the JSON are desktop coordinates, useful for telling windows apart but not for aiming: aim with screenshot pixels. Use computer_screenshot when workspace detail is too small to read. Request a screenshot or accessibility text only when needed because both increase payload size.`,
+        description: `Read the current desktop state, and call this before acting: the result lists every labeled actionable control (buttons, text fields, checkboxes...) as "elements", and targeting those by label is far more reliable than estimating pixel coordinates from a screenshot. The screenshot covers the entire desktop workspace across every monitor, scaled down. ${SCREENSHOT_FRAME_NOTE}. Window bounds and cursor positions in the JSON are desktop coordinates, useful for telling windows apart but not for aiming: aim by label, or with screenshot pixels. Use computer_screenshot when workspace detail is too small to read. include_text adds a full accessibility-text rendering of the tree on top of the elements list; request it or a screenshot only when needed because both increase payload size.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -633,15 +744,30 @@ export function makeAgentGatewayComputerTools(
         },
         annotations: { title: "Get computer state", ...READ_ONLY_TOOL_ANNOTATIONS },
       },
-      handler: handle("computer_get_state", async (args, context) =>
-        imageStateResult(
-          context.callerThreadId,
-          await manager.getState({
-            includeScreenshot: readBooleanArg(args, "include_screenshot") ?? false,
-            includeText: readBooleanArg(args, "include_text") ?? false,
-          }),
-        ),
-      ),
+      handler: handle("computer_get_state", async (args, context) => {
+        // One perception read feeds both renderings: the elements digest always
+        // rides (that is what makes labels discoverable), while the full
+        // accessibility text rendering stays opt-in for its payload size.
+        const state = await manager.getState({
+          includeScreenshot: readBooleanArg(args, "include_screenshot") ?? false,
+          includeText: true,
+        });
+        const { text, root, screenshot, ...rest } = state;
+        const wantText = readBooleanArg(args, "include_text") ?? false;
+        const elements = root ? actionableElements(root) : undefined;
+        const payload = {
+          ...rest,
+          ...(wantText && text !== undefined ? { text } : {}),
+          ...(elements
+            ? {
+                elements: elements.items,
+                ...(elements.complete ? {} : { elementsTruncated: true }),
+              }
+            : {}),
+        };
+        if (!screenshot) return mcpToolResultJson(payload);
+        return deliverScreenshot(context.callerThreadId, payload, screenshot);
+      }),
     },
     {
       requiredCapability: COMPUTER_CONTROL_CAPABILITY,
@@ -765,14 +891,14 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_click",
       "Click",
-      `Click a coordinate or a uniquely labelled visible control. Ambiguous and off-screen targets are refused. ${POINTER_COORDINATE_NOTE}`,
+      `Click a coordinate or a uniquely labelled visible control. Ambiguous and off-screen targets are refused. ${SEMANTIC_TARGETING_NOTE} ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) => manager.click(context.callerThreadId, readTarget(args, context)),
     ),
     observedActionEntry(
       "computer_double_click",
       "Double click",
-      `Double-click a coordinate or a uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
+      `Double-click a coordinate or a uniquely labelled visible control. ${SEMANTIC_TARGETING_NOTE} ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) =>
         manager.doubleClick(context.callerThreadId, readTarget(args, context)),
@@ -780,7 +906,7 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_right_click",
       "Right click",
-      `Right-click a coordinate or a uniquely labelled visible control. ${POINTER_COORDINATE_NOTE}`,
+      `Right-click a coordinate or a uniquely labelled visible control. ${SEMANTIC_TARGETING_NOTE} ${POINTER_COORDINATE_NOTE}`,
       targetSchema,
       async (args, context) =>
         manager.rightClick(context.callerThreadId, readTarget(args, context)),
@@ -818,7 +944,7 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_scroll",
       "Scroll",
-      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in pixels of the same screenshot the coordinates are in — roughly 80 pixels per notch of a physical wheel in a full-resolution window capture. To page through content, scroll by about half the window's height as it appears in the screenshot so each observation overlaps the last; larger steps skip content, and a wheel cannot scroll past the top or bottom, so a scroll that changes nothing means the end was already reached. ${POINTER_COORDINATE_NOTE}`,
+      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in pixels of the same screenshot the coordinates are in — roughly 80 pixels per notch of a physical wheel in a full-resolution window capture. To page through content, scroll by about half the window's height as it appears in the screenshot so each observation overlaps the last; larger steps skip content. Some applications gear scrolling up and travel several times the distance requested; browsers commonly do. The result reports what the content actually did in scroll.traveledY, in desktop pixels with the same sign as delta_y, and scrolls are corrected automatically using it: the first large scroll into a window is delivered as a small probe plus a pre-corrected remainder, so ask for the distance you actually want — even the first scroll lands close, and later ones land closer. A traveledY of 0 means the content did not move at all, which usually means the page is already at its edge — a wheel cannot scroll past the top or bottom. If you are scrolling to hunt for a control, stop and call computer_get_state instead: its elements list names the labeled controls on screen, and one of those may already be targetable by label. ${POINTER_COORDINATE_NOTE}`,
       {
         type: "object",
         properties: {
@@ -848,11 +974,12 @@ export function makeAgentGatewayComputerTools(
           readDelta(args, "delta_x"),
           readDelta(args, "delta_y"),
         );
-        return manager.scroll(
+        return manager.scrollCalibrated(
           threadId,
           hasTargetFields(target) ? target : null,
           delta.deltaX,
           delta.deltaY,
+          { observe: readBooleanArg(args, "include_screenshot") !== false },
         );
       },
     ),
@@ -900,14 +1027,7 @@ export function makeAgentGatewayComputerTools(
         additionalProperties: false,
       },
       async (args, context) =>
-        manager.hotkey(
-          context.callerThreadId,
-          readStringArrayArg(args, "keys") ??
-            (() => {
-              throw new ToolInputError('Missing required argument "keys".');
-            })(),
-          readWindowIdArg(args),
-        ),
+        manager.hotkey(context.callerThreadId, readHotkeyKeys(args), readWindowIdArg(args)),
     ),
     actionEntry(
       "computer_write_clipboard",
@@ -925,7 +1045,7 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_set_value",
       "Set computer value",
-      "Set the value of a uniquely labelled accessible control after a fresh snapshot.",
+      "Set the value of a uniquely labelled accessible control after a fresh snapshot. The label comes from computer_get_state's elements list; this writes atomically instead of typing keystrokes, so prefer it over click-then-type for any field that appears there.",
       {
         type: "object",
         properties: { ...TARGET_PROPERTIES, value: { type: "string" } },
@@ -936,7 +1056,7 @@ export function makeAgentGatewayComputerTools(
         manager.setValue(
           context.callerThreadId,
           readTarget(args, context),
-          readRawRequiredString(args, "value"),
+          readSetValueValue(args),
         ),
     ),
     observedActionEntry(
@@ -953,7 +1073,7 @@ export function makeAgentGatewayComputerTools(
         manager.performAction(
           context.callerThreadId,
           readTarget(args, context),
-          readStringArg(args, "action", { required: true })!,
+          readActionName(args),
         ),
     ),
   ];

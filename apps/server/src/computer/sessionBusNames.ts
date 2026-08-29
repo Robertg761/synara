@@ -3,9 +3,9 @@
  * Linux desktop about what it is.
  *
  * Backend selection uses it to decide whether the compositor is KWin, and the
- * Tier 2 probe uses it for the portal front-end and the Synara desktop
- * extension. It lives here rather than in either caller because both need the
- * same three properties: a fresh short-lived connection (a probe must not hold
+ * plugin backends' probes use it to see whether their service is up. It lives
+ * here rather than in any one caller because all of them need the same three
+ * properties: a fresh short-lived connection (a probe must not hold
  * a bus connection open for the life of the process), a bounded wait (an
  * unreachable bus must fail rather than hang startup), and a rejection rather
  * than a `false` when the bus itself is the problem — "nobody owns that name"
@@ -85,9 +85,13 @@ async function withSessionBus<T>(
   } catch (error) {
     throw asError(connectionError ?? error);
   } finally {
+    // Disconnecting can itself surface as an 'error' event on the bus
+    // (ECONNRESET during close is routine), so the handlers stay attached
+    // through it — removing them first would turn that into an unhandled
+    // 'error' on a bare EventEmitter, which crashes the process.
+    bus.disconnect();
     eventBus.off("error", onError);
     eventBus.off("disconnect", onError);
-    bus.disconnect();
   }
 }
 

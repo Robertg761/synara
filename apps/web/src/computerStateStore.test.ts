@@ -16,7 +16,6 @@ const FULL_CAPABILITIES: ThreadComputerState["capabilities"] = {
   clipboard: true,
   activation: true,
   ghostCursor: true,
-  sharedSeat: false,
   visibleDesktop: true,
 };
 

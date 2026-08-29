@@ -33,15 +33,10 @@ const BACKEND_DISPLAY_NAMES: Record<string, string> = {
   kwin: "KWin plugin (KDE)",
   hyprland: "Hyprland plugin",
   "nested-kwin": "Isolated agent desktop (nested KWin)",
-  portal: "Desktop portals (GNOME / wlroots)",
   fake: "Test backend",
 };
 
-/**
- * Ordered to read as a sentence of abilities, most consequential first. The
- * shared-seat flag is deliberately not in this list: it is a warning about how
- * input happens, not an ability, and gets its own line.
- */
+/** Ordered to read as a sentence of abilities, most consequential first. */
 const CAPABILITY_LABELS: ReadonlyArray<{
   readonly key: keyof ComputerCapabilities;
   readonly label: string;
@@ -72,7 +67,7 @@ export function ComputerSettingsPanel({
   const statusQuery = useQuery({
     ...computerStatusQueryOptions(),
     enabled: active,
-    // Health can flip (reconnecting, consent granted) while the panel is open.
+    // Health can flip (reconnecting, recovered) while the panel is open.
     refetchInterval: active ? COMPUTER_STATUS_VISIBLE_REFETCH_INTERVAL_MS : false,
   });
 
@@ -138,9 +133,6 @@ export function ComputerSettingsPanel({
   const needsSetup =
     status !== undefined && (!status.capabilities.input || !status.capabilities.capture);
   const healthNotes = [
-    ...(health?.status === "awaiting-consent"
-      ? ["Waiting for you to answer the desktop's permission dialog."]
-      : []),
     ...(health && health.reconnects > 0
       ? [
           `Reconnected ${health.reconnects === 1 ? "once" : `${health.reconnects} times`} since startup.`,
@@ -217,11 +209,7 @@ export function ComputerSettingsPanel({
           {status && availabilityView.kind === "ready" ? (
             <SettingsRow
               title="Capabilities"
-              description={
-                status.capabilities.sharedSeat
-                  ? "The agent shares your seat: the real cursor moves and real focus follows, and it yields whenever you touch the mouse or keyboard."
-                  : dedicatedSeatDescription
-              }
+              description={dedicatedSeatDescription}
               status={capabilitySummary(status.capabilities)}
             />
           ) : null}
@@ -257,7 +245,7 @@ export function ComputerSettingsPanel({
       <SettingsSection title="Computer control">
         <SettingsRow
           title="Allow agents to control the desktop in new chats"
-          description="When the desktop backend is available, any agent in a new chat can act on the desktop when asked — computer control behaves like a skill, on by default. Turn this off to opt the whole machine out; individual chats can still be switched either way from the composer's mode menu, and doing so never changes this setting."
+          description="When the desktop backend is available, any agent in a new chat can act on the desktop when asked. Off by default — desktop access, including screenshots, is an explicit opt-in. Individual chats can still be switched either way from the composer's mode menu, and doing so never changes this setting."
           resetAction={
             settings.allowComputerControlInNewChats !== defaults.allowComputerControlInNewChats ? (
               <SettingResetButton

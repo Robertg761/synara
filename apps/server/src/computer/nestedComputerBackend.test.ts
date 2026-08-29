@@ -30,6 +30,9 @@ function fakeDbusHandle(loaded: readonly string[] = [PLUGIN_ID]): {
   let disconnectListener: (() => void) | undefined;
   const dbus = {
     loaded: [...loaded],
+    // Owned once a plugin is loaded, with a stable unique name: the connect
+    // path pins its proxy to the owner and refuses a service nobody owns.
+    nameOwner: async () => (dbus.loaded.length > 0 ? ":1.42" : undefined),
     listLoadedPluginIds: async () => dbus.loaded,
     loadPlugin: async (id: string) => {
       dbus.loaded = [id];
@@ -228,7 +231,6 @@ describe("capabilities", () => {
     const capabilities = harness.backend.capabilities();
     expect(capabilities.input).toBe(true);
     expect(capabilities.capture).toBe(true);
-    expect(capabilities.sharedSeat).toBe(false);
     expect(capabilities.visibleDesktop).toBe(false);
   });
 

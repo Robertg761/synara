@@ -9,6 +9,7 @@ import {
 } from "@synara/contracts";
 
 import { requireWindowBounds } from "./computerGeometry.ts";
+import { clampTextToLength } from "./utf8Truncation.ts";
 
 /**
  * The bounds `ComputerUiNode` is encoded against. An accessible name is whatever
@@ -25,8 +26,6 @@ import { requireWindowBounds } from "./computerGeometry.ts";
 const NODE_ROLE_MAX_LENGTH = 128;
 const NODE_LABEL_MAX_LENGTH = 1_024;
 const NODE_TEXT_MAX_LENGTH = COMPUTER_TEXT_MAX_LENGTH;
-/** Says the text was cut, and is itself counted against the cap. */
-const TRUNCATION_MARKER = "…";
 
 /** The small, serializable subset returned by the AT-SPI helper. */
 export interface AtspiRawNode {
@@ -202,19 +201,13 @@ function fuseNode(
 }
 
 /**
- * `text` cut to `maxLength` characters with a marker in place of the tail, so a
- * truncated label reads as truncated rather than as a different control.
+ * `text` cut to `maxLength` characters with a marker in place of the tail.
  *
- * The cut never lands between the halves of a surrogate pair: one half on its
- * own decodes to a replacement character, which would put a symbol in the label
- * that the application never displayed.
+ * Kept as this module's name for the shared surrogate-safe clamp, because every
+ * caller here is talking about a UI node's text.
  */
 export function clampNodeText(text: string, maxLength: number): string {
-  if (text.length <= maxLength) return text;
-  let cut = maxLength - TRUNCATION_MARKER.length;
-  const code = cut > 0 ? text.charCodeAt(cut - 1) : 0;
-  if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
-  return `${text.slice(0, Math.max(0, cut))}${TRUNCATION_MARKER}`;
+  return clampTextToLength(text, maxLength);
 }
 
 function clampNullableNodeText(text: string | null | undefined, maxLength: number): string | null {

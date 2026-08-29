@@ -37,23 +37,36 @@ import {
 const DEFAULT_COMPUTER_ID = "primary" as ComputerId;
 const FALLBACK_MESSAGE = "The Synara computer backend is unavailable for an unstated reason.";
 
+export interface UnavailableComputerBackendOptions {
+  readonly computerId?: string;
+  readonly now?: () => number;
+  /**
+   * Replaces the default `backend-unavailable` verdict, for platforms where
+   * there is no backend because none could exist: the pane keys its blocked
+   * copy off the verdict kind, and "unsupported platform" is a different
+   * sentence from "the backend failed".
+   */
+  readonly availability?: ComputerAvailability;
+}
+
 export class UnavailableComputerBackend implements ComputerBackend {
   readonly computerId: ComputerId;
 
   private readonly message: string;
   private readonly at: string;
+  private readonly availabilityVerdict: ComputerAvailability | undefined;
 
-  constructor(
-    message: string,
-    options: { readonly computerId?: string; readonly now?: () => number } = {},
-  ) {
+  constructor(message: string, options: UnavailableComputerBackendOptions = {}) {
     this.computerId = (options.computerId ?? DEFAULT_COMPUTER_ID) as ComputerId;
     this.message = clampComputerMessage(message, FALLBACK_MESSAGE);
     this.at = new Date((options.now ?? Date.now)()).toISOString();
+    this.availabilityVerdict = options.availability;
   }
 
   availability(): Promise<ComputerAvailability> {
-    return Promise.resolve({ kind: "backend-unavailable", message: this.message });
+    return Promise.resolve(
+      this.availabilityVerdict ?? { kind: "backend-unavailable", message: this.message },
+    );
   }
 
   /** The failure is already known and already free to read, so both agree. */

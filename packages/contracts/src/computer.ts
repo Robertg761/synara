@@ -43,12 +43,21 @@ export const COMPUTER_WS_CHANNELS = {
   event: "computer.event",
 } as const;
 
+/**
+ * Caps a window or computer identifier, which a compositor-side enumerator
+ * copies off the desktop and must clamp to this.
+ */
 export const COMPUTER_ID_MAX_LENGTH = 128;
 /**
  * Exported because it bounds `ComputerActionResult.value`, and the clipboard
  * read path must enforce it before putting clipboard text on that field.
  */
 export const COMPUTER_TEXT_MAX_LENGTH = 16 * 1024;
+/**
+ * Exported because backend window enumerators copy titles and app names
+ * verbatim off the desktop, and must clamp them to this before constructing
+ * `ComputerWindow` objects.
+ */
 export const COMPUTER_LABEL_MAX_LENGTH = 1_024;
 /**
  * Exported because the backend composes health and availability messages from
@@ -56,8 +65,17 @@ export const COMPUTER_LABEL_MAX_LENGTH = 1_024;
  * a state payload.
  */
 export const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
-/** Caps both a reported window list and one window's occluder list. */
+/**
+ * Caps both a reported window list and one window's occluder list. Exported
+ * because a backend enumerator must clamp its own list to this.
+ */
 export const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
+/**
+ * A sane ceiling on one window's `occludedBy` entries, far below the list
+ * maximum: stacking metadata is an N² hint in the worst case, and no caller
+ * needs hundreds of occluders. Exported for the same reason as above.
+ */
+export const COMPUTER_OCCLUDERS_MAX_LENGTH = 32;
 
 /**
  * Thread-activity kind appended by the agent gateway when a computer tool call
@@ -142,19 +160,8 @@ export type ComputerAvailability = typeof ComputerAvailability.Type;
  * boot-time availability probe once found. `reconnecting` means the display
  * server dropped out and a retry is pending, which is the state a panel must be
  * able to tell apart from both a healthy desktop and a permanently dead one.
- *
- * `awaiting-consent` is the fourth state, and it is not a failure: the backend
- * is installed and reachable but the desktop's own permission dialog has not
- * been answered yet. Nothing is broken, nothing is retrying, and the user has to
- * go find a dialog — which is exactly the thing an `unavailable` badge would
- * hide. Availability stays `available` while health reports it.
  */
-export const ComputerHealthStatus = Schema.Literals([
-  "connected",
-  "reconnecting",
-  "awaiting-consent",
-  "unavailable",
-]);
+export const ComputerHealthStatus = Schema.Literals(["connected", "reconnecting", "unavailable"]);
 export type ComputerHealthStatus = typeof ComputerHealthStatus.Type;
 
 export const ComputerHealthFailure = Schema.Struct({
@@ -162,35 +169,6 @@ export const ComputerHealthFailure = Schema.Struct({
   at: IsoDateTime,
 });
 export type ComputerHealthFailure = typeof ComputerHealthFailure.Type;
-
-/**
- * How the agent is getting on with the human it shares a seat with.
- *
- * Present only on a backend that shares the human's seat and can watch it — a
- * dedicated seat has nobody to yield to, and a shared seat with no idle
- * protocol has nothing to report. It is not a health *status* because it never
- * makes the desktop unusable: mutating actions are refused while the human is
- * touching the seat and perception keeps working, so a panel that showed
- * `unavailable` would be describing a backend that is fine.
- */
-export const ComputerSeatHealth = Schema.Struct({
-  /**
-   * Whether the human's activity can be observed at all. `false` means the
-   * agent is driving the shared seat without giving way, which the panel has to
-   * say out loud rather than imply by omission.
-   */
-  observing: Schema.Boolean,
-  /** Why observation stopped, or why the last reading was unusable. */
-  reason: Schema.optional(
-    TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH)),
-  ),
-  /**
-   * When the agent last gave the seat back, which is what the "waiting for you"
-   * copy is keyed off. Absent until it has yielded once.
-   */
-  lastYieldAt: Schema.optional(IsoDateTime),
-});
-export type ComputerSeatHealth = typeof ComputerSeatHealth.Type;
 
 export const ComputerHealth = Schema.Struct({
   status: ComputerHealthStatus,
@@ -218,12 +196,6 @@ export const ComputerHealth = Schema.Struct({
    * difference between a blank pane and a broken one.
    */
   captureAvailable: Schema.Boolean,
-  /**
-   * The shared-seat arbiter's account of the human, on backends that have one.
-   * Absent means nobody is being yielded to — a dedicated seat, or a shared one
-   * this desktop cannot observe.
-   */
-  seat: Schema.optional(ComputerSeatHealth),
 });
 export type ComputerHealth = typeof ComputerHealth.Type;
 
@@ -233,13 +205,10 @@ export type ComputerHealth = typeof ComputerHealth.Type;
  *
  * The backends differ in kind, not only in quality: a compositor plugin owning
  * a dedicated seat can enumerate windows with geometry, stack them, and draw a
- * ghost cursor, while a display server reached through portals may expose
- * titles with no geometry at all and shares the human's one pointer. A caller
- * that cannot tell those apart either lies to the model — "no windows" when the
- * truth is "no window enumeration exists here" — or hides a shared seat from
- * the human whose cursor is about to move. Both were observed in the Tier 1
- * end-to-end runs, so the answer travels with the state instead of being
- * inferred from the backend's name.
+ * ghost cursor, while a backend still being provisioned may have none of that
+ * yet. A caller that cannot tell those apart lies to the model — "no windows"
+ * when the truth is "no window enumeration exists here" — so the answer travels
+ * with the state instead of being inferred from the backend's name.
  */
 export const ComputerCapabilities = Schema.Struct({
   /** Windows can be enumerated at all. `false` means listing refuses, never `[]`. */
@@ -256,17 +225,12 @@ export const ComputerCapabilities = Schema.Struct({
   /** A second pointer the agent drives, drawn without moving the human's cursor. */
   ghostCursor: Schema.Boolean,
   /**
-   * The agent drives the same seat as the human: the real cursor moves, real
-   * focus follows, and the human sees every action. The panel must say so.
-   */
-  sharedSeat: Schema.Boolean,
-  /**
    * The driven desktop is the display the human is already looking at, so every
    * action is visible without a preview. Auto-opening the Computer pane keys
    * off this being false: on a nested or offscreen desktop the pane is the only
    * window onto the agent's work, while mirroring the human's own screen back
-   * at them is noise. Distinct from `sharedSeat` — the KWin tier drives the
-   * visible desktop through a dedicated seat.
+   * at them is noise. The agent still drives that visible desktop through a
+   * seat of its own — never the human's.
    */
   visibleDesktop: Schema.Boolean,
 });
@@ -301,11 +265,11 @@ export const ComputerWindow = Schema.Struct({
   appName: Schema.optional(Schema.String.check(Schema.isMaxLength(COMPUTER_LABEL_MAX_LENGTH))),
   pid: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
   /**
-   * Absent when the display server exposes no window geometry. wlroots'
-   * foreign-toplevel protocol reports a title, an app id, and activation, and
-   * nothing about where the window is; a client under Wayland cannot ask.
-   * Callers must treat an absent rect as unknown rather than as the origin, and
-   * `ComputerCapabilities.windowBounds` says up front which case this is.
+   * Absent when the backend exposes no window geometry — a client under
+   * Wayland cannot ask where a window is, so only an in-compositor plugin can
+   * answer. Callers must treat an absent rect as unknown rather than as the
+   * origin, and `ComputerCapabilities.windowBounds` says up front which case
+   * this is.
    */
   bounds: Schema.optional(ComputerRect),
   focused: Schema.Boolean,
@@ -660,6 +624,22 @@ export const ComputerActionResult = Schema.Struct({
   clampedTo: Schema.optional(ComputerPoint),
   windowId: Schema.optional(ComputerWindowId),
   value: Schema.optional(Schema.String.check(Schema.isMaxLength(COMPUTER_TEXT_MAX_LENGTH))),
+  /**
+   * Scroll telemetry: what was asked, what was injected after gearing
+   * correction, and what the window content measurably did. `traveledY` is in
+   * logical pixels with the same sign convention as `deltaY` (positive = toward
+   * the end of the content); absent when the travel could not be measured.
+   * `gearing` is the learned travel-per-requested-pixel for this window — 1
+   * means pixel-true.
+   */
+  scroll: Schema.optional(
+    Schema.Struct({
+      requested: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
+      injected: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
+      traveledY: Schema.optional(Schema.Number),
+      gearing: Schema.optional(Schema.Number),
+    }),
+  ),
 });
 export type ComputerActionResult = typeof ComputerActionResult.Type;
 

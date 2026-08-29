@@ -246,7 +246,7 @@ export class FrameTransport<TStreamId extends string, TFrame> {
         continue;
       }
       if (isCodecConfig) {
-        this.deliver(subscriber, encoded);
+        this.deliver(subscriber, encoded, true);
         continue;
       }
       if (subscriber.awaitingKeyframe) {
@@ -287,7 +287,12 @@ export class FrameTransport<TStreamId extends string, TFrame> {
     return isFrameMetadata(frame, "keyframe");
   }
 
-  private deliver(subscriber: Subscriber<TStreamId>, encoded: Uint8Array): void {
+  private deliver(
+    subscriber: Subscriber<TStreamId>,
+    encoded: Uint8Array,
+    /** Codec config rides past the caps: it is tiny and nothing decodes without it. */
+    essential = false,
+  ): void {
     if (!subscriber.sink.isOpen()) {
       this.removeSubscriber(subscriber);
       return;
@@ -300,7 +305,14 @@ export class FrameTransport<TStreamId extends string, TFrame> {
       return;
     }
 
-    if (subscriber.queue.length >= this.queueLimit) {
+    // The count cap alone let a backlog of huge keyframes grow unbounded
+    // (eight frames x whatever a frame weighs), so the queue is bounded in
+    // bytes too: whichever ceiling trips first drops the backlog.
+    if (
+      !essential &&
+      (subscriber.queue.length >= this.queueLimit ||
+        subscriber.queuedBytes + encoded.byteLength > this.socketBudgetBytes)
+    ) {
       subscriber.dropped += subscriber.queue.length + 1;
       subscriber.queue.length = 0;
       subscriber.queuedBytes = 0;

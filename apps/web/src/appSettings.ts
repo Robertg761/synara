@@ -269,11 +269,12 @@ export const AppSettingsSchema = Schema.Struct({
   // Open the Computer pane automatically when an agent starts driving the desktop.
   autoOpenComputerPane: Schema.Boolean.pipe(withDefaults(() => true)),
   // Machine-wide switch: may agents control the desktop in a new chat when the
-  // backend is available? On by default — computer control behaves like a skill,
-  // available to any chat the moment the desktop backend is. This is a plain
-  // opt-out, never auto-flipped by a per-chat toggle; a chat's own override
+  // backend is available? Off by default — even the read-only tools (desktop
+  // screenshots, window listing) reach the user's screen without a per-call
+  // approval, so desktop access requires an explicit opt-in. This is a plain
+  // default, never auto-flipped by a per-chat toggle; a chat's own override
   // (composerDraft.enableComputerControl) still wins over it either way.
-  allowComputerControlInNewChats: Schema.Boolean.pipe(withDefaults(() => true)),
+  allowComputerControlInNewChats: Schema.Boolean.pipe(withDefaults(() => false)),
   // One-shot composer hint that suggests Medium effort for faster desktop actions.
   // Set when the user applies or dismisses it, so the hint never asks twice.
   dismissedComputerControlEffortHint: Schema.Boolean.pipe(withDefaults(() => false)),

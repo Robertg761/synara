@@ -159,10 +159,9 @@ function computerHealthDetail(health: ComputerHealth): string {
 /**
  * The emergency-release hint for the viewport, or null where it would be a lie.
  *
- * The hotkey is a compositor shortcut the KWin plugin registers, so it exists
- * only on that backend: the portal backend has nothing bound and would leave
- * the human pressing keys at a desktop that keeps being driven. It also has to
- * be the human's own compositor: a nested, offscreen KWin session registers the
+ * The hotkey is a compositor shortcut the KWin and Hyprland plugins register,
+ * so it exists only on those backends. It also has to be the human's own
+ * compositor: a nested, offscreen KWin session registers the
  * same shortcut, but the host desktop the human is typing at never routes keys
  * into it. The hint is also only worth the pixels while the agent is acting.
  */
