@@ -1427,9 +1427,24 @@ int takeDiscreteSteps(double& remainder, double delta120) {
 
 // Pixels per wheel notch. The whole stack speaks pixels — the tool surface,
 // the computer pane, and the `axis` D-Bus method — while a wheel speaks
-// notches, so the conversion lives at the one place the two meet. Keep in sync
-// with the KWin plugin and SCROLL_STEP_PX in computer-desktop-helper.
-constexpr double SCROLL_PIXELS_PER_NOTCH = 15.0;
+// notches, so the conversion lives at the one place the two meet. These are
+// content pixels, what a page moves per click (Chromium 53, Firefox about 57),
+// not the 15 wire units libinput reports per click: those are degrees, which
+// every toolkit scales up, and taking them for pixels made each scroll several
+// times longer than asked. Keep in sync with the KWin plugin and SCROLL_STEP_PX
+// in apps/server/src/computer/scrollUnits.ts, which carries the full rationale.
+constexpr double SCROLL_PIXELS_PER_NOTCH = 50.0;
+// What one notch is worth in wl_pointer.axis: libinput's wheel unit is degrees
+// of rotation, 15 per click, and that is the scale every client expects there.
+constexpr double AXIS_UNITS_PER_NOTCH = 15.0;
+
+// The continuous half of a wheel event for a scroll of `pixels`: the value a
+// client reads from wl_pointer.axis, in the units a physical wheel uses.
+double scrollAxisValue(double pixels) {
+    if (!std::isfinite(pixels))
+        return 0;
+    return pixels * AXIS_UNITS_PER_NOTCH / SCROLL_PIXELS_PER_NOTCH;
+}
 
 int scrollValue120(double pixels) {
     if (!std::isfinite(pixels))
@@ -1473,7 +1488,7 @@ bool injectAxis(double horizontal, double vertical) {
         if (version >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
             wl_pointer_send_axis_source(resource, WL_POINTER_AXIS_SOURCE_WHEEL);
         if (horizontal != 0) {
-            wl_pointer_send_axis(resource, time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_double(horizontal));
+            wl_pointer_send_axis(resource, time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_double(scrollAxisValue(horizontal)));
             // value120 supersedes axis_discrete for the clients that have it,
             // and the two must not both be sent for one scroll.
             if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
@@ -1482,7 +1497,7 @@ bool injectAxis(double horizontal, double vertical) {
                 wl_pointer_send_axis_discrete(resource, WL_POINTER_AXIS_HORIZONTAL_SCROLL, horizontalSteps);
         }
         if (vertical != 0) {
-            wl_pointer_send_axis(resource, time, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(vertical));
+            wl_pointer_send_axis(resource, time, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(scrollAxisValue(vertical)));
             if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
                 wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, verticalV120);
             else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && verticalSteps != 0)

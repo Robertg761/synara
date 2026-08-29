@@ -1487,9 +1487,28 @@ bool SynaraComputerUsePlugin::button(uint button, bool pressed)
 
 // Pixels per wheel notch. The whole stack speaks pixels - the tool surface, the
 // computer pane, and the `axis` D-Bus method below - while a wheel speaks
-// notches, so the conversion lives at the one place the two meet. Keep in sync
-// with SCROLL_STEP_PX in apps/server/native/computer-desktop-helper/src/wayland.c.
-static constexpr double s_scrollPixelsPerNotch = 15.0;
+// notches, so the conversion lives at the one place the two meet. These are
+// content pixels, what a page moves per click (Chromium 53, Firefox about 57),
+// not the 15 wire units libinput reports per click: those are degrees, which
+// every toolkit scales up, and taking them for pixels made each scroll several
+// times longer than asked. Keep in sync with SCROLL_STEP_PX in
+// apps/server/src/computer/scrollUnits.ts, which carries the full rationale.
+static constexpr double s_scrollPixelsPerNotch = 50.0;
+// What one notch is worth in wl_pointer.axis: libinput's wheel unit is degrees
+// of rotation, 15 per click, and that is the scale every client expects there.
+static constexpr double s_axisUnitsPerNotch = 15.0;
+
+/**
+ * The continuous half of a wheel event for a scroll of @p pixels: the value
+ * a client reads from wl_pointer.axis, in the units a physical wheel uses.
+ */
+static double scrollAxisValue(double pixels)
+{
+    if (!std::isfinite(pixels)) {
+        return 0;
+    }
+    return pixels * s_axisUnitsPerNotch / s_scrollPixelsPerNotch;
+}
 
 /**
  * The value120 half of a wheel event for a scroll of @p pixels.
@@ -1532,10 +1551,10 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 
     if (m_ownsCompositor) {
         if (horizontal != 0) {
-            m_inputDevice->sendAxis(PointerAxis::Horizontal, horizontal, scrollValue120(horizontal));
+            m_inputDevice->sendAxis(PointerAxis::Horizontal, scrollAxisValue(horizontal), scrollValue120(horizontal));
         }
         if (vertical != 0) {
-            m_inputDevice->sendAxis(PointerAxis::Vertical, vertical, scrollValue120(vertical));
+            m_inputDevice->sendAxis(PointerAxis::Vertical, scrollAxisValue(vertical), scrollValue120(vertical));
         }
         return true;
     }
@@ -1547,10 +1566,10 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 
     setTimestampNow();
     if (horizontal != 0) {
-        m_seat->notifyPointerAxis(Qt::Horizontal, horizontal, scrollValue120(horizontal), PointerAxisSource::Wheel);
+        m_seat->notifyPointerAxis(Qt::Horizontal, scrollAxisValue(horizontal), scrollValue120(horizontal), PointerAxisSource::Wheel);
     }
     if (vertical != 0) {
-        m_seat->notifyPointerAxis(Qt::Vertical, vertical, scrollValue120(vertical), PointerAxisSource::Wheel);
+        m_seat->notifyPointerAxis(Qt::Vertical, scrollAxisValue(vertical), scrollValue120(vertical), PointerAxisSource::Wheel);
     }
     m_seat->notifyPointerFrame();
     return true;
@@ -2557,7 +2576,7 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
             wl_pointer_send_axis(resource,
                                  time,
                                  WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-                                 wl_fixed_from_double(horizontal));
+                                 wl_fixed_from_double(scrollAxisValue(horizontal)));
             // value120 supersedes axis_discrete for the clients that have it, and
             // the two must not both be sent for one scroll.
             if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
@@ -2570,7 +2589,7 @@ void SynaraComputerUsePlugin::directPointerAxis(double horizontal, double vertic
             wl_pointer_send_axis(resource,
                                  time,
                                  WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                 wl_fixed_from_double(vertical));
+                                 wl_fixed_from_double(scrollAxisValue(vertical)));
             if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
                 wl_pointer_send_axis_value120(resource, WL_POINTER_AXIS_VERTICAL_SCROLL, verticalV120);
             } else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && verticalSteps != 0) {
