@@ -108,6 +108,29 @@ describe("PortalSession", () => {
     await session.dispose();
   });
 
+  it("asks once more after an explicit consent reset, and only then", async () => {
+    const portal = new FakePortalService({
+      screenCastVersion: 5,
+      startResponse: PORTAL_RESPONSE_CANCELLED,
+    });
+    const { session, consent } = sessionFor(portal);
+
+    await expect(session.ensureOpen()).rejects.toThrow(/dismissed/);
+    await expect(session.ensureOpen()).rejects.toThrow(/dismissed/);
+    expect(portal.startCount()).toBe(1);
+
+    session.resetDeniedConsent();
+    expect(session.consentState().state).toBe("not-requested");
+    expect(consent.at(-1)?.state).toBe("not-requested");
+
+    // The next action raises a fresh dialog — dismissed again here, which
+    // latches again: one reset buys exactly one more ask.
+    await expect(session.ensureOpen()).rejects.toThrow(/dismissed/);
+    expect(portal.startCount()).toBe(2);
+    expect(session.consentState().state).toBe("denied");
+    await session.dispose();
+  });
+
   it("refuses a denied session without retrying, because a retry is another dialog", async () => {
     const portal = new FakePortalService({
       screenCastVersion: 5,
@@ -190,6 +213,8 @@ describe("PortalSession", () => {
     await session.movePointerTo({ x: 2000, y: 40 });
     await session.pointerButton(EVDEV_BUTTON_CODES.left, true);
     await session.key(30, false);
+    // Pixels in, whole notches out: -150 px is one 80 px notch plus dust the
+    // session keeps for the next call.
     await session.scroll(0, -150);
 
     expect(portal.notifications).toEqual([
@@ -206,30 +231,67 @@ describe("PortalSession", () => {
     await session.dispose();
   });
 
-  it("converts scroll pixels to notches, carrying the sub-notch remainder", async () => {
+  /**
+   * The portal wire speaks wheel notches while the tool contract speaks
+   * pixels. Sub-notch dust is carried per axis across calls, so repeated
+   * small deltas still add up to a notch and nothing is invented — the same
+   * semantics as the wlroots helper's C conversion.
+   */
+  it("carries sub-notch scroll remainders per axis until they make a notch", async () => {
+    const portal = new FakePortalService({ screenCastVersion: 5 });
+    const { session } = sessionFor(portal);
+    await session.ensureOpen();
+
+    // 50 px is under one 80 px notch: nothing goes on the wire, nothing is lost.
+    await session.scroll(50, 50);
+    expect(portal.notifications).toEqual([]);
+
+    // Both axes reach 100 px together; vertical goes out first because each
+    // scroll sends its axes in that order, and 20 px stays owed on each.
+    await session.scroll(50, 50);
+    expect(portal.notifications).toEqual([
+      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, 1] },
+      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 1, 1] },
+    ]);
+
+    // 30 px more vertical dust stays under the line; nothing new goes out and
+    // each axis keeps its own remainder.
+    await session.scroll(0, 30);
+    expect(portal.notifications).toEqual([
+      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, 1] },
+      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 1, 1] },
+    ]);
+    await session.dispose();
+  });
+
+  it("sends nothing for a delta that has not reached one notch yet", async () => {
+    const portal = new FakePortalService({ screenCastVersion: 5 });
+    const { session } = sessionFor(portal);
+    await session.ensureOpen();
+
+    await session.scroll(0, 79);
+    expect(portal.notifications).toEqual([]);
+    await session.dispose();
+  });
+
+  /**
+   * A step that *throws* — a timeout on SelectSources, a bus error mid-handshake
+   * — must leave nothing behind: the failure-code paths close the handle
+   * themselves, but an exception used to skip straight out and every retry
+   * opened a second portal-side session while the first lived on.
+   */
+  it("closes the created session when a later open step throws", async () => {
     const portal = new FakePortalService({
       screenCastVersion: 5,
-      streams: [{ nodeId: 1, rect: { x: 0, y: 0, width: 1920, height: 1080 } }],
+      failMembers: ["org.freedesktop.portal.ScreenCast.SelectSources"],
     });
     const { session } = sessionFor(portal);
 
-    // 50 px is under one 80 px notch: nothing goes on the wire, nothing is lost.
-    await session.scroll(0, 50);
-    expect(portal.notifications).toEqual([]);
+    await expect(session.ensureOpen()).rejects.toThrow(/SelectSources failed on purpose/);
 
-    // The carried 50 px plus 50 px crosses the notch; 20 px stays owed.
-    await session.scroll(0, 50);
-    expect(portal.notifications).toEqual([
-      { member: "NotifyPointerAxisDiscrete", body: [expect.any(String), {}, 0, 1] },
-    ]);
-
-    // Each axis carries its own remainder: 100 px horizontal is 1 notch + 20 px,
-    // unaffected by the vertical axis's 20 px debt.
-    await session.scroll(100, 0);
-    expect(portal.notifications.at(-1)).toEqual({
-      member: "NotifyPointerAxisDiscrete",
-      body: [expect.any(String), {}, 1, 1],
-    });
+    // The portal saw exactly one Close for the handle the throw orphaned.
+    expect(portal.calls.filter((call) => call.endsWith("Session.Close"))).toHaveLength(1);
+    expect(portal.currentSessionHandle()).toBeUndefined();
     await session.dispose();
   });
 

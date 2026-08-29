@@ -53,6 +53,16 @@ const HELPER_CAPTURE_TIMEOUT_MS = 15_000;
 const HELPER_RECONNECT_BASE_DELAY_MS = 250;
 const HELPER_RECONNECT_MAX_DELAY_MS = 5_000;
 const HELPER_MAX_RECONNECT_FAILURES = 5;
+
+/**
+ * The helper wire protocol this server speaks, matching `HELPER_PROTOCOL_VERSION`
+ * in apps/server/native/computer-desktop-helper/src/main.c. The helper reports
+ * its own number in the `ready` notification (and in `--print-globals` output);
+ * a mismatch means the binary on disk predates or postdates this server, which
+ * is refused loudly here and treated as an install-upgrade trigger by
+ * `desktopHelperInstall.ts`.
+ */
+export const DESKTOP_HELPER_PROTOCOL_VERSION = 1;
 /**
  * Payloads that arrived before their response. One is the normal case (the
  * helper writes the frame first); more than a handful means responses are being
@@ -564,7 +574,25 @@ export class DesktopHelperClient implements DesktopHelperTransport {
     try {
       for (const line of framer.push(chunk)) {
         const message = asRecord(parseJson(line));
-        if (!("id" in message)) continue; // the `ready` notification
+        if (!("id" in message)) {
+          // The `ready` notification: the one chance to catch a helper binary
+          // that speaks a different protocol than this server before it
+          // answers anything. Not restartable — respawning the same bytes
+          // would answer the same way.
+          const version = asFiniteNumber(asRecord(message.params).protocolVersion);
+          if (version !== undefined && version !== DESKTOP_HELPER_PROTOCOL_VERSION) {
+            this.teardown(
+              new ComputerBackendError(
+                `The desktop helper at ${this.options.command} speaks protocol version ${version}, ` +
+                  `but this server speaks ${DESKTOP_HELPER_PROTOCOL_VERSION}. ` +
+                  "Reinstalling Synara replaces the helper binary.",
+                { retryable: false },
+              ),
+              { restartable: false },
+            );
+          }
+          continue;
+        }
         const id = message.id;
         if (typeof id !== "number" && typeof id !== "string") continue;
         const error = isRecord(message.error) ? message.error : undefined;
@@ -778,7 +806,20 @@ export function readWaylandGlobals(options: {
   });
   return child
     .readFirstStdoutLine(options.timeoutMs ?? HELPER_REQUEST_TIMEOUT_MS)
-    .then((line) => parseGlobals(asRecord(parseJson(line)).globals))
+    .then((line) => {
+      const document = asRecord(parseJson(line));
+      // The same protocol check the supervised client makes on `ready`: a
+      // probe that understands the binary is the cheapest place to say so.
+      const version = asFiniteNumber(document.protocolVersion);
+      if (version !== undefined && version !== DESKTOP_HELPER_PROTOCOL_VERSION) {
+        throw new ComputerBackendError(
+          `The desktop helper at ${options.command} speaks protocol version ${version}, ` +
+            `but this server speaks ${DESKTOP_HELPER_PROTOCOL_VERSION}.`,
+          { retryable: false },
+        );
+      }
+      return parseGlobals(document.globals);
+    })
     .finally(() => child.terminate());
 }
 

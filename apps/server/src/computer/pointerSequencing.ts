@@ -152,13 +152,25 @@ export async function pressKeyStroke(options: {
   if (stroke.shift) {
     await sink.key(EVDEV_KEY_CODES.LeftShift, true, POINTER_SEQUENCE_OPERATIONS.keyPress);
   }
+  let failed = false;
   try {
     await sink.key(stroke.code, true, POINTER_SEQUENCE_OPERATIONS.keyPress);
     await sink.key(stroke.code, false, POINTER_SEQUENCE_OPERATIONS.keyRelease);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    if (stroke.shift) {
-      await sink.key(EVDEV_KEY_CODES.LeftShift, false, POINTER_SEQUENCE_OPERATIONS.shiftRelease);
-    }
+    // The release runs whatever happened above; its own failure surfaces only
+    // when there is no earlier one to report.
+    const releaseError = await firstFailureOf(
+      stroke.shift
+        ? [
+            () =>
+              sink.key(EVDEV_KEY_CODES.LeftShift, false, POINTER_SEQUENCE_OPERATIONS.shiftRelease),
+          ]
+        : [],
+    );
+    if (!failed && releaseError !== undefined) throw releaseError;
   }
 }
 
@@ -166,6 +178,13 @@ export async function pressKeyStroke(options: {
  * A chord: every stroke pressed in order and held, then released in the reverse
  * order. The release list is built as the presses land, so a chord that fails
  * on its third key still releases the two that did go down — and only those.
+ *
+ * Every release is attempted even after one refuses: the releases are one D-Bus
+ * notify each on the portal path, and a transient refusal on the first would
+ * otherwise strand every modifier behind it on the human's keyboard until the
+ * backend is disposed. The first refusal is what surfaces, but only when the
+ * presses themselves had not already failed — that error is the one worth
+ * acting on.
  */
 export async function pressHotkeyStrokes(options: {
   readonly sink: Pick<ComputerInputSink, "key">;
@@ -173,6 +192,7 @@ export async function pressHotkeyStrokes(options: {
 }): Promise<void> {
   const { sink, strokes } = options;
   const releases: number[] = [];
+  let failed = false;
   try {
     for (const stroke of strokes) {
       if (stroke.shift) {
@@ -182,10 +202,16 @@ export async function pressHotkeyStrokes(options: {
       await sink.key(stroke.code, true, POINTER_SEQUENCE_OPERATIONS.keyPress);
       releases.push(stroke.code);
     }
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    for (const code of releases.toReversed()) {
-      await sink.key(code, false, POINTER_SEQUENCE_OPERATIONS.keyRelease);
-    }
+    const releaseError = await firstFailureOf(
+      releases
+        .toReversed()
+        .map((code) => () => sink.key(code, false, POINTER_SEQUENCE_OPERATIONS.keyRelease)),
+    );
+    if (!failed && releaseError !== undefined) throw releaseError;
   }
 }
 
@@ -198,9 +224,36 @@ export async function pressButtonOnce(options: {
 }): Promise<void> {
   const { sink, code } = options;
   await sink.button(code, true, POINTER_SEQUENCE_OPERATIONS.buttonPress);
+  let failed = false;
   try {
     await options.sleep(options.holdMs ?? BUTTON_HOLD_MS);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    await sink.button(code, false, POINTER_SEQUENCE_OPERATIONS.buttonRelease);
+    const releaseError = await firstFailureOf([
+      () => sink.button(code, false, POINTER_SEQUENCE_OPERATIONS.buttonRelease),
+    ]);
+    if (!failed && releaseError !== undefined) throw releaseError;
   }
+}
+
+/**
+ * Awaits every step even when some refuse, returning the first refusal.
+ *
+ * This is the shape every release path takes: one display-server refusal must
+ * cost that one event, not every event queued behind it.
+ */
+async function firstFailureOf(
+  steps: readonly (() => Promise<void>)[],
+): Promise<unknown | undefined> {
+  let first: unknown | undefined;
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (error) {
+      first ??= error;
+    }
+  }
+  return first;
 }

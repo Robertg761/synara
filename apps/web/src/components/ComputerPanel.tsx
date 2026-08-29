@@ -111,6 +111,22 @@ export default function ComputerPanel(props: {
     agentActive: threadState?.agentActive ?? false,
   });
 
+  const upsertThreadState = useComputerStateStore((store) => store.upsertThreadState);
+  // Clears a denied permission latch and re-seeds this thread's snapshot, so
+  // the blocked view gives way without waiting for the next push.
+  const askConsentAgain = useCallback(() => {
+    const api = ensureNativeApi().computer;
+    if (!api) return;
+    void api
+      .resetConsent({})
+      .then(() => api.getThreadState({ threadId }))
+      .then((state) => upsertThreadState(state))
+      .catch(() => {
+        // The next state push or pane reopen reports where consent stands; a
+        // failed reset changes nothing the panel needs to explain.
+      });
+  }, [threadId, upsertThreadState]);
+
   // ── User input ─────────────────────────────────────────────────────
   //
   // Input is opt-in: a pane that forwarded clicks while it was merely being
@@ -125,6 +141,10 @@ export default function ComputerPanel(props: {
     () =>
       createComputerInputQueue({
         onError: (error) => setInputError(inputErrorMessage(error)),
+        onDrop: () =>
+          setInputError(
+            "The desktop is busy, so that input was dropped. Wait for it to catch up and try again.",
+          ),
       }),
     [],
   );
@@ -350,6 +370,11 @@ export default function ComputerPanel(props: {
           <ComputerAvailabilityMessage
             title={availabilityView.title}
             description={availabilityView.description}
+            action={
+              availabilityView.kind === "blocked" && availabilityView.action === "ask-consent-again"
+                ? { label: "Ask for permission again", onClick: askConsentAgain }
+                : undefined
+            }
           />
         ) : runtimeMode === "preview" ? (
           <button
@@ -399,14 +424,27 @@ export default function ComputerPanel(props: {
               </div>
             ) : null}
             {cursorPosition ? (
-              <span
+              // The same look as the on-desktop ghost cursor the KWin plugin
+              // draws: an ordinary pointer glyph whose violet halo is what says
+              // it is the agent's. The path tip sits at the SVG origin, so the
+              // element is positioned by the hotspot with no centering shift.
+              <svg
                 aria-label="Agent cursor"
+                viewBox="0 0 14 16"
                 className={cn(
-                  "pointer-events-none absolute size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-blue-500 shadow-[0_0_0_1px_rgba(0,0,0,0.7)]",
+                  "pointer-events-none absolute h-4 w-3.5 overflow-visible [filter:drop-shadow(0_0_3px_rgba(124,58,237,0.9))_drop-shadow(0_0_7px_rgba(124,58,237,0.65))]",
                   threadState?.agentActive ? "opacity-100" : "opacity-65",
                 )}
                 style={{ left: cursorPosition.left, top: cursorPosition.top }}
-              />
+              >
+                <path
+                  d="M0 0 L0 10.64 L2.66 8.12 L4.2 12.32 L6.16 11.48 L4.48 7.56 L7.84 7.56 Z"
+                  fill="#ffffff"
+                  stroke="rgba(20,10,46,0.85)"
+                  strokeWidth="1.2"
+                  strokeLinejoin="round"
+                />
+              </svg>
             ) : null}
           </>
         )}
@@ -428,12 +466,25 @@ export default function ComputerPanel(props: {
   );
 }
 
-function ComputerAvailabilityMessage(props: { title: string; description: string }) {
+function ComputerAvailabilityMessage(props: {
+  title: string;
+  description: string;
+  action?: { label: string; onClick: () => void } | undefined;
+}) {
   return (
     <div className="max-w-sm px-6 text-center text-white/80" role="status">
       <MonitorIcon className="mx-auto mb-3 size-8 text-white/45" />
       <p className="font-medium text-sm text-white">{props.title}</p>
       <p className="mt-1 text-xs leading-5 text-white/60">{props.description}</p>
+      {props.action ? (
+        <button
+          type="button"
+          className="mt-3 rounded-full bg-white/95 px-3 py-1.5 font-medium text-[10px] text-black shadow-sm"
+          onClick={props.action.onClick}
+        >
+          {props.action.label}
+        </button>
+      ) : null}
     </div>
   );
 }

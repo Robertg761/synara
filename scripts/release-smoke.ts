@@ -143,9 +143,32 @@ function verifyReleaseWorkflowSafety(): void {
   );
   assertContains(
     workflow,
-    "  build:\n    name: Build ${{ matrix.label }}\n    needs: [preflight, desktop_helper_prebuilds, kwin_plugin_prebuilds]\n    runs-on: ${{ matrix.runner }}\n    timeout-minutes: 30\n    permissions:\n      contents: read",
+    "  build:\n    name: Build ${{ matrix.label }}\n    needs: [preflight, kwin_plugin_prebuilds, desktop_helper_prebuilds]\n    runs-on: ${{ matrix.runner }}\n    timeout-minutes: 30\n    permissions:\n      contents: read",
     "Expected artifact builds to receive read-only repository access.",
   );
+  // The prebuild workflows run inside this release run — per-run artifacts are
+  // the only way their output can reach the packaging jobs — and must stay
+  // read-only like every other build job.
+  assertContains(
+    workflow,
+    "  kwin_plugin_prebuilds:\n    name: KWin plugin prebuilds\n    permissions:\n      contents: read\n    uses: ./.github/workflows/kwin-plugin-prebuilds.yml",
+    "Expected the release run to build the KWin plugin prebuilts itself, read-only.",
+  );
+  assertContains(
+    workflow,
+    "  desktop_helper_prebuilds:\n    name: Desktop helper prebuilds\n    permissions:\n      contents: read\n    uses: ./.github/workflows/desktop-helper-prebuilds.yml",
+    "Expected the release run to build the desktop helper prebuilts itself, read-only.",
+  );
+  // Staged into the native prebuilt directories before packaging, in every job
+  // that packages the server: without this the packaged prebuilt/ directories
+  // are empty and users silently fall back to source builds.
+  const stagedPrebuilts =
+    "      - name: Stage KWin plugin prebuilts\n        uses: actions/download-artifact@v8\n        with:\n          name: kwin-plugin-prebuilt\n          path: apps/server/native/computer-use-kwin/prebuilt\n\n      - name: Stage desktop helper prebuilts\n        uses: actions/download-artifact@v8\n        with:\n          name: desktop-helper-prebuilt\n          path: apps/server/native/computer-desktop-helper/prebuilt";
+  if (workflow.split(stagedPrebuilts).length - 1 !== 3) {
+    throw new Error(
+      "Expected the desktop build, CLI publication, and server tarball jobs to each stage both native prebuilt directories before packaging.",
+    );
+  }
   assertContains(
     workflow,
     "    permissions:\n      contents: read\n      id-token: write\n    steps:",
@@ -153,7 +176,7 @@ function verifyReleaseWorkflowSafety(): void {
   );
   assertContains(
     workflow,
-    "  build_server_tarball:\n    name: Build server tarball\n    if: ${{ needs.preflight.outputs.publish_release == 'true' }}\n    needs: [preflight, build]\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions:\n      contents: read",
+    "  build_server_tarball:\n    name: Build server tarball\n    if: ${{ needs.preflight.outputs.publish_release == 'true' }}\n    needs: [preflight, build, kwin_plugin_prebuilds, desktop_helper_prebuilds]\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions:\n      contents: read",
     "Expected server tarball builds to receive read-only repository access.",
   );
   assertContains(

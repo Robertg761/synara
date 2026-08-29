@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { ComputerBackendError } from "../ComputerBackend.ts";
 import { FakePortalService } from "./fakePortalService.ts";
 import { createPortalComputerBackend } from "./PortalComputerBackend.ts";
 import { PortalSession } from "./portalSession.ts";
@@ -198,11 +199,56 @@ describe("PortalSelectionClipboardProvider", () => {
     );
     await provider.dispose();
   });
+
+  /**
+   * A paste target that never writes must not hang `computer_read_clipboard`
+   * forever — the bus timeout covers only the descriptor handout, so the read
+   * carries a deadline of its own.
+   */
+  it("abandons a stalled transfer with a structured error instead of waiting forever", async () => {
+    const portal = new FakePortalService({ screenCastVersion: 5 });
+    const { session } = clipboardFor(portal);
+    const provider = new PortalSelectionClipboardProvider(session, () => session.dispose(), {
+      // A descriptor whose writer never closes: the real shape of a stalled
+      // transfer, short-circuited at the seam so the test measures the
+      // deadline rather than the pipe.
+      readFd: () => new Promise<Buffer>(() => undefined),
+      writeFd: () => Promise.resolve(),
+      transferTimeoutMs: 50,
+    });
+    const startedAt = Date.now();
+
+    await expect(provider.read()).rejects.toThrow(
+      /clipboard transfer but sent nothing within 50 ms/,
+    );
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    await provider.dispose();
+  });
+
+  it("propagates a structured read failure instead of negotiating mime types over it", async () => {
+    const portal = new FakePortalService({ screenCastVersion: 5 });
+    const { session } = clipboardFor(portal);
+    const provider = new PortalSelectionClipboardProvider(session, () => session.dispose(), {
+      readFd: () =>
+        Promise.reject(new ComputerBackendError("the transfer timed out", { retryable: true })),
+      writeFd: () => Promise.resolve(),
+    });
+
+    // Retrying under the next mime name would stall the same way again.
+    await expect(provider.read()).rejects.toThrow(/transfer timed out/);
+    await provider.dispose();
+  });
 });
 
 describe("the GNOME backend's consent projection", () => {
   function backendFor(portal: FakePortalService) {
-    return createPortalComputerBackend(gnomeProbe(), {
+    const probe = gnomeProbe();
+    return createPortalComputerBackend(probe, {
+      // Pinned to this probe: the factory's defaults would re-probe the real
+      // desktop and install the real helper, and a capture provider found that
+      // way would make consent look like the only thing missing.
+      recomputeProbe: () => Promise.resolve(probe),
+      resolveHelper: () => Promise.resolve({}),
       providerOptions: {
         createSession: (sessionOptions) =>
           new PortalSession({
@@ -262,9 +308,9 @@ describe("the GNOME backend's consent projection", () => {
 
     expect(backend.consentState()).toEqual({
       state: "denied",
-      reason: expect.stringMatching(/Start computer control again from the panel/),
+      reason: expect.stringMatching(/Ask for permission again/),
     });
-    expect(backend.health().status).toBe("unavailable");
+    expect(backend.health().status).toBe("consent-denied");
     await backend.dispose();
   });
 
@@ -277,7 +323,7 @@ describe("the GNOME backend's consent projection", () => {
         kind: "region",
         region: { x: 0, y: 0, width: 100, height: 100 },
       }),
-    ).rejects.toThrow(/delivers frames over PipeWire.*not implemented.*SYNARA_COMPUTER_NESTED/s);
+    ).rejects.toThrow(/delivers frames over PipeWire.*cannot receive PipeWire streams yet/s);
     await backend.dispose();
   });
 

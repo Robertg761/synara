@@ -24,6 +24,9 @@ function fakeDbus(
   const loads: string[] = [];
   return {
     loads,
+    // The service is owned once something loaded the plugin, the same shape as
+    // the KWin fake: the owner check after a load has to find a unique name.
+    nameOwner: async () => (loads.length > 0 ? ":1.42" : undefined),
     listLoadedPluginIds: async () => [],
     loadPlugin: async (pluginId: string) => {
       loads.push(pluginId);

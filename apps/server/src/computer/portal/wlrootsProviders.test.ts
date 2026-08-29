@@ -165,7 +165,9 @@ describe("ForeignToplevelWindowProvider", () => {
         id: "toplevel-1",
         title: "README.md — Text Editor",
         appName: "org.gnome.TextEditor",
-        focused: true,
+        // Activation is the compositor's fact; `focused` is the agent's input
+        // target, which nothing here has aimed yet.
+        focused: false,
         active: true,
         minimized: false,
         visible: true,

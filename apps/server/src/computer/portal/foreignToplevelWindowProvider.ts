@@ -16,12 +16,13 @@
  * mode that had an agent relaunching the same app until its turn ended.
  */
 import {
+  COMPUTER_ID_MAX_LENGTH,
   COMPUTER_LABEL_MAX_LENGTH,
   COMPUTER_WINDOW_LIST_MAX_LENGTH,
   type ComputerWindow,
 } from "@synara/contracts";
 
-import { clampId, truncateLabel } from "../computerGeometry.ts";
+import { clampTextToLength } from "../utf8Truncation.ts";
 import type { DesktopHelperTransport, DesktopHelperWindow } from "./desktopHelperClient.ts";
 import type { PortalProviderId, PortalWindowProvider } from "./providers.ts";
 
@@ -35,15 +36,17 @@ import type { PortalProviderId, PortalWindowProvider } from "./providers.ts";
  */
 function toComputerWindow(toplevel: DesktopHelperWindow): ComputerWindow {
   return {
-    id: clampId(toplevel.id),
-    title: truncateLabel(toplevel.title, COMPUTER_LABEL_MAX_LENGTH),
+    id: clampTextToLength(toplevel.id, COMPUTER_ID_MAX_LENGTH) as ComputerWindow["id"],
+    title: clampTextToLength(toplevel.title, COMPUTER_LABEL_MAX_LENGTH),
     ...(toplevel.appId
-      ? { appName: truncateLabel(toplevel.appId, COMPUTER_LABEL_MAX_LENGTH) }
+      ? { appName: clampTextToLength(toplevel.appId, COMPUTER_LABEL_MAX_LENGTH) }
       : {}),
-    // Activation is the only focus signal the protocol carries, and it is the
-    // one that matters for input: a toolkit dispatches keyboard shortcuts only
-    // to the activated window.
-    focused: toplevel.activated,
+    // `focused` is the agent's input target and stays false until this backend
+    // actually aims at the window; activation — which is what the protocol
+    // carries, and what decides toolkit shortcut dispatch — rides on `active`,
+    // matching the GNOME provider's convention. Conflating the two would make
+    // every window claim to be where the agent is typing.
+    focused: false,
     active: toplevel.activated,
     minimized: toplevel.minimized,
     // "Not minimized" is the strongest visibility claim available. Occlusion is

@@ -266,7 +266,16 @@ describe("provisioning", () => {
     await writeFile(
       join(prebuiltRoot, "manifest.json"),
       JSON.stringify({
-        builds: [{ kwinVersion: "6.7.3", arch: "x64", file: "p.so", sha256: "00" }],
+        builds: [
+          {
+            kwinVersion: "6.7.3",
+            arch: "x64",
+            file: "p.so",
+            // Well-formed but wrong: this is the mismatch case, not the
+            // malformed-entry case.
+            sha256: "0".repeat(64),
+          },
+        ],
       }),
     );
 

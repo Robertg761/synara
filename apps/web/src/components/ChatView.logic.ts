@@ -125,7 +125,10 @@ export function resolveRuntimeModeAfterApprovalDecision(
   // Permission-profile grants are narrower than a runtime-mode override.
   // Their acceptForSession decision is persisted by the provider for only
   // that permission set and must not silently broaden the whole thread.
-  if (requestKind === "permissions") {
+  // Tool approvals keep their own, properly scoped channel too (the provider
+  // remembers the specific tool); widening them here would un-supervise
+  // commands and file changes the user never saw.
+  if (requestKind === "permissions" || requestKind === "tool") {
     return null;
   }
   if (decision === "acceptForSession" && currentRuntimeMode === "approval-required") {
@@ -1527,13 +1530,13 @@ export function deriveComposerSendState(options: {
 /**
  * The effective per-chat computer-control flag.
  *
- * Computer control behaves like a skill: the moment the desktop backend is
- * available for a thread, any agent in it may reach for the desktop, so the flag
- * defaults on. A chat's own override always wins — a user can turn it off (or
- * back on) for one chat without touching anything global. When the backend is
- * unavailable the flag is forced off regardless of the machine default, because
- * there is nothing to grant. The machine default (`allowInNewChats`) is a plain
- * opt-out, never rewritten by a per-chat choice.
+ * Desktop access is an explicit opt-in: a new chat gets computer control only
+ * when the machine-wide default allows it and the backend is available. A
+ * chat's own override always wins — a user can turn it on (or back off) for
+ * one chat without touching anything global. When the backend is unavailable
+ * the flag is forced off regardless of the machine default, because there is
+ * nothing to grant. The machine default (`allowInNewChats`) is a plain
+ * default, never rewritten by a per-chat choice.
  */
 export function resolveEffectiveComputerControl(input: {
   readonly draftOverride: boolean | undefined;

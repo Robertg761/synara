@@ -1987,6 +1987,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 ...(effectiveProviderOptions !== undefined
                   ? { providerOptions: effectiveProviderOptions }
                   : {}),
+                // The fork writes the thread's first binding row, so the flag
+                // must land here or resumeSession re-leases without it.
+                ...(input.enableComputerControl ? { enableComputerControl: true } : {}),
                 lastRuntimeEvent: "provider.thread.forked",
                 lastRuntimeEventAt: new Date().toISOString(),
               });
@@ -2009,6 +2012,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                   ...(effectiveProviderOptions !== undefined
                     ? { providerOptions: effectiveProviderOptions }
                     : {}),
+                  ...(input.enableComputerControl ? { enableComputerControl: true } : {}),
                   lastRuntimeEvent: "provider.thread.forked",
                   lastRuntimeEventAt: new Date().toISOString(),
                 },

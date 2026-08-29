@@ -63,4 +63,18 @@ describe("FakeComputerBackend", () => {
     backend.emitFrame(true, true);
     expect(frames.length).toBe(4);
   });
+
+  /**
+   * A long-running server must not grow the call log forever; the oldest
+   * entries fall off once the cap is reached.
+   */
+  it("caps recorded calls at a bounded recent window", () => {
+    const backend = new FakeComputerBackend();
+    for (let index = 0; index < 1_500; index += 1) {
+      backend.pressKey(`key-${index}`);
+    }
+    expect(backend.calls.length).toBe(1_000);
+    expect(backend.calls[0]?.args).toEqual(["key-500"]);
+    expect(backend.calls.at(-1)?.args).toEqual(["key-1499"]);
+  });
 });

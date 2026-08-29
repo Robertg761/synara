@@ -167,10 +167,14 @@ describe("startNestedKWinSession", () => {
     expect(harness.spawns[1]?.env.DBUS_SESSION_BUS_ADDRESS).toBe(BUS_ADDRESS);
     expect(harness.spawns[1]?.env.WAYLAND_DISPLAY).toBeUndefined();
     expect(harness.dbus.calls).toEqual([
+      // The service owner is pinned across the LoadPlugin boundary, before and
+      // after the load.
+      "nameOwner:org.synara.ComputerUse",
       "listLoadedPluginIds",
       "unloadPlugin:SynaraComputerUsePlugin",
       "unloadPlugin:SynaraComputerUsePluginV3",
       "loadPlugin:SynaraComputerUsePluginV3",
+      "nameOwner:org.synara.ComputerUse",
       "connectPlugin",
       "close",
     ]);
@@ -343,18 +347,28 @@ class FakeChild extends EventEmitter {
 class FakeDbus implements KWinComputerDbus {
   readonly calls: string[] = [];
   closed = false;
+  /** The unique name owning the Synara service once a load is accepted. */
+  serviceOwner: string | undefined;
 
   constructor(
     private readonly loaded: readonly string[],
     private readonly loadAccepted: boolean,
   ) {}
 
+  nameOwner = async (name: string) => {
+    this.calls.push(`nameOwner:${name}`);
+    if (this.serviceOwner !== undefined) return this.serviceOwner;
+    return this.loaded.some((id) => id.startsWith("SynaraComputerUsePlugin")) ? ":1.42" : undefined;
+  };
   listLoadedPluginIds = async () => {
     this.calls.push("listLoadedPluginIds");
     return this.loaded;
   };
   loadPlugin = async (pluginId: string) => {
     this.calls.push(`loadPlugin:${pluginId}`);
+    if (this.loadAccepted && pluginId.startsWith("SynaraComputerUsePlugin")) {
+      this.serviceOwner = ":1.43";
+    }
     return this.loadAccepted;
   };
   unloadPlugin = async (pluginId: string) => {

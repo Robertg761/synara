@@ -10,6 +10,7 @@ function fakeBus(healthJson?: () => Promise<unknown>): ComputerSessionBus {
   const api = { healthJson: healthJson ?? (() => Promise.reject(new Error("no plugin"))) };
   return {
     getProxyObject: () => Promise.reject(new Error("unused")),
+    nameOwner: () => Promise.resolve(undefined),
     connectPlugin: () => Promise.resolve(api as unknown as KWinComputerPluginApi),
     onDisconnect: () => () => undefined,
     close: () => Promise.resolve(),

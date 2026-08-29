@@ -17,6 +17,14 @@ if [[ "$(basename "$source_dir")" != "$uuid" ]]; then
   exit 1
 fi
 
+# The installed copy carries this script too, and its directory name is the
+# UUID, so it passes the check above. Running it would rm -rf the very
+# directory it is copying from.
+if [[ "$source_dir" == "$target_dir" ]]; then
+  echo "error: this is the installed copy; run install.sh from the Synara checkout instead" >&2
+  exit 1
+fi
+
 mkdir -p "$(dirname "$target_dir")"
 rm -rf "$target_dir"
 cp -r "$source_dir" "$target_dir"

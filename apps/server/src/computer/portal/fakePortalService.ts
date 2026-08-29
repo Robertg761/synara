@@ -76,6 +76,11 @@ export interface FakePortalOptions {
    * asked for, reproducing a portal that ignores the token.
    */
   readonly misdirect?: readonly string[];
+  /**
+   * Members whose method call itself throws — a portal or bus that fails
+   * mid-handshake, as opposed to answering a Request with a refusal code.
+   */
+  readonly failMembers?: readonly string[];
 }
 
 interface FakeRequest {
@@ -161,6 +166,10 @@ export class FakePortalService implements PortalBus {
     const body = call.body ?? [];
     const options = lastOptions(body);
     if (options) this.optionsByMember.set(call.member, options);
+
+    if (this.options.failMembers?.includes(member)) {
+      throw new Error(`org.freedesktop.DBus.Error.Failed: ${member} failed on purpose`);
+    }
 
     switch (member) {
       case "org.freedesktop.DBus.Properties.Get":

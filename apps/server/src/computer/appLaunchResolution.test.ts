@@ -182,11 +182,11 @@ describe("resolveAppLaunch", () => {
       message = (error as Error).message;
     }
     expect(message).toContain("app.zen_browser.zen");
-    expect(message).toContain("$PATH");
-    expect(message).toContain("/var/lib/flatpak/exports/bin");
-    expect(message).toContain(
-      "/var/lib/flatpak/exports/share/applications/app.zen_browser.zen.desktop",
-    );
+    // Kinds rather than paths: the searched directories include the user's
+    // home, and the error reaches whoever reads the tool result.
+    expect(message).toContain("the PATH");
+    expect(message).toContain(".desktop entries");
+    expect(message).not.toMatch(/\/home\//);
     expect(message).toContain("computer_list_windows");
   });
 

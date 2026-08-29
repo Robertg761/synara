@@ -80,16 +80,43 @@ jobs:
       matrix:
         arch: [x64, arm64]
         distro:
-          - { id: fedora-43, image: "fedora:43" }
-          - { id: fedora-44, image: "fedora:44" }
-          - { id: debian-trixie, image: "debian:trixie" }
-          - { id: ubuntu-2604, image: "ubuntu:26.04" }
-          - { id: opensuse-tumbleweed, image: "opensuse/tumbleweed" }
-          - { id: arch, image: "archlinux:latest" }
+          # Pinned by multi-arch manifest digest: these binaries execute with
+          # session-compositor authority on a user's machine, so a mutable tag
+          # is supply-chain drift waiting to happen. Rolling entries (tumbleweed,
+          # arch) freeze their snapshot until the digest is bumped - bumping it
+          # is the monthly refresh action that goes with this file's schedule.
+          - {
+              id: fedora-43,
+              image: "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+            }
+          - {
+              id: fedora-44,
+              image: "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+            }
+          - {
+              id: debian-trixie,
+              image: "debian:trixie@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958",
+            }
+          - {
+              id: ubuntu-2604,
+              image: "ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b",
+            }
+          - {
+              id: opensuse-tumbleweed,
+              image: "opensuse/tumbleweed:latest@sha256:ba9f806363116cb7633f10ca7dbe645d286915e9b898fe24b94615c2184b6911",
+            }
+          - {
+              id: arch,
+              image: "archlinux:latest@sha256:4bf33b21a715aac0b48ce6e9eaed4782a898eae96f88f5da3635572129c2584a",
+            }
         exclude:
           # Arch publishes no official arm64 image.
           - arch: arm64
-            distro: { id: arch, image: "archlinux:latest" }
+            distro:
+              {
+                id: arch,
+                image: "archlinux:latest@sha256:4bf33b21a715aac0b48ce6e9eaed4782a898eae96f88f5da3635572129c2584a",
+              }
     steps:
       - name: Install the toolchain and the Wayland development packages
         id: deps
@@ -138,9 +165,20 @@ jobs:
           # than to discover on a release tag.
           command -v cc >/dev/null 2>&1 || ln -s "$(command -v gcc)" /usr/local/bin/cc
 
+      - name: Report the dependency gap
+        if: steps.deps.outcome != 'success'
+        shell: bash
+        env:
+          DISTRO_ID: ${{ matrix.distro.id }}
+        # continue-on-error leaves the job green, so without this annotation a
+        # failed leg ships a release silently missing its prebuilt. The warning
+        # is the "reported" half of the reported-and-skipped contract above.
+        run: |
+          echo "::warning title=No prebuilt for $DISTRO_ID::Dependency install failed; this release ships no desktop-helper prebuilt for $DISTRO_ID and its users fall back to a local build."
+
       - name: Checkout
         if: steps.deps.outcome == 'success'
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.ref }}
 
@@ -214,7 +252,7 @@ jobs:
 
       - name: Upload
         if: steps.deps.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: desktop-helper-${{ matrix.distro.id }}-${{ matrix.arch }}
           path: out/
@@ -230,7 +268,7 @@ jobs:
       contents: read
     steps:
       - name: Download every build
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           # In a release run this workflow shares its artifact namespace with the
           # caller and the KWin prebuilds; the pattern keeps their uploads out.
@@ -306,7 +344,7 @@ jobs:
           cat prebuilt/manifest.json
 
       - name: Upload the drop-in directory
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           # Unpacks over apps/server/native/computer-desktop-helper/prebuilt/,
           # which is where the server looks when no

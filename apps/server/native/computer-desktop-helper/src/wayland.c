@@ -1226,24 +1226,29 @@ static int32_t take_discrete_steps(double *remainder, double delta) {
 	return (int32_t)steps;
 }
 
+/*
+ * Wheel source with both halves, matching SynaraComputerUsePlugin::axis(): a
+ * finger-source variant was tried on 2026-08-22 and Gecko ignored those
+ * events entirely while Qt geared them up, so wheel is the one scroll every
+ * toolkit acts on. The per-toolkit distance it travels is measured and
+ * corrected server-side (scrollCalibration.ts), not here.
+ *
+ * The protocol says `axis_discrete` "allows the client to extend data
+ * normally sent using the axis event with discrete value" — it is an
+ * annotation on an axis event, not a substitute for one, so the continuous
+ * half goes out first and the discrete half extends it. A compositor that
+ * takes the pixel delta only from `axis` sees nothing at all otherwise.
+ * They are not additive: both carry the same delta, and the discrete
+ * request names the notch count that delta amounts to.
+ */
 static void send_axis(helper_wayland *state, uint32_t axis, double delta, double *remainder) {
 	if (delta == 0) return;
 	int32_t steps = take_discrete_steps(remainder, delta);
 	zwlr_virtual_pointer_v1_axis_source(state->pointer, WL_POINTER_AXIS_SOURCE_WHEEL);
 	/*
-	 * Both halves of a wheel event: GTK reads the discrete steps, and anything
-	 * that scrolls by pixels reads the value. Sending one without the other
-	 * makes a toolkit either ignore the scroll or jump a whole page.
-	 *
-	 * The protocol says `axis_discrete` "allows the client to extend data
-	 * normally sent using the axis event with discrete value" — it is an
-	 * annotation on an axis event, not a substitute for one, so the continuous
-	 * half goes out first and the discrete half extends it. A compositor that
-	 * takes the pixel delta only from `axis` sees nothing at all otherwise.
-	 * They are not additive: both carry the same delta, and the discrete
-	 * request names the notch count that delta amounts to. The continuous
-	 * value is in the wheel's own units, not pixels: a client reads it at
-	 * libinput's scale of 15 per notch and multiplies up from there.
+	 * The continuous value is in the wheel's own units, not pixels: a client
+	 * reads it at libinput's scale of 15 per notch and multiplies up from
+	 * there, so the pixel delta is converted at SCROLL_STEP_PX per notch.
 	 */
 	double axis_value = delta * AXIS_UNITS_PER_NOTCH / SCROLL_STEP_PX;
 	zwlr_virtual_pointer_v1_axis(state->pointer, now_ms(state), axis,
@@ -1475,6 +1480,14 @@ static bool capture_one(helper_wayland *state, struct helper_output *output, hel
                         helper_error *error) {
 	struct capture_frame capture = {0};
 	capture.state = state;
+	/* A previous piece's wait_for dispatches events, and a global_remove can
+	 * destroy the manager between pieces; re-validate rather than marshal
+	 * through a NULL proxy. */
+	if (state->screencopy_manager == NULL) {
+		helper_error_set(error, HELPER_REFUSAL_TRANSIENT,
+		                 "the compositor withdrew zwlr_screencopy_manager_v1 mid-capture");
+		return false;
+	}
 	struct zwlr_screencopy_frame_v1 *frame = zwlr_screencopy_manager_v1_capture_output_region(
 		state->screencopy_manager, overlay_cursor ? 1 : 0, output->output, local.x, local.y,
 		local.width, local.height);

@@ -112,11 +112,19 @@ static const QString s_captureSizeLimitReason = QStringLiteral("capture exceeds 
 // The ghost cursor is drawn by the plugin instead of taken from the human's
 // cursor theme: a second arrow in their own theme is indistinguishable from
 // theirs, and being able to tell the two apart is the whole point of it.
-// A saturated violet and a light rim read against any wallpaper, so neither
-// colour depends on what is behind the cursor.
+// The glyph itself is an ordinary pointer — white body, dark ink — and the
+// telling-apart is done by a saturated violet halo behind it, which reads
+// against any wallpaper without making the arrow itself look foreign.
 static const QColor s_agentAccentColor = QColor(0x7c, 0x3a, 0xed);
 static const QColor s_agentRimColor = QColor(0xff, 0xff, 0xff);
 static const QColor s_agentInkColor = QColor(0x14, 0x0a, 0x2e, 0x99);
+// Halo reach in multiples of the cursor size, with a floor so the smallest
+// cursor sizes still show a visible glow; per-pass alpha of the innermost
+// stroke, from which the outer passes fade.
+static constexpr qreal s_agentGlowRadiusRatio = 0.30;
+static constexpr qreal s_agentMinGlowRadius = 4.0;
+static constexpr int s_agentGlowPasses = 6;
+static constexpr qreal s_agentGlowPassAlpha = 0.15;
 // Stroke widths in multiples of the cursor size. Fixed widths would swallow the
 // accent colour at small cursor sizes and disappear at large ones, so the whole
 // glyph has to scale together.
@@ -547,6 +555,8 @@ public:
     }
     void sendAxis(PointerAxis axis, qreal delta, qint32 delta120)
     {
+        // Wheel source with a value120 half, deliberately: see the delivery
+        // contract above SynaraComputerUsePlugin::axis().
         Q_EMIT pointerAxisChanged(axis, delta, delta120, PointerAxisSource::Wheel, false, timestamp(), this);
         Q_EMIT pointerFrame(this);
     }
@@ -712,6 +722,17 @@ static qreal agentStrokeMargin(qreal size)
     return agentInkStrokeWidth(size) / 2 + 1;
 }
 
+static qreal agentGlowRadius(qreal size)
+{
+    return std::max(s_agentMinGlowRadius, size * s_agentGlowRadiusRatio);
+}
+
+/** The cursor image's margin: the halo reaches further out than any stroke. */
+static qreal agentCursorMargin(qreal size)
+{
+    return std::max(agentStrokeMargin(size), agentGlowRadius(size) + 1);
+}
+
 static QPainterPath agentCursorPath(qreal size)
 {
     QPainterPath path;
@@ -749,21 +770,39 @@ static QImage renderAgentCursorImage(qreal size, qreal devicePixelRatio)
 {
     const QPainterPath path = agentCursorPath(size);
     const QRectF bounds = path.boundingRect();
-    const qreal margin = agentStrokeMargin(size);
+    const qreal margin = agentCursorMargin(size);
     const QSizeF logicalSize(bounds.right() + 2 * margin, bounds.bottom() + 2 * margin);
     return renderAgentImage(logicalSize, devicePixelRatio, [&path, size, margin](QPainter &painter) {
         painter.translate(margin, margin);
+        // The halo, widest and faintest pass first. Stroking the silhouette at
+        // shrinking widths and rising alpha layers into a soft radial falloff
+        // without a blur pass, which these CPU-rendered images have no
+        // pipeline for.
+        const qreal glowRadius = agentGlowRadius(size);
+        painter.setBrush(Qt::NoBrush);
+        for (int pass = s_agentGlowPasses; pass >= 1; --pass) {
+            QColor glow = s_agentAccentColor;
+            glow.setAlphaF(s_agentGlowPassAlpha * (s_agentGlowPasses - pass + 1) / s_agentGlowPasses);
+            QPen pen(glow, glowRadius * 2 * pass / s_agentGlowPasses);
+            pen.setJoinStyle(Qt::RoundJoin);
+            painter.setPen(pen);
+            painter.drawPath(path);
+        }
+        // A core under the glyph, so antialiased edges blend into the halo's
+        // colour rather than into whatever is behind the cursor.
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(s_agentAccentColor);
+        painter.drawPath(path);
+        // The glyph itself: an ordinary pointer, white body over dark ink, the
+        // same silhouette as a stock theme arrow. The halo is what says this
+        // one is the agent's.
         painter.setBrush(Qt::NoBrush);
         QPen pen(s_agentInkColor, agentInkStrokeWidth(size));
         pen.setJoinStyle(Qt::RoundJoin);
         painter.setPen(pen);
         painter.drawPath(path);
-        pen.setColor(s_agentRimColor);
-        pen.setWidthF(agentRimStrokeWidth(size));
-        painter.setPen(pen);
-        painter.drawPath(path);
         painter.setPen(Qt::NoPen);
-        painter.setBrush(s_agentAccentColor);
+        painter.setBrush(s_agentRimColor);
         painter.drawPath(path);
     });
 }
@@ -807,7 +846,7 @@ static qreal agentCursorSize()
     const Cursor *cursor = Cursors::self() ? Cursors::self()->mouse() : nullptr;
     const int size = cursor ? cursor->themeSize() : 0;
     // The human's own cursor size, so the ghost is the same physical size as the
-    // pointer it sits beside; only the colour and the badge tell them apart.
+    // pointer it sits beside; only the halo and the badge tell them apart.
     return size > 0 ? qreal(size) : qreal(Cursor::defaultThemeSize());
 }
 
@@ -896,9 +935,12 @@ void SynaraAgentCursorItem::refresh()
     if (!m_imageItem) {
         m_imageItem = std::make_unique<ImageItem>(this);
     }
-    const qreal margin = agentStrokeMargin(m_cursorSize);
+    // The arrow image carries the halo's margin, the badge only its strokes';
+    // each offset compensates for its own image's padding so the hotspot and
+    // the badge anchor stay exactly where they were.
+    const qreal cursorMargin = agentCursorMargin(m_cursorSize);
     m_imageItem->setImage(cursor);
-    m_imageItem->setPosition(QPointF(-margin, -margin));
+    m_imageItem->setPosition(QPointF(-cursorMargin, -cursorMargin));
     m_imageItem->setSize(cursor.deviceIndependentSize());
 
     const QImage badge = renderAgentBadgeImage(m_agentName.isEmpty() ? s_agentFallbackName : m_agentName,
@@ -908,11 +950,12 @@ void SynaraAgentCursorItem::refresh()
         m_badgeItem = std::make_unique<ImageItem>(this);
         m_badgeItem->setVisible(false);
     }
+    const qreal badgeMargin = agentStrokeMargin(m_cursorSize);
     m_badgeItem->setImage(badge);
     // Below and right of the hotspot, clear of the arrow, so the badge never
     // covers the pixel the agent is about to click.
-    m_badgeItem->setPosition(QPointF(std::round(m_cursorSize * 0.55) - margin,
-                                     std::round(m_cursorSize * 0.90) - margin));
+    m_badgeItem->setPosition(QPointF(std::round(m_cursorSize * 0.55) - badgeMargin,
+                                     std::round(m_cursorSize * 0.90) - badgeMargin));
     m_badgeItem->setSize(badge.deviceIndependentSize());
 }
 
@@ -1084,6 +1127,13 @@ QString SynaraComputerUsePlugin::stateJson() const
         {QStringLiteral("agentName"), m_agentName.isEmpty() ? s_agentFallbackName : m_agentName},
         {QStringLiteral("pressedButtonCount"), m_pressedButtons.size()},
         {QStringLiteral("pressedKeyCount"), m_pressedKeys.size()},
+        // Whether CapsLock is latched on the keyboard this plugin drives. The
+        // server's QWERTY synthesis is Shift-only, so a latched CapsLock would
+        // turn "Hello" into "hELLO"; reporting it lets the backend invert its
+        // Shift decisions for letters. Absent on builds older than this field.
+        {QStringLiteral("capsLockOn"),
+         m_xkbState != nullptr &&
+             xkb_state_mod_name_is_active(m_xkbState, XKB_MOD_NAME_CAPS, XKB_STATE_MODS_LOCKED) == 1},
         {QStringLiteral("idleTimeoutMs"), double(m_idleTimeoutMs)},
         {QStringLiteral("idleMs"), double(idleMilliseconds())},
         {QStringLiteral("releasedByUser"), m_releasedByUser},
@@ -1435,6 +1485,12 @@ bool SynaraComputerUsePlugin::movePointer(double x, double y)
     if (!inputReady()) {
         return false;
     }
+    // NaN survives every downstream clamp (comparisons are all false), and
+    // wl_fixed_from_double would encode it into the compositor's pointer
+    // position, so non-finite input is refused at the door.
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        return false;
+    }
 
     m_pos = confinedPoint(QPointF(x, y));
     if (m_ownsCompositor) {
@@ -1530,6 +1586,20 @@ static int scrollValue120(double pixels)
  * Scrolls by @p horizontal and @p vertical desktop pixels, not wheel notches.
  *
  * Positive is right and down, matching wl_pointer's axis directions.
+ *
+ * Wheel source with both halves — the pixel axis and its value120 notch count
+ * — because it is the only scroll every toolkit acts on, measured live on
+ * 2026-08-22: V22 sent finger-source continuous deltas instead, hoping their
+ * pixels would be taken at face value, and Gecko ignored them completely (a
+ * single 300 px burst and a touchpad-cadence stream of 6x50 px both moved a
+ * form page zero pixels) while KWrite geared them ~5x. Wheel events always
+ * deliver; what varies by toolkit is the distance — Qt honors the pixel half
+ * exactly, browsers multiply the notch count by their own per-notch line
+ * distance (~7x in Gecko). That per-window gearing is deliberately NOT
+ * corrected here: the server measures real travel from before/after captures
+ * and pre-divides each window's requests (scrollCalibration.ts), which is the
+ * only place the correction can live, because no compositor-side unit is read
+ * the same way by every client.
  */
 bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
 {
@@ -1537,6 +1607,11 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
         return false;
     }
     if (!inputReady()) {
+        return false;
+    }
+    // Same hazard as movePointer: a non-finite delta poisons the value120
+    // conversion and any accumulator it touches.
+    if (!std::isfinite(horizontal) || !std::isfinite(vertical)) {
         return false;
     }
     if (!updatePointerFocus()) {
@@ -1678,6 +1753,15 @@ QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint 
     if (!calledFromDBus()) {
         return {};
     }
+    // The release shortcut revokes the agent's view as well as its hands:
+    // a latched release refuses capture until the user resumes, matching
+    // start() and the input path.
+    if (m_releasedByUser) {
+        sendErrorReply(s_releasedErrorName,
+                       QStringLiteral("computer control was released with %1")
+                           .arg(releaseShortcut().toString(QKeySequence::NativeText)));
+        return {};
+    }
     setDelayedReply(true);
     if (m_running) {
         noteActivity();
@@ -1694,6 +1778,14 @@ QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint 
 QByteArray SynaraComputerUsePlugin::captureRegion(int x, int y, uint width, uint height, uint maxDimension)
 {
     if (!calledFromDBus()) {
+        return {};
+    }
+    // Same privacy rule as captureWindow: a latched user release blanks the
+    // agent's view of the desktop, not just its input.
+    if (m_releasedByUser) {
+        sendErrorReply(s_releasedErrorName,
+                       QStringLiteral("computer control was released with %1")
+                           .arg(releaseShortcut().toString(QKeySequence::NativeText)));
         return {};
     }
     setDelayedReply(true);

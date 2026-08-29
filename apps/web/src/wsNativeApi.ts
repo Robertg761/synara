@@ -897,6 +897,7 @@ export function createWsNativeApi(): NativeApi {
       // the server's own build timeout is the one that should decide.
       provision: (input) =>
         transport.request(COMPUTER_WS_METHODS.provision, input, { timeoutMs: null }),
+      resetConsent: (input) => transport.request(COMPUTER_WS_METHODS.resetConsent, input),
       getThreadState: (input) => transport.request(COMPUTER_WS_METHODS.getThreadState, input),
       listWindows: (input) => transport.request(COMPUTER_WS_METHODS.listWindows, input),
       getScreenSize: (input) => transport.request(COMPUTER_WS_METHODS.getScreenSize, input),

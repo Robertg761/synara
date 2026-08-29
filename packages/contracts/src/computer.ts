@@ -30,6 +30,10 @@ export const COMPUTER_WS_METHODS = {
   performAction: "computer.performAction",
   getThreadState: "computer.getThreadState",
   subscribeEvents: "computer.subscribeEvents",
+  // Human-only recovery: clears a denied portal-consent latch so the next
+  // action may ask again. Deliberately absent from the agent tool surface — an
+  // agent must never be able to re-open a dialog the user just dismissed.
+  resetConsent: "computer.resetConsent",
   // User-driven input from the computer dock pane. Separate from the tool
   // surface above because it must work with no agent turn in flight, and
   // because a pane only ever sends resolved desktop coordinates — never the
@@ -43,12 +47,21 @@ export const COMPUTER_WS_CHANNELS = {
   event: "computer.event",
 } as const;
 
+/**
+ * Caps a window or computer identifier, which a compositor-side enumerator
+ * copies off the desktop and must clamp to this.
+ */
 export const COMPUTER_ID_MAX_LENGTH = 128;
 /**
  * Exported because it bounds `ComputerActionResult.value`, and the clipboard
  * read path must enforce it before putting clipboard text on that field.
  */
 export const COMPUTER_TEXT_MAX_LENGTH = 16 * 1024;
+/**
+ * Exported because backend window enumerators copy titles and app names
+ * verbatim off the desktop, and must clamp them to this before constructing
+ * `ComputerWindow` objects.
+ */
 export const COMPUTER_LABEL_MAX_LENGTH = 1_024;
 /**
  * Exported because the backend composes health and availability messages from
@@ -56,8 +69,17 @@ export const COMPUTER_LABEL_MAX_LENGTH = 1_024;
  * a state payload.
  */
 export const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
-/** Caps both a reported window list and one window's occluder list. */
+/**
+ * Caps both a reported window list and one window's occluder list. Exported
+ * because a backend enumerator must clamp its own list to this.
+ */
 export const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
+/**
+ * A sane ceiling on one window's `occludedBy` entries, far below the list
+ * maximum: stacking metadata is an N² hint in the worst case, and no caller
+ * needs hundreds of occluders. Exported for the same reason as above.
+ */
+export const COMPUTER_OCCLUDERS_MAX_LENGTH = 32;
 
 /**
  * Thread-activity kind appended by the agent gateway when a computer tool call
@@ -148,11 +170,18 @@ export type ComputerAvailability = typeof ComputerAvailability.Type;
  * been answered yet. Nothing is broken, nothing is retrying, and the user has to
  * go find a dialog — which is exactly the thing an `unavailable` badge would
  * hide. Availability stays `available` while health reports it.
+ *
+ * `consent-denied` is the dialog's other answer: the user dismissed or refused
+ * the desktop's permission request, and nothing will ask again until they say
+ * so. Distinct from `unavailable` because its remedy is a user decision — the
+ * panel offers to ask again (`computer.resetConsent`) rather than implying
+ * something needs repairing.
  */
 export const ComputerHealthStatus = Schema.Literals([
   "connected",
   "reconnecting",
   "awaiting-consent",
+  "consent-denied",
   "unavailable",
 ]);
 export type ComputerHealthStatus = typeof ComputerHealthStatus.Type;
@@ -444,6 +473,14 @@ export const ComputerGetStatusInput = Schema.Struct({});
 export type ComputerGetStatusInput = typeof ComputerGetStatusInput.Type;
 
 /**
+ * Empty on purpose: consent belongs to the whole desktop backend, not to a
+ * thread, and the reset takes no options — it either clears a denied latch or
+ * finds none to clear. The fresh status in the result says which.
+ */
+export const ComputerResetConsentInput = Schema.Struct({});
+export type ComputerResetConsentInput = typeof ComputerResetConsentInput.Type;
+
+/**
  * `ThreadComputerState` without the thread: the settings screen asks how this
  * server's desktop backend is doing, and there is no conversation to attribute
  * the answer to. Availability is corrected by live health the same way a thread
@@ -660,6 +697,22 @@ export const ComputerActionResult = Schema.Struct({
   clampedTo: Schema.optional(ComputerPoint),
   windowId: Schema.optional(ComputerWindowId),
   value: Schema.optional(Schema.String.check(Schema.isMaxLength(COMPUTER_TEXT_MAX_LENGTH))),
+  /**
+   * Scroll telemetry: what was asked, what was injected after gearing
+   * correction, and what the window content measurably did. `traveledY` is in
+   * logical pixels with the same sign convention as `deltaY` (positive = toward
+   * the end of the content); absent when the travel could not be measured.
+   * `gearing` is the learned travel-per-requested-pixel for this window — 1
+   * means pixel-true.
+   */
+  scroll: Schema.optional(
+    Schema.Struct({
+      requested: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
+      injected: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
+      traveledY: Schema.optional(Schema.Number),
+      gearing: Schema.optional(Schema.Number),
+    }),
+  ),
 });
 export type ComputerActionResult = typeof ComputerActionResult.Type;
 

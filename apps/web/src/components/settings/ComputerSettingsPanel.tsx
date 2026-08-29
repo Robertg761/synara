@@ -141,6 +141,11 @@ export function ComputerSettingsPanel({
     ...(health?.status === "awaiting-consent"
       ? ["Waiting for you to answer the desktop's permission dialog."]
       : []),
+    ...(health?.status === "consent-denied"
+      ? [
+          'The desktop\'s permission dialog was declined. Use "Ask for permission again" in the Computer panel to be asked once more.',
+        ]
+      : []),
     ...(health && health.reconnects > 0
       ? [
           `Reconnected ${health.reconnects === 1 ? "once" : `${health.reconnects} times`} since startup.`,
@@ -257,7 +262,7 @@ export function ComputerSettingsPanel({
       <SettingsSection title="Computer control">
         <SettingsRow
           title="Allow agents to control the desktop in new chats"
-          description="When the desktop backend is available, any agent in a new chat can act on the desktop when asked — computer control behaves like a skill, on by default. Turn this off to opt the whole machine out; individual chats can still be switched either way from the composer's mode menu, and doing so never changes this setting."
+          description="When the desktop backend is available, any agent in a new chat can act on the desktop when asked. Off by default — desktop access, including screenshots, is an explicit opt-in. Individual chats can still be switched either way from the composer's mode menu, and doing so never changes this setting."
           resetAction={
             settings.allowComputerControlInNewChats !== defaults.allowComputerControlInNewChats ? (
               <SettingResetButton

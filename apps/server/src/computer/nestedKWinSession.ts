@@ -24,13 +24,15 @@
  * replacement the next time a user or agent actually uses the desktop,
  * exactly like first use did.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { randomBytes } from "node:crypto";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
 import { asRecord, parseJsonPayload } from "./computerGeometry.ts";
 import {
+  assertFreshServiceOwner,
+  assertServiceOwnerPresent,
   resolveSynaraPluginLoad,
   scanInstalledPluginIds,
   SYSTEM_QT_PLUGIN_ROOTS,
@@ -38,6 +40,7 @@ import {
 } from "./KWinComputerBackend.ts";
 import { resolveInstallTarget } from "./kwinPluginProvisioning.ts";
 import {
+  COMPUTER_SERVICE,
   createSessionKWinComputerDbus,
   KWIN_SERVICE,
   waitForSessionBusName,
@@ -167,6 +170,9 @@ export async function startNestedKWinSession(
       KWIN_COMMAND,
       compositorArgs(mode, waylandDisplay, size),
       compositorEnv(busAddress, mode, hostEnv),
+      // stdout is the undrained-buffer hazard; stderr stays piped because its
+      // diagnostics are what a failed session's error names.
+      ["ignore", "ignore", "pipe"],
     );
 
     const timeoutMs = options.readyTimeoutMs ?? KWIN_READY_TIMEOUT_MS;
@@ -372,6 +378,11 @@ async function loadNestedPlugin(
   dbus: KWinComputerDbus,
   installed: readonly string[],
 ): Promise<string> {
+  // Who owns the well-known name before anything is loaded, so a load that
+  // leaves the previous holder in place is refused rather than driven. The
+  // nested session owns its bus, so a mismatch here means an unload race
+  // against this process's own previous generation.
+  const ownerBefore = await dbus.nameOwner(COMPUTER_SERVICE);
   const plan = resolveSynaraPluginLoad({ loaded: await dbus.listLoadedPluginIds(), installed });
   if (!plan) {
     throw new ComputerBackendError(
@@ -387,6 +398,9 @@ async function loadNestedPlugin(
           `the exact KWin version it was built against. Rebuild it with ${INSTALL_SCRIPT_PATH}.`,
       );
     }
+    assertFreshServiceOwner(await dbus.nameOwner(COMPUTER_SERVICE), ownerBefore);
+  } else {
+    assertServiceOwnerPresent(await dbus.nameOwner(COMPUTER_SERVICE));
   }
   return plan.pluginId;
 }
@@ -492,8 +506,20 @@ function start(
   command: string,
   args: readonly string[],
   env: NodeJS.ProcessEnv,
+  /**
+   * Non-piped streams for this child. kwin_wayland's stdout is chatty and
+   * nobody reads it: left piped and undrained it fills its ~64 KiB buffer and
+   * blocks the compositor mid-frame while health still reports connected.
+   */
+  stdio?: StdioOptions,
 ): SupervisedProcess {
-  const supervised = startSupervisedProcess({ command, args, env, spawnProcess });
+  const supervised = startSupervisedProcess({
+    command,
+    args,
+    env,
+    ...(stdio ? { stdio } : {}),
+    spawnProcess,
+  });
   children.push(supervised);
   return supervised;
 }

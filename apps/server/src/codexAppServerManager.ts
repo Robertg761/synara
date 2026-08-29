@@ -1878,9 +1878,12 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           : {}),
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
       });
-      // A fork carries no session-start capability facts (ProviderForkThreadInput
-      // has none), so the forked runtime leases the base capabilities only.
-      gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
+      // A fork carries the same computer-control fact a start does, so the
+      // forked runtime leases like-for-like capabilities instead of dropping
+      // `computer:control` at the fork boundary.
+      gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId, {
+        enableComputerControl: input.enableComputerControl === true,
+      });
       const child = spawnCodexAppServer({
         binaryPath: codexBinaryPath,
         cwd: resolvedCwd,
@@ -2162,14 +2165,23 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
     context.pendingApprovals.delete(requestId);
     const isPermissionRequest = isPermissionApprovalRequest(pendingRequest);
-    if (decision === "acceptForSession" && !isPermissionRequest) {
+    // The session override widens every later approval — commands and file
+    // changes included — so only a command/file-change prompt may set it. A
+    // tool call keeps its own, properly scoped channel: `acceptForSession` on
+    // an MCP tool request rides back as `_meta.persist: "session"`, which is
+    // the persistence Codex itself advertised, not a blanket grant.
+    const overridesSessionPolicy =
+      decision === "acceptForSession" &&
+      !isPermissionRequest &&
+      pendingRequest.requestKind !== "tool";
+    if (overridesSessionPolicy) {
       context.sessionApprovalOverride = CODEX_ALWAYS_ALLOW_SESSION_TURN_OVERRIDES;
     }
     await this.resolveApprovalRequest(context, pendingRequest, decision);
     if (decision === "cancel" && isPermissionRequest) {
       await this.interruptTurn(threadId, pendingRequest.turnId, pendingRequest.providerThreadId);
     }
-    if (decision === "acceptForSession" && !isPermissionRequest) {
+    if (overridesSessionPolicy) {
       await this.resolveRemainingSessionApprovalRequests(context);
     }
   }

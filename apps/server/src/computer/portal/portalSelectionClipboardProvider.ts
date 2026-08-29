@@ -32,17 +32,33 @@ export const PORTAL_CLIPBOARD_TEXT_MIME_TYPES = [
   "UTF8_STRING",
 ] as const;
 
+/**
+ * How long a clipboard transfer may stay silent.
+ *
+ * The 10 s bus timeout covers only the descriptor handout; the bytes themselves
+ * arrive whenever the current owner feels like writing them, so without a
+ * deadline of its own a stalled paste target hangs `computer_read_clipboard`
+ * forever while the lease sits held.
+ */
+const CLIPBOARD_TRANSFER_TIMEOUT_MS = 10_000;
+
 export interface PortalSelectionClipboardProviderOptions {
   /** Test seams: the real ones wrap a portal file descriptor in a socket. */
-  readonly readFd?: (fd: number, limit: number) => Promise<Buffer>;
+  readonly readFd?: (fd: number, limit: number, timeoutMs?: number) => Promise<Buffer>;
   readonly writeFd?: (fd: number, bytes: Buffer) => Promise<void>;
+  /**
+   * How long one clipboard transfer may stay silent before it is abandoned.
+   * Tests shorten it; the default is `CLIPBOARD_TRANSFER_TIMEOUT_MS`.
+   */
+  readonly transferTimeoutMs?: number;
 }
 
 export class PortalSelectionClipboardProvider implements PortalClipboardProvider {
   readonly id: PortalProviderId = "portal-selection";
 
-  private readonly readFd: (fd: number, limit: number) => Promise<Buffer>;
+  private readonly readFd: (fd: number, limit: number, timeoutMs?: number) => Promise<Buffer>;
   private readonly writeFd: (fd: number, bytes: Buffer) => Promise<void>;
+  private readonly transferTimeoutMs: number;
   /** The bytes this session has claimed it can produce, if any. */
   private offered: Buffer | undefined;
   private unsubscribeTransfer: (() => void) | undefined;
@@ -55,6 +71,11 @@ export class PortalSelectionClipboardProvider implements PortalClipboardProvider
   ) {
     this.readFd = options.readFd ?? readFileDescriptor;
     this.writeFd = options.writeFd ?? writeFileDescriptor;
+    this.transferTimeoutMs = options.transferTimeoutMs ?? CLIPBOARD_TRANSFER_TIMEOUT_MS;
+  }
+
+  resetDeniedConsent(): void {
+    this.session.resetDeniedConsent();
   }
 
   async read(): Promise<string> {
@@ -63,11 +84,21 @@ export class PortalSelectionClipboardProvider implements PortalClipboardProvider
     for (const mimeType of PORTAL_CLIPBOARD_TEXT_MIME_TYPES) {
       try {
         const fd = await this.session.selectionRead(mimeType);
-        const bytes = await this.readFd(fd, MAX_COMPUTER_CLIPBOARD_BYTES);
+        // Two layers of the same deadline: the default readFd destroys its own
+        // socket on loss, and this race guarantees the caller an answer even
+        // when a custom readFd has none.
+        const bytes = await abandonAfter(
+          this.readFd(fd, MAX_COMPUTER_CLIPBOARD_BYTES, this.transferTimeoutMs),
+          this.transferTimeoutMs,
+        );
         // The read stops at a byte count, which can land inside a multi-byte
         // character, so the tail is trimmed back to a whole one here.
         return decodeUtf8Clamped(bytes, MAX_COMPUTER_CLIPBOARD_BYTES);
       } catch (error) {
+        // A structured failure — a transfer that timed out rather than a type
+        // the owner does not offer — is not part of the negotiation, and
+        // retrying it under the next mime name only stalls the same way again.
+        if (error instanceof ComputerBackendError) throw error;
         // The portal answers with an error for a type the current owner does
         // not offer, so the loop is the negotiation: try the types we can
         // decode, and only give up when none of them worked.
@@ -142,21 +173,90 @@ export class PortalSelectionClipboardProvider implements PortalClipboardProvider
  * has no size to stat and no offset to seek, so the only way to know how much
  * there is is to read until the writer closes.
  */
-function readFileDescriptor(fd: number, limit: number): Promise<Buffer> {
+/**
+ * Rejects with the structured stall error when `work` outlives `timeoutMs`.
+ *
+ * Losing the race does not cancel `work` — a promise cannot be — which is why
+ * the default `readFileDescriptor` destroys its own socket on the same clock;
+ * this is the guarantee the caller sees either way.
+ */
+function abandonAfter<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () =>
+        reject(
+          new ComputerBackendError(
+            `The desktop portal acknowledged a clipboard transfer but sent nothing within ` +
+              `${timeoutMs} ms, so the read was abandoned.`,
+            { retryable: true },
+          ),
+        ),
+      timeoutMs,
+    );
+    timer.unref?.();
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
+/**
+ * Portal descriptors are pipes, and a pipe is a stream rather than a file: it
+ * has no size to stat and no offset to seek, so the only way to know how much
+ * there is is to read until the writer closes. Exported because the stall test
+ * exercises the real deadline against a real pipe.
+ */
+export function readFileDescriptor(fd: number, limit: number, timeoutMs?: number): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const socket = new Socket({ fd, readable: true, writable: false });
     const chunks: Buffer[] = [];
     let total = 0;
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+    // A writer that never closes the pipe would otherwise hold this promise
+    // — and the desktop lease with it — forever.
+    const timer = setTimeout(() => {
+      socket.destroy();
+      settle(() =>
+        reject(
+          new ComputerBackendError(
+            `The desktop portal acknowledged a clipboard transfer but sent nothing within ` +
+              `${timeoutMs ?? CLIPBOARD_TRANSFER_TIMEOUT_MS} ms, so the read was abandoned.`,
+            { retryable: true },
+          ),
+        ),
+      );
+    }, timeoutMs ?? CLIPBOARD_TRANSFER_TIMEOUT_MS);
+    timer.unref?.();
     socket.on("data", (chunk: Buffer) => {
       total += chunk.byteLength;
       chunks.push(chunk);
       // Truncated rather than failed: a clipboard holding a whole document is a
       // normal thing for a human to have, and refusing to read any of it would
       // be worse for the agent than reading the first megabyte.
-      if (total >= limit) socket.destroy();
+      if (total >= limit) {
+        socket.destroy();
+        settle(() => resolve(Buffer.concat(chunks).subarray(0, limit)));
+      }
     });
-    socket.on("error", reject);
-    socket.on("close", () => resolve(Buffer.concat(chunks).subarray(0, limit)));
+    socket.on("error", (error: Error) => {
+      settle(() => reject(error));
+    });
+    socket.on("close", () => {
+      settle(() => resolve(Buffer.concat(chunks).subarray(0, limit)));
+    });
   });
 }
 

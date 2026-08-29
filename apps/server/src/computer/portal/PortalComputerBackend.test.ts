@@ -94,12 +94,14 @@ function fakeInput(): PortalInputProvider & { readonly calls: string[] } {
   };
 }
 
-function fakeCapture(): PortalCaptureProvider & { readonly requests: ComputerRect[] } {
+function fakeCapture(
+  workspace: ComputerRect = WORKSPACE,
+): PortalCaptureProvider & { readonly requests: ComputerRect[] } {
   const requests: ComputerRect[] = [];
   return {
     requests,
     id: "wlr-screencopy",
-    workspaceRect: () => Promise.resolve(WORKSPACE),
+    workspaceRect: () => Promise.resolve(workspace),
     captureRegion: (region) => {
       requests.push(region);
       return Promise.resolve({ bytes: pngOfSize(region.width, region.height), region });
@@ -397,6 +399,71 @@ describe("PortalComputerBackend availability", () => {
   });
 });
 
+describe("PortalComputerBackend reprobe", () => {
+  it("keeps live providers on an upgrade, adopts the new slot, and refreshes capabilities", async () => {
+    const oldInput = fakeInput();
+    const oldInputDispose = vi.spyOn(oldInput, "dispose");
+    const freshInput = { ...fakeInput(), dispose: vi.fn(() => Promise.resolve()) };
+    const freshCapture = { ...fakeCapture(), dispose: vi.fn(() => Promise.resolve()) };
+    const upgraded = probeFor({
+      wlClipboard: true,
+      waylandGlobals: [WLROOTS_GLOBALS.dataControl],
+    });
+    const backend = backendWith(providersOf({ input: resolvedProvider(oldInput) }), {
+      recomputeProbe: () => Promise.resolve(upgraded),
+      buildProviders: () =>
+        providersOf({
+          input: resolvedProvider(freshInput),
+          capture: resolvedProvider(freshCapture),
+          clipboard: resolvedProvider(fakeClipboard()),
+        }),
+    });
+    expect(backend.capabilities().clipboard).toBe(false);
+
+    await backend.probeAvailability();
+
+    // The upgraded slot arrives, and the capability set follows the providers
+    // it was derived from instead of freezing the boot answer.
+    expect(backend.capabilities().clipboard).toBe(true);
+    // The slots that already resolved keep their live providers — sessions and
+    // consent live there — and the fresh duplicates are disposed, not leaked.
+    expect(oldInputDispose).not.toHaveBeenCalled();
+    expect(freshInput.dispose).toHaveBeenCalledTimes(1);
+    expect(freshCapture.dispose).toHaveBeenCalledTimes(1);
+
+    await backend.click({ x: 10, y: 10 });
+    expect(oldInput.calls.length).toBeGreaterThan(0);
+    expect(freshInput.calls).toEqual([]);
+  });
+
+  it("installs the shipped helper only on the establishing read, then reprobes at once", async () => {
+    const resolveHelper = vi
+      .fn<() => Promise<{ path?: string }>>()
+      .mockResolvedValue({ path: "/tmp/synara-desktop-helper" });
+    const recomputeProbe = vi.fn(() => Promise.resolve(probeFor()));
+    const backend = backendWith(providersOf(), {
+      recomputeProbe,
+      buildProviders: () => providersOf(),
+      resolveHelper,
+    });
+
+    // Boot's passive read installs nothing, by contract.
+    await backend.probeAvailability();
+    expect(resolveHelper).not.toHaveBeenCalled();
+    expect(recomputeProbe).toHaveBeenCalledTimes(1);
+
+    // The establishing read is licensed to install, and a successful install
+    // un-throttles the refresh so the new binary is probed immediately.
+    await backend.availability();
+    expect(resolveHelper).toHaveBeenCalledTimes(1);
+    expect(recomputeProbe).toHaveBeenCalledTimes(2);
+
+    // Throttled thereafter: one establishing read does not hammer the installer.
+    await backend.availability();
+    expect(resolveHelper).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("PortalComputerBackend consent", () => {
   it("stays available while consent is outstanding and says so in health", async () => {
     // A missing grant is a user action, not a fault: an unavailable badge would
@@ -421,7 +488,19 @@ describe("PortalComputerBackend consent", () => {
     backend.setConsentState("granted");
 
     expect(backend.consentState().state).toBe("denied");
-    expect(backend.health().status).toBe("unavailable");
+    expect(backend.health().status).toBe("consent-denied");
+  });
+
+  it("blocks availability while denied, with the reason and its remedy", async () => {
+    const backend = backendWith(providersOf(), {
+      probe: probeFor({ portal: { present: true, remoteDesktopVersion: 2 } }),
+    });
+    backend.setConsentState("denied", "The user cancelled the screen-sharing dialog.");
+
+    await expect(backend.availability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("cancelled the screen-sharing dialog"),
+    });
   });
 
   it("clears a latched denial only through an explicit reset", () => {
@@ -430,6 +509,19 @@ describe("PortalComputerBackend consent", () => {
     backend.setConsentState("not-requested");
 
     expect(backend.consentState().state).toBe("not-requested");
+  });
+
+  it("resetConsent clears a denial exactly once and reports whether it did", () => {
+    const backend = backendWith(providersOf(), {
+      probe: probeFor({ portal: { present: true, remoteDesktopVersion: 2 } }),
+    });
+    backend.setConsentState("denied", "cancelled");
+
+    expect(backend.resetConsent()).toBe(true);
+    expect(backend.consentState().state).toBe("not-requested");
+    expect(backend.health().status).not.toBe("consent-denied");
+    // Nothing is latched any more, so a second reset has nothing to clear.
+    expect(backend.resetConsent()).toBe(false);
   });
 
   it("starts at not-required on a desktop with no portal to prompt from", () => {
@@ -818,6 +910,93 @@ describe("PortalComputerBackend perception", () => {
   });
 });
 
+describe("PortalComputerBackend negative-origin layouts", () => {
+  // A monitor left of or above the primary puts the desktop's top-left at
+  // negative layout coordinates. The providers speak that space; the agent
+  // speaks 0..screenSize. These pin the translation at the backend boundary —
+  // the same contract the KWin backend keeps — because a screenshot that shows
+  // pixels the agent cannot click is exactly the bug this exists to prevent.
+  const SHIFTED: ComputerRect = { x: -1920, y: -1080, width: 3840, height: 2160 };
+
+  it("clicks in agent space and drives the sink in layout space", async () => {
+    const input = fakeInput();
+    const backend = backendWith(
+      providersOf({
+        input: resolvedProvider(input),
+        capture: resolvedProvider(fakeCapture(SHIFTED)),
+      }),
+    );
+    // Perception first, as in a real turn: the origin comes from the freshest
+    // workspace read, and before one exists the backend can only assume (0,0).
+    await backend.getScreenSize();
+    await backend.click({ x: 200, y: 100 });
+
+    expect(input.calls.filter((call) => call.startsWith("movePointer")).at(-1)).toBe(
+      "movePointer -1720,-980",
+    );
+  });
+
+  it("reports window bounds in agent space", async () => {
+    const backend = backendWith(
+      providersOf({
+        capture: resolvedProvider(fakeCapture(SHIFTED)),
+        windows: resolvedProvider(
+          fakeWindows(
+            [
+              {
+                ...WINDOW_WITHOUT_BOUNDS,
+                bounds: { x: -1800, y: -1000, width: 640, height: 480 },
+              },
+            ],
+            { providesBounds: true },
+          ),
+        ),
+      }),
+    );
+
+    const windows = await backend.listWindows();
+    expect(windows[0]?.bounds).toEqual({ x: 120, y: 80, width: 640, height: 480 });
+  });
+
+  it("captures an agent-space region against the layout-space desktop and answers in agent space", async () => {
+    const capture = fakeCapture(SHIFTED);
+    const backend = backendWith(providersOf({ capture: resolvedProvider(capture) }));
+
+    const screenshot = await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 100, y: 50, width: 400, height: 300 },
+    });
+
+    expect(capture.requests.at(-1)).toEqual({ x: -1820, y: -1030, width: 400, height: 300 });
+    expect(screenshot.region).toEqual({ x: 100, y: 50, width: 400, height: 300 });
+  });
+
+  it("keeps the whole desktop addressable: agent space spans 0..screenSize", async () => {
+    const capture = fakeCapture(SHIFTED);
+    const backend = backendWith(providersOf({ capture: resolvedProvider(capture) }));
+
+    await expect(backend.getScreenSize()).resolves.toEqual({
+      width: 3840,
+      height: 2160,
+      scale: 1,
+    });
+    // The far corner of the bottom-right monitor is reachable...
+    const corner = await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 3800, y: 2100, width: 40, height: 60 },
+    });
+    expect(capture.requests.at(-1)).toEqual({ x: 1880, y: 1020, width: 40, height: 60 });
+    expect(corner.region).toEqual({ x: 3800, y: 2100, width: 40, height: 60 });
+    // ...and a request outside it refuses in agent space, not layout space.
+    await expect(
+      backend.captureScreenshot({
+        kind: "region",
+        region: { x: 4000, y: 2200, width: 10, height: 10 },
+      }),
+    ).rejects.toThrow(/lies outside the desktop 0,0 3840×2160|lies outside the desktop/);
+  });
+});
+
 describe("PortalComputerBackend lifecycle", () => {
   it("disposes every resolved provider even when one of them throws", async () => {
     const failing: PortalClipboardProvider = {
@@ -926,7 +1105,7 @@ describe("the Tier 2 provisioning lifecycle", () => {
           summary: "compiled",
         });
       },
-      reprobe: () => Promise.resolve(withHelper()),
+      recomputeProbe: () => Promise.resolve(withHelper()),
       buildProviders: () => {
         disposed.push("built");
         return workingProviders();
@@ -952,7 +1131,7 @@ describe("the Tier 2 provisioning lifecycle", () => {
       providers: resolvePortalProviders(withoutHelper()),
       platform: "linux",
       provisionHelper: () => Promise.reject(new Error("this machine is missing cc")),
-      reprobe: () => Promise.resolve(withoutHelper()),
+      recomputeProbe: () => Promise.resolve(withoutHelper()),
       buildProviders: () => resolvePortalProviders(withoutHelper()),
     });
 
@@ -978,7 +1157,7 @@ describe("the Tier 2 provisioning lifecycle", () => {
           path: "/tmp/synara-computer-desktop-helper",
           summary: "current",
         }),
-      reprobe: () => Promise.resolve(withoutHelper()),
+      recomputeProbe: () => Promise.resolve(withoutHelper()),
       buildProviders: () => {
         builds += 1;
         return workingProviders();
@@ -1008,7 +1187,10 @@ describe("the Tier 2 provisioning lifecycle", () => {
               summary: "compiled",
             });
       },
-      reprobe: () => Promise.resolve(withHelper()),
+      // The desktop only gains the helper once an attempt succeeds; a probe
+      // that found one after a failed compile would be describing a machine
+      // other than this one.
+      recomputeProbe: () => Promise.resolve(attempts >= 2 ? withHelper() : withoutHelper()),
       buildProviders: () => workingProviders(),
     });
 
@@ -1023,12 +1205,18 @@ describe("the Tier 2 provisioning lifecycle", () => {
     // An installed helper can still be stale against the sources this build
     // shipped; the check inside provisioning is the only thing that notices.
     // "Already current" with the helper already probed then changes nothing,
-    // so no re-probe spawns it to re-read a registry the plan reflects.
+    // so no re-probe spawns it to re-read a registry the plan reflects. Every
+    // slot is resolved here so the stale-capability catch-up has nothing to
+    // do either; the only candidate reprobe is provisioning's own.
     let attempts = 0;
-    const reprobe = vi.fn(() => Promise.resolve(withHelper()));
+    const recomputeProbe = vi.fn(() => Promise.resolve(withHelper()));
     const backend = new PortalComputerBackend({
       probe: withHelper(),
-      providers: workingProviders(),
+      providers: {
+        ...workingProviders(),
+        windows: resolvedProvider(fakeWindows([])),
+        clipboard: resolvedProvider(fakeClipboard()),
+      },
       platform: "linux",
       provisionHelper: () => {
         attempts += 1;
@@ -1038,13 +1226,13 @@ describe("the Tier 2 provisioning lifecycle", () => {
           summary: "current",
         });
       },
-      reprobe,
+      recomputeProbe,
       buildProviders: () => workingProviders(),
     });
 
     await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
     expect(attempts).toBe(1);
-    expect(reprobe).not.toHaveBeenCalled();
+    expect(recomputeProbe).not.toHaveBeenCalled();
     await backend.availability();
     expect(attempts).toBe(1);
     await backend.dispose();
@@ -1069,7 +1257,7 @@ describe("the Tier 2 provisioning lifecycle", () => {
             });
         });
       },
-      reprobe: () => Promise.resolve(withHelper()),
+      recomputeProbe: () => Promise.resolve(withHelper()),
       buildProviders: () => workingProviders(),
     });
 
@@ -1100,7 +1288,7 @@ describe("the Tier 2 provisioning lifecycle", () => {
           path: "/tmp/synara-computer-desktop-helper",
           summary: "compiled",
         }),
-      reprobe: () => Promise.resolve(withHelper()),
+      recomputeProbe: () => Promise.resolve(withHelper()),
       buildProviders: () => workingProviders(),
     });
     backend.onEvent((event) => {
@@ -1114,12 +1302,13 @@ describe("the Tier 2 provisioning lifecycle", () => {
     await backend.dispose();
   });
 
-  it("keeps an unchanged slot's live provider across an adoption", async () => {
-    // A GNOME desktop where provisioning's re-probe moves the clipboard from
-    // the portal to wl-clipboard: the windows provider's answer is unchanged
-    // and must survive, while the session-backed input is replaced along with
-    // the clipboard — splitting the portal session's slots across old and new
-    // sets would leave two sessions each raising its own consent dialog.
+  it("keeps every resolved slot's live provider across an adoption", async () => {
+    // A GNOME desktop whose helper arrives after the portal session was
+    // granted. The fresh plan would now serve the clipboard through
+    // wl-clipboard, but the slot already resolved through the portal and holds
+    // the user's grant; rebuilding it — or the session-backed input beside it
+    // — would put a second consent dialog on their screen for no gain. Only a
+    // slot that was blocked takes the freshly built provider.
     const gnomeBase = {
       desktop: "gnome",
       desktopExtensionPresent: true,
@@ -1135,17 +1324,23 @@ describe("the Tier 2 provisioning lifecycle", () => {
     const after = probeFor({
       ...gnomeBase,
       helperBinary: "/tmp/synara-computer-desktop-helper",
-      waylandGlobals: [WLROOTS_GLOBALS.dataControl],
+      waylandGlobals: [WLROOTS_GLOBALS.dataControl, WLROOTS_GLOBALS.screencopy],
     });
     const keptWindow = { id: "kept-window", title: "Kept" } as unknown as ComputerWindow;
     const oldWindows = fakeWindows([keptWindow]);
     const oldInput = fakeInput();
     const oldClipboard = fakeClipboard();
     const freshWindows = fakeWindows([]);
+    const freshInput = fakeInput();
+    const freshClipboard = fakeClipboard();
+    const freshCapture = fakeCapture();
     const disposeOldWindows = vi.spyOn(oldWindows, "dispose");
     const disposeOldInput = vi.spyOn(oldInput, "dispose");
     const disposeOldClipboard = vi.spyOn(oldClipboard, "dispose");
     const disposeFreshWindows = vi.spyOn(freshWindows, "dispose");
+    const disposeFreshInput = vi.spyOn(freshInput, "dispose");
+    const disposeFreshClipboard = vi.spyOn(freshClipboard, "dispose");
+    const disposeFreshCapture = vi.spyOn(freshCapture, "dispose");
     const backend = new PortalComputerBackend({
       probe: before,
       providers: {
@@ -1161,20 +1356,24 @@ describe("the Tier 2 provisioning lifecycle", () => {
           path: "/tmp/synara-computer-desktop-helper",
           summary: "installed",
         }),
-      reprobe: () => Promise.resolve(after),
+      recomputeProbe: () => Promise.resolve(after),
       buildProviders: () => ({
-        input: resolvedProvider<PortalInputProvider>(fakeInput()),
-        capture: missingProvider<PortalCaptureProvider>("still no capture"),
+        input: resolvedProvider<PortalInputProvider>(freshInput),
+        capture: resolvedProvider<PortalCaptureProvider>(freshCapture),
         windows: resolvedProvider<PortalWindowProvider>(freshWindows),
-        clipboard: resolvedProvider<PortalClipboardProvider>(fakeClipboard()),
+        clipboard: resolvedProvider<PortalClipboardProvider>(freshClipboard),
       }),
     });
 
     await backend.availability();
     expect(disposeOldWindows).not.toHaveBeenCalled();
+    expect(disposeOldInput).not.toHaveBeenCalled();
+    expect(disposeOldClipboard).not.toHaveBeenCalled();
     expect(disposeFreshWindows).toHaveBeenCalledOnce();
-    expect(disposeOldInput).toHaveBeenCalledOnce();
-    expect(disposeOldClipboard).toHaveBeenCalledOnce();
+    expect(disposeFreshInput).toHaveBeenCalledOnce();
+    expect(disposeFreshClipboard).toHaveBeenCalledOnce();
+    expect(disposeFreshCapture).not.toHaveBeenCalled();
+    expect(backend.capabilities().capture).toBe(true);
     await expect(backend.listWindows()).resolves.toEqual([keptWindow]);
     await backend.dispose();
   });
@@ -1192,7 +1391,7 @@ describe("the Tier 2 provisioning lifecycle", () => {
           path: "/tmp/synara-computer-desktop-helper",
           summary: "compiled",
         }),
-      reprobe: () =>
+      recomputeProbe: () =>
         new Promise<PortalProbe>((resolveProbe) => {
           releaseReprobe = () => resolveProbe(withHelper());
         }),
@@ -1217,7 +1416,7 @@ describe("the Tier 2 provisioning lifecycle", () => {
       providers: resolvePortalProviders(withoutHelper()),
       platform: "linux",
       provisionHelper: () => Promise.reject(new Error("cc is missing ".repeat(500))),
-      reprobe: () => Promise.resolve(withoutHelper()),
+      recomputeProbe: () => Promise.resolve(withoutHelper()),
       buildProviders: () => resolvePortalProviders(withoutHelper()),
     });
 
@@ -1232,25 +1431,28 @@ describe("the Tier 2 provisioning lifecycle", () => {
 
 describe("createPortalComputerBackend", () => {
   it("resolves the providers from the probe when none are supplied", async () => {
-    const backend = createPortalComputerBackend(
-      probeFor({
-        desktop: "gnome",
-        portal: {
-          present: true,
-          remoteDesktopVersion: 2,
-          screenCastVersion: 5,
-          availableDeviceTypes: REMOTE_DESKTOP_DEVICE_POINTER,
-        },
-      }),
-      {
-        platform: "linux",
-        // Without the seam the arbiter would arm the real
-        // `org.gnome.Mutter.IdleMonitor` on this machine's session bus.
-        providerOptions: {
-          createSeatIdleSource: () => ({ sample: () => Promise.resolve(SEAT_QUIET) }),
-        },
+    const probe = probeFor({
+      desktop: "gnome",
+      portal: {
+        present: true,
+        remoteDesktopVersion: 2,
+        screenCastVersion: 5,
+        availableDeviceTypes: REMOTE_DESKTOP_DEVICE_POINTER,
       },
-    );
+    });
+    const backend = createPortalComputerBackend(probe, {
+      platform: "linux",
+      // The factory's defaults re-probe the real desktop and install the real
+      // helper; on a developer's machine either could turn this fixed probe's
+      // missing capture into a present one.
+      recomputeProbe: () => Promise.resolve(probe),
+      resolveHelper: () => Promise.resolve({}),
+      // Without the seam the arbiter would arm the real
+      // `org.gnome.Mutter.IdleMonitor` on this machine's session bus.
+      providerOptions: {
+        createSeatIdleSource: () => ({ sample: () => Promise.resolve(SEAT_QUIET) }),
+      },
+    });
 
     // The portal session is built lazily, so resolving providers raises no
     // dialog and touches no bus until something actually asks for input.

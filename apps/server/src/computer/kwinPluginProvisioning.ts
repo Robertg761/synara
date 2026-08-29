@@ -26,7 +26,7 @@
  * path is already there.
  */
 import { existsSync } from "node:fs";
-import { chmod, copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -108,12 +108,25 @@ export function renderEnvScript(qtPluginRoot: string): string {
 
 export type EnvScriptOutcome = "unchanged" | "written";
 
-/** Idempotent: rewrites only when the content differs, so mtime means something. */
+/**
+ * Idempotent: rewrites only when the content differs, so mtime means something.
+ *
+ * The write is temp-plus-rename, matching install-and-load.sh: Plasma sources
+ * every script in this directory at login, and a crash mid-`writeFile` would
+ * leave a truncated one sourced by every future session.
+ */
 export async function ensureEnvScript(path: string, contents: string): Promise<EnvScriptOutcome> {
   const existing = await readFile(path, "utf8").catch(() => undefined);
   if (existing === contents) return "unchanged";
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, contents, { mode: 0o755 });
+  const staged = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(staged, contents, { mode: 0o755 });
+    await rename(staged, path);
+  } catch (error) {
+    await rm(staged, { force: true }).catch(() => undefined);
+    throw error;
+  }
   return "written";
 }
 
@@ -163,16 +176,40 @@ export function selectPrebuilt(
   return manifest.builds.find((build) => build.kwinVersion === kwinVersion && build.arch === arch);
 }
 
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/**
+ * Reads a manifest, dropping any entry that could not be acted on anyway.
+ *
+ * The same guard `desktopHelperInstall` applies: a `file` is a name inside the
+ * prebuilt root and nothing else, so a path escape or an empty checksum is a
+ * malformed entry rather than something to resolve or install.
+ */
 export async function readPrebuiltManifest(path: string): Promise<PrebuiltManifest | undefined> {
   const raw = await readFile(path, "utf8").catch(() => undefined);
   if (raw === undefined) return undefined;
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    const builds = (parsed as { builds?: unknown }).builds;
-    return Array.isArray(builds) ? { builds: builds as readonly PrebuiltBuild[] } : undefined;
+    parsed = JSON.parse(raw);
   } catch {
     return undefined;
   }
+  const builds = (parsed as { builds?: unknown }).builds;
+  if (!Array.isArray(builds)) return undefined;
+  const accepted = builds.flatMap((entry) => {
+    const build = entry as Partial<PrebuiltBuild> | null;
+    if (!build || typeof build !== "object") return [];
+    const { kwinVersion, arch, file, sha256 } = build;
+    if (!isText(kwinVersion) || !isText(arch) || !isText(file) || !isText(sha256)) return [];
+    if (file.includes("/") || file.includes("\\") || file === "." || file === "..") return [];
+    if (!SHA256_HEX.test(sha256)) return [];
+    return [{ kwinVersion, arch, file, sha256 } satisfies PrebuiltBuild];
+  });
+  return accepted.length > 0 ? { builds: accepted } : undefined;
+}
+
+function isText(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
 }
 
 /**
@@ -253,16 +290,25 @@ export async function writeInstallStamp(
   },
 ): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(
-    path,
-    [
-      `plugin_id=${record.pluginId}`,
-      `installed_at=${record.installedAt}`,
-      `plugin_path=${record.pluginPath}`,
-      `kwin_version=${record.kwinVersion ?? ""}`,
-      "",
-    ].join("\n"),
-  );
+  // Temp-plus-rename for the same reason the env script is: a crash mid-write
+  // would leave a half-read stamp answering version questions wrongly.
+  const staged = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(
+      staged,
+      [
+        `plugin_id=${record.pluginId}`,
+        `installed_at=${record.installedAt}`,
+        `plugin_path=${record.pluginPath}`,
+        `kwin_version=${record.kwinVersion ?? ""}`,
+        "",
+      ].join("\n"),
+    );
+    await rename(staged, path);
+  } catch (error) {
+    await rm(staged, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 export type ProvisionAction = "already-current" | "installed-prebuilt" | "installed-from-source";

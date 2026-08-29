@@ -22,15 +22,11 @@
  * user is shown.
  */
 import { KWIN_SERVICE } from "../kwinDbus.ts";
-import { commandExists as commandOnPath } from "../provisioning/toolchain.ts";
+import { commandExists as commandOnPath, executableExists } from "../provisioning/toolchain.ts";
 import { readSessionBusProperty, sessionBusNameHasOwner } from "../sessionBusNames.ts";
 import { unwrapDbusValue } from "../computerGeometry.ts";
 import { readWaylandGlobals } from "./desktopHelperClient.ts";
-import {
-  desktopHelperPath,
-  resolveDesktopHelper,
-  type DesktopHelperResolution,
-} from "./desktopHelperInstall.ts";
+import { desktopHelperPath } from "./desktopHelperInstall.ts";
 import type { PortalCapabilitySlot, PortalProviderId } from "./providers.ts";
 
 /**
@@ -246,26 +242,20 @@ export async function probeDesktop(
     );
   }
 
-  // Resolved before the globals are read, not after: the resolution is what may
-  // install a shipped binary, and a global list read without one is an empty
-  // list that would plan every wlroots capability away until the next boot.
+  // Checked for presence only — not resolved. Resolving installs a shipped
+  // binary, and the boot-time probe runs for every user of every build, so an
+  // install here would contradict "install nothing until someone uses the
+  // desktop". Resolution is deferred to the first real use; until then a
+  // missing helper plans the wlroots capabilities away in this probe, and the
+  // backend's re-probe brings them back once one exists.
   const helperPath = desktopHelperPath(env);
-  const helper = await resolveDesktopHelper({
-    env,
-    ...(dependencies.executableExists ? { executableExists: dependencies.executableExists } : {}),
-    ...("prebuiltRoot" in dependencies ? { prebuiltRoot: dependencies.prebuiltRoot } : {}),
-  }).catch(
-    (error: unknown): DesktopHelperResolution => ({
-      note: `A binary shipped with this build could not be checked (${describe(error)}).`,
-    }),
-  );
-  const helperBinary = helper.path;
+  const helperPresent = await (dependencies.executableExists ?? executableExists)(helperPath);
+  const helperBinary = helperPresent ? helperPath : undefined;
   if (!helperBinary) {
     record(
       "desktop-helper",
       `The native desktop helper is not built at ${helperPath}, so libei input, PipeWire capture, and the wlroots protocols have no transport. ` +
-        "Build it with the computer-desktop-helper target, or point SYNARA_COMPUTER_HELPER at an existing build." +
-        (helper.note ? ` ${helper.note}` : ""),
+        "Build it with the computer-desktop-helper target, or point SYNARA_COMPUTER_HELPER at an existing build.",
     );
   }
 
@@ -585,29 +575,26 @@ function helperBacked(implementation: PortalProviderId, probe: PortalProbe): Por
 }
 
 /**
- * The one Tier 2 gap that is Synara's missing code, not the user's missing
- * package.
+ * The one Tier 2 gap that is unimplemented code, and must say so.
  *
  * The ScreenCast portal is reachable and its session is already brokered — the
  * granted stream's node id, position, and size come back in the `Start`
  * response, which is what makes absolute pointing work on this desktop today.
  * What is missing is the other half: the frames themselves arrive over
- * PipeWire, and Synara has no PipeWire receiver written — not in Node, not in
- * the native helper. This refusal must not read as an instruction: an earlier
- * version told users to install the PipeWire headers and rebuild the helper,
- * which changes nothing, because there is no PipeWire code waiting on those
- * headers. Saying plainly that the feature is not implemented yet — and what
- * works instead — is what stops a user chasing a rebuild that cannot help, or
- * concluding GNOME is unsupported.
+ * PipeWire, and Synara has no PipeWire receiver anywhere — not in Node and not
+ * in the native helper, whatever headers it is rebuilt against. The refusal
+ * must not promise a rebuild that changes nothing; the honest answer is that
+ * GNOME screen capture is not implemented yet, plus the nested desktop that
+ * works today.
  */
 function nativeCaptureGap(): PortalProviderChoice {
   return {
     implementation: "pipewire-screencast",
     blockedBy:
-      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara cannot " +
-      "receive PipeWire streams yet — that part is not implemented, so no package install or helper rebuild will " +
-      "enable it. Until it ships this desktop's screen cannot be read; SYNARA_COMPUTER_NESTED=window runs an " +
-      "isolated agent desktop that can be captured today.",
+      "This desktop captures through the ScreenCast portal, which delivers frames over PipeWire, and Synara " +
+      "cannot receive PipeWire streams yet — no rebuild or package adds that, so this desktop's screen cannot " +
+      "be read by the agent for now. SYNARA_COMPUTER_NESTED=window runs an isolated agent desktop that can be " +
+      "captured today.",
   };
 }
 

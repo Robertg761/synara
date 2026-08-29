@@ -1,6 +1,6 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -140,41 +140,26 @@ describe("probeDesktop", () => {
     expect(messages["desktop-helper"]).toContain("SYNARA_COMPUTER_HELPER");
   });
 
-  it("keeps the build.sh refusal word for word and adds why no shipped binary was used", async () => {
+  it("records the missing helper without installing anything, deferring resolution to first use", async () => {
     const probe = await probeDesktop(desktop({ env: { XDG_SESSION_TYPE: "wayland" } }));
     const message = probe.gaps.find((gap) => gap.step === "desktop-helper")?.message ?? "";
 
-    // The sentence a user acts on has not moved: the note is an addition to it,
-    // never a replacement for it.
+    // The sentence a user acts on has not moved. The probe itself installs
+    // nothing — boot must not put a binary in place — so the shipped-bundle
+    // check happens later, when someone actually uses the desktop.
     expect(message).toContain("The native desktop helper is not built at");
     expect(message).toContain(
       "Build it with the computer-desktop-helper target, or point SYNARA_COMPUTER_HELPER at an existing build.",
     );
-    expect(message).toContain("No prebuilt helpers ship with this build");
   });
 
-  it("says which system a shipped binary would have had to be built for", async () => {
-    const root = await mkdtemp(join(tmpdir(), "synara-helper-prebuilt-"));
-    await writeFile(
-      join(root, "manifest.json"),
-      JSON.stringify({
-        builds: [
-          {
-            osId: "a-distribution-nobody-runs",
-            osVersionId: "1",
-            arch: "x64",
-            file: "synara-computer-desktop-helper-a-distribution-nobody-runs-1-x64",
-            sha256: "00",
-          },
-        ],
-      }),
+  it("uses a helper that is already present without touching the manifest", async () => {
+    const probe = await probeDesktop(desktop({ helper: true }));
+
+    expect(probe.helperBinary).toBe(
+      "/home/tester/.local/share/synara/computer/synara-computer-desktop-helper",
     );
-
-    const probe = await probeDesktop(desktop({ prebuiltRoot: root }));
-    const message = probe.gaps.find((gap) => gap.step === "desktop-helper")?.message ?? "";
-
-    expect(message).toContain("for this system");
-    expect(probe.helperBinary).toBeUndefined();
+    expect(probe.gaps.find((gap) => gap.step === "desktop-helper")).toBeUndefined();
   });
 
   it("reports an X11 session as the wrong session type, with the nested escape hatch", async () => {
@@ -360,12 +345,12 @@ describe("planPortalProviders", () => {
     expect(plan.input.implementation).toBe("portal-remote-desktop");
     expect(plan.input.blockedBy).toBeUndefined();
     expect(plan.clipboard.implementation).toBe("portal-selection");
-    // Only the frames are missing, and the sentence says the gap is Synara's
-    // unwritten PipeWire receiver — not a package or rebuild the user owes.
+    // Only the frames are missing, and the sentence says so honestly: no
+    // rebuild adds a PipeWire receiver, so none may be promised.
     expect(plan.capture.implementation).toBe("pipewire-screencast");
-    expect(plan.capture.blockedBy).toMatch(/not implemented/);
+    expect(plan.capture.blockedBy).toMatch(/cannot receive PipeWire streams yet/);
     expect(plan.capture.blockedBy).toMatch(/SYNARA_COMPUTER_NESTED=window/);
-    expect(plan.capture.blockedBy).not.toMatch(/pipewire-devel|rebuild the helper|build\.sh/);
+    expect(plan.capture.blockedBy).not.toMatch(/pipewire-devel|build\.sh/);
   });
 
   it("blocks portal input when the desktop has no ScreenCast to anchor motion to", () => {

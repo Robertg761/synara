@@ -14,11 +14,23 @@
  * distribution containers and this module installs one. The order is:
  *
  * 1. `SYNARA_COMPUTER_HELPER`, when it points at something executable.
- * 2. Whatever `build.sh` left at the default path.
+ * 2. Whatever `build.sh` left at the default path — executed as-is when this
+ *    build ships nothing to verify it against, and re-verified against the
+ *    shipped manifest when it does.
  * 3. A binary shipped with this build that matches this system, checksum
  *    verified, copied into the default path.
  * 4. Nothing — and the refusal keeps naming `build.sh`, because it is still the
  *    answer for a system no container in the matrix resembles.
+ *
+ * An install this module performed is **stamped**: the manifest entry's
+ * checksum, the system tuple it was chosen for, and the helper protocol version
+ * land in a `.stamp` beside the binary. On every later resolution the installed
+ * bytes are re-verified against that stamp instead of being trusted forever —
+ * a truncated copy or a tampered binary is replaced from the bundle, a shipped
+ * manifest that has moved on upgrades the install in place, and a stamp written
+ * by a build speaking an older helper protocol is a reinstall trigger. Only a
+ * binary with no stamp and no shipped counterpart (the `build.sh` case) is ever
+ * executed unverified.
  *
  * ## The matching key, and why it is this one
  *
@@ -58,11 +70,23 @@
  * because the build linked against the newest libraries that still fit is the
  * one compiled on the system most like this one.
  */
-import { access, chmod, constants, copyFile, mkdir, readFile, rename, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  access,
+  chmod,
+  constants,
+  copyFile,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { verifyPrebuilt } from "../provisioning/prebuiltVerification.ts";
+import { DESKTOP_HELPER_PROTOCOL_VERSION } from "./desktopHelperClient.ts";
 
 /** Points at a directory of prebuilt helpers, for a packager or a developer. */
 export const DESKTOP_HELPER_PREBUILT_DIR_ENV = "SYNARA_COMPUTER_HELPER_PREBUILT_DIR";
@@ -162,26 +186,38 @@ export async function resolveDesktopHelper(
   const override = env.SYNARA_COMPUTER_HELPER?.trim();
   const path = desktopHelperPath(env);
 
-  if (await executableExists(path)) {
-    return { path, source: override ? "override" : "installed" };
-  }
-  // An operator who named a path named it as the answer. Installing a different
-  // binary somewhere else would leave the override still pointing at nothing,
-  // and installing over the override would replace a build they chose.
   if (override) {
+    // An operator who named a path named it as the answer. Installing a
+    // different binary somewhere else would leave the override still pointing
+    // at nothing, and installing over the override would replace a build they
+    // chose — so an override is never stamped and never second-guessed.
+    if (await executableExists(path)) {
+      return { path, source: "override" };
+    }
     return {
       note: `SYNARA_COMPUTER_HELPER points at this path, so no binary shipped with this build was installed over it.`,
     };
   }
 
   const shipped = await locatePrebuilt(dependencies, env);
-  if (!shipped) {
-    return { note: "No prebuilt helpers ship with this build, so there was nothing to install." };
-  }
-
   const system = await readHostSystem(dependencies);
-  const build = selectDesktopHelperPrebuild(shipped.manifest, system);
-  if (!build) {
+  const build = shipped ? selectDesktopHelperPrebuild(shipped.manifest, system) : undefined;
+
+  if (await executableExists(path)) {
+    const verdict = await installedHelperVerdict(path, build);
+    if (verdict === "trusted") return { path, source: "installed" };
+    if (verdict === "refuse") {
+      return {
+        note:
+          `The installed desktop helper no longer matches the record of what was installed, and ` +
+          `this build ships no replacement for ${describeSystem(system)}. ` +
+          `Delete ${path} and try again, or reinstall Synara.`,
+      };
+    }
+    // "replace": fall through, and the bundle below is installed over it.
+  } else if (!shipped) {
+    return { note: "No prebuilt helpers ship with this build, so there was nothing to install." };
+  } else if (!build) {
     const count = shipped.manifest.builds.length;
     return {
       note:
@@ -192,14 +228,14 @@ export async function resolveDesktopHelper(
     };
   }
 
-  const source = join(shipped.root, build.file);
-  if (!(await verifyPrebuilt(source, build.sha256))) {
+  const source = join(shipped!.root, build!.file);
+  if (!(await verifyPrebuilt(source, build!.sha256))) {
     // Not silently ignored: a checksum failure means the file that shipped is
     // not the file that was built, and that is worth saying out loud rather
     // than letting it read as "your distribution is not covered".
     return {
       note:
-        `The helper binary shipped for ${describeBuild(build)} failed its checksum, so it was not ` +
+        `The helper binary shipped for ${describeBuild(build!)} failed its checksum, so it was not ` +
         "installed. Reinstalling Synara replaces it.",
     };
   }
@@ -208,10 +244,103 @@ export async function resolveDesktopHelper(
     await installExecutable(source, path);
   } catch (error) {
     return {
-      note: `The helper binary shipped for ${describeBuild(build)} could not be installed at ${path} (${describe(error)}).`,
+      note: `The helper binary shipped for ${describeBuild(build!)} could not be installed at ${path} (${describe(error)}).`,
     };
   }
+  await writeDesktopHelperStamp(path, build!, new Date().toISOString());
   return { path, source: "prebuilt" };
+}
+
+/**
+ * Whether an already-installed helper may be executed as-is.
+ *
+ * The trust anchor is the stamp this module writes at install time: bytes that
+ * still match it are good until the shipped bundle moves on (a different
+ * manifest entry, or a helper protocol this server no longer speaks), either of
+ * which is an upgrade rather than a verdict on the old binary. Bytes that
+ * contradict their stamp were corrupted or tampered with after the fact, and
+ * are replaced when the bundle can do it and refused when it cannot. A missing
+ * stamp means `build.sh` put the binary there — trusted only when this build
+ * ships nothing to check it against, and re-verified against the manifest when
+ * it does.
+ */
+async function installedHelperVerdict(
+  path: string,
+  build: DesktopHelperPrebuild | undefined,
+): Promise<"trusted" | "replace" | "refuse"> {
+  const stamp = await readDesktopHelperStamp(path);
+  const actual = await sha256File(path);
+  if (!stamp || !actual) {
+    return build ? "replace" : "trusted";
+  }
+  if (stamp.sha256 !== actual) return build ? "replace" : "refuse";
+  if (!build) return "trusted";
+  if (build.sha256 !== stamp.sha256) return "replace";
+  if (stamp.protocolVersion !== DESKTOP_HELPER_PROTOCOL_VERSION) return "replace";
+  return "trusted";
+}
+
+/** The record left beside an installed helper; see the module header. */
+export interface DesktopHelperInstallStamp {
+  readonly sha256: string;
+  readonly osId: string;
+  readonly osVersionId: string;
+  readonly arch: string;
+  readonly protocolVersion: number;
+  readonly installedAt: string;
+}
+
+function helperStampPath(path: string): string {
+  return `${path}.stamp`;
+}
+
+async function sha256File(path: string): Promise<string | undefined> {
+  const bytes = await readFile(path).catch(() => undefined);
+  if (!bytes) return undefined;
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** Reads the `.stamp` beside an installed helper, or undefined when absent/unusable. */
+export async function readDesktopHelperStamp(
+  path: string,
+): Promise<DesktopHelperInstallStamp | undefined> {
+  const raw = await readFile(helperStampPath(path), "utf8").catch(() => undefined);
+  if (raw === undefined) return undefined;
+  const fields = new Map<string, string>();
+  for (const line of raw.split("\n")) {
+    const separator = line.indexOf("=");
+    if (separator > 0) fields.set(line.slice(0, separator), line.slice(separator + 1));
+  }
+  const sha256 = fields.get("sha256");
+  if (!sha256 || !/^[0-9a-f]{64}$/.test(sha256)) return undefined;
+  const protocolVersion = Number.parseInt(fields.get("protocol_version") ?? "", 10);
+  return {
+    sha256,
+    osId: fields.get("os_id") ?? "",
+    osVersionId: fields.get("os_version_id") ?? "",
+    arch: fields.get("arch") ?? "",
+    protocolVersion: Number.isFinite(protocolVersion) ? protocolVersion : 0,
+    installedAt: fields.get("installed_at") ?? "",
+  };
+}
+
+async function writeDesktopHelperStamp(
+  path: string,
+  build: DesktopHelperPrebuild,
+  installedAt: string,
+): Promise<void> {
+  await writeFile(
+    helperStampPath(path),
+    [
+      `sha256=${build.sha256}`,
+      `os_id=${build.osId}`,
+      `os_version_id=${build.osVersionId}`,
+      `arch=${build.arch}`,
+      `protocol_version=${DESKTOP_HELPER_PROTOCOL_VERSION}`,
+      `installed_at=${installedAt}`,
+      "",
+    ].join("\n"),
+  );
 }
 
 /**

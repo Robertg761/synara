@@ -81,7 +81,6 @@ export interface GnomeShellComputerUseApi {
   listWindows(): Promise<unknown>;
   activateWindow(windowId: string): Promise<unknown>;
   raiseWindow(windowId: string): Promise<unknown>;
-  closeWindow(windowId: string): Promise<unknown>;
 }
 
 export interface GnomeShellExtensionConnection {
@@ -144,11 +143,6 @@ export class GnomeShellWindowProvider implements PortalWindowProvider {
   async raiseWindow(windowId: string): Promise<void> {
     const api = await this.service();
     await this.call(api.raiseWindow(windowId), `raise window ${JSON.stringify(windowId)}`);
-  }
-
-  async closeWindow(windowId: string): Promise<void> {
-    const api = await this.service();
-    await this.call(api.closeWindow(windowId), `close window ${JSON.stringify(windowId)}`);
   }
 
   async dispose(): Promise<void> {
@@ -386,7 +380,6 @@ export async function connectGnomeShellExtension(
         listWindows: () => invokeKWinDbusMethod(iface, "ListWindows"),
         activateWindow: (windowId) => invokeKWinDbusMethod(iface, "ActivateWindow", windowId),
         raiseWindow: (windowId) => invokeKWinDbusMethod(iface, "RaiseWindow", windowId),
-        closeWindow: (windowId) => invokeKWinDbusMethod(iface, "CloseWindow", windowId),
       },
       close: () => {
         eventBus.off("error", onError);

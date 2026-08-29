@@ -32,6 +32,13 @@ const FAKE_SCREENSHOT_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 /**
+ * How many calls the fake remembers. A long-running server that leaves the
+ * fake wired in would otherwise grow this array for the life of the process;
+ * tests only ever look at recent calls, so the oldest entries are dropped.
+ */
+const MAX_RECORDED_CALLS = 1_000;
+
+/**
  * What the fake actually simulates. It enumerates windows with bounds and a
  * stacking order, captures, takes input, holds a clipboard, and focuses and
  * raises — so those are all true. `ghostCursor` is true because the fake moves
@@ -90,6 +97,7 @@ export class FakeComputerBackend implements ComputerBackend {
   private nextSequence = 1;
   private clipboardText = "";
   private failures = new Map<string, Error>();
+  private readonly queuedScreenshots: string[] = [];
   private disposed = false;
 
   constructor(options: FakeComputerBackendOptions = {}) {
@@ -213,11 +221,20 @@ export class FakeComputerBackend implements ComputerBackend {
   async focusWindow(windowId: string): Promise<void> {
     this.record("focusWindow", windowId);
     this.throwIfFailed("focusWindow");
+    // Mirror the KWin plugin: the pinned target is the only window that
+    // reports focused, so clearing and re-pinning behave like the real seat.
+    this.currentWindows = this.currentWindows.map((item) => ({
+      ...item,
+      focused: item.id === windowId,
+    }));
   }
 
   async clearFocusWindow(): Promise<void> {
     this.record("clearFocusWindow");
     this.throwIfFailed("clearFocusWindow");
+    // Mirror the KWin plugin: no pinned target means no window reports
+    // focused — the blind spot behind the untargeted-scroll regression.
+    this.currentWindows = this.currentWindows.map((item) => ({ ...item, focused: false }));
   }
 
   async click(point: ComputerPoint): Promise<ComputerBackendActionResult> {
@@ -379,6 +396,16 @@ export class FakeComputerBackend implements ComputerBackend {
     this.failures.set(method, error);
   }
 
+  /**
+   * Hands the next captures these exact PNG bytes, in order, so a test can make
+   * two captures of one window differ — which is what any before/after
+   * comparison needs and what the single fixed fixture cannot express. Captures
+   * past the end of the queue return the fixture again.
+   */
+  queueScreenshots(bytesBase64List: readonly string[]): void {
+    this.queuedScreenshots.push(...bytesBase64List);
+  }
+
   callsFor(method: string): readonly FakeComputerCall[] {
     return this.calls.filter((call) => call.method === method);
   }
@@ -411,12 +438,13 @@ export class FakeComputerBackend implements ComputerBackend {
   private screenshotOfRegion(region: ComputerRect, maxDimension?: number): ComputerScreenshot {
     const limit = maxDimension ?? DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION;
     const scale = Math.min(1, limit / Math.max(region.width, region.height));
+    const bytesBase64 = this.queuedScreenshots.shift() ?? FAKE_SCREENSHOT_BASE64;
     return {
       mimeType: "image/png",
       width: Math.max(1, Math.round(region.width * scale)),
       height: Math.max(1, Math.round(region.height * scale)),
-      sizeBytes: Buffer.from(FAKE_SCREENSHOT_BASE64, "base64").byteLength,
-      bytesBase64: FAKE_SCREENSHOT_BASE64,
+      sizeBytes: Buffer.from(bytesBase64, "base64").byteLength,
+      bytesBase64,
       region,
       scale,
       capturedAt: this.now(),
@@ -446,6 +474,9 @@ export class FakeComputerBackend implements ComputerBackend {
 
   private record(method: string, ...args: readonly unknown[]): void {
     this.calls.push({ method, args });
+    if (this.calls.length > MAX_RECORDED_CALLS) {
+      this.calls.splice(0, this.calls.length - MAX_RECORDED_CALLS);
+    }
   }
 
   private throwIfFailed(method: string): void {

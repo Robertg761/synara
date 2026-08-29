@@ -61,3 +61,24 @@ export function clampUtf8Bytes(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   return decodeUtf8Clamped(Buffer.from(text, "utf8"), maxBytes);
 }
+
+/** Placed where a cut tail was, so truncated text reads as truncated. */
+export const TRUNCATION_MARKER = "…";
+
+/**
+ * `text` cut to `maxLength` *characters* with a marker in place of the tail, so
+ * a truncated label reads as truncated rather than as a different value.
+ *
+ * The cut never lands between the halves of a surrogate pair: one half on its
+ * own decodes to a replacement character, which would put a symbol in the
+ * result that the source never displayed. This is the char-count complement to
+ * `clampUtf8Bytes` above — schema-bounded string fields count characters, not
+ * bytes.
+ */
+export function clampTextToLength(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  let cut = maxLength - TRUNCATION_MARKER.length;
+  const code = cut > 0 ? text.charCodeAt(cut - 1) : 0;
+  if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+  return `${text.slice(0, Math.max(0, cut))}${TRUNCATION_MARKER}`;
+}

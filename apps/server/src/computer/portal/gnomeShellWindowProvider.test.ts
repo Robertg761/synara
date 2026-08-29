@@ -65,10 +65,6 @@ function fakeExtension(options: FakeExtensionOptions = {}): FakeExtension {
           state.calls.push(`RaiseWindow ${windowId}`);
           return Promise.resolve(undefined);
         },
-        closeWindow: (windowId) => {
-          state.calls.push(`CloseWindow ${windowId}`);
-          return Promise.resolve(undefined);
-        },
       };
       return Promise.resolve({
         api,
@@ -372,7 +368,6 @@ describe("GnomeShellWindowProvider", () => {
                 : Promise.resolve(JSON.stringify([extensionWindow()])),
             activateWindow: () => Promise.resolve(undefined),
             raiseWindow: () => Promise.resolve(undefined),
-            closeWindow: () => Promise.resolve(undefined),
           },
           close: () => {
             state.closes += 1;

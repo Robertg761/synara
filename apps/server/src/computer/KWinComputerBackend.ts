@@ -24,6 +24,7 @@ import {
 import { describeErrorMessage } from "@synara/shared/errorMessages";
 
 import {
+  clampComputerMessage,
   ComputerBackendError,
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   intersectComputerRects,
@@ -40,6 +41,7 @@ import {
   atspiTextWriteAddress,
   describeComputerUiTree,
   fuseAtspiTrees,
+  type AtspiRawNode,
   type AtspiWindowTree,
 } from "./atspiTreeTargeting.ts";
 import {
@@ -55,7 +57,10 @@ import {
   requireWindowBounds,
   screenSizeFromWindows,
   screenshotFromPng,
+  shiftPoint,
+  shiftRect,
   unwrapDbusValue,
+  windowInAgentSpace,
   workspaceRectFromWindows,
 } from "./computerGeometry.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
@@ -158,6 +163,16 @@ const PLUGIN_BUILD_TIMEOUT_MS = 10 * 60 * 1_000;
 const execFileAsync = promisify(execFile);
 const MAX_PLUGIN_ID = /^SynaraComputerUsePlugin(?:V(\d+))?$/;
 const INSTALLED_PLUGIN_FILE = /^(SynaraComputerUsePluginV(\d+))\.so$/;
+/** Shifts every coordinate in an AT-SPI tree, preserving shape and identity. */
+function shiftTree(tree: AtspiWindowTree, dx: number, dy: number): AtspiWindowTree {
+  const shiftNode = (node: AtspiRawNode): AtspiRawNode => ({
+    ...node,
+    frame: shiftRect(node.frame, dx, dy),
+    ...(node.activationPoint ? { activationPoint: shiftPoint(node.activationPoint, dx, dy) } : {}),
+    children: node.children.map(shiftNode),
+  });
+  return { ...tree, root: shiftNode(tree.root) };
+}
 
 interface KWinHealth {
   readonly ok: boolean;
@@ -177,6 +192,8 @@ interface KWinPluginState {
    */
   readonly humanFocusWindowId: string | undefined;
   readonly msSinceHumanInput: number | undefined;
+  /** CapsLock latched on the plugin's keyboard; `undefined` on an older build. */
+  readonly capsLockOn: boolean | undefined;
 }
 
 /**
@@ -291,6 +308,10 @@ export class KWinComputerBackend implements ComputerBackend {
   readonly computerId: ComputerId;
 
   protected readonly integrationName: string;
+  /** What an empty availability or health message degrades to. */
+  protected get failureFallbackMessage(): string {
+    return `The Synara ${this.integrationName} backend failed without a message.`;
+  }
   protected readonly installHint: string;
   /** Names this backend in a capture failure, which reaches a tool call verbatim. */
   private readonly captureSource: string;
@@ -353,6 +374,12 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly runClipboardCommand: ClipboardCommandRunner;
   private nextSequence = 1;
   private currentPoint: ComputerPoint | null = null;
+  /**
+   * Where the workspace's top-left sat in global coordinates at the last
+   * window or workspace read. Input actions translate through it; see
+   * `readWindows` for why the agent speaks a 0-based space at all.
+   */
+  private lastAgentOrigin: ComputerPoint = { x: 0, y: 0 };
   private previousWindowsFingerprint: string | undefined;
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
 
@@ -425,9 +452,19 @@ export class KWinComputerBackend implements ComputerBackend {
           arch: process.arch,
           prebuiltRoot: allowPrebuilt ? prebuiltPluginRoot() : undefined,
           buildFromSource: buildPluginFromSource,
-          // Provisioning only runs once connecting has established that nothing
-          // installed will load, so there is nothing current by construction.
-          isCurrent: async () => false,
+          // Provisioning runs again whenever connecting finds nothing loadable
+          // - a failed first attempt, a KWin upgrade - so "current" has to be
+          // read off the machine rather than assumed false. This check is what
+          // keeps those repeat calls cheap instead of reinstalling or
+          // rebuilding an install that is already in place.
+          isCurrent: async () => {
+            const [stamp, files, running] = await Promise.all([
+              this.readInstallStamp(),
+              listPluginFiles(options.pluginDirectories ?? defaultPluginDirectories()),
+              this.probeRunningKwinVersion(),
+            ]);
+            return installStampIsCurrent(stamp, files, running);
+          },
           stampPath: options.installStampPath ?? defaultInstallStampPath(),
           ...(options.compositorSeesPluginRoot
             ? { compositorSeesPluginRoot: options.compositorSeesPluginRoot }
@@ -444,7 +481,7 @@ export class KWinComputerBackend implements ComputerBackend {
       }),
       emit: (health) => this.emit({ type: "health-changed", health }),
       now: () => this.now(),
-      failureFallbackMessage: `The Synara ${this.integrationName} backend failed without a message.`,
+      failureFallbackMessage: this.failureFallbackMessage,
     });
   }
 
@@ -564,7 +601,10 @@ export class KWinComputerBackend implements ComputerBackend {
       this.publishHealth();
       return {
         kind: "backend-unavailable",
-        message: failure.message,
+        // Composed from error text this backend does not control, so it meets
+        // the contract's bound here rather than failing the payload carrying
+        // it. Same fallback the health state uses for the same reason.
+        message: clampComputerMessage(failure.message, this.failureFallbackMessage),
       };
     }
   }
@@ -580,22 +620,48 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async listWindows(): Promise<readonly ComputerWindow[]> {
+    const [windows] = await this.readWindows();
+    return windows;
+  }
+
+  /**
+   * One window enumeration, in both coordinate spaces.
+   *
+   * The plugin reports global desktop coordinates, and a multi-monitor layout
+   * may place monitors left of or above the primary, so the workspace's
+   * top-left can sit at negative globals. Everything crossing this backend's
+   * boundary speaks **agent space** — 0..screenSize — instead: window bounds
+   * and screenshot regions go out shifted by the workspace origin, pointer
+   * coordinates come in and are shifted back. That keeps one translation at
+   * one choke point rather than teaching every tool, the manager, and the pane
+   * that the origin might not be (0, 0).
+   */
+  private async readWindows(): Promise<
+    readonly [windows: ComputerWindow[], origin: ComputerPoint]
+  > {
     const plugin = await this.ensurePlugin({ start: false });
     try {
       const state = await this.readPluginState(plugin);
       const payload = await plugin.windowsJson();
-      const windows = parseWindows(payload, state.targetWindowId);
+      const raw = parseWindows(payload, state.targetWindowId);
+      const rect = workspaceRectFromWindows(raw, this.pluginHealth?.workspace);
+      const origin = { x: rect.x, y: rect.y };
+      // The cached origin input actions translate with until the next read:
+      // it comes from the reported workspace whenever KWin has one, which is
+      // the same rule this computation applies, so the two never disagree.
+      this.lastAgentOrigin = origin;
+      const windows = raw.map((window) => windowInAgentSpace(window, origin));
       // The plugin's own document is the change fingerprint. It is already a
       // string on the wire and it changes whenever any window does, so
       // re-serializing the parsed list — on a call that runs several times per
       // action and per publish — buys nothing. The focus target rides along
       // because it decides `focused` without appearing in that document.
-      const fingerprint = `${state.targetWindowId ?? ""} ${windowsPayloadFingerprint(payload)}`;
+      const fingerprint = `${state.targetWindowId ?? ""} ${windowsPayloadFingerprint(payload)}`;
       if (fingerprint !== this.previousWindowsFingerprint) {
         this.previousWindowsFingerprint = fingerprint;
         this.emit({ type: "windows-changed", windows });
       }
-      return windows;
+      return [windows, origin];
     } catch (error) {
       throw this.reportPluginFailure(error);
     }
@@ -621,14 +687,18 @@ export class KWinComputerBackend implements ComputerBackend {
     readonly includeText?: boolean;
   }): Promise<ComputerState> {
     await this.ensurePlugin({ start: false });
-    // listWindows already reads the plugin state to resolve the focused window,
-    // so a second stateJson round trip here would only add latency.
-    const windows = await this.listWindows();
+    // One enumeration feeds the windows, the size, the tree fusion, and the
+    // workspace capture; a second round trip here would only add latency.
+    const [windows, origin] = await this.readWindows();
     const screenSize = screenSizeFromWindows(windows, this.pluginHealth?.workspace);
     let root: ComputerUiNode | undefined;
     if (options.includeText) {
       try {
-        const trees = await this.atspi.readTrees(windows);
+        // AT-SPI reports extents in global screen coordinates, so the trees
+        // shift into agent space with everything else before fusing.
+        const trees = (await this.atspi.readTrees(windows)).map((tree) =>
+          shiftTree(tree, -origin.x, -origin.y),
+        );
         root = fuseAtspiTrees({ windows, trees, screenSize });
       } catch {
         // AT-SPI is an optional perception source. KWin window state and
@@ -639,7 +709,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
     const screenshot =
       options.includeScreenshot && this.pluginHealth?.capture === true
-        ? await this.captureWorkspaceScreenshot(windows).catch(() => undefined)
+        ? await this.captureWorkspaceScreenshot(origin).catch(() => undefined)
         : undefined;
     return {
       computerId: this.computerId,
@@ -795,8 +865,13 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async typeText(text: string): Promise<ComputerBackendActionResult> {
-    const strokes = qwertyTextKeyStrokes(text);
     const plugin = await this.ensurePlugin();
+    // Sampled before the first stroke: CapsLock latched on the driven keyboard
+    // inverts the letter Shifts, and synthesizing blind would land `Hello` as
+    // `hELLO`. Older plugins do not report it, which leaves Shift-only
+    // synthesis — the documented limitation on this tier.
+    const capsLockOn = (await this.readPluginState(plugin)).capsLockOn === true;
+    const strokes = qwertyTextKeyStrokes(text, { capsLock: capsLockOn });
     const sink = this.inputSink(plugin);
     for (const stroke of strokes) await pressKeyStroke({ sink, stroke });
     return { value: text };
@@ -912,6 +987,12 @@ export class KWinComputerBackend implements ComputerBackend {
     if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
     this.streamTimer = undefined;
     await this.ensurePlugin();
+    // An overlapping attach (a second pane joining mid-attach) cleared the
+    // first interval above, but the await let the FIRST attach resume here and
+    // install its own interval — which nothing would ever clear again, because
+    // `streamTimer` now names the second one. Cleared once more so exactly the
+    // newest attach's interval survives.
+    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
     this.streamListener = listener;
     await this.publishStillFrame();
     this.streamTimer = setInterval(() => {
@@ -986,7 +1067,7 @@ export class KWinComputerBackend implements ComputerBackend {
   async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
     const maxDimension = request.maxDimension ?? this.captureMaxDimension;
     if (request.kind === "window") {
-      const windows = await this.listWindows();
+      const [windows, origin] = await this.readWindows();
       const window = windows.find((candidate) => candidate.id === request.windowId);
       if (!window) {
         throw new ComputerBackendError(
@@ -994,9 +1075,17 @@ export class KWinComputerBackend implements ComputerBackend {
             "Call computer_list_windows for the current window ids.",
         );
       }
+      // Both rects are agent-space. The clip is the *reported* workspace when
+      // KWin gave one — its edges are what actually clip a capture — and the
+      // window bounding box otherwise.
+      const reported = this.pluginHealth?.workspace;
+      const agentWorkspace =
+        reported && reported.width > 0 && reported.height > 0
+          ? shiftRect(reported, -origin.x, -origin.y)
+          : workspaceRectFromWindows(windows);
       const region = intersectComputerRects(
         requireWindowBounds(window, "a window screenshot"),
-        workspaceRectFromWindows(windows, this.pluginHealth?.workspace),
+        agentWorkspace,
       );
       if (!region) {
         throw new ComputerBackendError(
@@ -1018,16 +1107,24 @@ export class KWinComputerBackend implements ComputerBackend {
         "A screenshot region needs finite x/y and a positive width and height.",
       );
     }
-    const region = intersectComputerRects(alignRect(requested), await this.workspaceRect());
-    if (!region) {
+    // The request arrives in agent space; the plugin captures in globals.
+    // workspaceRect() is already global — shifting it again would double the
+    // origin offset and reject on-screen regions on negative-origin layouts.
+    const origin = this.currentOrigin();
+    const globalWorkspace = await this.workspaceRect();
+    const global = intersectComputerRects(
+      shiftRect(alignRect(requested), origin.x, origin.y),
+      globalWorkspace,
+    );
+    if (!global) {
       throw new ComputerBackendError(
         `Region ${formatRect(requested)} does not overlap the desktop workspace. ` +
-          "Regions use global desktop logical pixels, the same space as window bounds.",
+          "Regions use desktop logical pixels, the same space as window bounds.",
       );
     }
     return this.screenshot(
-      await this.captureRegion(region.x, region.y, region.width, region.height, maxDimension),
-      region,
+      await this.captureRegion(global.x, global.y, global.width, global.height, maxDimension),
+      shiftRect(global, -origin.x, -origin.y),
     );
   }
 
@@ -1154,6 +1251,12 @@ export class KWinComputerBackend implements ComputerBackend {
         this.scheduleReconnect();
       });
     }
+    // Who owns the well-known service name *before* anything is loaded. The
+    // plugin is addressed by that name, so without pinning the owner, a stale
+    // duplicate Synara instance — or any same-session squatter — would receive
+    // every pointer, key, and capture call this server sends, and could serve
+    // forged state and screenshots an agent then acts on.
+    const ownerBefore = await dbus.nameOwner(COMPUTER_SERVICE);
     let loaded: readonly string[];
     try {
       loaded = await dbus.listLoadedPluginIds();
@@ -1163,6 +1266,7 @@ export class KWinComputerBackend implements ComputerBackend {
       // already exists, use it directly; otherwise continue with the
       // installed-file scan below and let LoadPlugin establish the service.
       try {
+        assertServiceOwnerPresent(await dbus.nameOwner(COMPUTER_SERVICE));
         const plugin = await dbus.connectPlugin();
         return await this.finishPluginConnection(plugin, undefined);
       } catch (fallbackError) {
@@ -1208,30 +1312,51 @@ export class KWinComputerBackend implements ComputerBackend {
         if (!accepted) throw new ComputerBackendError(await this.describeLoadRefusal(refusedId));
         plan = { kind: "replace", unload: plan.unload, pluginId: accepted };
       }
+      // A successful load must have moved the name to a *new* registration. If
+      // the owner is unchanged, whatever answered before still holds the name —
+      // an unload race or a squatter — and connecting would drive the wrong
+      // build. Retryable: a genuine race settles within moments, and the next
+      // attempt re-checks from scratch.
+      await assertFreshServiceOwner(await dbus.nameOwner(COMPUTER_SERVICE), ownerBefore);
+    } else {
+      // Nothing was (re)loaded, so the name may legitimately be held by the
+      // generation already running — but something must hold it at all.
+      assertServiceOwnerPresent(await dbus.nameOwner(COMPUTER_SERVICE));
     }
     const plugin = await dbus.connectPlugin();
     return await this.finishPluginConnection(plugin, plan.pluginId);
   }
 
   /**
-   * Installs the plugin, at most once per backend.
+   * Installs the plugin, deduplicating only concurrent callers.
    *
    * The user's side of "enable computer use" is the toggle; everything under it
    * happens here. It writes the session env script, installs a shipped binary
    * for this KWin when there is one, and builds against the local headers when
    * there is not.
+   *
+   * The map exists so the reconnect loop cannot start a second install - or a
+   * second source build, which takes minutes - while the first is still
+   * running; it is keyed by attempt because the source-only retry is a
+   * different install, not a repeat of the first. Entries are dropped on
+   * settlement: a memoized failure would replay forever, and a memoized
+   * success would keep naming an id KWin may since have refused, so every
+   * later call re-asks `provisionPlugin`, whose already-current stamp check
+   * keeps a repeat cheap when nothing changed.
    */
   protected async provisionOnce(allowPrebuilt = true): Promise<ProvisionResult> {
-    const cached = this.provisionPromises.get(allowPrebuilt);
-    const pending = cached ?? this.provisionPlugin({ allowPrebuilt });
-    if (!cached) {
-      this.provisionPromises.set(allowPrebuilt, pending);
-      // Only success is cached. A failed install's usual causes — missing
-      // packages, missing headers — are exactly what the user fixes next, and
-      // replaying the stale rejection would turn a fixed machine into one that
-      // still reports the old error until the server restarts.
-      pending.catch(() => this.provisionPromises.delete(allowPrebuilt));
-    }
+    const existing = this.provisionPromises.get(allowPrebuilt);
+    if (existing) return await existing;
+    const pending = this.provisionPlugin({ allowPrebuilt });
+    this.provisionPromises.set(allowPrebuilt, pending);
+    const forget = () => {
+      if (this.provisionPromises.get(allowPrebuilt) === pending) {
+        this.provisionPromises.delete(allowPrebuilt);
+      }
+    };
+    // Both branches handled together, so the derived promise never rejects
+    // unobserved; the caller gets the original rejection from the await below.
+    void pending.then(forget, forget);
     return await pending;
   }
 
@@ -1241,19 +1366,22 @@ export class KWinComputerBackend implements ComputerBackend {
    * Failures are swallowed on purpose: the caller's next move is to report the
    * refusal, and a build error here would replace that accurate message with a
    * less useful one about cmake.
+   *
+   * Whatever the first attempt settled on, the other install shape gets its own
+   * attempt: prebuilt→source covers a distribution mismatch the shipped binary
+   * hits, and source→prebuilt covers the reverse - a version probe or checksum
+   * that failed the first time but passes now. When the first attempt left a
+   * current install behind, the repeat answers from the install stamp instead
+   * of rebuilding, so the extra attempt costs two file reads.
    */
   private async reprovisionAfterRefusal(refusedId: string): Promise<readonly string[]> {
     const ids: string[] = [];
     const first = await this.provisionOnce().catch(() => undefined);
     if (first?.pluginId && first.pluginId !== refusedId) ids.push(first.pluginId);
-    // A shipped binary can be built for the right KWin version and still be
-    // wrong for this distribution's Qt or libstdc++, and KWin refuses it in
-    // exactly the same wordless way. Building against the local headers is the
-    // answer to that, so it gets its own attempt rather than being written off
-    // as the same failure.
-    if (!first || first.action === "installed-prebuilt") {
-      const source = await this.provisionOnce(false).catch(() => undefined);
-      if (source?.pluginId && source.pluginId !== refusedId) ids.push(source.pluginId);
+    const retryPrebuilt = first?.action === "installed-from-source";
+    const second = await this.provisionOnce(retryPrebuilt).catch(() => undefined);
+    if (second?.pluginId && second.pluginId !== refusedId && !ids.includes(second.pluginId)) {
+      ids.push(second.pluginId);
     }
     return ids;
   }
@@ -1376,10 +1504,14 @@ export class KWinComputerBackend implements ComputerBackend {
       throw this.reportPluginFailure(error);
     }
     const parsed = asRecord(parseJsonPayload(raw));
-    const position = parseComputerPoint(parsed.position);
+    const globalPosition = parseComputerPoint(parsed.position);
+    // The plugin speaks global coordinates; everything this backend caches and
+    // returns is agent-space, so the cached position shifts with the origin.
+    const origin = this.currentOrigin();
+    const position = globalPosition ? shiftPoint(globalPosition, -origin.x, -origin.y) : null;
+    if (position) this.currentPoint = position;
     const targetWindowId =
       asString(parsed.targetWindowId) ?? asString(parsed.focusedWindowId) ?? null;
-    if (position) this.currentPoint = position;
     // The plugin reports an empty id for "nobody has focus", which is a real
     // answer and not a missing field; a missing field is an older plugin.
     const humanFocusWindowId = asString(parsed.humanFocusWindowId);
@@ -1395,6 +1527,8 @@ export class KWinComputerBackend implements ComputerBackend {
       targetWindowId,
       humanFocusWindowId: guarded ? humanFocusWindowId : undefined,
       msSinceHumanInput: guarded ? msSinceHumanInput : undefined,
+      capsLockOn:
+        parsed.capsLockOn === true ? true : parsed.capsLockOn === false ? false : undefined,
     };
   }
 
@@ -1469,12 +1603,15 @@ export class KWinComputerBackend implements ComputerBackend {
   /**
    * The plugin's evdev-shaped D-Bus API as the shared sequencing sink. Each
    * method carries the operation name through so a refusal still says which half
-   * of a press/release pair KWin rejected.
+   * of a press/release pair KWin rejected. Coordinates arrive in agent space
+   * and leave translated into the global space the plugin drives.
    */
   private inputSink(plugin: KWinComputerPluginApi): ComputerInputSink {
     return {
-      movePointer: (x, y, operation) =>
-        this.pluginSuccess(operation, () => plugin.movePointer(x, y)),
+      movePointer: (x, y, operation) => {
+        const origin = this.currentOrigin();
+        return this.pluginSuccess(operation, () => plugin.movePointer(x + origin.x, y + origin.y));
+      },
       button: (code, pressed, operation) =>
         this.pluginSuccess(operation, () => plugin.button(code, pressed)),
       key: (code, pressed, operation) =>
@@ -1486,7 +1623,9 @@ export class KWinComputerBackend implements ComputerBackend {
    * Pointer requests are advisory: KWin clamps a move to the nearest output
    * when the global coordinate lands in a gap between monitors. One state read
    * after the final move tells the caller where the pointer really is without
-   * paying a round trip for every intermediate glide step.
+   * paying a round trip for every intermediate glide step. The state read
+   * already reports agent-space coordinates, so request and answer are
+   * compared in the same space.
    */
   private async pointerResult(
     plugin: KWinComputerPluginApi,
@@ -1507,16 +1646,18 @@ export class KWinComputerBackend implements ComputerBackend {
 
   /**
    * Captures the whole workspace instead of one window. A window capture cannot
-   * tell the model where anything sits in the global coordinate space that the
-   * pointer tools use, and the focused-window fallback silently resolved to the
-   * desktop wallpaper whenever KWin had no better candidate.
+   * tell the model where anything sits in the coordinate space that the pointer
+   * tools use, and the focused-window fallback silently resolved to the desktop
+   * wallpaper whenever KWin had no better candidate.
+   *
+   * The pixels come from the global workspace rect the plugin speaks; the
+   * reported region is that same rect in agent space, which is what every
+   * caller maps screenshot pixels against.
    */
-  private async captureWorkspaceScreenshot(
-    windows: readonly ComputerWindow[],
-  ): Promise<ComputerScreenshot> {
-    const region = workspaceRectFromWindows(windows, this.pluginHealth?.workspace);
-    const bytes = await this.captureRegion(region.x, region.y, region.width, region.height);
-    return this.screenshot(bytes, region);
+  private async captureWorkspaceScreenshot(origin: ComputerPoint): Promise<ComputerScreenshot> {
+    const global = await this.workspaceRect();
+    const bytes = await this.captureRegion(global.x, global.y, global.width, global.height);
+    return this.screenshot(bytes, shiftRect(global, -origin.x, -origin.y));
   }
 
   private screenshot(bytes: Uint8Array, region: ComputerRect): ComputerScreenshot {
@@ -1528,13 +1669,36 @@ export class KWinComputerBackend implements ComputerBackend {
     });
   }
 
-  /** Workspace geometry without a window round trip when KWin reported it. */
+  /** Workspace geometry in GLOBAL coordinates, without a window read when KWin reported it. */
   private async workspaceRect(): Promise<ComputerRect> {
     const workspace = this.pluginHealth?.workspace;
     if (workspace && workspace.width > 0 && workspace.height > 0) {
-      return workspaceRectFromWindows([], workspace);
+      const rect = workspaceRectFromWindows([], workspace);
+      this.lastAgentOrigin = { x: rect.x, y: rect.y };
+      return rect;
     }
-    return workspaceRectFromWindows(await this.listWindows());
+    const [windows, origin] = await this.readWindows();
+    // The list is agent-space, so its bounding box is anchored near zero;
+    // re-anchored at the real origin it becomes the global capture region.
+    return shiftRect(workspaceRectFromWindows(windows), origin.x, origin.y);
+  }
+
+  /**
+   * The global-space origin agent coordinates are translated by, as of the
+   * freshest information this backend has without extra round trips. Pointer
+   * actions run between window reads, so the cached value is what they get —
+   * and it is refreshed from the reported workspace whenever health carries
+   * one, which is every reconnect and state publish.
+   */
+  private currentOrigin(): ComputerPoint {
+    const workspace = this.pluginHealth?.workspace;
+    if (workspace && workspace.width > 0 && workspace.height > 0) {
+      this.lastAgentOrigin = {
+        x: Math.floor(workspace.x),
+        y: Math.floor(workspace.y),
+      };
+    }
+    return this.lastAgentOrigin;
   }
 
   /**
@@ -1894,6 +2058,40 @@ function stampKwinVersion(stamp: string | undefined): string | undefined {
   return line ? (KWIN_VERSION_PATTERN.exec(line)?.[0] ?? undefined) : undefined;
 }
 
+/** Reads the `plugin_id=` line both installers record. */
+function stampPluginId(stamp: string | undefined): string | undefined {
+  const line = stamp
+    ?.split("\n")
+    .find((entry) => entry.startsWith("plugin_id="))
+    ?.slice("plugin_id=".length)
+    .trim();
+  return line || undefined;
+}
+
+/**
+ * Whether the install stamp describes a plugin this machine still has and the
+ * running KWin can still load.
+ *
+ * The stamped file must exist - a deleted plugin is not current - and the KWin
+ * version it was built for must match the running compositor when both are
+ * readable. That mismatch check is what lets provisioning produce a fresh
+ * candidate after a KWin upgrade instead of answering "already current" about
+ * an install KWin now refuses; a half-known pair stays current, because an
+ * unreadable version is not evidence of anything.
+ */
+export function installStampIsCurrent(
+  stamp: string | undefined,
+  installedFiles: readonly string[],
+  runningKwinVersion: string | undefined,
+): boolean {
+  const pluginId = stampPluginId(stamp);
+  if (!pluginId) return false;
+  if (!installedFiles.includes(`${pluginId}.so`)) return false;
+  const builtFor = stampKwinVersion(stamp);
+  if (builtFor && runningKwinVersion && builtFor !== runningKwinVersion) return false;
+  return true;
+}
+
 /**
  * `kwin_wayland --version` prints `kwin <version>` and exits, and it is only
  * spawned on the cold load-refusal path, so a missing or exotic binary just
@@ -1937,6 +2135,53 @@ const CONNECTION_DBUS_ERROR_TYPES = new Set([
 
 function isDormantBackendError(error: unknown): boolean {
   return error instanceof ComputerBackendError && error.dormant;
+}
+
+/**
+ * The well-known service name arriving from the wrong process.
+ *
+ * Method-level on purpose: a retry inside `connectWithBackoff` would re-read
+ * the (now stale) loaded list, take the "keep" path, and connect straight to
+ * the owner this check exists to refuse — so it must propagate out of the
+ * attempt instead. The next explicit action starts a fresh connect that
+ * re-checks ownership from scratch.
+ */
+class ServiceOwnerMismatchError extends ComputerBackendError {
+  readonly type = "org.synara.ComputerUse.Error.ServiceOwnerMismatch";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ServiceOwnerMismatchError";
+  }
+}
+
+export function assertServiceOwnerPresent(owner: string | undefined): void {
+  if (owner !== undefined) return;
+  throw new ServiceOwnerMismatchError(
+    `Nothing owns ${COMPUTER_SERVICE} on the session bus even though KWin reports a Synara plugin loaded, ` +
+      "so no computer-use plugin is answering. Retrying may help; if this persists, another process may be interfering with the session bus.",
+  );
+}
+
+export function assertFreshServiceOwner(
+  owner: string | undefined,
+  previous: string | undefined,
+): void {
+  if (previous === undefined) {
+    assertServiceOwnerPresent(owner);
+    return;
+  }
+  if (owner === undefined) {
+    throw new ServiceOwnerMismatchError(
+      `Nobody owns ${COMPUTER_SERVICE} after LoadPlugin succeeded, so the plugin that was just loaded did not register its service.`,
+    );
+  }
+  if (owner === previous) {
+    throw new ServiceOwnerMismatchError(
+      `${COMPUTER_SERVICE} is still owned by ${previous}, its holder from before this server loaded a new plugin generation. ` +
+        "Connecting anyway would drive whichever process answered first rather than the one just loaded, so it was refused.",
+    );
+  }
 }
 
 function isMethodLevelDbusError(error: unknown): boolean {

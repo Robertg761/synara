@@ -1296,9 +1296,9 @@ export default function ChatView({
   useThreadComputerStateSeed(threadId);
   const computerThreadState = useComputerStateStore(selectThreadComputerState(threadId));
   const computerControlAvailable = computerThreadState?.availability.kind === "available";
-  // Skill semantics: an untouched chat gets computer control whenever the backend
-  // is available (governed by the machine-wide opt-out), and a per-chat override
-  // wins over both. Availability is required first, so this reads after it.
+  // An untouched chat gets computer control only when the machine-wide opt-in
+  // allows it and the backend is available; a per-chat override wins over both.
+  // Availability is required first, so this reads after it.
   const enableComputerControl = resolveEffectiveComputerControl({
     draftOverride: composerDraft.enableComputerControl,
     backendAvailable: computerControlAvailable,

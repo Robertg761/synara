@@ -18,18 +18,18 @@
 import {
   COMPUTER_ID_MAX_LENGTH,
   COMPUTER_LABEL_MAX_LENGTH,
+  COMPUTER_OCCLUDERS_MAX_LENGTH,
   COMPUTER_WINDOW_LIST_MAX_LENGTH,
-} from "@synara/contracts";
-import type {
-  ComputerPoint,
-  ComputerRect,
-  ComputerScreenshot,
-  ComputerScreenSize,
-  ComputerWindow,
+  type ComputerPoint,
+  type ComputerRect,
+  type ComputerScreenshot,
+  type ComputerScreenSize,
+  type ComputerWindow,
 } from "@synara/contracts";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { unwrapDbusValue } from "./dbusPlumbing.ts";
+import { clampTextToLength } from "./utf8Truncation.ts";
 
 const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
 const PNG_IHDR = Uint8Array.of(0x49, 0x48, 0x44, 0x52);
@@ -95,50 +95,21 @@ export function parseComputerPoint(value: unknown): ComputerPoint | null {
 }
 
 /**
- * A compositor reports whatever an application set; the contract's schemas cap
- * it. Nothing downstream reconciles the two, so a single window with a
- * paragraph-long title used to fail the encode of every state payload and push
- * event for the rest of the session. Clamping here keeps one bad window from
- * silencing the whole desktop.
- */
-export function truncateLabel(text: string, max: number): string {
-  if (text.length <= max) return text;
-  // Leave room for the ellipsis so the result is exactly `max`, and never cut
-  // between the halves of an astral character — a lone surrogate is a symbol
-  // that no font draws.
-  let cut = max - 1;
-  const last = text.charCodeAt(cut - 1);
-  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
-  return `${text.slice(0, cut)}…`;
-}
-
-/**
- * Ids are clamped rather than dropped. A truncated id still names the window
- * for the compositor calls that follow, whereas dropping the entry hides a real
- * window from the model entirely.
- */
-export function clampId(id: string): ComputerWindow["id"] {
-  // The contract's id type is trimmed as well as bounded, and a cut that lands
-  // on whitespace would fail encode over the one thing clamping is for.
-  return (
-    id.length <= COMPUTER_ID_MAX_LENGTH ? id : id.slice(0, COMPUTER_ID_MAX_LENGTH).trimEnd()
-  ) as ComputerWindow["id"];
-}
-
-/**
  * Occluder ids from a source that reports them. Both the field and its
  * individual entries degrade to absent rather than failing the whole window
  * list, because stacking metadata is an optional hint and an older loaded
  * plugin omits it entirely. An empty list is dropped: "nothing above this
- * window" is what an absent field already means.
+ * window" is what an absent field already means. The list is clamped well
+ * below the contract's ceiling because the plugin's occluder enumeration is
+ * N² in the worst case, and no caller can use hundreds of entries.
  */
 function asWindowIds(value: unknown): readonly ComputerWindow["id"][] | undefined {
   if (!Array.isArray(value)) return undefined;
   const ids = value
     .filter((item): item is string => typeof item === "string" && item.length > 0)
-    .slice(0, COMPUTER_WINDOW_LIST_MAX_LENGTH)
-    .map(clampId);
-  return ids.length > 0 ? ids : undefined;
+    .slice(0, COMPUTER_OCCLUDERS_MAX_LENGTH)
+    .map((id) => clampTextToLength(id, COMPUTER_ID_MAX_LENGTH));
+  return ids.length > 0 ? (ids as ComputerWindow["id"][]) : undefined;
 }
 
 /**
@@ -153,32 +124,37 @@ function asWindowIds(value: unknown): readonly ComputerWindow["id"][] | undefine
  * single malformed entry from a source that does report geometry is a bug in
  * that entry, and admitting it would put an unlocatable window in front of a
  * model that has no way to tell the two cases apart.
+ *
+ * Every free-form string — id, title, app name — is clamped to its contract
+ * bound before an object is constructed: one application with a paragraph-long
+ * window title (browsers and SPAs do this) must cost that title's tail, not
+ * fail the schema encode of every state payload and push event for the whole
+ * session. The list itself is clamped to the same ceiling the contract checks.
  */
 export function parseWindows(value: unknown, focusedWindowId: string | null): ComputerWindow[] {
   const parsed = parseJsonPayload(value);
   const items = Array.isArray(parsed) ? parsed : [];
   const windows: ComputerWindow[] = [];
-  for (const item of items) {
-    if (windows.length >= COMPUTER_WINDOW_LIST_MAX_LENGTH) break;
+  for (const item of items.slice(0, COMPUTER_WINDOW_LIST_MAX_LENGTH)) {
     const record = asRecord(item);
-    const id = asString(record.id) ?? asString(record.windowId);
+    const rawId = asString(record.id) ?? asString(record.windowId);
     const bounds = parseComputerRect(record.bounds);
-    if (!id || !bounds) continue;
-    const title = truncateLabel(asString(record.title) ?? "", COMPUTER_LABEL_MAX_LENGTH);
-    const rawAppName = asString(record.appId) ?? asString(record.resourceClass);
-    const appName =
-      rawAppName === undefined ? undefined : truncateLabel(rawAppName, COMPUTER_LABEL_MAX_LENGTH);
-    const pid =
-      typeof record.pid === "number" && record.pid > 0 ? Math.trunc(record.pid) : undefined;
+    if (!rawId || !bounds) continue;
+    // An oversized id cannot be addressed through the schema either way, so
+    // the tail is cut rather than the whole window dropped.
+    const id = clampTextToLength(rawId, COMPUTER_ID_MAX_LENGTH);
+    const appNameSource = asString(record.appId) ?? asString(record.resourceClass);
     const stackingIndex = asNonNegativeInt(record.stackingIndex);
     const occludedBy = asWindowIds(record.occludedBy);
     windows.push({
-      id: clampId(id),
-      title,
-      ...(appName ? { appName } : {}),
-      ...(pid ? { pid } : {}),
+      id: id as ComputerWindow["id"],
+      title: clampTextToLength(asString(record.title) ?? "", COMPUTER_LABEL_MAX_LENGTH),
+      ...(appNameSource
+        ? { appName: clampTextToLength(appNameSource, COMPUTER_LABEL_MAX_LENGTH) }
+        : {}),
+      ...(typeof record.pid === "number" && record.pid > 0 ? { pid: Math.trunc(record.pid) } : {}),
       bounds,
-      focused: record.focused === true || id === focusedWindowId,
+      focused: record.focused === true || rawId === focusedWindowId,
       ...(typeof record.active === "boolean" ? { active: record.active } : {}),
       minimized: record.minimized === true,
       visible: record.visible !== false,
@@ -218,6 +194,30 @@ export function windowsCoveringPoint(
   );
 }
 
+/**
+ * The window a bare coordinate action at `point` was delivered to: the topmost
+ * visible, unminimized window whose frame contains the point — the same
+ * stacking rule the compositor applies to an unscoped click.
+ *
+ * With one candidate the stacking order is irrelevant. With several, every
+ * candidate must report a stacking index: ranking only the windows that have
+ * one could crown a window that an unranked one actually covers, and a wrong
+ * answer here photographs a window the action never touched.
+ */
+export function topmostWindowAtPoint(
+  windows: readonly ComputerWindow[],
+  point: ComputerPoint,
+): ComputerWindow | undefined {
+  const candidates = windows.filter(
+    (window) => window.visible && !window.minimized && rectContainsPoint(window.bounds, point),
+  );
+  if (candidates.length <= 1) return candidates[0];
+  if (candidates.some((window) => window.stackingIndex === undefined)) return undefined;
+  return candidates.reduce((top, window) =>
+    (window.stackingIndex as number) < (top.stackingIndex as number) ? window : top,
+  );
+}
+
 export function rectContainsPoint(rect: ComputerRect | undefined, point: ComputerPoint): boolean {
   if (!rect) return false;
   return (
@@ -229,6 +229,26 @@ export function rectContainsPoint(rect: ComputerRect | undefined, point: Compute
 }
 
 // ── Workspace geometry ───────────────────────────────────────────────
+
+/**
+ * Shifts a rect between the display server's global space and the agent's
+ * 0-based one. A multi-monitor layout may place monitors left of or above the
+ * primary, so the workspace's top-left can sit at negative globals; every
+ * backend translates at its own boundary so agent space stays 0..screenSize.
+ */
+export function shiftRect(rect: ComputerRect, dx: number, dy: number): ComputerRect {
+  return { x: rect.x + dx, y: rect.y + dy, width: rect.width, height: rect.height };
+}
+
+export function shiftPoint(point: ComputerPoint, dx: number, dy: number): ComputerPoint {
+  return { x: point.x + dx, y: point.y + dy };
+}
+
+/** One window's bounds moved into agent space; identity and flags ride along. */
+export function windowInAgentSpace(window: ComputerWindow, origin: ComputerPoint): ComputerWindow {
+  if (window.bounds === undefined) return window;
+  return { ...window, bounds: shiftRect(window.bounds, -origin.x, -origin.y) };
+}
 
 /**
  * Resolves the global desktop rect. The display server's reported workspace

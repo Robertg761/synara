@@ -241,11 +241,32 @@ const NAMED_KEYS: Readonly<Record<string, number>> = {
   f12: EVDEV_KEY_CODES.F12,
 };
 
-export function qwertyKeyStroke(character: string): QwertyKeyStroke {
+/**
+ * How the host keyboard's lock state bends QWERTY synthesis.
+ *
+ * CapsLock inverts the letter Shifts: `Hello` under a latched CapsLock would
+ * land as `hELLO` if synthesis kept its Shift-only view of case. Only Tier 1
+ * can detect it — the KWin plugin reads its own xkb state — so callers on
+ * other tiers omit the flag and accept the limitation, which is documented
+ * where their input surfaces are.
+ */
+export interface QwertySynthesisOptions {
+  /** Whether CapsLock is latched on the seat about to receive the text. */
+  readonly capsLock?: boolean;
+}
+
+export function qwertyKeyStroke(
+  character: string,
+  options: QwertySynthesisOptions = {},
+): QwertyKeyStroke {
   if (character.length !== 1) throw new UnsupportedQwertyKeyError(character);
   const letter = LETTER_CODES[character.toLowerCase()];
   if (letter !== undefined) {
-    return { code: letter, shift: character !== character.toLowerCase() };
+    const shiftForCase = character !== character.toLowerCase();
+    // CapsLock applies to letters only, and it flips whatever case the Shift
+    // decision was going to produce.
+    const shift = options.capsLock === true ? !shiftForCase : shiftForCase;
+    return { code: letter, shift };
   }
   const unshifted = UNSHIFTED_CODES[character];
   if (unshifted !== undefined) return { code: unshifted, shift: false };
@@ -259,8 +280,11 @@ export function qwertyKeyStroke(character: string): QwertyKeyStroke {
   throw new UnsupportedQwertyKeyError(character);
 }
 
-export function qwertyTextKeyStrokes(text: string): readonly QwertyKeyStroke[] {
-  return [...text].map(qwertyKeyStroke);
+export function qwertyTextKeyStrokes(
+  text: string,
+  options: QwertySynthesisOptions = {},
+): readonly QwertyKeyStroke[] {
+  return [...text].map((character) => qwertyKeyStroke(character, options));
 }
 
 export function keyStrokeForKey(key: string): QwertyKeyStroke {
