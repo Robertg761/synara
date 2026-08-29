@@ -1428,12 +1428,12 @@ int takeDiscreteSteps(double& remainder, double delta120) {
 // Pixels per wheel notch. The whole stack speaks pixels — the tool surface,
 // the computer pane, and the `axis` D-Bus method — while a wheel speaks
 // notches, so the conversion lives at the one place the two meet. These are
-// content pixels, what a page moves per click (Chromium 53, Firefox about 57),
-// not the 15 wire units libinput reports per click: those are degrees, which
-// every toolkit scales up, and taking them for pixels made each scroll several
-// times longer than asked. Keep in sync with the KWin plugin and SCROLL_STEP_PX
+// content pixels, what a page moves per click (about 86 in Firefox on Wayland,
+// 80 in Chromium), not the 15 wire units libinput reports per click: those are
+// degrees, which every toolkit scales up, and taking them for pixels made each
+// scroll several times longer than asked. Keep in sync with the KWin plugin and SCROLL_STEP_PX
 // in apps/server/src/computer/scrollUnits.ts, which carries the full rationale.
-constexpr double SCROLL_PIXELS_PER_NOTCH = 50.0;
+constexpr double SCROLL_PIXELS_PER_NOTCH = 80.0;
 // What one notch is worth in wl_pointer.axis: libinput's wheel unit is degrees
 // of rotation, 15 per click, and that is the scale every client expects there.
 constexpr double AXIS_UNITS_PER_NOTCH = 15.0;
