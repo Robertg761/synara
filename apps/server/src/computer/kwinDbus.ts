@@ -91,15 +91,27 @@ export interface KWinComputerDbusOptions {
 }
 
 /**
- * Connect to a session bus and KWin's plugin manager.
- *
- * The plugin proxy is resolved only after the backend has selected and loaded
- * an installed plugin. This matters because KWin does not own the Synara
- * service until the plugin has been loaded.
+ * The half of a plugin-host connection that is the same for every compositor:
+ * the session bus itself and the Synara plugin proxy on it. The KWin host adds
+ * KWin's D-Bus plugin manager on top; the Hyprland host adds `hyprctl`.
  */
-export async function createSessionKWinComputerDbus(
+export interface ComputerSessionBus {
+  /** Resolves a proxy object, with the shared connection-level timeout. */
+  readonly getProxyObject: (service: string, path: string) => Promise<dbusModule.ProxyObject>;
+  readonly connectPlugin: () => Promise<KWinComputerPluginApi>;
+  readonly onDisconnect: (listener: () => void) => () => void;
+  readonly close: () => Promise<void>;
+}
+
+/**
+ * Connect to a session bus, wired for plugin-host use: disconnect fan-out, the
+ * Synara plugin proxy, and idempotent close. The plugin proxy is resolved only
+ * after the backend has selected and loaded an installed plugin, because no
+ * compositor owns the Synara service until a plugin has been loaded.
+ */
+export async function openComputerSessionBus(
   options: KWinComputerDbusOptions = {},
-): Promise<KWinComputerDbus> {
+): Promise<ComputerSessionBus> {
   // Keep the optional Linux runtime out of test imports. The production path
   // resolves it only when the backend has passed the Linux/Wayland gate.
   const require = createRequire(import.meta.url);
@@ -115,13 +127,46 @@ export async function createSessionKWinComputerDbus(
   const eventBus = bus as unknown as EventEmitter;
   eventBus.on("disconnect", onDisconnectEvent);
   eventBus.on("error", onDisconnectEvent);
+  return {
+    getProxyObject: (service, path) =>
+      withTimeout(
+        Promise.resolve(bus.getProxyObject(service, path)),
+        KWIN_DBUS_DEFAULT_TIMEOUT_MS,
+        "getProxyObject",
+      ),
+    connectPlugin: async () => {
+      const object = await withTimeout(
+        Promise.resolve(bus.getProxyObject(COMPUTER_SERVICE, COMPUTER_OBJECT_PATH)),
+        KWIN_DBUS_DEFAULT_TIMEOUT_MS,
+        "getProxyObject",
+      );
+      const plugin = object.getInterface(COMPUTER_INTERFACE);
+      return makePluginApi(plugin);
+    },
+    onDisconnect: (listener) => {
+      disconnectListeners.add(listener);
+      return () => disconnectListeners.delete(listener);
+    },
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      disconnectListeners.clear();
+      eventBus.off("disconnect", onDisconnectEvent);
+      eventBus.off("error", onDisconnectEvent);
+      bus.disconnect();
+    },
+  };
+}
 
+/**
+ * Connect to a session bus and KWin's plugin manager.
+ */
+export async function createSessionKWinComputerDbus(
+  options: KWinComputerDbusOptions = {},
+): Promise<KWinComputerDbus> {
+  const session = await openComputerSessionBus(options);
   try {
-    const pluginsObject = await withTimeout(
-      Promise.resolve(bus.getProxyObject(KWIN_SERVICE, KWIN_PLUGINS_PATH)),
-      KWIN_DBUS_DEFAULT_TIMEOUT_MS,
-      "getProxyObject",
-    );
+    const pluginsObject = await session.getProxyObject(KWIN_SERVICE, KWIN_PLUGINS_PATH);
     const plugins = pluginsObject.getInterface(KWIN_PLUGINS_INTERFACE);
     // KWin exposes the loaded plugin list as the LoadedPlugins property (KWin 6
     // has no loadedPlugins method); keep the method as a fallback for variants
@@ -150,32 +195,12 @@ export async function createSessionKWinComputerDbus(
         const result = await invoke(plugins, "UnloadPlugin", pluginId);
         return readOptionalBoolean(result) ?? true;
       },
-      connectPlugin: async () => {
-        const object = await withTimeout(
-          Promise.resolve(bus.getProxyObject(COMPUTER_SERVICE, COMPUTER_OBJECT_PATH)),
-          KWIN_DBUS_DEFAULT_TIMEOUT_MS,
-          "getProxyObject",
-        );
-        const plugin = object.getInterface(COMPUTER_INTERFACE);
-        return makePluginApi(plugin);
-      },
-      onDisconnect: (listener) => {
-        disconnectListeners.add(listener);
-        return () => disconnectListeners.delete(listener);
-      },
-      close: async () => {
-        if (closed) return;
-        closed = true;
-        disconnectListeners.clear();
-        eventBus.off("disconnect", onDisconnectEvent);
-        eventBus.off("error", onDisconnectEvent);
-        bus.disconnect();
-      },
+      connectPlugin: session.connectPlugin,
+      onDisconnect: session.onDisconnect,
+      close: session.close,
     };
   } catch (error) {
-    eventBus.off("disconnect", onDisconnectEvent);
-    eventBus.off("error", onDisconnectEvent);
-    bus.disconnect();
+    await session.close();
     throw error;
   }
 }

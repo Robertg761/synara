@@ -163,6 +163,15 @@ const buildCmd = Command.make(
       yield* fs.chmod(path.join(kwinPluginTarget, "scripts/uninstall.sh"), 0o755);
       yield* Effect.log("[cli] Bundled KWin computer-use plugin into dist/computer-use-kwin");
 
+      // The Hyprland twin resolves its sources and installer the same way.
+      const hyprlandPluginSource = path.join(serverDir, "native/computer-use-hyprland");
+      const hyprlandPluginTarget = path.join(serverDir, "dist/computer-use-hyprland");
+      yield* fs.copy(hyprlandPluginSource, hyprlandPluginTarget);
+      yield* fs.chmod(path.join(hyprlandPluginTarget, "scripts/install-and-load.sh"), 0o755);
+      yield* Effect.log(
+        "[cli] Bundled Hyprland computer-use plugin into dist/computer-use-hyprland",
+      );
+
       const desktopHelperSource = path.join(serverDir, "native/computer-desktop-helper");
       const desktopHelperTarget = path.join(serverDir, "dist/computer-desktop-helper");
       yield* fs.copy(desktopHelperSource, desktopHelperTarget);
