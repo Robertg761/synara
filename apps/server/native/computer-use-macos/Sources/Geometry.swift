@@ -14,6 +14,22 @@ import CoreGraphics
 enum Geometry {
   /// The union of every screen's frame, in global top-left points — the
   /// workspace the Node backend translates into its 0-based agent space.
+  /// A point pinned inside the desktop's bounding rect.
+  ///
+  /// A coordinate outside every display resolves no target window, so the event
+  /// is posted nowhere and the action reports success having done nothing.
+  /// Clamping puts it on the nearest edge instead, and the caller echoes the
+  /// clamped point so the backend can tell the agent the request moved.
+  /// Non-finite input collapses to the workspace origin rather than propagating
+  /// a NaN through the event fields.
+  static func clampToWorkspace(_ point: CGPoint) -> CGPoint {
+    let rect = workspaceRect()
+    guard point.x.isFinite, point.y.isFinite else { return rect.origin }
+    return CGPoint(
+      x: min(max(point.x, rect.minX), rect.maxX),
+      y: min(max(point.y, rect.minY), rect.maxY))
+  }
+
   static func workspaceRect() -> CGRect {
     let screens = NSScreen.screens
     guard let primary = screens.first else {

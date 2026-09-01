@@ -1,11 +1,11 @@
 /**
- * MacComputerHelperClient — the only module that knows the native macOS
+ * MacComputerHelperClient — the only server module that knows the native macOS
  * computer-use helper's wire protocol.
  *
- * The helper is a Swift process compiled on demand against the user's Xcode
- * (it resolves private Quartz/AppKit SPI at runtime — `CGEventSetWindowLocation`
- * and friends — so it cannot ship a prebuilt binary that would break between
- * OS releases), mirroring the device helper. It speaks one channel:
+ * Packaged builds ship a signed universal Swift helper. Source builds retain a
+ * compile-and-cache fallback for development. Private Quartz/AppKit SPI such as
+ * `CGEventSetWindowLocation` is resolved at runtime so OS drift is reported as
+ * a capability failure rather than a loader crash. It speaks one channel:
  *
  * - Control: newline-delimited JSON-RPC 2.0 over stdin/stdout. Requests carry
  *   an integer id; responses carry `result` or `error`. It also emits a `ready`
@@ -51,6 +51,7 @@ export const MAC_HELPER_METHODS = {
   hotkey: "hotkey",
   setValue: "set-value",
   performAction: "perform-action",
+  focusWindow: "focus-window",
   raiseWindow: "raise-window",
   readClipboard: "read-clipboard",
   writeClipboard: "write-clipboard",
@@ -59,7 +60,16 @@ export const MAC_HELPER_METHODS = {
 
 /** A long turn can hold the helper (a slow AX walk, a Screen Recording prompt), so the default is generous. */
 const REQUEST_TIMEOUT_MS = 15_000;
-const MAX_CONTROL_LINE_BYTES = 4 * 1024 * 1024;
+/**
+ * The control line carries a whole-desktop capture as base64, so this bounds a
+ * picture, not a command. A 1680x1050 desktop measures ~1.4 MB encoded; a
+ * Retina multi-display workspace at the 2048px capture ceiling is several times
+ * that, and 4 MB put the cap inside the range of an ordinary screenshot. Base64
+ * costs a third on top of the PNG, which the margin here accounts for.
+ */
+const MAX_CONTROL_LINE_BYTES = 24 * 1024 * 1024;
+/** How long a helper gets to exit on its own before SIGKILL. */
+const HELPER_SHUTDOWN_GRACE_MS = 2_000;
 
 export class MacComputerHelperError extends Error {
   readonly code: string;
@@ -78,6 +88,12 @@ export class MacComputerHelperError extends Error {
  */
 export interface MacHelperTransport {
   readonly running: boolean;
+  /**
+   * Spawns the helper process. Idempotent, and optional in the sense that
+   * `request` starts a client that has not been started — the backend calls it
+   * anyway so a connect pays the spawn instead of the first agent action.
+   */
+  start(): void;
   request(method: string, params?: Record<string, unknown>): Promise<unknown>;
   dispose(): Promise<void>;
 }
@@ -118,6 +134,8 @@ export class MacComputerHelperClient implements MacHelperTransport {
   private readonly requestTimeoutMs: number;
   private stderrTail = "";
   private exited = false;
+  /** Terminal. `dispose()` is not a pause: a later request must not respawn. */
+  private disposed = false;
 
   constructor(private readonly options: MacComputerHelperClientOptions) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
@@ -128,7 +146,7 @@ export class MacComputerHelperClient implements MacHelperTransport {
   }
 
   start(): void {
-    if (this.process) return;
+    if (this.disposed || this.process) return;
     const spawnFn =
       this.options.spawn ??
       ((command, args, env) => spawn(command, [...args], { stdio: ["pipe", "pipe", "pipe"], env }));
@@ -177,6 +195,12 @@ export class MacComputerHelperClient implements MacHelperTransport {
   }
 
   async request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    // `dispose()` clears `process` and sets `exited`, so without this a request
+    // arriving afterwards took the "not started yet" path and spawned a fresh
+    // child that nothing owned or would ever shut down.
+    if (this.disposed) {
+      throw new MacComputerHelperError("helper_disposed", "Computer helper was shut down");
+    }
     if (!this.process) this.start();
     const child = this.process;
     if (!child || this.exited) {
@@ -203,12 +227,35 @@ export class MacComputerHelperClient implements MacHelperTransport {
   }
 
   async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
     this.fail(new MacComputerHelperError("helper_disposed", "Computer helper was shut down"));
     const child = this.process;
     this.process = null;
     this.exited = true;
-    child?.stdin.end();
-    child?.kill("SIGTERM");
+    if (!child) return;
+    child.stdin.end();
+    child.kill("SIGTERM");
+    // Closed stdin and SIGTERM are both clean-exit paths the helper handles, but
+    // neither is a guarantee: a helper wedged in a synchronous AX or capture call
+    // answers no signal, and a leaked helper holds the Accessibility grant and
+    // keeps drawing its cursor overlay. Escalate rather than leak.
+    await new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve();
+      }, HELPER_SHUTDOWN_GRACE_MS);
+      // Node keeps the loop alive for this timer otherwise, delaying every exit.
+      timer.unref?.();
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   // ── Internals ──────────────────────────────────────────────────────

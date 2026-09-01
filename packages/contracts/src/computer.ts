@@ -338,6 +338,12 @@ export interface ComputerUiNode {
   readonly nodePath?: readonly number[] | undefined;
   /** The node accepts a semantic text write (AT-SPI `EditableText`). */
   readonly editable?: boolean | undefined;
+  /**
+   * The walk stopped short under this node, so `children` is incomplete.
+   * Without it an agent reads a budget-truncated subtree as a complete one and
+   * concludes a control is absent when the walk simply never reached it.
+   */
+  readonly truncated?: boolean | undefined;
   readonly children: readonly ComputerUiNode[];
 }
 
@@ -354,6 +360,7 @@ export const ComputerUiNode: Schema.Schema<ComputerUiNode> = Schema.Struct({
     Schema.Array(NonNegativeInt).check(Schema.isMaxLength(COMPUTER_NODE_PATH_MAX_DEPTH)),
   ),
   editable: Schema.optional(Schema.Boolean),
+  truncated: Schema.optional(Schema.Boolean),
   children: Schema.Array(Schema.suspend((): Schema.Schema<ComputerUiNode> => ComputerUiNode)).check(
     Schema.isMaxLength(2_048),
   ),

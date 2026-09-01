@@ -76,6 +76,20 @@ export interface ComputerBackendActionResult {
   readonly clampedTo?: ComputerPoint;
   readonly windowId?: string;
   readonly value?: string;
+  /**
+   * Which rung of a backend's delivery ladder actually ran, and whether the
+   * backend could confirm the effect. The macOS helper answers both for every
+   * keyboard action (`ax-insert` | `keystrokes` | `foreground` |
+   * `foreground-keys`), and an unverified delivery is a materially different
+   * outcome from a verified one — a caller that must know the text landed can
+   * re-read the target instead of assuming.
+   *
+   * Server-side only for now: the wire-level `ComputerActionResult` is a
+   * contracts schema shared with the Linux backends, and
+   * `computerBackendActionResult` projects only the fields that schema declares.
+   */
+  readonly deliveryPath?: string;
+  readonly verified?: boolean;
 }
 
 export type ComputerBackendEvent =
@@ -211,6 +225,20 @@ export interface ComputerBackend {
    * `region` + `scale` mapping so pixels still convert to desktop coordinates.
    */
   captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot>;
+  /**
+   * True when input addressed at a named window reaches that window whatever is
+   * stacked above it.
+   *
+   * The Linux tiers inject at a screen coordinate, so whatever is on top of that
+   * point receives the event — a covered target has to be raised first, or the
+   * click lands somewhere the caller did not mean. The macOS helper instead
+   * stamps the target window on the event and posts it to that window's process,
+   * so stacking has no bearing on delivery. Declaring that here lets the manager
+   * skip both the raise and the occlusion refusal, neither of which is meaningful
+   * for such a backend — and the raise was the step that pulled the human's
+   * frontmost application out from under them on every click.
+   */
+  readonly deliversToNamedWindowRegardlessOfStacking?: boolean;
   /** Pin or release the plugin's per-seat target window when supported. */
   focusWindow?(windowId: string): Promise<void>;
   /**
@@ -229,19 +257,29 @@ export interface ComputerBackend {
    */
   setDrivingAgent?(name: string | null): Promise<void>;
   launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult>;
-  click(point: ComputerPoint): Promise<ComputerBackendActionResult | void>;
-  doubleClick(point: ComputerPoint): Promise<ComputerBackendActionResult | void>;
-  rightClick(point: ComputerPoint): Promise<ComputerBackendActionResult | void>;
-  moveCursor(point: ComputerPoint): Promise<ComputerBackendActionResult | void>;
+  /**
+   * `windowId` is the window the caller resolved this point to, when it named
+   * one. A backend that injects at a screen coordinate ignores it — whatever is
+   * stacked at that point receives the event either way. A backend that posts to
+   * a window by id uses it as the delivery target, which is what makes a click
+   * on a partially covered window reach the window the caller meant rather than
+   * the one drawn on top of it.
+   */
+  click(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult | void>;
+  doubleClick(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult | void>;
+  rightClick(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult | void>;
+  moveCursor(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult | void>;
   drag(
     from: ComputerPoint,
     to: ComputerPoint,
     durationMs: number,
+    windowId?: string,
   ): Promise<ComputerBackendActionResult | void>;
   scroll(
     point: ComputerPoint | null,
     deltaX: number,
     deltaY: number,
+    windowId?: string,
   ): Promise<ComputerBackendActionResult | void>;
   typeText(text: string): Promise<ComputerBackendActionResult | void>;
   pressKey(key: string): Promise<ComputerBackendActionResult | void>;

@@ -271,7 +271,7 @@ export function ComputerSettingsPanel({
         />
         <SettingsRow
           title="Per-chat control"
-          description="Switch computer control for a single chat from the composer's mode menu (the Full access picker); the mode button shows a monitor icon while it is on. Desktop actions then ask for approval as they run, and clipboard reads always ask."
+          description="Switch computer control for a single chat from the composer's mode menu (the Full access picker); the mode button shows a monitor icon while it is on. Turning it on is when Synara asks for any desktop permissions it still needs. If an agent tries to use the desktop while it is off, the chat offers a one-click Enable instead. Desktop actions then ask for approval as they run, and clipboard reads always ask."
         />
       </SettingsSection>
     </div>

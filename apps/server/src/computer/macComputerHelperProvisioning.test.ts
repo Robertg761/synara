@@ -22,11 +22,13 @@ function harness(options: {
   readonly xcode?: ProcessRunResult;
   readonly build?: ProcessRunResult;
   readonly existing?: Set<string>;
+  readonly bundledBinaryPath?: string;
 }): Harness {
   const runCalls: { command: string; args: readonly string[] }[] = [];
   const existing = options.existing ?? new Set<string>();
   const provisioner = new MacComputerHelperProvisioner({
     helperSourceDir: "/repo/native/computer-use-macos",
+    ...(options.bundledBinaryPath ? { bundledBinaryPath: options.bundledBinaryPath } : {}),
     helperCacheRoot: "/cache",
     run: async (command, args) => {
       runCalls.push({ command, args });
@@ -47,6 +49,17 @@ function harness(options: {
 }
 
 describe("MacComputerHelperProvisioner", () => {
+  it("prefers the signed helper bundled with Synara without probing Xcode", async () => {
+    const bundledBinaryPath = "/Applications/Synara.app/Contents/Helpers/synara-computer-helper";
+    const { provisioner, runCalls } = harness({
+      bundledBinaryPath,
+      existing: new Set([bundledBinaryPath]),
+      xcode: { code: 127, stdout: "", stderr: "not found" },
+    });
+    await expect(provisioner.ensureBinary()).resolves.toBe(bundledBinaryPath);
+    expect(runCalls).toEqual([]);
+  });
+
   it("reports the toolchain present when xcodebuild answers", async () => {
     const { provisioner } = harness({});
     expect(await provisioner.xcodeToolchainPresent()).toBe(true);

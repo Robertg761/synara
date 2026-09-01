@@ -462,6 +462,15 @@ export interface DesktopAppSnapState {
   message: string | null;
 }
 
+/** macOS privacy grants needed by Synara's real-desktop computer-use backend. */
+export interface DesktopComputerControlPermissionState {
+  readonly supported: boolean;
+  readonly screenRecordingPermission: DesktopAppSnapPermission;
+  readonly accessibilityPermission: DesktopAppSnapPermission;
+  readonly ready: boolean;
+  readonly message: string | null;
+}
+
 export interface DesktopAppSnapCapture {
   id: string;
   capturedAt: string;
@@ -674,6 +683,15 @@ export interface DesktopBridge {
     onCaptured: (listener: (capture: DesktopAppSnapCapture) => void) => () => void;
     onError: (listener: (error: DesktopAppSnapErrorEvent) => void) => () => void;
     onState: (listener: (state: DesktopAppSnapState) => void) => () => void;
+  };
+  /**
+   * Electron-main permission preflight for real-desktop computer use. Keeping
+   * this in the signed desktop process makes macOS attribute prompts to Synara
+   * rather than to an agent's shell or Terminal.
+   */
+  computerControl?: {
+    getPermissionState: () => Promise<DesktopComputerControlPermissionState>;
+    requestPermissions: () => Promise<DesktopComputerControlPermissionState>;
   };
   storageMigration: {
     readSnapshot: () => SynaraStorageSnapshot | null;

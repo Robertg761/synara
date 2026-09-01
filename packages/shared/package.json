@@ -300,6 +300,11 @@
       "types": "./src/deviceHelperCache.ts",
       "import": "./src/deviceHelperCache.ts"
     },
+    "./computerHelperPaths": {
+      "types": "./src/computerHelperPaths.ts",
+      "import": "./src/computerHelperPaths.ts"
+    },
+    "./computerHelperBundle": "./src/computerHelperBundle.json",
     "./lengthPrefixedRecords": {
       "types": "./src/lengthPrefixedRecords.ts",
       "import": "./src/lengthPrefixedRecords.ts"

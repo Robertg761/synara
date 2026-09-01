@@ -19,11 +19,6 @@ final class AgentCursor {
   private var window: NSWindow?
   private var badgeLabel: NSTextField?
   private let size = CGFloat(24)
-  private let primaryHeight: CGFloat
-
-  init() {
-    self.primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-  }
 
   /// Build the overlay window. Must run on the main thread.
   func install() {
@@ -80,10 +75,23 @@ final class AgentCursor {
   func move(to global: CGPoint) {
     onMain {
       guard let window = self.window else { return }
-      // Global top-left → AppKit bottom-left; the arrow tip sits at the point.
-      let originY = self.primaryHeight - global.y - window.frame.height
+      // Global top-left → AppKit bottom-left, against the primary screen's
+      // height *now*: caching it at init misplaces the overlay on every
+      // subsequent display change (resolution switch, external display, a
+      // laptop lid closing) until the helper restarts.
+      let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+      let originY = primaryHeight - global.y - window.frame.height
       window.setFrameOrigin(NSPoint(x: global.x - 4, y: originY))
       window.orderFrontRegardless()
+    }
+  }
+
+  /// Re-order the overlay front without moving it. Changing another app's
+  /// AppKit-active state (the focus prelude in Input.swift) can drop the overlay
+  /// behind that app's windows.
+  func repin() {
+    onMain {
+      self.window?.orderFrontRegardless()
     }
   }
 

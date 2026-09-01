@@ -9,7 +9,10 @@ import {
 } from "@synara/contracts";
 
 import { requireWindowBounds } from "./computerGeometry.ts";
-import { clampTextToLength } from "./utf8Truncation.ts";
+import { clampNodeText } from "./uiTreeText.ts";
+
+// Re-exported for the existing AT-SPI tests and callers that import it here.
+export { clampNodeText };
 
 /**
  * The bounds `ComputerUiNode` is encoded against. An accessible name is whatever
@@ -152,19 +155,6 @@ export function atspiTextWriteAddress(node: ComputerUiNode): AtspiNodeAddress | 
   return { windowId: node.windowId, path: [...path] };
 }
 
-export function describeComputerUiTree(root: ComputerUiNode): string {
-  const lines: string[] = [];
-  const visit = (node: ComputerUiNode, depth: number): void => {
-    const label = node.label ?? node.description ?? "(unlabelled)";
-    lines.push(
-      `${"  ".repeat(depth)}${node.role}: ${label}${node.value ? ` = ${node.value}` : ""}`,
-    );
-    for (const child of node.children) visit(child, depth + 1);
-  };
-  visit(root, 0);
-  return lines.join("\n");
-}
-
 function fuseNode(
   node: AtspiRawNode,
   input: {
@@ -198,16 +188,6 @@ function fuseNode(
     ...(node.editable === true ? { editable: true } : {}),
     children: node.children.map((child) => fuseNode(child, input)),
   };
-}
-
-/**
- * `text` cut to `maxLength` characters with a marker in place of the tail.
- *
- * Kept as this module's name for the shared surrogate-safe clamp, because every
- * caller here is talking about a UI node's text.
- */
-export function clampNodeText(text: string, maxLength: number): string {
-  return clampTextToLength(text, maxLength);
 }
 
 function clampNullableNodeText(text: string | null | undefined, maxLength: number): string | null {

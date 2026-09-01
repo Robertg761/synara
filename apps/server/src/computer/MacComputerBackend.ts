@@ -22,6 +22,7 @@ import {
   ComputerBackendError,
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   intersectComputerRects,
+  MAX_COMPUTER_CLIPBOARD_BYTES,
   type ComputerBackend,
   type ComputerBackendActionResult,
   type ComputerBackendEventListener,
@@ -35,17 +36,20 @@ import {
   asRecord,
   asString,
   formatRect,
+  pointerClampResult,
   readPngDimensions,
   requireWindowBounds,
   screenSizeFromWindows,
   screenshotFromPng,
   shiftRect,
+  windowsPayloadFingerprint,
   workspaceRectFromWindows,
   parseWindows,
   windowInAgentSpace,
 } from "./computerGeometry.ts";
-import { describeComputerUiTree } from "./atspiTreeTargeting.ts";
+import { describeComputerUiTree } from "./uiTreeText.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
+import { StillFrameDedupe } from "./stillFrameDedupe.ts";
 import {
   MacComputerHelperClient,
   MAC_HELPER_METHODS,
@@ -64,11 +68,31 @@ const DEFAULT_COMPUTER_ID = "desktop";
 const DEFAULT_STILL_INTERVAL_MS = 500;
 const DEFAULT_DRAG_DURATION_MS = 220;
 const UNSUPPORTED_MACOS_MESSAGE =
-  "Synara computer control on this host requires macOS with a full Xcode install to build the " +
-  "native helper; no Xcode toolchain was found. Install Xcode and run " +
-  "`sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.";
+  "This Synara build does not include its macOS computer-control helper, and no Xcode " +
+  "toolchain is available for the development fallback. Update or reinstall Synara.";
+
+/**
+ * The JSON-RPC code the helper returns when the action needed a TCC grant it
+ * does not have (`RPCError.permissionDenied` = -32000, wrapped by the client as
+ * `helper_<code>`). A capture that fails this way is the live answer to
+ * "is Screen Recording granted?", so the backend believes it over the last
+ * capability probe.
+ */
+const HELPER_PERMISSION_DENIED_CODE = "helper_-32000";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * The helper's own error code behind a failure, whether it arrived raw or
+ * already wrapped in a `ComputerBackendError` (which keeps the original as
+ * `cause`).
+ */
+function helperErrorCode(error: unknown): string | undefined {
+  const record = asRecord(error);
+  if (typeof record.code === "string") return record.code;
+  const cause = asRecord(record.cause);
+  return typeof cause.code === "string" ? cause.code : undefined;
+}
 
 /**
  * Runs a subprocess to completion, capturing stdout/stderr and never throwing
@@ -181,6 +205,8 @@ export class MacComputerBackend implements ComputerBackend {
   private streamTimer: ReturnType<typeof setInterval> | undefined;
   private stillInFlight = false;
   private nextSequence = 1;
+  /** Suppresses stills identical to the one the pane already has. */
+  private readonly frameDedupe = new StillFrameDedupe();
   private previousWindowsFingerprint: string | undefined;
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
 
@@ -259,6 +285,7 @@ export class MacComputerBackend implements ComputerBackend {
     if (this.buildFailure) {
       return { kind: "backend-unavailable", message: this.buildFailure };
     }
+    if (await this.provisioner.bundledBinary().catch(() => null)) return this.availableNow();
     if (await this.provisioner.cachedBinaryPath().catch(() => null)) return this.availableNow();
     if (await this.provisioner.xcodeToolchainPresent().catch(() => false))
       return this.availableNow();
@@ -276,9 +303,19 @@ export class MacComputerBackend implements ComputerBackend {
     }
     try {
       const capabilities = await this.readCapabilities();
-      this.captureGranted = capabilities.screenRecording;
       this.healthState.recordConnected();
       this.publishHealth();
+      // Accessibility is not optional for this backend: without it every click
+      // and keystroke is dropped by WindowServer. Reporting "available" here
+      // let the pane open onto a desktop nothing could be done to.
+      if (!capabilities.accessibility) {
+        return {
+          kind: "backend-unavailable",
+          message:
+            "Synara needs Accessibility access to control this Mac. Allow it for Synara in " +
+            "System Settings › Privacy & Security › Accessibility, then try again.",
+        };
+      }
       return this.availableNow();
     } catch (error) {
       this.recordHealthFailure(error);
@@ -312,7 +349,6 @@ export class MacComputerBackend implements ComputerBackend {
     }
     await this.ensureHelper();
     const capabilities = await this.readCapabilities();
-    this.captureGranted = capabilities.screenRecording;
     this.publishHealth();
     const missing: string[] = [];
     if (!capabilities.screenRecording) missing.push("Screen Recording");
@@ -342,15 +378,14 @@ export class MacComputerBackend implements ComputerBackend {
   private async readWindows(): Promise<readonly [readonly ComputerWindow[], ComputerPoint]> {
     const payload = await this.call(MAC_HELPER_METHODS.listWindows);
     const record = asRecord(payload);
-    const raw = parseWindows(record.windows, asString(record.focusedWindowId) ?? null);
+    const focusedWindowId = asString(record.focusedWindowId) ?? null;
+    const raw = parseWindows(record.windows, focusedWindowId);
     const workspace = this.parseWorkspace(record.workspace) ?? workspaceRectFromWindows(raw);
     const origin = { x: workspace.x, y: workspace.y };
     this.lastOrigin = origin;
     this.lastWorkspaceGlobal = workspace;
     const windows = raw.map((window) => windowInAgentSpace(window, origin));
-    const fingerprint = `${asString(record.focusedWindowId) ?? ""} ${JSON.stringify(
-      raw.map((window) => [window.id, window.bounds, window.stackingIndex, window.minimized]),
-    )}`;
+    const fingerprint = windowsPayloadFingerprint(record.windows, focusedWindowId);
     if (fingerprint !== this.previousWindowsFingerprint) {
       this.previousWindowsFingerprint = fingerprint;
       this.emit({ type: "windows-changed", windows });
@@ -388,21 +423,29 @@ export class MacComputerBackend implements ComputerBackend {
   }): Promise<ComputerState> {
     const [windows, origin] = await this.readWindows();
     const screenSize = screenSizeFromWindows(windows, this.lastWorkspaceGlobal);
+    // The AX walk and the capture are independent reads of the same moment, and
+    // the helper serves perception and pixels on separate queues, so they are
+    // issued together: running them back to back doubled the latency of every
+    // `computer_get_state` for nothing.
+    const [uiPayload, screenshot] = await Promise.all([
+      options.includeText
+        ? // AX is an optional perception source: a window with no tree, a helper
+          // restarting, or a missing Accessibility grant degrades to
+          // windows-only rather than failing the state, as the KWin path does.
+          this.call(MAC_HELPER_METHODS.describeUi).catch(() => undefined)
+        : undefined,
+      options.includeScreenshot && this.captureGranted
+        ? this.captureWorkspaceScreenshot(origin).catch(() => undefined)
+        : undefined,
+    ]);
     let root: ComputerUiNode | undefined;
-    if (options.includeText) {
+    if (uiPayload !== undefined) {
       try {
-        const payload = await this.call(MAC_HELPER_METHODS.describeUi);
-        root = parseMacUiForest(payload, screenSize, origin);
+        root = parseMacUiForest(uiPayload, screenSize, origin);
       } catch {
-        // AX is an optional perception source: a window with no tree, a helper
-        // restarting, or a missing Accessibility grant degrades to windows-only
-        // rather than failing the state, exactly as the KWin path does.
+        // A tree this build cannot parse degrades the same way a missing one does.
       }
     }
-    const screenshot =
-      options.includeScreenshot && this.captureGranted
-        ? await this.captureWorkspaceScreenshot(origin).catch(() => undefined)
-        : undefined;
     return {
       computerId: this.computerId,
       windows,
@@ -480,26 +523,27 @@ export class MacComputerBackend implements ComputerBackend {
     };
   }
 
-  async click(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction(MAC_HELPER_METHODS.click, point);
+  async click(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction(MAC_HELPER_METHODS.click, point, windowId);
   }
 
-  async doubleClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction(MAC_HELPER_METHODS.doubleClick, point);
+  async doubleClick(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction(MAC_HELPER_METHODS.doubleClick, point, windowId);
   }
 
-  async rightClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction(MAC_HELPER_METHODS.rightClick, point);
+  async rightClick(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction(MAC_HELPER_METHODS.rightClick, point, windowId);
   }
 
-  async moveCursor(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction(MAC_HELPER_METHODS.move, point);
+  async moveCursor(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction(MAC_HELPER_METHODS.move, point, windowId);
   }
 
   async drag(
     from: ComputerPoint,
     to: ComputerPoint,
     durationMs: number,
+    windowId?: string,
   ): Promise<ComputerBackendActionResult> {
     const origin = this.currentOrigin();
     await this.call(MAC_HELPER_METHODS.drag, {
@@ -508,6 +552,7 @@ export class MacComputerBackend implements ComputerBackend {
       toX: to.x + origin.x,
       toY: to.y + origin.y,
       durationMs: durationMs > 0 ? durationMs : DEFAULT_DRAG_DURATION_MS,
+      ...(windowId ? { windowId } : {}),
     });
     return { point: to };
   }
@@ -516,9 +561,11 @@ export class MacComputerBackend implements ComputerBackend {
     point: ComputerPoint | null,
     deltaX: number,
     deltaY: number,
+    windowId?: string,
   ): Promise<ComputerBackendActionResult> {
     const origin = this.currentOrigin();
     const params: Record<string, unknown> = { deltaX, deltaY };
+    if (windowId) params.windowId = windowId;
     if (point) {
       params.x = point.x + origin.x;
       params.y = point.y + origin.y;
@@ -527,24 +574,56 @@ export class MacComputerBackend implements ComputerBackend {
     return point ? { point } : {};
   }
 
+  /**
+   * Every keyboard reply names the rung the helper took and whether it could
+   * confirm the effect — the whole point of the helper's delivery ladder — and
+   * this backend used to discard both, so an unverified delivery and a proven
+   * one were indistinguishable to everything above it.
+   */
+  private static deliveryReport(payload: unknown): ComputerBackendActionResult {
+    const record = asRecord(payload);
+    const deliveryPath = asString(record.path);
+    const verified = record.verified;
+    return {
+      ...(deliveryPath !== undefined ? { deliveryPath } : {}),
+      ...(typeof verified === "boolean" ? { verified } : {}),
+    };
+  }
+
   async typeText(text: string): Promise<ComputerBackendActionResult> {
-    await this.call(MAC_HELPER_METHODS.type, { text });
-    return { value: text };
+    const payload = await this.call(MAC_HELPER_METHODS.type, { text });
+    return { value: text, ...MacComputerBackend.deliveryReport(payload) };
   }
 
   async pressKey(key: string): Promise<ComputerBackendActionResult> {
-    await this.call(MAC_HELPER_METHODS.pressKey, { key });
-    return {};
+    const payload = await this.call(MAC_HELPER_METHODS.pressKey, { key });
+    return MacComputerBackend.deliveryReport(payload);
   }
 
   async hotkey(keys: readonly string[]): Promise<ComputerBackendActionResult> {
-    await this.call(MAC_HELPER_METHODS.hotkey, { keys: [...keys] });
-    return {};
+    const payload = await this.call(MAC_HELPER_METHODS.hotkey, { keys: [...keys] });
+    return MacComputerBackend.deliveryReport(payload);
   }
 
   async readClipboard(): Promise<string> {
-    const payload = asRecord(await this.call(MAC_HELPER_METHODS.readClipboard));
-    return asString(payload.text) ?? "";
+    const payload = asRecord(
+      await this.call(MAC_HELPER_METHODS.readClipboard, {
+        maxBytes: MAX_COMPUTER_CLIPBOARD_BYTES,
+      }),
+    );
+    const text = asString(payload.text) ?? "";
+    // The same ceiling the Linux clipboard path enforces, and for the same
+    // reason: a clipboard holding a whole document would otherwise stream
+    // unbounded text into a turn — and, here, through the helper's line framer.
+    if (
+      payload.truncated === true ||
+      Buffer.byteLength(text, "utf8") > MAX_COMPUTER_CLIPBOARD_BYTES
+    ) {
+      throw new ComputerBackendError(
+        `The desktop clipboard holds more than ${MAX_COMPUTER_CLIPBOARD_BYTES} bytes of text, which is past the limit this tool reads.`,
+      );
+    }
+    return text;
   }
 
   async writeClipboard(text: string): Promise<void> {
@@ -598,6 +677,23 @@ export class MacComputerBackend implements ComputerBackend {
     };
   }
 
+  /**
+   * Input is stamped with the target window and posted to its process, so it
+   * arrives whatever is stacked above. See the field's contract note: this is
+   * what lets the manager skip raising, which is what used to steal the human's
+   * frontmost application on every click.
+   */
+  readonly deliversToNamedWindowRegardlessOfStacking = true;
+
+  /**
+   * Points the helper's keyboard at a window without raising or activating it,
+   * so a `computer_type_text` that names a window reaches it even when the last
+   * pointer gesture aimed somewhere else.
+   */
+  async focusWindow(windowId: string): Promise<void> {
+    await this.call(MAC_HELPER_METHODS.focusWindow, { windowId });
+  }
+
   async raiseWindow(windowId: string): Promise<void> {
     await this.call(MAC_HELPER_METHODS.raiseWindow, { windowId });
   }
@@ -623,7 +719,10 @@ export class MacComputerBackend implements ComputerBackend {
     await this.ensureHelper();
     if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
     this.streamListener = listener;
-    await this.publishStillFrame();
+    // A re-attached pane has seen nothing, so the dedupe memory must not
+    // suppress its first frame.
+    this.frameDedupe.reset();
+    await this.publishStillFrame({ force: true });
     this.streamTimer = setInterval(() => {
       void this.publishStillFrame();
     }, this.stillIntervalMs);
@@ -638,13 +737,19 @@ export class MacComputerBackend implements ComputerBackend {
 
   async requestKeyframe(): Promise<void> {
     if (!this.streamListener) return;
-    await this.publishStillFrame();
+    // A keyframe is asked for because the receiver has nothing to draw, so it
+    // publishes even when the desktop is byte-identical to the last frame.
+    await this.publishStillFrame({ force: true });
   }
 
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     await this.detachStream();
+    // A helper still being spawned owns a child process that nothing else will
+    // ever reach: `this.helper` is not assigned until the start resolves, so
+    // disposing only what is already assigned leaked the process.
+    await this.helperPromise?.catch(() => undefined);
     await this.helper?.dispose().catch(() => undefined);
     this.helper = undefined;
     this.eventListeners.clear();
@@ -664,23 +769,29 @@ export class MacComputerBackend implements ComputerBackend {
   private async pointerAction(
     method: string,
     point: ComputerPoint,
+    windowId?: string,
   ): Promise<ComputerBackendActionResult> {
     const origin = this.currentOrigin();
     const payload = asRecord(
-      await this.call(method, { x: point.x + origin.x, y: point.y + origin.y }),
+      await this.call(method, {
+        x: point.x + origin.x,
+        y: point.y + origin.y,
+        // Names the delivery target. Without it the helper resolves the
+        // topmost window at the point, so a click meant for a partially
+        // covered window landed on whatever was drawn over it.
+        ...(windowId ? { windowId } : {}),
+      }),
     );
     // The helper reports where the pointer actually landed when the display
     // clamped it (a coordinate in a gap between screens); shift back to agent
-    // space and surface the mismatch, matching the KWin path's `clampedTo`.
+    // space and surface the mismatch through the same rule the KWin path uses.
     const landedX = asFiniteNumber(payload.x);
     const landedY = asFiniteNumber(payload.y);
-    if (landedX !== undefined && landedY !== undefined) {
-      const landed = { x: landedX - origin.x, y: landedY - origin.y };
-      if (Math.abs(landed.x - point.x) > 2 || Math.abs(landed.y - point.y) > 2) {
-        return { point, clampedTo: landed };
-      }
-    }
-    return { point };
+    const landed =
+      landedX !== undefined && landedY !== undefined
+        ? { x: landedX - origin.x, y: landedY - origin.y }
+        : null;
+    return pointerClampResult(point, landed);
   }
 
   private async captureWorkspaceScreenshot(origin: ComputerPoint): Promise<ComputerScreenshot> {
@@ -696,10 +807,27 @@ export class MacComputerBackend implements ComputerBackend {
     );
   }
 
-  private async publishStillFrame(): Promise<void> {
+  /**
+   * One workspace still onto the attached stream, unless it is the picture the
+   * pane already has. The timer pulls a full-desktop PNG twice a second, and an
+   * idle desktop encodes the same bytes every time; republishing them costs the
+   * socket a megabyte to convey nothing. `force` is for the cases where the
+   * receiver has no picture yet — a fresh attach, an explicit keyframe request.
+   */
+  private async publishStillFrame(options: { readonly force?: boolean } = {}): Promise<void> {
     const listener = this.streamListener;
-    if (!listener || this.stillInFlight || !this.captureGranted) return;
+    if (!listener || !this.captureGranted) return;
+    if (this.stillInFlight) {
+      // A keyframe asked for while a still is already in flight used to be
+      // dropped outright. The in-flight capture then deduped against the digest
+      // it had just published and sent nothing, so the receiver that asked
+      // precisely because it had no picture stayed blank until the desktop
+      // happened to change. The request is remembered instead.
+      if (options.force) this.frameDedupe.deferForce();
+      return;
+    }
     this.stillInFlight = true;
+    const force = this.frameDedupe.takeForce(options.force === true);
     try {
       const global = await this.workspaceRect();
       const captured = await this.callCapture({
@@ -711,6 +839,7 @@ export class MacComputerBackend implements ComputerBackend {
       // blank pane: a payload that is not a PNG must be caught at the source.
       readPngDimensions(captured.bytes, { source: "Synara macOS capture" });
       if (this.streamListener !== listener) return;
+      if (!this.frameDedupe.shouldPublish(captured.bytes, force)) return;
       const frame = {
         sequence: this.nextSequence++,
         timestampMs: this.now(),
@@ -722,8 +851,15 @@ export class MacComputerBackend implements ComputerBackend {
       this.emit({ type: "frame", frame });
     } catch {
       // A transient capture failure must not tear down a subscribed stream.
+      // The force request survives it: the receiver still has no picture.
+      if (force) this.frameDedupe.deferForce();
     } finally {
       this.stillInFlight = false;
+      // A forced request that arrived mid-flight is served now rather than
+      // waiting for the next timer tick.
+      if (this.frameDedupe.forcePending && this.streamListener === listener) {
+        void this.publishStillFrame();
+      }
     }
   }
 
@@ -771,10 +907,11 @@ export class MacComputerBackend implements ComputerBackend {
     readonly accessibility: boolean;
   }> {
     const payload = asRecord(await this.call(MAC_HELPER_METHODS.capabilities));
-    return {
-      screenRecording: payload.screenRecording === true,
-      accessibility: payload.accessibility === true,
-    };
+    const screenRecording = payload.screenRecording === true;
+    // The probe is the authority on the grant in both directions: it restores
+    // capture health after a refusal the user has since fixed in System Settings.
+    this.setCaptureGranted(screenRecording);
+    return { screenRecording, accessibility: payload.accessibility === true };
   }
 
   private async callCapture(request: {
@@ -789,13 +926,37 @@ export class MacComputerBackend implements ComputerBackend {
     };
     if (request.kind === "window") params.windowId = request.windowId;
     if (request.region) params.region = request.region;
-    const payload = asRecord(await this.call(MAC_HELPER_METHODS.capture, params));
+    const payload = asRecord(await this.callCaptureMethod(params));
     const base64 = asString(payload.base64);
     if (!base64) {
       throw new ComputerBackendError("The macOS capture returned no image data.");
     }
     const bytes = new Uint8Array(Buffer.from(base64, "base64"));
     return { bytes, region: this.parseWorkspace(payload.region) };
+  }
+
+  /**
+   * The capture round trip, with the one failure that means more than itself:
+   * a permission refusal is the desktop saying Screen Recording is gone, which
+   * `availability()` alone would not notice until someone asked again. Health
+   * follows the live answer, and the next capability read puts it back.
+   */
+  private async callCaptureMethod(params: Record<string, unknown>): Promise<unknown> {
+    try {
+      return await this.call(MAC_HELPER_METHODS.capture, params);
+    } catch (error) {
+      if (helperErrorCode(error) === HELPER_PERMISSION_DENIED_CODE) {
+        this.setCaptureGranted(false);
+      }
+      throw error;
+    }
+  }
+
+  /** Records the live Screen Recording grant, publishing health when it moved. */
+  private setCaptureGranted(granted: boolean): void {
+    if (this.captureGranted === granted) return;
+    this.captureGranted = granted;
+    this.publishHealth();
   }
 
   /**
@@ -869,7 +1030,19 @@ export class MacComputerBackend implements ComputerBackend {
     });
     helper.start();
     this.helper = helper;
+    // A dispose that raced this start would otherwise leave the child running
+    // with nothing holding it: `dispose()` already ran and saw no helper.
+    if (this.disposed) {
+      await helper.dispose().catch(() => undefined);
+      this.helper = undefined;
+      throw new ComputerBackendError("macOS computer backend is disposed.");
+    }
     this.healthState.recordConnected();
+    // Establish the TCC grants here, where the helper comes up, so every path
+    // that starts it knows whether capture is allowed. Learning this only from
+    // `availability()` meant a stream attached through another path published
+    // no frames at all, because `captureGranted` was still false.
+    await this.readCapabilities().catch(() => undefined);
     // Push the cached badge name onto the fresh session so a reconnect brings
     // the agent cursor back naming the same thread.
     if (this.drivingAgent) {

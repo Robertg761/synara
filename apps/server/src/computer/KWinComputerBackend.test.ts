@@ -1961,6 +1961,7 @@ describe("KWinComputerBackend", () => {
         window: {
           id: "window-1",
           title: "Terminal",
+          appName: "org.kde.konsole",
           pid: 123,
           bounds: { x: 956, y: 1_519, width: 648, height: 518 },
           focused: true,

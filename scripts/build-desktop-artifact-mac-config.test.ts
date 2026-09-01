@@ -4,16 +4,27 @@ import {
   createDesktopPlatformBuildConfig,
   MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
   MAC_APPSNAP_HELPER_BUNDLE_PATH,
+  MAC_APPSNAP_HELPER_NAME,
   MAC_APPSNAP_HELPER_STAGE_PATH,
+  MAC_COMPUTER_HELPER_ASAR_EXCLUSION,
+  MAC_COMPUTER_HELPER_BUNDLE_PATH,
+  MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH,
+  MAC_COMPUTER_HELPER_STAGE_PATH,
   MAC_DEVICE_HELPER_RESOURCE_PATH,
   MAC_DEVICE_HELPER_STAGE_PATH,
   MAC_ENTITLEMENTS_PATH,
   MAC_INHERITED_ENTITLEMENTS_PATH,
   MICROPHONE_USAGE_DESCRIPTION,
+  MAC_HELPER_X64_ARCH_FILES,
   NODE_PTY_ASAR_UNPACK_GLOBS,
+  SCREEN_RECORDING_USAGE_DESCRIPTION,
   validateDesktopNativeBuildHost,
   WINDOWS_INSTALLER_GUID,
 } from "./lib/desktop-platform-build-config.ts";
+import {
+  COMPUTER_HELPER_BUNDLE_NAME,
+  COMPUTER_HELPER_PACKAGED_EXECUTABLE_PATH,
+} from "@synara/shared/computerHelperPaths";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
 
 describe("createDesktopPlatformBuildConfig", () => {
@@ -37,18 +48,52 @@ describe("createDesktopPlatformBuildConfig", () => {
     assert.equal(mac.entitlements, MAC_ENTITLEMENTS_PATH);
     assert.equal(mac.entitlementsInherit, MAC_INHERITED_ENTITLEMENTS_PATH);
     assert.equal(MAC_APPSNAP_HELPER_BUNDLE_PATH, "Contents/Helpers/synara-appsnap-helper");
-    assert.deepStrictEqual(mac.binaries, ["Contents/Helpers/synara-appsnap-helper"]);
-    assert.equal(mac.x64ArchFiles, "Contents/Helpers/synara-appsnap-helper");
+    // The packaged helper path is the shared constant the desktop main process
+    // resolves at runtime, not a second spelling of it: a bundle rename that
+    // only reached one of them is exactly the failure this pins.
+    assert.equal(
+      MAC_COMPUTER_HELPER_BUNDLE_PATH,
+      `Contents/Helpers/${COMPUTER_HELPER_BUNDLE_NAME}`,
+    );
+    assert.equal(
+      MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH,
+      COMPUTER_HELPER_PACKAGED_EXECUTABLE_PATH,
+    );
+    assert.deepStrictEqual(mac.binaries, [
+      MAC_APPSNAP_HELPER_BUNDLE_PATH,
+      MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH,
+    ]);
+    // @electron/universal takes one glob; both helper paths must survive into it.
+    assert.equal(mac.x64ArchFiles, MAC_HELPER_X64_ARCH_FILES);
+    assert.ok(MAC_HELPER_X64_ARCH_FILES.includes(MAC_APPSNAP_HELPER_NAME));
+    assert.ok(
+      MAC_HELPER_X64_ARCH_FILES.includes(
+        MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH.slice("Contents/Helpers/".length),
+      ),
+    );
     assert.equal(
       MAC_APPSNAP_HELPER_STAGE_PATH,
       "apps/desktop/native/appsnap/build/synara-appsnap-helper",
     );
     assert.equal(MAC_APPSNAP_HELPER_ASAR_EXCLUSION, "!apps/desktop/native/appsnap/build/**");
-    assert.deepStrictEqual(config.files, ["**/*", MAC_APPSNAP_HELPER_ASAR_EXCLUSION]);
+    assert.equal(MAC_COMPUTER_HELPER_ASAR_EXCLUSION, "!apps/desktop/native/computer-use/build/**");
+    assert.equal(
+      MAC_COMPUTER_HELPER_STAGE_PATH,
+      `apps/desktop/native/computer-use/build/${COMPUTER_HELPER_BUNDLE_NAME}`,
+    );
+    assert.deepStrictEqual(config.files, [
+      "**/*",
+      MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
+      MAC_COMPUTER_HELPER_ASAR_EXCLUSION,
+    ]);
     assert.deepStrictEqual(config.extraFiles, [
       {
         from: "apps/desktop/native/appsnap/build/synara-appsnap-helper",
         to: "Helpers/synara-appsnap-helper",
+      },
+      {
+        from: MAC_COMPUTER_HELPER_STAGE_PATH,
+        to: `Helpers/${COMPUTER_HELPER_BUNDLE_NAME}`,
       },
       {
         from: MAC_DEVICE_HELPER_STAGE_PATH,
@@ -56,7 +101,7 @@ describe("createDesktopPlatformBuildConfig", () => {
       },
     ]);
     assert.equal(extendInfo.NSMicrophoneUsageDescription, MICROPHONE_USAGE_DESCRIPTION);
-    assert.equal(extendInfo.NSScreenCaptureUsageDescription, undefined);
+    assert.equal(extendInfo.NSScreenCaptureUsageDescription, SCREEN_RECORDING_USAGE_DESCRIPTION);
   });
 
   it("leaves the DMG container unsigned for build-only macOS artifacts", () => {

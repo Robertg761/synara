@@ -18,6 +18,8 @@ import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
 import {
   createDesktopPlatformBuildConfig,
   MAC_APPSNAP_HELPER_STAGE_PATH,
+  MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH,
+  MAC_COMPUTER_HELPER_STAGE_PATH,
   MAC_DEVICE_HELPER_RESOURCE_PATH,
   validateDesktopNativeBuildHost,
 } from "./lib/desktop-platform-build-config.ts";
@@ -34,7 +36,18 @@ import { resolveCatalogDependencies } from "./lib/resolve-catalog.ts";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { Config, Data, Effect, FileSystem, Layer, Logger, Option, Path, Schema } from "effect";
+import {
+  Config,
+  Data,
+  Effect,
+  FileSystem,
+  Layer,
+  Logger,
+  Option,
+  Path,
+  PlatformError,
+  Schema,
+} from "effect";
 import { Command, Flag } from "effect/unstable/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
@@ -72,6 +85,11 @@ const AppSnapHelperBuildScript = Effect.zipWith(
   RepoRoot,
   Effect.service(Path.Path),
   (repoRoot, path) => path.join(repoRoot, "apps/desktop/scripts/build-appsnap-helper.mjs"),
+);
+const ComputerHelperBuildScript = Effect.zipWith(
+  RepoRoot,
+  Effect.service(Path.Path),
+  (repoRoot, path) => path.join(repoRoot, "apps/desktop/scripts/build-computer-helper.mjs"),
 );
 const encodeJsonString = Schema.encodeEffect(Schema.UnknownFromJsonString);
 
@@ -795,61 +813,138 @@ const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(f
   }
 });
 
+/**
+ * Compiles one native Swift helper into the staged app tree.
+ *
+ * Both macOS helpers are produced the same way — a node build script invoked
+ * with the target arch and an output path inside the stage — so they share one
+ * implementation. The build script is resolved from the real repository (not
+ * the stage), which is what lets it find the Swift sources while running with
+ * the stage as its working directory.
+ */
+const stageMacSwiftHelper = Effect.fn("stageMacSwiftHelper")(function* (options: {
+  readonly label: string;
+  readonly buildScript: string;
+  readonly stageAppDir: string;
+  readonly stageRelativeOutputPath: string;
+  readonly arch: typeof BuildArch.Type;
+  readonly verbose: boolean;
+}) {
+  const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  const outputPath = path.join(options.stageAppDir, options.stageRelativeOutputPath);
+
+  yield* fs.makeDirectory(path.dirname(outputPath), { recursive: true });
+  yield* Effect.log(
+    `[desktop-artifact] Building native ${options.label} helper (${options.arch})...`,
+  );
+  yield* runCommand(
+    ChildProcess.make({
+      cwd: options.stageAppDir,
+      ...commandOutputOptions(options.verbose),
+    })`node ${options.buildScript} --arch ${options.arch} --release --output ${outputPath}`,
+  );
+
+  if (!(yield* fs.exists(outputPath))) {
+    return yield* new BuildScriptError({
+      message: `${options.label} helper build completed but output was not found at ${outputPath}`,
+    });
+  }
+});
+
 const stageMacAppSnapHelper = Effect.fn("stageMacAppSnapHelper")(function* (
   stageAppDir: string,
   arch: typeof BuildArch.Type,
   verbose: boolean,
 ) {
+  yield* stageMacSwiftHelper({
+    label: "AppSnap",
+    buildScript: yield* AppSnapHelperBuildScript,
+    stageAppDir,
+    stageRelativeOutputPath: MAC_APPSNAP_HELPER_STAGE_PATH,
+    arch,
+    verbose,
+  });
+});
+
+const stageMacComputerHelper = Effect.fn("stageMacComputerHelper")(function* (
+  stageAppDir: string,
+  arch: typeof BuildArch.Type,
+  verbose: boolean,
+) {
+  yield* stageMacSwiftHelper({
+    label: "computer-use",
+    buildScript: yield* ComputerHelperBuildScript,
+    stageAppDir,
+    stageRelativeOutputPath: MAC_COMPUTER_HELPER_STAGE_PATH,
+    arch,
+    verbose,
+  });
+});
+
+/**
+ * Runs `check` against each packaged `<ProductName>.app` under the dist dir and
+ * succeeds on the first that satisfies it. electron-builder writes one such app
+ * per target directory, so the scan is over targets, not over candidates.
+ */
+const assertPackagedMacApp = Effect.fn("assertPackagedMacApp")(function* (options: {
+  readonly stageDistDir: string;
+  readonly productName: string;
+  readonly missingMessage: string;
+  readonly check: (
+    appDir: string,
+  ) => Effect.Effect<boolean, PlatformError.PlatformError, FileSystem.FileSystem | Path.Path>;
+}) {
   const path = yield* Path.Path;
   const fs = yield* FileSystem.FileSystem;
-  const buildScript = yield* AppSnapHelperBuildScript;
-  const outputPath = path.join(stageAppDir, MAC_APPSNAP_HELPER_STAGE_PATH);
-
-  yield* fs.makeDirectory(path.dirname(outputPath), { recursive: true });
-  yield* Effect.log(`[desktop-artifact] Building native AppSnap helper (${arch})...`);
-  yield* runCommand(
-    ChildProcess.make({
-      cwd: stageAppDir,
-      ...commandOutputOptions(verbose),
-    })`node ${buildScript} --arch ${arch} --release --output ${outputPath}`,
-  );
-
-  if (!(yield* fs.exists(outputPath))) {
-    return yield* new BuildScriptError({
-      message: `AppSnap helper build completed but output was not found at ${outputPath}`,
-    });
+  const entries = yield* fs.readDirectory(options.stageDistDir);
+  for (const entry of entries) {
+    const packagedEntryPath = path.join(options.stageDistDir, entry);
+    const packagedEntryStat = yield* fs
+      .stat(packagedEntryPath)
+      .pipe(Effect.catch(() => Effect.succeed(null)));
+    if (!packagedEntryStat || packagedEntryStat.type !== "Directory") continue;
+    const appDir = path.join(packagedEntryPath, `${options.productName}.app`);
+    if (yield* options.check(appDir)) return;
   }
+  return yield* new BuildScriptError({ message: options.missingMessage });
 });
 
 const assertPackagedMacDeviceHelper = Effect.fn("assertPackagedMacDeviceHelper")(function* (
   stageDistDir: string,
   productName: string,
 ) {
-  const path = yield* Path.Path;
-  const fs = yield* FileSystem.FileSystem;
-  const entries = yield* fs.readDirectory(stageDistDir);
-  for (const entry of entries) {
-    const packagedEntryPath = path.join(stageDistDir, entry);
-    const packagedEntryStat = yield* fs
-      .stat(packagedEntryPath)
-      .pipe(Effect.catch(() => Effect.succeed(null)));
-    if (!packagedEntryStat || packagedEntryStat.type !== "Directory") continue;
+  yield* assertPackagedMacApp({
+    stageDistDir,
+    productName,
+    missingMessage: `Packaged macOS app is missing physical device helper sources under Contents/${MAC_DEVICE_HELPER_RESOURCE_PATH}`,
+    check: Effect.fn(function* (appDir: string) {
+      const path = yield* Path.Path;
+      const fs = yield* FileSystem.FileSystem;
+      const helperRoot = path.join(appDir, "Contents", MAC_DEVICE_HELPER_RESOURCE_PATH);
+      return (
+        (yield* fs.exists(path.join(helperRoot, "build.sh"))) &&
+        (yield* fs.exists(path.join(helperRoot, "Sources/main.swift")))
+      );
+    }),
+  });
+});
 
-    const helperRoot = path.join(
-      packagedEntryPath,
-      `${productName}.app`,
-      "Contents",
-      MAC_DEVICE_HELPER_RESOURCE_PATH,
-    );
-    if (
-      (yield* fs.exists(path.join(helperRoot, "build.sh"))) &&
-      (yield* fs.exists(path.join(helperRoot, "Sources/main.swift")))
-    ) {
-      return;
-    }
-  }
-  return yield* new BuildScriptError({
-    message: `Packaged macOS app is missing physical device helper sources under Contents/${MAC_DEVICE_HELPER_RESOURCE_PATH}`,
+const assertPackagedMacComputerHelper = Effect.fn("assertPackagedMacComputerHelper")(function* (
+  stageDistDir: string,
+  productName: string,
+) {
+  yield* assertPackagedMacApp({
+    stageDistDir,
+    productName,
+    // The executable, not just the bundle directory: an empty `.app` shell
+    // satisfies a directory check and still ships a build with no helper.
+    missingMessage: `Packaged macOS app is missing ${MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH}`,
+    check: Effect.fn(function* (appDir: string) {
+      const path = yield* Path.Path;
+      const fs = yield* FileSystem.FileSystem;
+      return yield* fs.exists(path.join(appDir, MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH));
+    }),
   });
 });
 
@@ -1037,6 +1132,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   if (options.platform === "mac") {
     yield* stageMacAppSnapHelper(stageAppDir, options.arch, options.verbose);
+    yield* stageMacComputerHelper(stageAppDir, options.arch, options.verbose);
   }
 
   // electron-builder is filtering out stageResourcesDir directory in the AppImage for production
@@ -1133,6 +1229,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   if (options.platform === "mac") {
     yield* assertPackagedMacDeviceHelper(stageDistDir, desktopPackageJson.productName ?? "Synara");
+    yield* assertPackagedMacComputerHelper(
+      stageDistDir,
+      desktopPackageJson.productName ?? "Synara",
+    );
   }
 
   if (options.platform === "mac" && options.target === "dmg" && options.signed) {

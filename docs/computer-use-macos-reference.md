@@ -79,7 +79,7 @@ Non-obvious choices worth keeping: normal window level + dynamic z-ordering (so 
 
 The validated crux: **keeping `CGEventSetWindowLocation` delivers `mouseDown`/`mouseUp` to a background window; removing it delivers nothing.** That one private call is what makes background, non-pointer-warping input work. Posting to a PID (rather than `CGEventPost` to the HID tap) is what prevents the real cursor from warping — WindowServer warps the pointer as a _side effect_ of HID-stream events, and PID-targeted posting skips that path.
 
-**Focus without raising** is a subsystem Codex calls `SyntheticAppFocusEnforcer`. It maintains two parallel truths for the target — "the app _believes_ it is active / has key focus" (synthetic state delivered to the target) vs. "the app _is_ actually frontmost" (real system state) — by posting synthetic focus packets to the target PID (`NSEvent` types 13/21 with specific subtypes) and guarding them with a private annotated-session event tap on private event-type `32`. Net effect: the target routes input as if focused, while WindowServer never actually raises it or changes Space. This is semantically yabai's "focus without raise," but implemented as PID-targeted focus packets, not the `SLPSPostEventRecordTo` call everyone assumed.
+**Focus without raising** is a subsystem Codex calls `SyntheticAppFocusEnforcer`. It maintains two parallel truths for the target — "the app _believes_ it is active / has key focus" vs. "the app _is_ actually frontmost" — so the target routes input as if focused while WindowServer never raises it or changes Space. The confirmed working mechanism (validated by the open-source `cua-driver`, whose macOS ledger passes this against a per-toolkit matrix, and what Synara's helper implements in `SkyLight.swift`) is yabai's `window_manager_focus_window_without_raise`: a **pair of 248-byte process-level event records posted with `SLPSPostEventRecordTo`** — a deactivate (`bytes[0x8A]=0x02`) to the process that is currently front, then an activate (`bytes[0x8A]=0x01`, target window id little-endian at `bytes[0x3C]`) to the target's PSN — deliberately _not_ calling `SLPSSetFrontProcessWithOptions`. (An earlier reading of the Codex binary guessed PID-targeted `NSEvent` types 13/21; the record-pair path is the one that actually flips AppKit-active state without a raise.) The target's PSN is resolved through `CGSMainConnectionID` → `SLSGetWindowOwner` → `SLSGetConnectionPSN`. After the gesture the inverse pair restores the human's previous app.
 
 **Perception is AX-first.** `get_app_state` (internally a "skyshot") returns a screenshot **plus** the accessibility tree. Semantic actions (`set_value`, `perform_secondary_action`) are pure AX calls. But `click` is deliberately **real synthetic input, not `AXPress`** — the binary literally contains the string _"Prefer simulating physical clicks over Accessibility actions."_ AX is used to _find_ and _describe_ targets and for a few semantic writes; clicking/typing/scrolling/dragging go through synthetic events.
 
@@ -158,8 +158,8 @@ So no new protocol is required. The agent-facing surface is a set of MCP tools; 
 │      │                                     └─ SyntheticAppFocusEnforcer │
 │      │                                          focus-without-raise     │
 │      │                                                                  │
-│      ├─ control plane: newline-delimited JSON-RPC over stdio           │
-│      └─ frame plane:   unix domain socket (screenshot bytes)           │
+│      └─ one plane: newline-delimited JSON-RPC over stdio                │
+│           (stills ride back base64 inside the `capture` result)         │
 │                                                                       │
 └───────────────────────────────┬─────────────────────────────────────┘
                                  │ WebSocket (existing Synara transport)
@@ -194,7 +194,9 @@ A single long-lived, signed native helper that:
 ### 4.2 Out-of-process, spawned by Electron main — both are load-bearing
 
 - **Out-of-process, not an in-process native addon.** `SCShareableContent` has a confirmed, still-unfixed macOS bug (radars FB12114396 / FB15779754) where it _hangs forever_. In-process, that is a permanently leaked thread inside Electron; out-of-process it is a `SIGKILL` + ~100 ms respawn. Combined with the general blast radius of driving the real desktop, the process boundary is mandatory. Kap/aperture is the verified Electron+Swift-helper precedent.
-- **Spawned by the Electron main process, not the Node server.** TCC attributes grants to the _responsible process_ — the app bundle. The helper must be a signed `.app` inside `Synara.app`, same Team ID, spawned by the app (never by the separate `node` server, never via `open`/launchd), so its Accessibility/Screen Recording/Input Monitoring grants are covered by the app's identity. Codex enforces this with a hard launch constraint; we should adopt the same posture. **This TCC inheritance is the one assumption to verify with a ~30-minute experiment before committing to the design** (spawn a signed same-team helper from the Electron main process and confirm it inherits the grants without a second prompt).
+- **Spawned from inside the app bundle, never via `open`/launchd.** TCC attributes grants to the _responsible process_, which for a child process is the app that started it. The helper is a signed `.app` inside `Synara.app` (`Contents/Helpers/Synara Computer Use.app`), same Team ID, so its Accessibility/Screen Recording grants are covered by the app's identity.
+
+  **What shipped, and why it differs from the sentence above.** The long-lived helper is spawned by the Node backend (`macComputerHelperClient.ts`), not by Electron main: the backend is itself a child of the signed app, so the responsible process is still Synara, and keeping the helper next to the code that drives it avoids proxying every RPC through IPC. Electron main spawns the helper only for the one-shot `--probe` / `--request-permissions` commands (`computerControlPermissions.ts`), because that is where the TCC prompt has to be attributed and where a serialized queue can stop two prompts stacking. Both paths run the same signed binary out of the same bundle.
 
 ### 4.3 Reliability rules baked in from day one (from cua-driver production code)
 
@@ -221,6 +223,8 @@ A single long-lived, signed native helper that:
 
 Mirror Codex's confirmed `sky.*` / `mcp__computer_use.*` surface, adapted to Synara conventions and the device-family idioms (snapshot → act, activationPoint over frame-centre, candidate labels surfaced in error messages).
 
+> **This section is the design target, not an inventory of what shipped.** The names below are the intended shape; the tools Synara actually registers are defined in `computerTools.ts`, and the helper methods behind them in `macComputerHelperClient.ts` (`MAC_HELPER_METHODS`). Where the two disagree, the code is the answer — notably `computer_get_state` rather than `computer_get_window_state`, and no `computer_list_apps` / `computer_invoke_menu` / agent-cursor query tool.
+
 Perception / query (no approval, read-only, but still gated behind `computer:control`):
 
 - `computer_list_apps` — running apps with windows.
@@ -241,7 +245,9 @@ Action (approval-required — see §7):
 
 **Design principle to adopt from cua-driver: refuse rather than guess.** Input routing order is semantic-AX → exact window-local pointer → PID keyboard with delivery proof → **structured refusal** (`background_unavailable`, `background_occluded`). Never silently fall back to global HID that could mutate the wrong window. A refused action is a better product than a wrong-window action that looks like it succeeded.
 
-**Known limits to encode** (published + technique-inherent): cannot drive terminal apps or Synara itself; cannot authenticate as admin or approve security/privacy prompts; Chromium coerces synthetic right-clicks to left-clicks in web content and needs `AXManualAccessibility`; canvas/game engines need temporary foreground activation; minimized/off-Space windows are observe-only; **Electron target apps refuse background scroll and drag on macOS** (relevant since Synara is itself Electron). macOS 14.4+, Apple Silicon only.
+**Known limits to encode** (published + technique-inherent): cannot drive terminal apps or Synara itself; cannot authenticate as admin or approve security/privacy prompts; Chromium coerces synthetic right-clicks to left-clicks in web content and needs `AXManualAccessibility`; canvas/game engines need temporary foreground activation; minimized/off-Space windows are observe-only; **Electron target apps refuse background scroll and drag on macOS** (relevant since Synara is itself Electron).
+
+**Version floor as built:** the helper targets macOS 12.3 (`build.sh`) and ships as a universal arm64 + x86_64 binary, not the 14.4/Apple-Silicon-only floor Codex chose. `SCScreenshotManager` is 14.0+, so 12.3–13.x runs the `screencapture` fallback; the capability probe reports what the running OS actually allows rather than refusing at a version check.
 
 ---
 

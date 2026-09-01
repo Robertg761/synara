@@ -172,6 +172,16 @@ const buildCmd = Command.make(
         "[cli] Bundled Hyprland computer-use plugin into dist/computer-use-hyprland",
       );
 
+      // The macOS computer-use helper is normally the signed bundle the desktop
+      // app ships, but the CLI has no such bundle and the desktop can lose its
+      // own to quarantine, so the source-build fallback has to be reachable from
+      // a packaged tree exactly like the two Linux plugins above.
+      const macComputerHelperSource = path.join(serverDir, "native/computer-use-macos");
+      const macComputerHelperTarget = path.join(serverDir, "dist/computer-use-macos");
+      yield* fs.copy(macComputerHelperSource, macComputerHelperTarget);
+      yield* fs.chmod(path.join(macComputerHelperTarget, "build.sh"), 0o755);
+      yield* Effect.log("[cli] Bundled macOS computer-use helper into dist/computer-use-macos");
+
       const webDist = path.join(repoRoot, "apps/web/dist");
       const clientTarget = path.join(serverDir, "dist/client");
 

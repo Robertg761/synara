@@ -29,6 +29,14 @@ describe("Synara harness policy", () => {
     assert.include(policy, "BrowserDownloadApprovalRequired");
     assert.include(policy, "OAuth popup requiring human action");
     assert.include(policy, "stop using tools and answer");
+    assert.include(policy, "Use the computer_* tools");
+    assert.include(policy, "Never substitute shell-driven UI automation");
+    assert.include(policy, "Terminal rather than Synara");
+    assert.include(policy, "computer_list_windows or computer_get_state");
+    // The policy goes to Linux hosts too, so it must not assert that a desktop
+    // permission failure is a macOS one.
+    assert.notInclude(policy, "a macOS privacy grant");
+    assert.include(policy, "do not route around the denial");
     assert.include(policy, "do not create Synara threads");
     assert.include(policy, "3–8 word outcome-oriented task label");
     assert.include(policy, "no assumed chat context");

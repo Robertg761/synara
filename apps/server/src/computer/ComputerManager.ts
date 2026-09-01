@@ -690,7 +690,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved);
     const result = await this.injectScoped("computer_click", resolved, () =>
-      this.backend.click(resolved.point),
+      this.backend.click(resolved.point, resolved.windowId),
     );
     return this.actionResult(threadId, "computer_click", resolved.point, result, resolved.windowId);
   }
@@ -703,7 +703,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved);
     const result = await this.injectScoped("computer_double_click", resolved, () =>
-      this.backend.doubleClick(resolved.point),
+      this.backend.doubleClick(resolved.point, resolved.windowId),
     );
     return this.actionResult(
       threadId,
@@ -722,7 +722,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved);
     const result = await this.injectScoped("computer_right_click", resolved, () =>
-      this.backend.rightClick(resolved.point),
+      this.backend.rightClick(resolved.point, resolved.windowId),
     );
     return this.actionResult(
       threadId,
@@ -741,7 +741,7 @@ export class ComputerManager {
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved);
     const result = await this.injectScoped("computer_move_cursor", resolved, () =>
-      this.backend.moveCursor(resolved.point),
+      this.backend.moveCursor(resolved.point, resolved.windowId),
     );
     return this.actionResult(
       threadId,
@@ -769,7 +769,7 @@ export class ComputerManager {
     const grabbed = resolvedFrom.windowId ? resolvedFrom : resolvedTo;
     await this.prepareResolvedTarget(grabbed);
     const result = await this.injectScoped("computer_drag", grabbed, () =>
-      this.backend.drag(resolvedFrom.point, resolvedTo.point, durationMs),
+      this.backend.drag(resolvedFrom.point, resolvedTo.point, durationMs, resolvedFrom.windowId),
     );
     return this.actionResult(
       threadId,
@@ -998,7 +998,7 @@ export class ComputerManager {
     deltaY: number,
   ): Promise<ComputerBackendActionResult | void> {
     return this.injectScoped("computer_scroll", resolved ?? {}, () =>
-      this.backend.scroll(resolved?.point ?? null, deltaX, deltaY),
+      this.backend.scroll(resolved?.point ?? null, deltaX, deltaY, resolved?.windowId),
     );
   }
 
@@ -1567,6 +1567,12 @@ export class ComputerManager {
     const windowId = target?.windowId;
     if (windowId === undefined) {
       await this.backend.clearFocusWindow?.();
+      return;
+    }
+    // A backend that posts to the window by id needs neither the raise nor the
+    // occlusion refusal: the event reaches the named window whatever covers it.
+    if (this.backend.deliversToNamedWindowRegardlessOfStacking === true) {
+      await this.backend.focusWindow?.(windowId);
       return;
     }
     const raiseFailure = await this.raiseTargetWindow(windowId);

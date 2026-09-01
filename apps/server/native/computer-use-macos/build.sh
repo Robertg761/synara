@@ -10,6 +10,7 @@
 # Usage:
 #   build.sh [output-directory]
 #   SYNARA_COMPUTER_HELPER_OUT=/path build.sh
+#   SYNARA_COMPUTER_HELPER_OPTIMIZE=debug build.sh   # faster compile, no -O
 #
 # Defaults to ./build next to this script.
 
@@ -24,10 +25,12 @@ if ! command -v xcrun >/dev/null 2>&1; then
   exit 1
 fi
 
-# The command line tools are enough: unlike the device helper this links no
-# private framework, only public Quartz/AppKit/ScreenCaptureKit, and resolves
-# the one private symbol at runtime. A full Xcode still works and is what the
-# server selects when present.
+# The command line tools are enough to *compile*: unlike the device helper this
+# links no private framework, only public Quartz/AppKit/ScreenCaptureKit, and
+# resolves its private symbols at runtime. Note the server's provisioner is
+# stricter than this script — it gates the source-build fallback on a full Xcode
+# — so a CLT-only machine can run build.sh by hand but will not have the helper
+# built for it automatically.
 DEVELOPER_DIR_PATH="${DEVELOPER_DIR:-}"
 if [ -z "$DEVELOPER_DIR_PATH" ]; then
   DEVELOPER_DIR_PATH="$(xcode-select -p 2>/dev/null || true)"
@@ -48,11 +51,22 @@ trap 'rm -f "$TMP_BINARY"' EXIT
 # ScreenCaptureKit needs macOS 12.3; the input path's window-targeted posting is
 # unchanged back to there. Codex ships a 14.4 floor for its own reasons; we build
 # lower and let the capability probe report what the running OS actually allows.
-TARGET_TRIPLE="$(uname -m)-apple-macosx12.3"
+TARGET_TRIPLE="${SYNARA_COMPUTER_HELPER_TARGET:-$(uname -m)-apple-macosx12.3}"
+
+# Release is the default and what packaging asks for. A debug build skips
+# whole-module optimization, which is roughly three times faster to compile and
+# is what a developer iterating on the Swift wants.
+case "${SYNARA_COMPUTER_HELPER_OPTIMIZE:-release}" in
+  debug) OPTIMIZE_ARGS=(-Onone -g) ;;
+  release) OPTIMIZE_ARGS=(-O -whole-module-optimization) ;;
+  *)
+    echo "error: SYNARA_COMPUTER_HELPER_OPTIMIZE must be 'release' or 'debug'" >&2
+    exit 1
+    ;;
+esac
 
 xcrun swiftc \
-  -O \
-  -whole-module-optimization \
+  "${OPTIMIZE_ARGS[@]}" \
   -swift-version 5 \
   -target "$TARGET_TRIPLE" \
   -framework Foundation \
@@ -67,9 +81,11 @@ xcrun swiftc \
   "$SOURCE_DIR/Sources/JSONRPC.swift" \
   "$SOURCE_DIR/Sources/Capability.swift" \
   "$SOURCE_DIR/Sources/Geometry.swift" \
+  "$SOURCE_DIR/Sources/Dispatch.swift" \
   "$SOURCE_DIR/Sources/Windows.swift" \
   "$SOURCE_DIR/Sources/Capture.swift" \
   "$SOURCE_DIR/Sources/Accessibility.swift" \
+  "$SOURCE_DIR/Sources/SkyLight.swift" \
   "$SOURCE_DIR/Sources/Input.swift" \
   "$SOURCE_DIR/Sources/Cursor.swift" \
   "$SOURCE_DIR/Sources/main.swift" \

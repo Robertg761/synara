@@ -45,6 +45,28 @@ describe("parseMacUiForest", () => {
     expect(parseMacUiForest({}, screenSize, { x: 0, y: 0 })).toBeUndefined();
   });
 
+  it("carries the helper's truncation marker through to the agent", () => {
+    const payload = {
+      root: {
+        role: "desktop",
+        frame: { x: 0, y: 0, width: 100, height: 100 },
+        children: [
+          {
+            role: "AXWindow",
+            truncated: true,
+            frame: { x: 0, y: 0, width: 50, height: 50 },
+            children: [],
+          },
+        ],
+      },
+    };
+    const root = parseMacUiForest(payload, screenSize, { x: 0, y: 0 });
+    // Dropping this left a budget-truncated subtree indistinguishable from a
+    // complete one, so an agent reads "no such control" instead of "not walked".
+    expect(root?.children[0]?.truncated).toBe(true);
+    expect(root?.truncated).toBeUndefined();
+  });
+
   it("clamps an oversized label so the schema encode cannot fail", () => {
     const huge = "x".repeat(5_000);
     const payload = {

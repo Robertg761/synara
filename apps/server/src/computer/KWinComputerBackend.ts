@@ -39,7 +39,6 @@ import { resolveAppLaunchOnHost, type AppLaunchResolver } from "./appLaunchResol
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
 import {
   atspiTextWriteAddress,
-  describeComputerUiTree,
   fuseAtspiTrees,
   type AtspiRawNode,
   type AtspiWindowTree,
@@ -53,6 +52,8 @@ import {
   parseComputerRect,
   parseJsonPayload,
   parseWindows,
+  pointerClampResult,
+  windowsPayloadFingerprint,
   readPngDimensions,
   requireWindowBounds,
   screenSizeFromWindows,
@@ -63,6 +64,8 @@ import {
   windowInAgentSpace,
   workspaceRectFromWindows,
 } from "./computerGeometry.ts";
+import { StillFrameDedupe } from "./stillFrameDedupe.ts";
+import { describeComputerUiTree } from "./uiTreeText.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
 import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./humanActivity.ts";
 import {
@@ -101,7 +104,6 @@ const DEFAULT_COMPUTER_ID = "desktop";
 const DEFAULT_GLIDE_DURATION_MS = 180;
 const DEFAULT_STILL_INTERVAL_MS = 500;
 const DEFAULT_CAPTURE_MAX_DIMENSION = DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION;
-const POINTER_CLAMP_TOLERANCE_PX = 2;
 const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 const KWIN_RECONNECT_BASE_DELAY_MS = 250;
 const KWIN_RECONNECT_MAX_DELAY_MS = 5_000;
@@ -366,6 +368,8 @@ export class KWinComputerBackend implements ComputerBackend {
   private streamListener: ComputerFrameListener | undefined;
   private streamTimer: ReturnType<typeof setInterval> | undefined;
   private stillInFlight = false;
+  /** Suppresses stills identical to the one the pane already has. */
+  private readonly frameDedupe = new StillFrameDedupe();
   private captureQueue: Promise<void> = Promise.resolve();
   private capturePending = 0;
   private startPromise: Promise<void> | undefined;
@@ -653,7 +657,7 @@ export class KWinComputerBackend implements ComputerBackend {
       // re-serializing the parsed list — on a call that runs several times per
       // action and per publish — buys nothing. The focus target rides along
       // because it decides `focused` without appearing in that document.
-      const fingerprint = `${state.targetWindowId ?? ""} ${windowsPayloadFingerprint(payload)}`;
+      const fingerprint = windowsPayloadFingerprint(payload, state.targetWindowId ?? null);
       if (fingerprint !== this.previousWindowsFingerprint) {
         this.previousWindowsFingerprint = fingerprint;
         this.emit({ type: "windows-changed", windows });
@@ -991,7 +995,10 @@ export class KWinComputerBackend implements ComputerBackend {
     // newest attach's interval survives.
     if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
     this.streamListener = listener;
-    await this.publishStillFrame();
+    // A re-attached pane has seen nothing, so the memory of what the previous
+    // one saw must not suppress its first frame.
+    this.frameDedupe.reset();
+    await this.publishStillFrame({ force: true });
     this.streamTimer = setInterval(() => {
       void this.publishStillFrame();
     }, this.stillIntervalMs);
@@ -1006,7 +1013,9 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async requestKeyframe(): Promise<void> {
     if (!this.streamListener) return;
-    await this.publishStillFrame();
+    // A keyframe is asked for because the receiver has nothing to draw, so it
+    // publishes even when the desktop is byte-identical to the last frame.
+    await this.publishStillFrame({ force: true });
   }
 
   async captureWindow(
@@ -1631,14 +1640,7 @@ export class KWinComputerBackend implements ComputerBackend {
     const actual = await this.readPluginState(plugin)
       .then((state) => state.position)
       .catch(() => null);
-    if (
-      !actual ||
-      (Math.abs(actual.x - point.x) <= POINTER_CLAMP_TOLERANCE_PX &&
-        Math.abs(actual.y - point.y) <= POINTER_CLAMP_TOLERANCE_PX)
-    ) {
-      return { point };
-    }
-    return { point, clampedTo: actual };
+    return pointerClampResult(point, actual);
   }
 
   /**
@@ -1709,16 +1711,17 @@ export class KWinComputerBackend implements ComputerBackend {
    * returned. The rect comes from the cached workspace geometry for the same
    * reason: a window enumeration per frame is a window enumeration per frame.
    */
-  private async publishStillFrame(): Promise<void> {
+  private async publishStillFrame(options: { readonly force?: boolean } = {}): Promise<void> {
     const listener = this.streamListener;
-    if (
-      !listener ||
-      this.pluginHealth?.capture !== true ||
-      this.stillInFlight ||
-      this.capturePending > 0
-    )
+    if (!listener || this.pluginHealth?.capture !== true || this.capturePending > 0) return;
+    if (this.stillInFlight) {
+      // A receiver with nothing to draw asked for this, so the request outlives
+      // the capture already running rather than being dropped into it.
+      if (options.force) this.frameDedupe.deferForce();
       return;
+    }
     this.stillInFlight = true;
+    const force = this.frameDedupe.takeForce(options.force === true);
     try {
       const region = await this.workspaceRect();
       if (this.capturePending > 0) return;
@@ -1728,6 +1731,9 @@ export class KWinComputerBackend implements ComputerBackend {
       // the browser, where the only symptom is a blank pane.
       readPngDimensions(data, { source: this.captureSource });
       if (this.streamListener !== listener) return;
+      // An idle desktop encodes the same bytes twice a second; republishing
+      // them spends a megabyte of socket to convey nothing.
+      if (!this.frameDedupe.shouldPublish(data, force)) return;
       const frame = {
         sequence: this.nextSequence++,
         timestampMs: this.now(),
@@ -1741,8 +1747,12 @@ export class KWinComputerBackend implements ComputerBackend {
       this.emit({ type: "frame", frame });
     } catch {
       // A transient capture failure should not tear down a subscribed stream.
+      if (force) this.frameDedupe.deferForce();
     } finally {
       this.stillInFlight = false;
+      if (this.frameDedupe.forcePending && this.streamListener === listener) {
+        void this.publishStillFrame();
+      }
     }
   }
 
@@ -2277,11 +2287,6 @@ function parseWorkspaceGeometry(record: Record<string, unknown>): ComputerRect |
  * The plugin's window document as an opaque change key. It arrives as a string
  * on the wire, so in the normal case this costs nothing at all.
  */
-function windowsPayloadFingerprint(payload: unknown): string {
-  const unwrapped = unwrapDbusValue(payload);
-  return typeof unwrapped === "string" ? unwrapped : JSON.stringify(unwrapped);
-}
-
 function readBoolean(value: unknown): boolean {
   const unwrapped = unwrapDbusValue(value);
   return unwrapped === true;

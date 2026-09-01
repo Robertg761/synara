@@ -22,6 +22,10 @@ import { homedir } from "node:os";
 import * as path from "node:path";
 
 import {
+  COMPUTER_HELPER_BINARY_NAME,
+  COMPUTER_HELPER_BINARY_PATH_ENV,
+} from "@synara/shared/computerHelperPaths";
+import {
   deviceHelperCacheKey,
   readDeviceHelperSourceRevision,
 } from "@synara/shared/deviceHelperCache";
@@ -34,10 +38,15 @@ export const COMPUTER_HELPER_CACHE_SEGMENTS = [
   "computer-helper",
 ] as const;
 
-export const COMPUTER_HELPER_BINARY_NAME = "synara-computer-helper";
-
-/** Physical helper source directory passed from a packaged desktop app to its backend child. */
+/**
+ * Operator override for the helper source directory. Nothing in the product
+ * sets it: packaged desktop builds ship the signed binary and point at it with
+ * `COMPUTER_HELPER_BINARY_PATH_ENV`, and the CLI finds its staged sources
+ * beside the bundle. This exists so a source tree in an unusual location can
+ * still be built from.
+ */
 export const COMPUTER_HELPER_SOURCE_DIR_ENV = "SYNARA_COMPUTER_HELPER_SOURCE_DIR";
+export { COMPUTER_HELPER_BINARY_NAME };
 
 export const COMPUTER_HELPER_CACHE_ROOT = path.join(homedir(), ...COMPUTER_HELPER_CACHE_SEGMENTS);
 
@@ -73,6 +82,7 @@ export interface ProcessRunResult {
 
 export interface MacHelperProvisionerOptions {
   readonly helperSourceDir: string;
+  readonly bundledBinaryPath?: string;
   readonly helperCacheRoot?: string;
   /** Runs a subprocess to completion; injected so tests never touch a real toolchain. */
   readonly run: (
@@ -107,7 +117,10 @@ export class MacHelperBuildError extends Error {
  */
 export class MacComputerHelperProvisioner {
   private readonly helperSourceDir: string;
+  private readonly bundledBinaryPath: string | undefined;
   private readonly helperCacheRoot: string;
+  /** Memoized `xcodebuild -version`; the active toolchain cannot change here. */
+  private xcodeVersionPromise: Promise<string | null> | undefined;
   private readonly run: MacHelperProvisionerOptions["run"];
   private readonly fileExists: (candidate: string) => Promise<boolean>;
   private readonly readSources: (dir: string) => Promise<readonly string[]>;
@@ -116,6 +129,10 @@ export class MacComputerHelperProvisioner {
 
   constructor(options: MacHelperProvisionerOptions) {
     this.helperSourceDir = options.helperSourceDir;
+    this.bundledBinaryPath =
+      options.bundledBinaryPath ??
+      options.env?.[COMPUTER_HELPER_BINARY_PATH_ENV] ??
+      process.env[COMPUTER_HELPER_BINARY_PATH_ENV];
     this.helperCacheRoot = options.helperCacheRoot ?? COMPUTER_HELPER_CACHE_ROOT;
     this.run = options.run;
     this.fileExists =
@@ -130,12 +147,36 @@ export class MacComputerHelperProvisioner {
     this.env = options.env ?? process.env;
   }
 
+  /**
+   * `xcodebuild -version`, run at most once per provisioner.
+   *
+   * `probeAvailability()` calls this twice over — once directly and once through
+   * the cache key — and it runs at boot for every user on every platform check.
+   * The active toolchain cannot change under a running server without a restart
+   * (it is `xcode-select`'d machine state), so the spawn is memoized while the
+   * source hash below is deliberately left live: sources *do* change while a
+   * developer works, and a stale key there would serve a stale binary.
+   */
+  private async xcodeVersionOutput(): Promise<string | null> {
+    this.xcodeVersionPromise ??= this.run("xcodebuild", ["-version"], {
+      timeoutMs: 20_000,
+      env: this.env,
+    })
+      .then((value) => (value.code === 0 ? value.stdout : null))
+      .catch(() => null);
+    return await this.xcodeVersionPromise;
+  }
+
   /** Whether a full Xcode toolchain — not just the CLI tools — is present to build with. */
   async xcodeToolchainPresent(): Promise<boolean> {
-    const result = await this.run("xcodebuild", ["-version"], { timeoutMs: 20_000, env: this.env })
-      .then((value) => value.code === 0)
-      .catch(() => false);
-    return result;
+    return (await this.xcodeVersionOutput()) !== null;
+  }
+
+  /** Signed helper shipped inside Synara.app, when this is a packaged desktop build. */
+  async bundledBinary(): Promise<string | null> {
+    const candidate = this.bundledBinaryPath?.trim();
+    if (!candidate) return null;
+    return (await this.fileExists(candidate)) ? candidate : null;
   }
 
   /** The cached binary path if one exists for the current toolchain and sources, else null. */
@@ -151,6 +192,8 @@ export class MacComputerHelperProvisioner {
    * an actionable message when the toolchain is missing or the compile fails.
    */
   async ensureBinary(): Promise<string> {
+    const bundled = await this.bundledBinary();
+    if (bundled) return bundled;
     const cached = await this.cachedBinaryPath();
     if (cached) return cached;
 
@@ -188,12 +231,9 @@ export class MacComputerHelperProvisioner {
   }
 
   private async buildKey(): Promise<string> {
-    const result = await this.run("xcodebuild", ["-version"], {
-      timeoutMs: 20_000,
-      env: this.env,
-    }).catch(() => null);
+    const versionOutput = await this.xcodeVersionOutput();
     const revision = await this.sourceRevision();
-    const key = result?.code === 0 ? deviceHelperCacheKey(result.stdout, revision) : null;
+    const key = versionOutput === null ? null : deviceHelperCacheKey(versionOutput, revision);
     if (key === null) {
       throw new MacHelperBuildError("Could not determine the Xcode version.");
     }

@@ -53,8 +53,19 @@ import {
 
 import type { ContextMenuItem } from "@synara/contracts";
 import { isKeyboardShortcutsHelpChord } from "@synara/shared/browserShortcuts";
+import {
+  DesktopComputerControlPermissions,
+  registerComputerControlIpcHandlers,
+} from "./computerControlPermissions";
 import { getMacTrafficLightPosition } from "@synara/shared/desktopChrome";
 import { DEVICE_HELPER_SOURCE_DIR_ENV } from "@synara/shared/deviceHelperCache";
+import {
+  COMPUTER_HELPER_BINARY_PATH_ENV,
+  COMPUTER_HELPER_BUNDLE_EXECUTABLE_SEGMENTS,
+  COMPUTER_HELPER_DEV_BUNDLE_SEGMENTS,
+  COMPUTER_HELPER_DEV_RAW_SEGMENTS,
+  COMPUTER_HELPER_PACKAGED_SEGMENTS,
+} from "@synara/shared/computerHelperPaths";
 import {
   SYNARA_DESKTOP_UPDATE_CHANNEL,
   resolveSynaraDesktopFlavor,
@@ -1748,6 +1759,55 @@ function resolveNotificationIconPath(): string | null {
   }
   return resolveResourcePath("synara.png") ?? resolveIconPath("png");
 }
+
+/** The signed computer-use helper inside a packaged `Synara.app`. */
+function packagedComputerHelperPath(): string {
+  return Path.resolve(
+    process.resourcesPath,
+    "..",
+    ...COMPUTER_HELPER_PACKAGED_SEGMENTS.slice(1),
+    ...COMPUTER_HELPER_BUNDLE_EXECUTABLE_SEGMENTS,
+  );
+}
+
+/**
+ * The helper this build can run, or null when none has been produced yet.
+ * A development checkout may have either the bundle the packaging script writes
+ * or the loose binary `build.sh` writes; both are accepted so a developer who
+ * built the Swift side directly does not also have to package it.
+ */
+function resolveDesktopComputerHelperPath(): string | null {
+  if (process.platform !== "darwin") return null;
+  const candidates = app.isPackaged
+    ? [packagedComputerHelperPath()]
+    : [
+        Path.join(
+          resolveAppRoot(),
+          ...COMPUTER_HELPER_DEV_BUNDLE_SEGMENTS,
+          ...COMPUTER_HELPER_BUNDLE_EXECUTABLE_SEGMENTS,
+        ),
+        Path.join(resolveAppRoot(), ...COMPUTER_HELPER_DEV_RAW_SEGMENTS),
+      ];
+  return candidates.find((candidate) => FS.existsSync(candidate)) ?? null;
+}
+
+/**
+ * The helper binary the backend child should spawn, in whichever build shape
+ * this is. Packaged builds get the bundle inside `Synara.app`; a development
+ * checkout gets whichever dev bundle has been built. Null when there is none,
+ * which leaves the backend on its own source-build fallback.
+ */
+function macComputerHelperPathForBackend(): string | null {
+  if (process.platform !== "darwin") return null;
+  return resolveDesktopComputerHelperPath();
+}
+
+const computerControlPermissions = new DesktopComputerControlPermissions({
+  platform: process.platform,
+  resolveHelperPath: resolveDesktopComputerHelperPath,
+  systemPreferences,
+  openExternal: (url) => shell.openExternal(url),
+});
 
 function resolveAppSnapHelperPath(): string {
   if (app.isPackaged) {
@@ -3468,6 +3528,16 @@ function backendEnv(): NodeJS.ProcessEnv {
     ...(app.isPackaged
       ? { [DEVICE_HELPER_SOURCE_DIR_ENV]: Path.join(process.resourcesPath, "device-helper") }
       : {}),
+    // macOS only, and in development as well as packaged. Without the dev path
+    // the backend fell through to its source-build fallback and ran a loose
+    // binary out of ~/Library/Caches — no bundle, so no `LSUIElement`, no bundle
+    // identity for TCC, and a cold Swift compile on first use. The signed bundle
+    // is the thing this feature is designed around, so dev should exercise it
+    // too. A Windows or Linux backend that saw this variable would stat a path
+    // that cannot exist, hence the platform guard.
+    ...(macComputerHelperPathForBackend()
+      ? { [COMPUTER_HELPER_BINARY_PATH_ENV]: macComputerHelperPathForBackend() as string }
+      : {}),
     SYNARA_MODE: "desktop",
     SYNARA_NO_BROWSER: "1",
     SYNARA_PORT: String(backendPort),
@@ -4130,6 +4200,8 @@ function registerIpcHandlers(): void {
   ipcMain.on(IPC.zoomFactor, (event: IpcMainEvent) => {
     event.returnValue = event.sender.getZoomFactor();
   });
+
+  registerComputerControlIpcHandlers(ipcMain, computerControlPermissions);
 
   ipcMain.removeHandler(IPC.remoteAccess.getState);
   ipcMain.handle(IPC.remoteAccess.getState, () => currentRemoteAccessState());

@@ -100,9 +100,26 @@ struct Params {
     (raw[key] as? NSNumber)?.intValue ?? fallback
   }
 
+  /// A required string parameter that must carry content — a method name, a
+  /// window id, a key name. Use `text` for agent-supplied text, where the empty
+  /// string is a legitimate value.
   func string(_ key: String) throws -> String {
     guard let value = raw[key] as? String, !value.isEmpty else {
       throw RPCError(.invalidParams, "missing or empty parameter '\(key)'")
+    }
+    return value
+  }
+
+  /// A required string parameter that may legitimately be empty.
+  ///
+  /// Clearing a text field is `set-value` with `""`, and emptying the clipboard
+  /// is `write-clipboard` with `""`; the contract allows both. Conflating
+  /// "missing" with "empty" rejected them — and `write-clipboard` had already
+  /// cleared the pasteboard by the time the throw happened, so the operation
+  /// destroyed the clipboard and then reported failure.
+  func text(_ key: String) throws -> String {
+    guard let value = raw[key] as? String else {
+      throw RPCError(.invalidParams, "missing parameter '\(key)'")
     }
     return value
   }

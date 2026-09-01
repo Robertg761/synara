@@ -27,7 +27,7 @@ import {
 } from "@synara/contracts";
 
 import { asFiniteNumber, asRecord, asString, parseComputerRect } from "./computerGeometry.ts";
-import { clampNodeText } from "./atspiTreeTargeting.ts";
+import { clampNodeText } from "./uiTreeText.ts";
 
 const NODE_ROLE_MAX_LENGTH = 128;
 /** Matches the schema's `nodePath` depth cap so a write address stays addressable. */
@@ -117,6 +117,9 @@ function parseNode(
     windowId,
     ...(path ? { nodePath: [...path] } : {}),
     ...(record.editable === true ? { editable: true } : {}),
+    // The helper marks a node whose walk hit its budget. Dropping it here left
+    // the agent unable to tell a partial subtree from a complete one.
+    ...(record.truncated === true ? { truncated: true } : {}),
     children,
   };
 }

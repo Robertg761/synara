@@ -620,6 +620,7 @@ import {
   revokeUserMessagePreviewUrls,
 } from "./ChatView.logic";
 import { clearPendingTurnDispatch, markPendingTurnDispatch } from "../pendingTurnDispatch";
+import { preflightComputerControlPermissions } from "../lib/computerControlFirstUse";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerSlashCommands } from "../hooks/useComposerSlashCommands";
 import { useFeatureFlags } from "../featureFlags";
@@ -1306,7 +1307,7 @@ export default function ChatView({
   });
   const computerControlDisabledReason = computerThreadState
     ? computerThreadState.availability.kind === "unsupported-platform"
-      ? `Computer control needs a Wayland desktop on Linux (KWin or Hyprland, or Synara's own nested desktop). This server is ${computerThreadState.availability.platform}.`
+      ? `Computer control needs macOS, or a Wayland desktop on Linux (KWin or Hyprland, or Synara's own nested desktop). This server is ${computerThreadState.availability.platform}.`
       : computerThreadState.availability.kind === "backend-unavailable"
         ? computerThreadState.availability.message
         : undefined
@@ -5088,6 +5089,20 @@ export default function ChatView({
     },
     [persistRuntimeModeChange],
   );
+  // Ends any in-flight permission wait when this view goes away: the poll spawns
+  // a helper process per tick, and a System Settings pane can sit open far
+  // longer than the user stays on this chat.
+  const computerControlPreflightAbortRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    computerControlPreflightAbortRef.current = controller;
+    return () => {
+      controller.abort();
+      if (computerControlPreflightAbortRef.current === controller) {
+        computerControlPreflightAbortRef.current = null;
+      }
+    };
+  }, []);
   const handleComputerControlChange = useCallback(
     (enabled: boolean) => {
       // A per-chat override only. It never rewrites the machine-wide default —
@@ -5095,8 +5110,45 @@ export default function ChatView({
       // later chat after a single per-chat "off".
       setComposerDraftComputerControl(threadId, enabled);
       scheduleComposerFocus();
+      if (!enabled) return;
+      // Turning it on is the consent, so this is where macOS gets asked — from
+      // the signed desktop process, so the grant is attributed to Synara rather
+      // than to whatever shell an agent happens to run in. The send path is
+      // never blocked on it: a missing grant comes back through the denial card
+      // like any other refused desktop action.
+      void preflightComputerControlPermissions(window.desktopBridge?.computerControl, {
+        signal: computerControlPreflightAbortRef.current?.signal,
+        onPermissionRequest: () =>
+          toastManager.add({
+            type: "info",
+            title: "Setting up computer control",
+            description: "macOS may ask for Screen Recording and Accessibility for Synara.",
+          }),
+      })
+        .then((preflight) => {
+          if (preflight.kind !== "permission-required") return;
+          toastManager.add({
+            type: "warning",
+            title: "Finish enabling Synara in System Settings",
+            description:
+              preflight.state.message ??
+              "Allow Screen Recording and Accessibility for Synara, then try again.",
+          });
+        })
+        .catch((error: unknown) => {
+          toastManager.add({
+            type: "error",
+            title: "Couldn't check computer-control permissions",
+            description: error instanceof Error ? error.message : String(error),
+          });
+        });
     },
-    [scheduleComposerFocus, setComposerDraftComputerControl, threadId],
+    [
+      computerControlPreflightAbortRef,
+      scheduleComposerFocus,
+      setComposerDraftComputerControl,
+      threadId,
+    ],
   );
   // "Enable" on a computer-control denial card: switch control on for this chat
   // and suggest a retry message when the composer is empty, so the user can just

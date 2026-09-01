@@ -292,6 +292,31 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("neither raises nor refuses a covered target on a window-addressed backend", async () => {
+    const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
+    // The macOS helper stamps the target window on the event and posts it to
+    // that window's process, so stacking has no bearing on delivery. Raising was
+    // what pulled the human's frontmost application out from under them on every
+    // click, and refusing a covered target refused clicks that would have landed.
+    (
+      backend as { deliversToNamedWindowRegardlessOfStacking?: boolean }
+    ).deliversToNamedWindowRegardlessOfStacking = true;
+    const manager = new ComputerManager({ backend });
+
+    const covered = await manager.click("thread-1", {
+      x: 1_100,
+      y: 200,
+      windowId: "fake-calculator",
+    });
+
+    expect(covered.point).toEqual({ x: 1_100, y: 200 });
+    expect(backend.callsFor("raiseWindow")).toHaveLength(0);
+    expect(backend.callsFor("focusWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+    expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 1_100, y: 200 });
+
+    await manager.dispose();
+  });
+
   it("raises a target window before focusing it and scopes a coordinate click to it", async () => {
     const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
     const manager = new ComputerManager({ backend });

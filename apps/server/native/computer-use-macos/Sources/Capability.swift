@@ -12,6 +12,20 @@ import CoreGraphics
 import Foundation
 
 enum Capability {
+  /** Ask macOS on an explicit user action; TCC remains the authority. */
+  static func requestPermissions() -> [String: Any] {
+    if !CGPreflightScreenCaptureAccess() {
+      _ = CGRequestScreenCaptureAccess()
+    }
+    if !AXIsProcessTrusted() {
+      let options = [
+        kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+      ] as CFDictionary
+      _ = AXIsProcessTrustedWithOptions(options)
+    }
+    return report()
+  }
+
   static func report() -> [String: Any] {
     let version = ProcessInfo.processInfo.operatingSystemVersion
     return [
@@ -21,6 +35,9 @@ enum Capability {
       // grant is reported, never demanded, so the backend can surface a card.
       "screenRecording": CGPreflightScreenCaptureAccess(),
       "accessibility": AXIsProcessTrusted(),
+      // Which private WindowServer entry points resolved on this OS: the
+      // background focus prelude and window-local stamping depend on them.
+      "skylight": SkyLight.report(),
       "protocolVersion": 1,
     ]
   }
