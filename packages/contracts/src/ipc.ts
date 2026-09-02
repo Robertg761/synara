@@ -602,6 +602,12 @@ export interface SynaraStorageSnapshot {
 }
 
 export interface DesktopBridge {
+  /**
+   * Desktop flavor ("stable" | "dev" | "canary") answered synchronously by the
+   * main process so the window can brand itself before the app boots. Null
+   * when the shell predates the channel.
+   */
+  getFlavor?: () => string | null;
   getWsUrl: () => string | null;
   /**
    * Absolute filesystem path for a File from drag/drop or file inputs.

@@ -51,6 +51,7 @@ import {
   isVoiceAuthExpiredMessage,
   LOCAL_DISPATCH_TURN_TAKEOVER_TIMEOUT_MS,
   resolveActiveThreadTitle,
+  resolveDraftFallbackModelSelection,
   resolveActiveTurnLiveDiffState,
   resolveCommittedProviderModel,
   resolveComposerStripWorkLogEntries,
@@ -3262,5 +3263,61 @@ describe("phone command menu height cap", () => {
     for (const candidate of COMPOSER_COMMAND_MENU_PHONE_MAX_HEIGHT_CLASS_NAME.split(" ")) {
       expect(candidate.startsWith("[html[data-layout=phone]_&")).toBe(true);
     }
+  });
+});
+
+describe("resolveDraftFallbackModelSelection", () => {
+  it("prefers an explicit project default over the settings default provider", () => {
+    expect(
+      resolveDraftFallbackModelSelection({
+        projectDefault: { provider: "codex", model: "gpt-5.5" },
+        settingsDefaultProvider: "devin",
+      }),
+    ).toEqual({ provider: "codex", model: "gpt-5.5" });
+  });
+
+  it("uses the settings default provider when the project has no default", () => {
+    expect(
+      resolveDraftFallbackModelSelection({
+        projectDefault: null,
+        settingsDefaultProvider: "devin",
+      }),
+    ).toEqual({ provider: "devin", model: "adaptive" });
+  });
+
+  it("keeps the project default model when it matches the settings provider", () => {
+    expect(
+      resolveDraftFallbackModelSelection({
+        projectDefault: { provider: "devin", model: "swe-1-7" },
+        settingsDefaultProvider: "devin",
+      }),
+    ).toEqual({ provider: "devin", model: "swe-1-7" });
+  });
+
+  it("uses the project default provider when the settings default is pi", () => {
+    expect(
+      resolveDraftFallbackModelSelection({
+        projectDefault: { provider: "claudeAgent", model: "claude-sonnet-5" },
+        settingsDefaultProvider: "pi",
+      }),
+    ).toEqual({ provider: "claudeAgent", model: "claude-sonnet-5" });
+  });
+
+  it("falls back to codex when the settings default is pi and no project default exists", () => {
+    expect(
+      resolveDraftFallbackModelSelection({
+        projectDefault: null,
+        settingsDefaultProvider: "pi",
+      }),
+    ).toEqual({ provider: "codex", model: "gpt-5.5" });
+  });
+
+  it("uses the settings provider default model when no project default exists", () => {
+    expect(
+      resolveDraftFallbackModelSelection({
+        projectDefault: undefined,
+        settingsDefaultProvider: "grok",
+      }),
+    ).toEqual({ provider: "grok", model: "grok-4.6" });
   });
 });
