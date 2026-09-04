@@ -220,7 +220,6 @@ describe("Antigravity CLI integration helpers", () => {
     const liveTokens = new Set<string>();
     const bootstrapOwners = new Map<string, string>();
     const revokedTokens: string[] = [];
-    const leasedCapabilities: Array<readonly string[]> = [];
     const spawnedEnvironments: NodeJS.ProcessEnv[] = [];
     let tokenSequence = 0;
     let bootstrapSequence = 0;
@@ -259,13 +258,10 @@ describe("Antigravity CLI integration helpers", () => {
           if (owner === token) bootstrapOwners.delete(bootstrap);
         }
       },
-      connectionForThread: (_threadId, _provider, options) => {
-        leasedCapabilities.push(options?.additionalCapabilities ?? []);
-        return {
-          url: "http://127.0.0.1:3773/mcp",
-          bearerToken: issueSessionToken(),
-        };
-      },
+      connectionForThread: () => ({
+        url: "http://127.0.0.1:3773/mcp",
+        bearerToken: issueSessionToken(),
+      }),
       stdioProxy: { command: process.execPath, args: ["proxy.mjs"] },
     };
     let processSequence = 0;
@@ -303,10 +299,6 @@ describe("Antigravity CLI integration helpers", () => {
             threadId,
             runtimeMode: "full-access",
             cwd: root,
-            // Antigravity leases per turn, so the session-start capability facts
-            // have to survive in the session context or every turn silently
-            // loses the computer tools.
-            enableComputerControl: true,
             providerOptions: { antigravity: { binaryPath: "/fake/agy" } },
           });
           const waitUntilReady = Effect.gen(function* () {
@@ -333,7 +325,6 @@ describe("Antigravity CLI integration helpers", () => {
           expect(credentials.exchangeStdioBootstrapToken(bootstrapB!)).toBe("turn-session-2");
           yield* waitUntilReady;
           expect(revokedTokens).toEqual(["turn-session-1", "turn-session-2"]);
-          expect(leasedCapabilities).toEqual([["computer:control"], ["computer:control"]]);
           yield* adapter.stopSession(threadId);
         }).pipe(
           Effect.provide(

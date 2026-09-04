@@ -86,14 +86,13 @@ describe("AgentGatewaySessionRegistry", () => {
     assert.notInclude(JSON.stringify(verified), issued.token);
   });
 
-  it("keeps computer control opt-in instead of adding it to provider defaults", () => {
-    const registry = makeAgentGatewaySessionRegistry({ randomId: () => "computer" });
-    const ordinary = registry.issue(ThreadId.makeUnsafe("thread-1"), "codex");
-    const optedIn = registry.issue(ThreadId.makeUnsafe("thread-2"), "codex", {
-      additionalCapabilities: ["computer:control"],
-    });
-
-    assert.isFalse(ordinary.capabilities.has("computer:control"));
-    assert.isTrue(optedIn.capabilities.has("computer:control"));
+  it("grants computer control to every provider session", () => {
+    let nextId = 0;
+    const registry = makeAgentGatewaySessionRegistry({ randomId: () => String(++nextId) });
+    for (const provider of ["codex", "claudeAgent", "antigravity"] as const) {
+      const issued = registry.issue(ThreadId.makeUnsafe("thread-1"), provider);
+      assert.isTrue(issued.capabilities.has("computer:control"));
+      assert.isTrue(registry.verify(issued.token)?.capabilities.has("computer:control"));
+    }
   });
 });

@@ -33,6 +33,33 @@ const buildScript = join(sourceDirectory, "build.sh");
 // can never name two different bundles.
 const bundleManifestPath = join(repoRoot, "packages/shared/src/computerHelperBundle.json");
 const bundle = JSON.parse(readFileSync(bundleManifestPath, "utf8"));
+
+/**
+ * The helper's bundle identifier, derived from the app's own.
+ *
+ * `packages/shared/src/desktopIdentity.ts` is the single source of Synara's
+ * bundle ID, and the helper's is that ID plus the suffix in the manifest —
+ * macOS files the helper's TCC grants under it, and the Swift helper's
+ * "never drive Synara" guard matches windows against the app's ID. This script
+ * runs under plain `node` and cannot import the TypeScript module, so the
+ * constant is read out of it and a miss is fatal: a rebrand must break this
+ * build rather than ship a helper claiming an identity nothing else uses.
+ */
+function synaraProductionBundleId() {
+  const identitySource = readFileSync(
+    join(repoRoot, "packages/shared/src/desktopIdentity.ts"),
+    "utf8",
+  );
+  const match = /export const SYNARA_PRODUCTION_BUNDLE_ID\s*=\s*"([^"]+)"/.exec(identitySource);
+  if (!match) {
+    throw new Error(
+      "Could not read SYNARA_PRODUCTION_BUNDLE_ID from packages/shared/src/desktopIdentity.ts",
+    );
+  }
+  return match[1];
+}
+
+export const computerHelperBundleIdentifier = `${synaraProductionBundleId()}.${bundle.bundleIdentifierSuffix}`;
 // The helper ships inside Synara.app and is replaced with it, so it carries the
 // app's version rather than a frozen "1". macOS shows this in Privacy & Security
 // next to the entry the user is being asked to trust.
@@ -58,7 +85,7 @@ const helperInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
   <key>CFBundleExecutable</key>
   <string>${bundle.binaryName}</string>
   <key>CFBundleIdentifier</key>
-  <string>${bundle.bundleIdentifier}</string>
+  <string>${computerHelperBundleIdentifier}</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -93,18 +120,41 @@ export function computerHelperTargetsForArch(arch) {
   }
 }
 
+/** Memoized: the toolchain cannot change inside one process. */
+let toolchainDescription = null;
+
+/**
+ * What `build.sh` will actually compile with. `build.sh` resolves everything
+ * through `xcrun`, so the Swift driver's own version banner — which names the
+ * Swift release, the target, and the toolchain path — is the honest identity of
+ * the compiler. It goes into the fingerprint because a toolchain upgrade
+ * produces a different binary from identical sources, and a cache that ignored
+ * it happily reused a helper built by the previous Xcode.
+ *
+ * A machine that cannot answer contributes a constant instead of failing: the
+ * build itself will report a missing toolchain far better than the cache key
+ * can, and until then an unknown toolchain simply never matches a known one.
+ */
+function toolchain() {
+  if (toolchainDescription !== null) return toolchainDescription;
+  const result = spawnSync("xcrun", ["swiftc", "-version"], { encoding: "utf8" });
+  const banner = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+  toolchainDescription = result.status === 0 && banner ? banner : "unknown-toolchain";
+  return toolchainDescription;
+}
+
 /**
  * Everything that can change the produced binary. Mirrors the AppSnap helper's
  * cache so a repeat packaging run — or a developer rebuilding after touching an
  * unrelated file — does not pay a whole-module-optimization Swift compile
  * (twice, for a universal build) to reproduce a byte-identical helper.
  */
-function buildFingerprint({ arch, release, sources, targets }) {
+function buildFingerprint({ arch, sources, targets }) {
   const hash = createHash("sha256");
-  hash.update("synara-computer-helper-build-v1\0");
-  hash.update(arch);
+  hash.update("synara-computer-helper-build-v2\0");
+  hash.update(toolchain());
   hash.update("\0");
-  hash.update(release ? "release" : "debug");
+  hash.update(arch);
   hash.update("\0");
   hash.update(JSON.stringify(targets));
   hash.update("\0");
@@ -167,7 +217,6 @@ function run(command, args, options = {}) {
 export function buildComputerHelper({
   arch = process.arch,
   outputPath = defaultComputerHelperPath,
-  release = false,
   quiet = false,
 } = {}) {
   if (process.platform !== "darwin") {
@@ -181,7 +230,7 @@ export function buildComputerHelper({
   const sources = helperSources();
   const resolvedOutputPath = resolve(outputPath);
   const metadataPath = `${resolvedOutputPath}.build.json`;
-  const fingerprint = buildFingerprint({ arch, release, sources, targets });
+  const fingerprint = buildFingerprint({ arch, sources, targets });
   if (isUsableCachedBuild(resolvedOutputPath, metadataPath, fingerprint)) {
     if (!quiet) {
       console.error(`[computer-use] Reusing ${arch} helper at ${resolvedOutputPath}`);
@@ -202,8 +251,13 @@ export function buildComputerHelper({
           CLANG_MODULE_CACHE_PATH: moduleCacheDirectory,
           SWIFT_MODULECACHE_PATH: moduleCacheDirectory,
           SYNARA_COMPUTER_HELPER_TARGET: target.triple,
-          // Dev iteration compiles unoptimized; packaging always asks for release.
-          SYNARA_COMPUTER_HELPER_OPTIMIZE: release ? "release" : "debug",
+          // Always optimized: an unoptimized helper measurably changes the input
+          // and capture latencies this helper exists to keep low, so a dev build
+          // that differs from the shipped one would hide regressions until
+          // packaging. Iterating on the Swift itself is the one case that wants
+          // a faster compile, and that runs build.sh directly with
+          // SYNARA_COMPUTER_HELPER_OPTIMIZE=debug.
+          SYNARA_COMPUTER_HELPER_OPTIMIZE: "release",
         },
       });
       thinBinaries.push(join(outputDirectory, bundle.binaryName));
@@ -227,9 +281,9 @@ export function buildComputerHelper({
     // One signature, on the bundle. Signing the loose binary first was redundant
     // — the bundle signature supersedes it — and `--deep` is deprecated by Apple
     // for exactly this shape: there is one nested executable and signing the
-    // bundle covers it. electron-builder replaces this ad-hoc identity with
-    // Synara's release identity when packaging, because the executable path is
-    // listed in `mac.binaries`.
+    // bundle covers it. A release build replaces this ad-hoc identity: signing
+    // walks everything under the packaged `Contents/`, and any nested `.app` it
+    // finds there is re-signed as a bundle in its own right.
     run("codesign", ["--force", "--sign", "-", "--timestamp=none", pendingPath]);
     rmSync(resolvedOutputPath, { recursive: true, force: true });
     renameSync(pendingPath, resolvedOutputPath);
@@ -241,9 +295,7 @@ export function buildComputerHelper({
     renameSync(pendingMetadataPath, metadataPath);
 
     if (!quiet) {
-      console.error(
-        `[computer-use] Built ${arch} ${release ? "release" : "debug"} helper at ${resolvedOutputPath}`,
-      );
+      console.error(`[computer-use] Built ${arch} helper at ${resolvedOutputPath}`);
     }
     return resolvedOutputPath;
   } finally {
@@ -264,7 +316,6 @@ function requireValue(args, index, flag) {
 function parseCommandLine(args) {
   let arch = process.arch;
   let outputPath = defaultComputerHelperPath;
-  let release = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     switch (argument) {
@@ -280,13 +331,16 @@ function parseCommandLine(args) {
         outputPath = requireValue(args, index, "--output");
         break;
       case "--release":
-        release = true;
+        // Accepted and ignored: every build is optimized now, but the desktop
+        // packaging script drives this helper and the AppSnap one through one
+        // shared command line that still passes `--release`, and rejecting it
+        // here would fail the release build.
         break;
       default:
         throw new Error(`Unknown computer helper build argument: ${argument}`);
     }
   }
-  return { arch, outputPath, release };
+  return { arch, outputPath };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {

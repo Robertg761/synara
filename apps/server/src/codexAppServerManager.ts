@@ -58,7 +58,6 @@ import {
 import { SYNARA_GATEWAY_HARNESS_POLICY } from "./agentGateway/harnessPolicy.ts";
 import {
   AGENT_GATEWAY_TURN_AUTHORITY_RETIRED,
-  type AgentGatewayCapabilityInput,
   type AgentGatewaySessionLease,
 } from "./agentGateway/sessionLease.ts";
 import { isNonFatalCodexErrorMessage } from "./codexErrorClassification.ts";
@@ -279,8 +278,6 @@ export interface CodexAppServerStartSessionInput {
   readonly resumeCursor?: unknown;
   readonly forkSourceResumeCursor?: unknown;
   readonly providerOptions?: ProviderSessionStartInput["providerOptions"];
-  /** Session-start facts the gateway lease derives its capabilities from. */
-  readonly agentGatewayCapabilityInput?: AgentGatewayCapabilityInput;
   readonly runtimeMode: RuntimeMode;
 }
 
@@ -979,10 +976,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   private readonly agentGatewayMcp:
     | {
         readonly endpointUrl: () => string;
-        readonly acquireSessionLease: (
-          threadId: ThreadId,
-          capabilityInput?: AgentGatewayCapabilityInput,
-        ) => AgentGatewaySessionLease;
+        readonly acquireSessionLease: (threadId: ThreadId) => AgentGatewaySessionLease;
       }
     | undefined;
   private readonly teardownProcessTree: typeof teardownProviderProcessTree;
@@ -994,10 +988,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       readonly synaraSkillsDir?: string;
       readonly agentGatewayMcp?: {
         readonly endpointUrl: () => string;
-        readonly acquireSessionLease: (
-          threadId: ThreadId,
-          capabilityInput?: AgentGatewayCapabilityInput,
-        ) => AgentGatewaySessionLease;
+        readonly acquireSessionLease: (threadId: ThreadId) => AgentGatewaySessionLease;
       };
       readonly teardownProcessTree?: typeof teardownProviderProcessTree;
       readonly taskCompleteFallbackGraceMs?: number;
@@ -1090,10 +1081,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           : {}),
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
       });
-      gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(
-        threadId,
-        input.agentGatewayCapabilityInput,
-      );
+      gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
       const child = spawnCodexAppServer({
         binaryPath: codexBinaryPath,
         cwd: resolvedCwd,
@@ -1878,12 +1866,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           : {}),
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
       });
-      // A fork carries the same computer-control fact a start does, so the
-      // forked runtime leases like-for-like capabilities instead of dropping
-      // `computer:control` at the fork boundary.
-      gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId, {
-        enableComputerControl: input.enableComputerControl === true,
-      });
+      gatewaySessionLease = this.agentGatewayMcp?.acquireSessionLease(threadId);
       const child = spawnCodexAppServer({
         binaryPath: codexBinaryPath,
         cwd: resolvedCwd,

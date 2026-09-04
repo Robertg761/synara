@@ -37,6 +37,11 @@ if arguments.contains("--probe") || arguments.contains("--request-permissions") 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
+// Screen geometry is read from AppKit, which is main-thread API, and then
+// served to every lane from an immutable snapshot. Primed here, before any lane
+// exists, and refreshed on the display-parameters notification.
+Geometry.startObservingScreenChanges()
+
 let cursor = AgentCursor()
 cursor.install()
 let input = InputController(cursor: cursor)
@@ -51,20 +56,40 @@ func handle(method: String, params: Params) throws -> Any {
   case "capabilities":
     return Capability.report()
 
+  case "request-permissions":
+    // Ask macOS for whatever this process is still missing, and answer with the
+    // same report `capabilities` returns.
+    //
+    // This is the live twin of the one-shot `--request-permissions` command, and
+    // it exists because the one-shot form could only ever be run by something
+    // other than the process that drives the desktop. The grant is attributed to
+    // the responsible process — Synara — either way (see Capability.swift), so
+    // asking from the long-lived helper puts the prompt in front of the user at
+    // the moment an agent actually needs it instead of at the moment somebody
+    // presses a button in Settings.
+    //
+    // `Capability.requestPermissions()` prompts only for a grant that is
+    // genuinely absent, so a repeat call on a granted Mac is a plain report.
+    return Capability.requestPermissions()
+
   case "list-windows":
     // The helper's own overlay is not in this list, and must not be: see
     // Windows.swift.
     let windows = Windows.list()
+    // The focused application's front window — asked once, and the same answer
+    // fills every window's `focused` flag, so the two can never disagree. Nil
+    // when the front application owns no window the agent may drive (Synara
+    // itself, or an app showing only a panel).
+    let focused = Windows.frontmost()
     let payload = windows.map { window in
-      Windows.dictionary(window, occluders: Windows.occluders(of: window, in: windows))
+      Windows.dictionary(
+        window, occluders: Windows.occluders(of: window, in: windows),
+        focusedWindowID: focused?.windowNumber)
     }
     return [
       "windows": payload,
       "workspace": Geometry.rectDictionary(Geometry.workspaceRect()),
-      // The frontmost on-screen application window is the focus target. The
-      // list also carries minimized windows, which can never hold focus.
-      "focusedWindowId": windows.first { $0.onScreen }.map { String($0.windowNumber) } as Any?
-        ?? NSNull(),
+      "focusedWindowId": focused.map { String($0.windowNumber) } as Any? ?? NSNull(),
     ]
 
   case "screen-size":
@@ -112,23 +137,24 @@ func handle(method: String, params: Params) throws -> Any {
 
   case "move":
     let point = try point(from: params)
-    try input.move(to: point, window: optionalWindowId(from: params))
+    try input.move(to: point, window: try optionalWindowId(from: params))
     return ["x": Double(point.x), "y": Double(point.y)]
 
   case "click":
     let point = try point(from: params)
-    try input.click(at: point, window: optionalWindowId(from: params))
-    return ["x": Double(point.x), "y": Double(point.y)]
+    return pointerResult(
+      point, try input.click(at: point, window: try optionalWindowId(from: params)))
 
   case "double-click":
     let point = try point(from: params)
-    try input.click(at: point, count: 2, window: optionalWindowId(from: params))
-    return ["x": Double(point.x), "y": Double(point.y)]
+    return pointerResult(
+      point,
+      try input.click(at: point, count: 2, window: try optionalWindowId(from: params)))
 
   case "right-click":
     let point = try point(from: params)
-    try input.rightClick(at: point, window: optionalWindowId(from: params))
-    return ["x": Double(point.x), "y": Double(point.y)]
+    return pointerResult(
+      point, try input.rightClick(at: point, window: try optionalWindowId(from: params)))
 
   case "drag":
     let from = Geometry.clampToWorkspace(
@@ -143,36 +169,36 @@ func handle(method: String, params: Params) throws -> Any {
     // agent the gesture was invisible when it was not.
     let resolved = try input.drag(
       from: from, to: to, durationMs: params.optionalInt("durationMs", default: 220), mode: mode,
-      window: optionalWindowId(from: params))
-    return ["ok": true, "path": resolved.rawValue]
+      window: try optionalWindowId(from: params))
+    return ["ok": true, "path": resolved.path, "verified": resolved.verified.rawValue]
 
   case "scroll":
     let x = params.optionalDouble("x")
     let y = params.optionalDouble("y")
     let point =
       (x != nil && y != nil) ? Geometry.clampToWorkspace(CGPoint(x: x!, y: y!)) : nil
-    try input.scroll(
+    let scrolled = try input.scroll(
       at: point, deltaX: try params.double("deltaX"), deltaY: try params.double("deltaY"),
-      window: optionalWindowId(from: params))
-    return ["ok": true]
+      window: try optionalWindowId(from: params))
+    return ["ok": true, "path": scrolled.path, "verified": scrolled.verified.rawValue]
 
   case "type":
     let outcome = try input.typeText(
       try params.text("text"), mode: try DeliveryMode(param: params.optionalString("deliveryMode")))
-    return ["ok": true, "path": outcome.path, "verified": outcome.verified]
+    return ["ok": true, "path": outcome.path, "verified": outcome.verified.rawValue]
 
   case "press-key":
-    let path = try input.pressKey(
+    let pressed = try input.pressKey(
       try params.string("key"), modifiers: params.stringArray("modifiers"),
       mode: try DeliveryMode(param: params.optionalString("deliveryMode")))
-    return ["ok": true, "path": path]
+    return ["ok": true, "path": pressed.path, "verified": pressed.verified.rawValue]
 
   case "hotkey":
     let keys = params.stringArray("keys")
     guard !keys.isEmpty else { throw RPCError(.invalidParams, "hotkey needs a non-empty keys array") }
-    let path = try input.hotkey(
+    let chord = try input.hotkey(
       keys, mode: try DeliveryMode(param: params.optionalString("deliveryMode")))
-    return ["ok": true, "path": path]
+    return ["ok": true, "path": chord.path, "verified": chord.verified.rawValue]
 
   case "set-value":
     let windowId = try windowId(from: params)
@@ -235,6 +261,23 @@ func handle(method: String, params: Params) throws -> Any {
 
 // MARK: - Method helpers
 
+/// The window the caller named for this action, if any. Absent means "whatever
+/// is topmost at the point", which is how a bare coordinate behaves.
+///
+/// A `windowId` that is present but unreadable is a bad request, not an absent
+/// one. Returning nil for it — which this used to do for a numeric JSON value,
+/// or any typo — quietly demoted a window-scoped click to "whatever is topmost
+/// at this coordinate", so a click the agent aimed into a partially covered
+/// window landed in whatever was drawn over it.
+func optionalWindowId(from params: Params) throws -> CGWindowID? {
+  guard let raw = params.raw["windowId"], !(raw is NSNull) else { return nil }
+  if let text = raw as? String, let number = UInt32(text) { return CGWindowID(number) }
+  if let value = raw as? NSNumber, value.int64Value >= 0, value.int64Value <= Int64(UInt32.max) {
+    return CGWindowID(value.uint32Value)
+  }
+  throw RPCError(.invalidParams, "windowId must be a numeric CGWindowID")
+}
+
 /// A requested point, clamped onto the desktop.
 ///
 /// The helper used to echo whatever it was given, which made the backend's
@@ -243,16 +286,22 @@ func handle(method: String, params: Params) throws -> Any {
 /// target window and the action silently did nothing. Clamping onto the
 /// workspace makes the action land somewhere real and makes the echoed point an
 /// honest answer to "where did this go", which is what the backend compares.
-/// The window the caller named for this action, if any. Absent means "whatever is
-/// topmost at the point", which is how a bare coordinate behaves.
-func optionalWindowId(from params: Params) -> CGWindowID? {
-  guard let raw = params.optionalString("windowId"), let number = UInt32(raw) else { return nil }
-  return CGWindowID(number)
-}
-
 func point(from params: Params) throws -> CGPoint {
   let requested = CGPoint(x: try params.double("x"), y: try params.double("y"))
   return Geometry.clampToWorkspace(requested)
+}
+
+/// The reply every pointer gesture makes: where it went, which rung took it
+/// there, and what the delivery watch was able to observe. The helper knew the
+/// last two and used to drop them, so a click that reached nothing and one the
+/// target visibly reacted to were the same reply.
+func pointerResult(_ point: CGPoint, _ outcome: PointerOutcome) -> [String: Any] {
+  [
+    "x": Double(point.x),
+    "y": Double(point.y),
+    "path": outcome.path,
+    "verified": outcome.verified.rawValue,
+  ]
 }
 
 func windowId(from params: Params) throws -> CGWindowID {
@@ -277,6 +326,9 @@ func intArray(_ params: Params, _ key: String) -> [Int] {
   (params.raw[key] as? [Any])?.compactMap { ($0 as? NSNumber)?.intValue } ?? []
 }
 
+/// How long `open` may take to hand a launch off before the input lane gives up.
+let launchDeadlineSeconds: Double = 10
+
 func launchApp(app: String, arguments: [String]) throws -> [String: Any] {
   let process = Process()
   process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
@@ -288,12 +340,25 @@ func launchApp(app: String, arguments: [String]) throws -> [String: Any] {
     args.append(contentsOf: arguments)
   }
   process.arguments = args
+  // `open` normally returns as soon as the launch is handed off, but it can sit
+  // there — a first launch of a quarantined app puts up a system dialog, and a
+  // wedged LaunchServices does not answer at all. `waitUntilExit()` is
+  // unbounded, and this runs on the serial input lane, so that one call used to
+  // hold every subsequent click and keystroke behind it for as long as the
+  // subprocess lived. Same deadline shape the capture fallback uses.
+  let finished = DispatchSemaphore(value: 0)
+  process.terminationHandler = { _ in finished.signal() }
   do {
     try process.run()
   } catch {
     throw RPCError(.internalError, "could not launch \(app): \(error.localizedDescription)")
   }
-  process.waitUntilExit()
+  if finished.wait(timeout: .now() + launchDeadlineSeconds) == .timedOut {
+    process.terminate()
+    _ = finished.wait(timeout: .now() + 1)
+    throw RPCError(
+      .internalError, "launching \(app) exceeded its \(launchDeadlineSeconds)s deadline")
+  }
   guard process.terminationStatus == 0 else {
     throw RPCError(.targetMissing, "no application named \(app) could be opened")
   }

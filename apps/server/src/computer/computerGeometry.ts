@@ -151,6 +151,67 @@ export function windowsPayloadFingerprint(
 }
 
 /**
+ * The same identity, built from the parsed list instead of the payload it came
+ * from.
+ *
+ * The macOS helper answers `list-windows` with a decoded JSON object rather than
+ * the string document the KWin plugin sends, so `windowsPayloadFingerprint`
+ * there means "re-encode the whole array" — on a call that runs several times
+ * per action and per publish. This digests only the fields a `windows-changed`
+ * event is about: identity, geometry, stacking, focus, visibility, and the
+ * labels a viewer reads. Anything else the desktop reports (occluders, for one)
+ * is derived from those, so a change it would catch is a change these catch
+ * first.
+ */
+export function windowsDigestFingerprint(
+  windows: readonly ComputerWindow[],
+  focusedWindowId: string | null,
+): string {
+  const parts = [focusedWindowId ?? ""];
+  for (const window of windows) {
+    const bounds = window.bounds;
+    parts.push(
+      [
+        window.id,
+        bounds?.x ?? "",
+        bounds?.y ?? "",
+        bounds?.width ?? "",
+        bounds?.height ?? "",
+        window.stackingIndex ?? "",
+        window.focused ? 1 : 0,
+        window.active === true ? 1 : window.active === false ? 0 : "",
+        window.minimized ? 1 : 0,
+        window.visible ? 1 : 0,
+        window.title,
+        window.appName ?? "",
+      ].join("\u0001"),
+    );
+  }
+  return parts.join("\u0002");
+}
+
+/**
+ * Emits `windows-changed` only when an enumeration differs from the last one.
+ *
+ * Every backend enumerates windows several times per action, and every
+ * enumeration that reported a change schedules a state publish — which
+ * enumerates again. Both backends therefore kept a "previous fingerprint" field
+ * and the same three-line compare beside it; this is that loop, owned once, so
+ * the two cannot drift on what counts as a change.
+ */
+export class WindowListChangeNotifier {
+  #fingerprint: string | undefined;
+
+  constructor(private readonly emit: (windows: readonly ComputerWindow[]) => void) {}
+
+  observe(fingerprint: string, windows: readonly ComputerWindow[]): void {
+    if (fingerprint === this.#fingerprint) return;
+    this.#fingerprint = fingerprint;
+    this.emit(windows);
+  }
+}
+
+/**
  * How far a landed pointer may sit from the requested point before it counts as
  * a clamp. A display server that puts the pointer in the nearest output when a
  * coordinate falls in a gap between monitors lands a pixel or two off for
@@ -359,9 +420,16 @@ export function requireWindowBounds(
 export function screenSizeFromWindows(
   windows: readonly ComputerWindow[],
   workspace?: ComputerRect | null,
+  /**
+   * The desktop's backing-store scale, when the backend knows it. Defaults to 1
+   * because a display server that reports logical pixels and nothing else has
+   * no better answer — but on a Retina Mac 1 is simply false, and a caller
+   * reading the reported size cannot tell a truthful 1 from a placeholder.
+   */
+  scale = 1,
 ): ComputerScreenSize {
   const rect = workspaceRectFromWindows(windows, workspace);
-  return { width: rect.width, height: rect.height, scale: 1 };
+  return { width: rect.width, height: rect.height, scale: scale > 0 ? scale : 1 };
 }
 
 /**

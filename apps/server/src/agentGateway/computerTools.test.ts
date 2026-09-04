@@ -1,12 +1,18 @@
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { COMPUTER_TEXT_MAX_LENGTH, type ProviderKind } from "@synara/contracts";
+import {
+  COMPUTER_TEXT_MAX_LENGTH,
+  type ComputerPermission,
+  type ProviderKind,
+} from "@synara/contracts";
 
 import {
   COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+  ComputerBackendError,
   MAX_COMPUTER_CLIPBOARD_BYTES,
 } from "../computer/ComputerBackend.ts";
+import { ComputerTargetError } from "../computer/uiTreeTargeting.ts";
 import { ComputerManager } from "../computer/ComputerManager.ts";
 import { FakeComputerBackend } from "../computer/FakeComputerBackend.ts";
 import {
@@ -96,7 +102,58 @@ async function setup(backend = new FakeComputerBackend()) {
   return { backend, manager, tools, byName, call, see };
 }
 
+/** The `window_id` blurb one tool advertises, which is backend-dependent prose. */
+function windowIdDescription(
+  byName: Map<string, { definition: { inputSchema: unknown } }>,
+  tool: string,
+): string {
+  const schema = byName.get(tool)?.definition.inputSchema as
+    | { properties?: { window_id?: { description?: string } } }
+    | undefined;
+  return schema?.properties?.window_id?.description ?? "";
+}
+
 describe("agent gateway computer tools", () => {
+  it("describes window_id as a raise on a backend that raises", async () => {
+    const { byName } = await setup();
+    const description = byName.get("computer_press_key")?.definition.description ?? "";
+    expect(description).toContain("raise and focus a specific window");
+    expect(windowIdDescription(byName, "computer_press_key")).toContain("The window is raised");
+    expect(windowIdDescription(byName, "computer_click")).toContain("the window is raised");
+  });
+
+  it("describes window_id as delivery-without-raising on a backend that does not raise", async () => {
+    // Telling the model the window will come forward on a backend that
+    // deliberately leaves the stacking order alone taught it to expect a raise
+    // and to "fix" it when nothing moved.
+    const backend = Object.assign(new FakeComputerBackend(), {
+      deliversToNamedWindowRegardlessOfStacking: true,
+    });
+    const { byName } = await setup(backend);
+    const description = byName.get("computer_press_key")?.definition.description ?? "";
+    expect(description).toContain("regardless of what covers it");
+    expect(description).toContain("without bringing it to the front");
+    expect(description).not.toContain("raise and focus");
+    // The helper refuses an unaimed keyboard action rather than falling back to
+    // the frontmost window, which used to type into the human's own document.
+    expect(description).toContain("a keyboard action needs a target");
+    expect(description).toContain("That refusal is not transient");
+    const clickWindowId = windowIdDescription(byName, "computer_click");
+    expect(clickWindowId).toContain("regardless of what covers it");
+    expect(clickWindowId).not.toContain("raised");
+  });
+
+  it("spells out all three delivery verdicts on every keyboard tool", async () => {
+    // Collapsing "unverifiable" into "not confirmed" buys a screenshot after
+    // every keystroke on the many native controls that expose no readable value.
+    const { byName } = await setup();
+    for (const name of ["computer_type_text", "computer_press_key", "computer_hotkey"]) {
+      const description = byName.get(name)?.definition.description ?? "";
+      expect(description).toContain('"unverifiable" means the control exposes no readable value');
+      expect(description).toContain('Only on "unconfirmed"');
+    }
+  });
+
   it("carries the caller's name to the backend that draws the agent cursor", async () => {
     // The tool layer is the only place that knows what a thread is called, and
     // the badge on the human's desktop is the only reason it has to say so.
@@ -1165,5 +1222,183 @@ describe("agent gateway computer tools", () => {
     };
     // The clamp is the schema's own bound, not a second opinion about it.
     expect(schema.properties.duration_ms).toMatchObject({ maximum: 30_000, minimum: 0 });
+  });
+});
+
+describe("agent gateway computer setup prompts", () => {
+  /** One tool call against a backend whose window read fails the given way. */
+  async function readFailingWith(error: unknown) {
+    const backend = Object.assign(new FakeComputerBackend(), {
+      listWindows: () => Promise.reject(error),
+    });
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    const setupPrompts: string[] = [];
+    const tools = makeAgentGatewayComputerTools({
+      manager,
+      onSetupRequired: ({ toolName }) => Effect.sync(() => void setupPrompts.push(toolName)),
+    });
+    const tool = tools.find((entry) => entry.definition.name === "computer_list_windows")!;
+    const result = await Effect.runPromise(tool.handler({}, makeContext()));
+    return { result, setupPrompts };
+  }
+
+  it("prompts for setup when the desktop withheld an OS permission", async () => {
+    const { result, setupPrompts } = await readFailingWith(
+      new ComputerBackendError("Screen Recording is not granted.", { setupRequired: true }),
+    );
+    expect(result.isError).toBe(true);
+    expect(setupPrompts).toEqual(["computer_list_windows"]);
+  });
+
+  it("prompts for setup when the permission failure arrived wrapped", async () => {
+    const wrapped = new Error("the desktop refused", {
+      cause: new ComputerBackendError("Accessibility is not granted.", { setupRequired: true }),
+    });
+    const { setupPrompts } = await readFailingWith(wrapped);
+    expect(setupPrompts).toEqual(["computer_list_windows"]);
+  });
+
+  it.each([
+    [
+      "a target that is no longer there",
+      new ComputerTargetError({
+        code: "computer_target_not_found",
+        message: "No control matches that label.",
+      }),
+    ],
+    ["an ordinary backend fault", new ComputerBackendError("The click was not delivered.")],
+    ["an unrelated failure", new Error("boom")],
+  ])("does not prompt for setup after %s", async (_name, error) => {
+    const { result, setupPrompts } = await readFailingWith(error);
+    expect(result.isError).toBe(true);
+    expect(setupPrompts).toEqual([]);
+  });
+
+  /** One `computer_list_windows` against a backend that succeeds but is blocked. */
+  async function readWith(overrides: Partial<FakeComputerBackend>) {
+    const backend = Object.assign(new FakeComputerBackend(), overrides);
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    const prompts: {
+      toolName: string;
+      missing: readonly string[];
+      buildSignature?: string;
+    }[] = [];
+    const tools = makeAgentGatewayComputerTools({
+      manager,
+      onSetupRequired: ({ toolName, missing, buildSignature }) =>
+        Effect.sync(
+          () =>
+            void prompts.push({
+              toolName,
+              missing,
+              ...(buildSignature ? { buildSignature } : {}),
+            }),
+        ),
+    });
+    const tool = tools.find((entry) => entry.definition.name === "computer_list_windows")!;
+    const result = await Effect.runPromise(tool.handler({}, makeContext()));
+    const text = result.content.find((part) => part.type === "text")?.text ?? "";
+    return { result, prompts, text };
+  }
+
+  it("prompts for setup when a successful result reports a permission state", async () => {
+    // The shape that slipped through before this funnel: the call succeeded, the
+    // payload said "Synara needs Accessibility", and nothing put a card on
+    // screen — so the model explained macOS privacy in prose instead.
+    const { result, prompts, text } = await readWith({
+      availability: () =>
+        Promise.resolve({
+          kind: "permission-required",
+          missing: ["accessibility"],
+          message: "Synara needs Accessibility to control this Mac. Turn Synara on in…",
+          buildSignature: "signed",
+        }),
+      missingPermissions: () => Promise.resolve(["accessibility"]),
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(prompts).toEqual([
+      { toolName: "computer_list_windows", missing: ["accessibility"], buildSignature: "signed" },
+    ]);
+    // The model is told the OS is asking the user right now — not how macOS
+    // privacy works, and not to walk them through System Settings over the top
+    // of a dialog that is already on screen.
+    expect(text).toContain("macOS is asking the user right now for Accessibility");
+    expect(text).toContain("waiting for the user to grant it");
+    expect(text).not.toContain("Turn Synara on in");
+  });
+
+  it("prompts for setup for a grant that only blinds the desktop", async () => {
+    // Screen Recording alone leaves availability `available` on purpose, so the
+    // only thing that can raise the card is the backend saying what it lacks.
+    const { result, prompts } = await readWith({
+      missingPermissions: () => Promise.resolve(["screenRecording"]),
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(prompts).toEqual([{ toolName: "computer_list_windows", missing: ["screenRecording"] }]);
+  });
+
+  it("reads the missing grants fresh on every call, never from the previous answer", async () => {
+    // The live failure this signature exists to prevent: the user granted Screen
+    // Recording between two tool calls, the second call re-read a cached
+    // "missing", and the card and the model's refusal stayed on screen over a
+    // desktop that already worked.
+    let granted = false;
+    const { prompts } = await readWith({
+      missingPermissions: () => {
+        const answer = granted ? [] : ["screenRecording"];
+        granted = true;
+        return Promise.resolve(answer as readonly ComputerPermission[]);
+      },
+    });
+    expect(prompts).toEqual([{ toolName: "computer_list_windows", missing: ["screenRecording"] }]);
+
+    const second = await readWith({
+      missingPermissions: () => Promise.resolve([]),
+    });
+    expect(second.prompts).toEqual([]);
+  });
+
+  it("carries an ad-hoc build signature to the card, so it can explain a stale grant", async () => {
+    // On a locally built copy System Settings can show Synara switched on while
+    // the grant is pinned to a binary a rebuild replaced; without this the card
+    // tells the user to flip a switch that is already flipped.
+    const { prompts } = await readWith({
+      missingPermissions: () => Promise.resolve(["screenRecording"]),
+      buildSignature: () => "adhoc",
+    });
+
+    expect(prompts).toEqual([
+      { toolName: "computer_list_windows", missing: ["screenRecording"], buildSignature: "adhoc" },
+    ]);
+  });
+
+  it("carries the named grants through a thrown refusal", async () => {
+    const backend = Object.assign(new FakeComputerBackend(), {
+      listWindows: () =>
+        Promise.reject(
+          new ComputerBackendError("The helper refused: -32000.", { setupRequired: true }),
+        ),
+      missingPermissions: () => Promise.resolve(["screenRecording"] as const),
+    });
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    const prompts: { toolName: string; missing: readonly string[] }[] = [];
+    const tools = makeAgentGatewayComputerTools({
+      manager,
+      onSetupRequired: ({ toolName, missing }) =>
+        Effect.sync(() => void prompts.push({ toolName, missing })),
+    });
+    const tool = tools.find((entry) => entry.definition.name === "computer_list_windows")!;
+    await Effect.runPromise(tool.handler({}, makeContext()));
+
+    expect(prompts).toEqual([{ toolName: "computer_list_windows", missing: ["screenRecording"] }]);
+  });
+
+  it("says nothing about setup when every grant is in place", async () => {
+    const { prompts, text } = await readWith({});
+    expect(prompts).toEqual([]);
+    expect(text).not.toContain("setup card");
+    expect(text).not.toContain("macOS is asking");
   });
 });

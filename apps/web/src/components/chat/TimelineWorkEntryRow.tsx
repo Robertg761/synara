@@ -49,7 +49,7 @@ import {
   isReasoningUpdateWorkEntry,
 } from "./agentActivity.logic";
 import { AutomationCreatedCard } from "./AutomationCreatedCard";
-import { ComputerControlDeniedCard } from "./ComputerControlDeniedCard";
+import { ComputerSetupRequiredCard } from "./ComputerSetupRequiredCard";
 import ChatMarkdown from "../ChatMarkdown";
 import { DiffStatLabel } from "./DiffStatLabel";
 import { type ExpandedImagePreview } from "./ExpandedImagePreview";
@@ -451,8 +451,8 @@ export const TimelineWorkEntryRow = memo(function TimelineWorkEntryRow(props: {
   onOpenTurnDiff?: (turnId: TurnId, filePath?: string) => void;
   onOpenAgentActivity?: (activityId: string) => void;
   onOpenAutomation?: (automationId: string) => void;
-  computerControlEnabled?: boolean;
-  onEnableComputerControl?: () => void;
+  computerControlReady?: boolean;
+  onSetUpComputerControl?: () => void;
   timestampFormat: TimestampFormat;
 }) {
   // Defaults are applied in the body (not in the destructuring pattern): a default
@@ -470,8 +470,8 @@ export const TimelineWorkEntryRow = memo(function TimelineWorkEntryRow(props: {
     onOpenTurnDiff,
     onOpenAgentActivity,
     onOpenAutomation,
-    computerControlEnabled,
-    onEnableComputerControl,
+    computerControlReady,
+    onSetUpComputerControl,
     timestampFormat,
   } = props;
   const textFontSizePx = textFontSizePxProp ?? chatMetaFontSizePx;
@@ -556,19 +556,22 @@ export const TimelineWorkEntryRow = memo(function TimelineWorkEntryRow(props: {
     ? formatLiveActivityMeta(workEntry.liveActivity, liveActivityNowMs)
     : null;
 
-  // A computer-control denial renders as an actionable card (enable + retry)
+  // A missing desktop permission renders as an actionable card (grant + retry)
   // instead of a buried tool-error line. Kept after the hooks above so the
   // early return never changes hook order.
-  const computerControlDenied = workEntry.computerControlDenied;
-  if (computerControlDenied) {
+  const computerSetupRequired = workEntry.computerSetupRequired;
+  if (computerSetupRequired) {
     return (
       <div className={cn(compact ? "py-0.5" : "py-1")}>
-        <ComputerControlDeniedCard
-          toolName={computerControlDenied.toolName}
-          {...(computerControlEnabled !== undefined ? { computerControlEnabled } : {})}
+        <ComputerSetupRequiredCard
+          missing={computerSetupRequired.missing}
+          {...(computerSetupRequired.buildSignature
+            ? { buildSignature: computerSetupRequired.buildSignature }
+            : {})}
+          {...(computerControlReady !== undefined ? { computerControlReady } : {})}
           textFontSizePx={textFontSizePx}
           metaFontSizePx={chatMetaFontSizePx}
-          {...(onEnableComputerControl ? { onEnable: onEnableComputerControl } : {})}
+          {...(onSetUpComputerControl ? { onSetUp: onSetUpComputerControl } : {})}
         />
       </div>
     );

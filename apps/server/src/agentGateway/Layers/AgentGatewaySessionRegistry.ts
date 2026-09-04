@@ -10,6 +10,14 @@ import {
   type AgentGatewayWriteAuthority,
 } from "../Services/AgentGatewaySessionRegistry.ts";
 
+/**
+ * What every provider-session credential may do. `computer:control` is in the
+ * set unconditionally: computer use is not a mode a chat is switched into, it
+ * is a thing an agent can reach for whenever a task needs the desktop. Consent
+ * lives one layer down — a mutating computer tool goes through the provider's
+ * own approval gate (`COMPUTER_APPROVAL_REQUIRED_TOOLS`) — and a host with no
+ * desktop backend simply lists no computer tools.
+ */
 const PROVIDER_SESSION_CAPABILITIES = [
   "thread:read",
   "thread:write",
@@ -17,6 +25,7 @@ const PROVIDER_SESSION_CAPABILITIES = [
   "diagnostics:read",
   "browser:control",
   "device:control",
+  "computer:control",
 ] as const;
 
 export function makeAgentGatewaySessionRegistry(options?: {
@@ -33,7 +42,7 @@ export function makeAgentGatewaySessionRegistry(options?: {
   const sessionsByKey = new Map<string, RegisteredSession>();
 
   return {
-    issue: (threadId, provider, issueOptions) => {
+    issue: (threadId, provider) => {
       // Every provider runtime owns an independent credential. Replacement
       // runtimes overlap their predecessor during startup, and the outgoing
       // runtime revokes its own token during teardown. Reusing a token here
@@ -46,10 +55,7 @@ export function makeAgentGatewaySessionRegistry(options?: {
         threadId,
         provider,
         issuedAt,
-        capabilities: new Set<AgentGatewayCapability>([
-          ...PROVIDER_SESSION_CAPABILITIES,
-          ...(issueOptions?.additionalCapabilities ?? []),
-        ]),
+        capabilities: new Set<AgentGatewayCapability>(PROVIDER_SESSION_CAPABILITIES),
       };
       const registered: RegisteredSession = {
         identity,

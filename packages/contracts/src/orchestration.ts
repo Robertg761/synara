@@ -1351,7 +1351,6 @@ export const ThreadTurnStartCommand = Schema.Struct({
   }).check(TurnMessageContentCheck),
   modelSelection: Schema.optional(ModelSelection),
   providerOptions: Schema.optional(ProviderStartOptions),
-  enableComputerControl: Schema.optional(Schema.Boolean),
   reviewTarget: Schema.optional(ProviderReviewTarget),
   assistantDeliveryMode: Schema.optional(AssistantDeliveryMode),
   dispatchMode: Schema.optional(TurnDispatchMode).pipe(
@@ -1393,7 +1392,6 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   }).check(TurnMessageContentCheck),
   modelSelection: Schema.optional(ModelSelection),
   providerOptions: Schema.optional(ProviderStartOptions),
-  enableComputerControl: Schema.optional(Schema.Boolean),
   reviewTarget: Schema.optional(ProviderReviewTarget),
   assistantDeliveryMode: Schema.optional(AssistantDeliveryMode),
   dispatchMode: Schema.optional(TurnDispatchMode).pipe(
@@ -1436,7 +1434,6 @@ const ThreadDispatchQueuedTurnCommand = Schema.Struct({
   messageId: MessageId,
   modelSelection: Schema.optional(ModelSelection),
   providerOptions: Schema.optional(ProviderStartOptions),
-  enableComputerControl: Schema.optional(Schema.Boolean),
   reviewTarget: Schema.optional(ProviderReviewTarget),
   assistantDeliveryMode: Schema.optional(AssistantDeliveryMode),
   dispatchMode: Schema.optional(TurnDispatchMode).pipe(
@@ -1497,7 +1494,6 @@ const ThreadMessageEditAndResendCommand = Schema.Struct({
   text: TrimmedNonEmptyString.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
   modelSelection: Schema.optional(ModelSelection),
   providerOptions: Schema.optional(ProviderStartOptions),
-  enableComputerControl: Schema.optional(Schema.Boolean),
   assistantDeliveryMode: Schema.optional(AssistantDeliveryMode),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
@@ -2024,6 +2020,13 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   messageId: MessageId,
   modelSelection: Schema.optional(ModelSelection),
   providerOptions: Schema.optional(ProviderStartOptions),
+  /**
+   * Legacy, ignored. Computer control was once a per-turn switch; it is now
+   * always available to an agent (mutating actions still go through the
+   * provider's own approval). The field stays declared because this payload is
+   * persisted in every user's event store, and dropping it would make every
+   * historical turn-start event fail to decode. Nothing reads it.
+   */
   enableComputerControl: Schema.optional(Schema.Boolean),
   reviewTarget: Schema.optional(ProviderReviewTarget),
   assistantDeliveryMode: Schema.optional(AssistantDeliveryMode),
@@ -2118,6 +2121,7 @@ export const ThreadMessageEditResendRequestedPayload = Schema.Struct({
   removedTurnIds: Schema.optional(Schema.Array(TurnId)),
   modelSelection: Schema.optional(ModelSelection),
   providerOptions: Schema.optional(ProviderStartOptions),
+  /** Legacy, ignored — see `ThreadTurnStartRequestedPayload`. */
   enableComputerControl: Schema.optional(Schema.Boolean),
   assistantDeliveryMode: Schema.optional(AssistantDeliveryMode),
   runtimeMode: RuntimeMode,

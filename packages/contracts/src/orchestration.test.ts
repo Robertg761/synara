@@ -430,7 +430,21 @@ it.effect("decodes thread.turn.start defaults for provider, runtime mode, and di
   }),
 );
 
-it.effect("preserves the per-thread computer-control opt-in", () =>
+// Computer control stopped being a per-turn switch, but the flag survives in
+// every user's event store, so a historical turn-start event must still decode.
+it.effect("still decodes a persisted turn-start event carrying the legacy computer flag", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeThreadTurnStartRequestedPayload({
+      threadId: "thread-1",
+      messageId: "msg-computer-1",
+      enableComputerControl: true,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(parsed.threadId, "thread-1");
+  }),
+);
+
+it.effect("strips the legacy computer flag from a turn-start command", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeThreadTurnStartCommand({
       type: "thread.turn.start",
@@ -445,7 +459,7 @@ it.effect("preserves the per-thread computer-control opt-in", () =>
       enableComputerControl: true,
       createdAt: "2026-01-01T00:00:00.000Z",
     });
-    assert.strictEqual(parsed.enableComputerControl, true);
+    assert.strictEqual("enableComputerControl" in parsed, false);
   }),
 );
 

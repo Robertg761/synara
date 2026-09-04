@@ -8,6 +8,7 @@ import {
   COMPUTER_HELPER_BUNDLE_NAME,
   COMPUTER_HELPER_PACKAGED_BUNDLE_PATH,
   COMPUTER_HELPER_PACKAGED_EXECUTABLE_PATH,
+  COMPUTER_HELPER_SOURCE_DIR_NAME,
 } from "@synara/shared/computerHelperPaths";
 
 export const MICROPHONE_USAGE_DESCRIPTION =
@@ -34,6 +35,21 @@ export const MAC_COMPUTER_HELPER_STAGE_PATH = `${MAC_COMPUTER_HELPER_STAGE_DIR}/
 export const MAC_COMPUTER_HELPER_ASAR_EXCLUSION = `!${MAC_COMPUTER_HELPER_STAGE_DIR}/**`;
 export const MAC_COMPUTER_HELPER_BUNDLE_PATH = COMPUTER_HELPER_PACKAGED_BUNDLE_PATH;
 export const MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH = COMPUTER_HELPER_PACKAGED_EXECUTABLE_PATH;
+/**
+ * The helper's Swift sources, staged beside the app rather than inside
+ * `app.asar`.
+ *
+ * `apps/server/scripts/cli.ts` copies them into `dist` so the server's
+ * source-build fallback survives packaging, but an archive is not a directory a
+ * compiler can read: inside the asar the sources are visible to `stat` and
+ * useless to `build.sh`, which is worse than absent because the fallback then
+ * fails at compile time instead of declining up front. Staged here they are a
+ * real directory the fallback can actually build, for the one case that needs
+ * it — a shipped helper bundle lost to quarantine or a broken signature.
+ */
+export const MAC_COMPUTER_HELPER_SOURCES_STAGE_PATH = `apps/server/dist/${COMPUTER_HELPER_SOURCE_DIR_NAME}`;
+export const MAC_COMPUTER_HELPER_SOURCES_RESOURCE_PATH = `Resources/${COMPUTER_HELPER_SOURCE_DIR_NAME}`;
+export const MAC_COMPUTER_HELPER_SOURCES_ASAR_EXCLUSION = `!${MAC_COMPUTER_HELPER_SOURCES_STAGE_PATH}/**`;
 /**
  * The one `x64ArchFiles` pattern for both Swift helpers. @electron/universal
  * takes a single glob, so the two paths are brace-expanded into it; both halves
@@ -114,7 +130,14 @@ export function createDesktopPlatformBuildConfig(
       notarize: input.signed === true,
       entitlements: MAC_ENTITLEMENTS_PATH,
       entitlementsInherit: MAC_INHERITED_ENTITLEMENTS_PATH,
-      binaries: [MAC_APPSNAP_HELPER_BUNDLE_PATH, MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH],
+      // The AppSnap helper is a bare executable; the computer-use helper is an
+      // app bundle, and a bundle is the unit macOS signs and TCC identifies, so
+      // that is what is named here rather than the executable buried in it.
+      // @electron/osx-sign walks the packaged `Contents/` and already collects
+      // nested `.app` directories, so this is a statement of intent more than a
+      // discovery mechanism — `assertPackagedMacComputerHelper` is what proves
+      // the signature actually landed.
+      binaries: [MAC_APPSNAP_HELPER_BUNDLE_PATH, MAC_COMPUTER_HELPER_BUNDLE_PATH],
       // The universal build stages the same pre-lipo'd helpers in both app trees.
       // @electron/universal needs this pattern to preserve those existing fat
       // binaries. Composed from the same constants the paths above use so a
@@ -135,7 +158,12 @@ export function createDesktopPlatformBuildConfig(
         // macOS auto-updates use the separately finalized ZIP artifact.
         writeUpdateInfo: false,
       },
-      files: ["**/*", MAC_APPSNAP_HELPER_ASAR_EXCLUSION, MAC_COMPUTER_HELPER_ASAR_EXCLUSION],
+      files: [
+        "**/*",
+        MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
+        MAC_COMPUTER_HELPER_ASAR_EXCLUSION,
+        MAC_COMPUTER_HELPER_SOURCES_ASAR_EXCLUSION,
+      ],
       extraFiles: [
         {
           from: MAC_APPSNAP_HELPER_STAGE_PATH,
@@ -144,6 +172,10 @@ export function createDesktopPlatformBuildConfig(
         {
           from: MAC_COMPUTER_HELPER_STAGE_PATH,
           to: `Helpers/${COMPUTER_HELPER_BUNDLE_NAME}`,
+        },
+        {
+          from: MAC_COMPUTER_HELPER_SOURCES_STAGE_PATH,
+          to: MAC_COMPUTER_HELPER_SOURCES_RESOURCE_PATH,
         },
         {
           from: MAC_DEVICE_HELPER_STAGE_PATH,

@@ -4,6 +4,9 @@ import { Effect } from "effect";
 import {
   COMPUTER_TEXT_MAX_LENGTH,
   type ComputerActionResult,
+  type ComputerAvailability,
+  type ComputerBuildSignature,
+  type ComputerPermission,
   type ComputerRect,
   type ComputerScreenshot,
   type ComputerTarget,
@@ -17,6 +20,11 @@ import {
   MAX_COMPUTER_CLIPBOARD_BYTES,
   type ComputerCaptureRequest,
 } from "../computer/ComputerBackend.ts";
+import {
+  computerSetupSignal,
+  computerSetupToolNote,
+  type ComputerSetupSignal,
+} from "../computer/computerSetupSignal.ts";
 import {
   ComputerLeaseError,
   ComputerManager,
@@ -94,6 +102,22 @@ export function computerToolRequiresApproval(name: string): boolean {
 
 export interface AgentGatewayComputerToolsOptions {
   readonly manager: ComputerManager;
+  /**
+   * Called when a tool call failed because the OS is withholding a privacy
+   * grant Synara needs. The gateway turns it into one actionable chat card;
+   * the tool result is returned unchanged either way, so this must not fail.
+   */
+  readonly onSetupRequired?: (input: {
+    readonly toolName: string;
+    /** The grants to name on the card; empty when the backend named none. */
+    readonly missing: readonly ComputerPermission[];
+    /**
+     * How the backend's build is signed, when it knows. The card says nothing
+     * about stale grants without it, and must not on a signed build.
+     */
+    readonly buildSignature?: ComputerBuildSignature;
+    readonly context: ToolContext;
+  }) => Effect.Effect<void>;
 }
 
 /**
@@ -163,17 +187,45 @@ const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
  * Keyboard input carries no coordinate, so the only thing that decides where it
  * lands is seat focus. Every keyboard tool says so identically, and says what to
  * pass to make it deterministic.
+ *
+ * What naming a window actually *does* differs by backend, and the difference is
+ * visible to the user: the Linux tiers raise it to the front, while the macOS
+ * helper posts the event straight at that window's process and deliberately
+ * leaves the stacking order alone. Describing the raise on a backend that does
+ * not raise taught the model to expect a window to come forward, and to "fix" it
+ * when nothing did.
  */
-const KEYBOARD_TARGET_NOTE =
-  "Keys go to whichever window holds the agent seat's keyboard focus. Pass window_id to raise and focus a specific window first — recommended whenever more than one window is open, since focus otherwise sits wherever the last action left it.";
+function keyboardTargetNote(deliversWithoutRaising: boolean): string {
+  return deliversWithoutRaising
+    ? "Keys go to whichever window holds the agent seat's keyboard focus, and a keyboard action needs a target: click into the window you mean first, or pass window_id, which delivers to that window regardless of what covers it and without bringing it to the front. With nothing aimed, the action is refused and nothing is typed — there is no \"whatever is in front\" fallback, because that fallback used to type the agent's text into the human's own document. That refusal is not transient: aim first, then send the input again rather than retrying it unchanged."
+    : "Keys go to whichever window holds the agent seat's keyboard focus. Pass window_id to raise and focus a specific window first — recommended whenever more than one window is open, since focus otherwise sits wherever the last action left it.";
+}
 
-const KEYBOARD_TARGET_PROPERTY = {
-  window_id: {
-    type: "string",
-    description:
-      "Optional window id from computer_list_windows. The window is raised and given the agent seat's keyboard focus before the keys are sent, and the result's screenshot is zoomed to it.",
-  },
-} as const;
+/**
+ * The result already carries the verdict; this is what makes the model read it.
+ * Without it an unconfirmed delivery reads as plain success, and the model
+ * re-sends the same keys — a real session retyped an email address in
+ * six-character chunks and looped select-all/paste six times because every call
+ * said `ok` while nothing had landed.
+ *
+ * The three verdicts are spelled out because collapsing them is the opposite
+ * failure: most native controls expose no value to read back, so treating
+ * anything short of `confirmed` as suspect buys a screenshot after every
+ * keystroke and slows every desktop turn for nothing.
+ */
+const DELIVERY_NOTE =
+  'The result may carry delivery.verified: "confirmed" means the effect was read back, "unverifiable" means the control exposes no readable value and is the normal answer for most native controls, and "unconfirmed" means the backend looked and did not see the input land. Only on "unconfirmed" check with computer_get_state or computer_screenshot before continuing. Never retry the same input blindly on any verdict.';
+
+function keyboardTargetProperty(deliversWithoutRaising: boolean): Record<string, unknown> {
+  return {
+    window_id: {
+      type: "string",
+      description: deliversWithoutRaising
+        ? "Optional window id from computer_list_windows. The keys are delivered to that window regardless of what is stacked over it, without bringing it to the front, and the result's screenshot is zoomed to it."
+        : "Optional window id from computer_list_windows. The window is raised and given the agent seat's keyboard focus before the keys are sent, and the result's screenshot is zoomed to it.",
+    },
+  };
+}
 
 function withActionScreenshotSchema(schema: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -211,12 +263,25 @@ const TARGET_PROPERTIES = {
       "Accessible label to resolve from a fresh UI snapshot — use the exact label from computer_get_state's elements list.",
   },
   role: { type: "string", description: "Optional accessible role used to disambiguate a label." },
-  window_id: {
-    type: "string",
-    description:
-      "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the coordinate is outside the window. For computer_scroll it is also a target on its own, scrolling the window itself.",
-  },
 } as const;
+
+/**
+ * The pointer target set, whose `window_id` wording depends on the backend for
+ * the same reason the keyboard one does — and here the difference decides
+ * whether the click is refused: a backend that delivers by window id has no
+ * occlusion problem to refuse over.
+ */
+function targetProperties(deliversWithoutRaising: boolean): Record<string, unknown> {
+  return {
+    ...TARGET_PROPERTIES,
+    window_id: {
+      type: "string",
+      description: deliversWithoutRaising
+        ? "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the input is delivered to that window regardless of what covers it and without bringing it to the front, and the action is refused if the coordinate is outside the window. For computer_scroll it is also a target on its own, scrolling the window itself."
+        : "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the coordinate is outside the window. For computer_scroll it is also a target on its own, scrolling the window itself.",
+    },
+  };
+}
 
 function approvalUnavailableResult(name: string): McpToolCallResult {
   return {
@@ -485,10 +550,42 @@ function isToolResult(value: unknown): value is McpToolCallResult {
   );
 }
 
+/** The availability a manager result carries, for the results that carry one. */
+function resultAvailability(value: unknown): ComputerAvailability | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const availability = (value as { readonly availability?: unknown }).availability;
+  if (typeof availability !== "object" || availability === null) return undefined;
+  return availability as ComputerAvailability;
+}
+
+/**
+ * Replaces a permission-blocked result's user-facing prose with one line aimed
+ * at the model.
+ *
+ * The availability message is written for the person reading the setup card —
+ * where to click in System Settings, why the switch may already look on — and
+ * handing it to an agent produced essays about macOS privacy instead of the one
+ * sentence the situation needs. The card is already on screen; the model's part
+ * is to stop. The rest of the payload is untouched, because a result can be
+ * genuinely useful (a window list, a screen size) and still report a grant that
+ * is missing.
+ */
+function withSetupNote(value: unknown, signal: ComputerSetupSignal | undefined): unknown {
+  if (signal === undefined || typeof value !== "object" || value === null) return value;
+  const availability = resultAvailability(value);
+  return {
+    ...(value as Record<string, unknown>),
+    ...(availability?.kind === "permission-required"
+      ? { availability: { kind: availability.kind, missing: availability.missing } }
+      : {}),
+    setupRequired: computerSetupToolNote(signal),
+  };
+}
+
 export function makeAgentGatewayComputerTools(
   options: AgentGatewayComputerToolsOptions,
 ): ReadonlyArray<ToolEntry> {
-  const { manager } = options;
+  const { manager, onSetupRequired } = options;
   /**
    * The screenshots each thread has been shown, so its x/y can be read as
    * pixels in one of them. Lives with the tools rather than the manager
@@ -568,6 +665,26 @@ export function makeAgentGatewayComputerTools(
   ): ComputerTarget =>
     resolveTarget(readNestedScreenshotTarget(args, name), context.callerThreadId);
 
+  /**
+   * Raise the chat's setup card for this call, if it earned one, and hand the
+   * result back either way. A card is user-facing feedback about the tool call,
+   * never a substitute for answering it.
+   */
+  const withSetupCard = (
+    name: string,
+    context: ToolContext,
+    signal: ComputerSetupSignal | undefined,
+    result: McpToolCallResult,
+  ): Effect.Effect<McpToolCallResult> => {
+    if (onSetupRequired === undefined || signal === undefined) return Effect.succeed(result);
+    return onSetupRequired({
+      toolName: name,
+      missing: signal.missing,
+      ...(signal.buildSignature === undefined ? {} : { buildSignature: signal.buildSignature }),
+      context,
+    }).pipe(Effect.as(result));
+  };
+
   const handle =
     (
       name: string,
@@ -580,7 +697,7 @@ export function makeAgentGatewayComputerTools(
             computerToolRequiresApproval(name) &&
             PROVIDERS_WITHOUT_APPROVAL_GATE.has(context.callerProvider)
           ) {
-            return approvalUnavailableResult(name);
+            return { result: approvalUnavailableResult(name), signal: undefined };
           }
           // Recorded before the call, because the call is what claims the
           // desktop, and the badge has to name this thread from the first
@@ -589,19 +706,55 @@ export function makeAgentGatewayComputerTools(
           const value = await manager.withAgentActivity(context.callerThreadId, () =>
             run(args, context),
           );
-          return isToolResult(value) ? value : mcpToolResultJson(value);
+          // A call can succeed and still report that the desktop is out of
+          // reach: a perception read answers with a `permission-required`
+          // availability, and a missing Screen Recording grant blocks nothing at
+          // all yet leaves the agent blind. Both are the user's to fix, so both
+          // take the same route to the same card as a thrown refusal.
+          //
+          // Awaited rather than remembered: the read costs a round trip only
+          // when the last one saw a gap, and that is exactly the moment it must
+          // not be answered from memory — the call after the user grants the
+          // permission is the one that has to see it land.
+          const signal = computerSetupSignal({
+            availability: resultAvailability(value),
+            missing: await manager.missingPermissions(),
+            buildSignature: manager.buildSignature(),
+          });
+          return {
+            result: isToolResult(value) ? value : mcpToolResultJson(withSetupNote(value, signal)),
+            signal,
+          };
         },
         catch: (error) => error,
       }).pipe(
-        Effect.catch((error) =>
-          Effect.succeed(
+        Effect.flatMap(({ result, signal }) => withSetupCard(name, context, signal, result)),
+        Effect.catch((error) => {
+          const result =
             error instanceof ComputerTargetError
               ? targetErrorResult(error)
               : error instanceof ComputerLeaseError
                 ? leaseErrorResult(error)
-                : mcpToolResultError(errorText(error)),
-          ),
-        ),
+                : mcpToolResultError(errorText(error));
+          // A missing OS grant is the only failure a user has to act on, so it
+          // is the only one that raises a card. Everything else — a target that
+          // moved, an undelivered keystroke, arguments the desktop refused — is
+          // the agent's to recover from and stays a plain tool error.
+          return Effect.promise(() => manager.missingPermissions()).pipe(
+            Effect.flatMap((missing) =>
+              withSetupCard(
+                name,
+                context,
+                computerSetupSignal({
+                  error,
+                  missing,
+                  buildSignature: manager.buildSignature(),
+                }),
+                result,
+              ),
+            ),
+          );
+        }),
       );
 
   const actionEntry = (
@@ -709,9 +862,17 @@ export function makeAgentGatewayComputerTools(
       },
     );
 
+  // Whether this desktop delivers input to a named window without restacking
+  // it. Read once per tool build rather than per description, because it is a
+  // property of the backend the manager was constructed with.
+  const deliversWithoutRaising = manager.deliversToNamedWindowRegardlessOfStacking;
+  const pointerTargetProperties = targetProperties(deliversWithoutRaising);
+  const keyboardTargetProperties = keyboardTargetProperty(deliversWithoutRaising);
+  const keyboardTargetNoteText = keyboardTargetNote(deliversWithoutRaising);
+
   const targetSchema = {
     type: "object",
-    properties: TARGET_PROPERTIES,
+    properties: pointerTargetProperties,
     additionalProperties: false,
   } as const;
 
@@ -747,13 +908,16 @@ export function makeAgentGatewayComputerTools(
       handler: handle("computer_get_state", async (args, context) => {
         // One perception read feeds both renderings: the elements digest always
         // rides (that is what makes labels discoverable), while the full
-        // accessibility text rendering stays opt-in for its payload size.
+        // accessibility text rendering stays opt-in for its payload size — and
+        // is now only *rendered* when asked for, rather than rendered on every
+        // read and discarded here.
+        const wantText = readBooleanArg(args, "include_text") ?? false;
         const state = await manager.getState({
           includeScreenshot: readBooleanArg(args, "include_screenshot") ?? false,
-          includeText: true,
+          includeText: wantText,
+          includeTree: true,
         });
         const { text, root, screenshot, ...rest } = state;
-        const wantText = readBooleanArg(args, "include_text") ?? false;
         const elements = root ? actionableElements(root) : undefined;
         const payload = {
           ...rest,
@@ -948,7 +1112,7 @@ export function makeAgentGatewayComputerTools(
       {
         type: "object",
         properties: {
-          ...TARGET_PROPERTIES,
+          ...pointerTargetProperties,
           delta_x: {
             type: "number",
             description:
@@ -986,10 +1150,10 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_type_text",
       "Type text",
-      `Type text into the focused desktop control. ${KEYBOARD_TARGET_NOTE}`,
+      `Type text into the focused desktop control. Type the whole string in one call — a name, an email address, a URL — and do not split it into pieces; splitting only multiplies the chance of a partial result. ${keyboardTargetNoteText} ${DELIVERY_NOTE}`,
       {
         type: "object",
-        properties: { text: { type: "string" }, ...KEYBOARD_TARGET_PROPERTY },
+        properties: { text: { type: "string" }, ...keyboardTargetProperties },
         required: ["text"],
         additionalProperties: false,
       },
@@ -999,10 +1163,10 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_press_key",
       "Press key",
-      `Press one keyboard key on the computer-use seat. ${KEYBOARD_TARGET_NOTE}`,
+      `Press one keyboard key on the computer-use seat. ${keyboardTargetNoteText} ${DELIVERY_NOTE}`,
       {
         type: "object",
-        properties: { key: { type: "string" }, ...KEYBOARD_TARGET_PROPERTY },
+        properties: { key: { type: "string" }, ...keyboardTargetProperties },
         required: ["key"],
         additionalProperties: false,
       },
@@ -1016,12 +1180,12 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_hotkey",
       "Press hotkey",
-      `Press a keyboard shortcut as an ordered key sequence. ${KEYBOARD_TARGET_NOTE}`,
+      `Press a keyboard shortcut as an ordered key sequence. ${keyboardTargetNoteText} ${DELIVERY_NOTE}`,
       {
         type: "object",
         properties: {
           keys: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 16 },
-          ...KEYBOARD_TARGET_PROPERTY,
+          ...keyboardTargetProperties,
         },
         required: ["keys"],
         additionalProperties: false,
@@ -1048,7 +1212,7 @@ export function makeAgentGatewayComputerTools(
       "Set the value of a uniquely labelled accessible control after a fresh snapshot. The label comes from computer_get_state's elements list; this writes atomically instead of typing keystrokes, so prefer it over click-then-type for any field that appears there.",
       {
         type: "object",
-        properties: { ...TARGET_PROPERTIES, value: { type: "string" } },
+        properties: { ...pointerTargetProperties, value: { type: "string" } },
         required: ["value"],
         additionalProperties: false,
       },
@@ -1065,7 +1229,7 @@ export function makeAgentGatewayComputerTools(
       "Perform a named semantic action on a uniquely labelled accessible control.",
       {
         type: "object",
-        properties: { ...TARGET_PROPERTIES, action: { type: "string" } },
+        properties: { ...pointerTargetProperties, action: { type: "string" } },
         required: ["action"],
         additionalProperties: false,
       },

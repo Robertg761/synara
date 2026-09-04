@@ -1,9 +1,11 @@
 import type {
   ComputerAvailability,
+  ComputerBuildSignature,
   ComputerCapabilities,
   ComputerHealth,
   ComputerId,
   ComputerLaunchAppResult,
+  ComputerPermission,
   ComputerPoint,
   ComputerRect,
   ComputerScreenSize,
@@ -84,6 +86,8 @@ export class FakeComputerBackend implements ComputerBackend {
   readonly calls: FakeComputerCall[] = [];
 
   private currentAvailability: ComputerAvailability;
+  private currentMissingPermissions: readonly ComputerPermission[] = [];
+  private currentBuildSignature: ComputerBuildSignature | undefined;
   private currentHealth: ComputerHealth;
   private readonly currentCapabilities: ComputerCapabilities;
   private currentScreenSize: ComputerScreenSize;
@@ -144,6 +148,33 @@ export class FakeComputerBackend implements ComputerBackend {
     return this.currentCapabilities;
   }
 
+  /**
+   * No OS withholds anything from the fake. Declared rather than omitted so a
+   * test can substitute a backend that *is* missing a grant without the type
+   * complaining about a property the interface only optionally has.
+   */
+  async missingPermissions(): Promise<readonly ComputerPermission[]> {
+    return this.currentMissingPermissions;
+  }
+
+  setMissingPermissions(permissions: readonly ComputerPermission[]): void {
+    this.currentMissingPermissions = [...permissions];
+  }
+
+  /**
+   * Undefined by default: the fake is not a signed binary and has no signature
+   * to report, and reporting `signed` would be a lie a card could act on.
+   * Declared for the same reason `missingPermissions` is — so a test can
+   * substitute a build that *is* ad-hoc.
+   */
+  buildSignature(): ComputerBuildSignature | undefined {
+    return this.currentBuildSignature;
+  }
+
+  setBuildSignature(signature: ComputerBuildSignature | undefined): void {
+    this.currentBuildSignature = signature;
+  }
+
   async listWindows(): Promise<readonly ComputerWindow[]> {
     this.record("listWindows");
     this.throwIfFailed("listWindows");
@@ -161,7 +192,7 @@ export class FakeComputerBackend implements ComputerBackend {
 
   async getState(options: {
     readonly includeScreenshot?: boolean;
-    readonly includeText?: boolean;
+    readonly includeTree?: boolean;
   }): Promise<ComputerState> {
     this.record("getState", options);
     this.throwIfFailed("getState");
@@ -173,7 +204,6 @@ export class FakeComputerBackend implements ComputerBackend {
       windows: await this.listWindows(),
       screenSize: { ...this.currentScreenSize },
       root: this.currentRoot,
-      ...(options.includeText ? { text: describeTree(this.currentRoot) } : {}),
       ...(screenshot ? { screenshot } : {}),
       capturedAt: this.now(),
     } as ComputerState;
@@ -583,19 +613,6 @@ function defaultRoot(
       },
     ],
   };
-}
-
-function describeTree(root: ComputerUiNode): string {
-  const lines: string[] = [];
-  const visit = (node: ComputerUiNode, depth: number) => {
-    const label = node.label ?? node.description ?? "(unlabelled)";
-    lines.push(
-      `${"  ".repeat(depth)}${node.role}: ${label}${node.value ? ` = ${node.value}` : ""}`,
-    );
-    for (const child of node.children) visit(child, depth + 1);
-  };
-  visit(root, 0);
-  return lines.join("\n");
 }
 
 function replaceNodeValue(

@@ -279,7 +279,7 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     section: "computer",
     title: "Desktop backend",
     keywords:
-      "Whether agents can see and control this computer's desktop right now. beta availability health kwin hyprland nested wayland linux computer use control status set up install plugin repair",
+      "Whether agents can see and control this computer's desktop right now. beta availability health kwin hyprland nested wayland linux mac macos screen recording accessibility computer use control status set up install plugin repair",
     // The status row's title is dynamic (Ready / Reconnecting / Unavailable), so
     // link to the section rather than an anchored row.
     target: null,
@@ -292,18 +292,11 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
       "Open the Computer pane the first time an agent acts on the desktop in a chat. auto open dock computer use",
   },
   {
-    id: "computer:start-new-chats-with-computer-control",
+    id: "computer:how-agents-use-the-desktop",
     section: "computer",
-    title: "Start new chats with computer control",
+    title: "How agents use the desktop",
     keywords:
-      "New chats follow your last computer-control choice; flipping the per-chat switch updates this default. sticky default enable computer use desktop control new chat",
-  },
-  {
-    id: "computer:enabling-computer-control",
-    section: "computer",
-    title: "Enabling computer control",
-    keywords:
-      "Computer control is switched on per chat from the composer's mode menu. full access toggle desktop agent computer use",
+      "Computer control is not a switch: any chat's agent can see and drive the desktop when a task needs it. Mutating actions ask for approval as they run, and clipboard reads always ask. enable enabling toggle permission desktop agent computer use screenshots approval",
   },
 
   // ── Behavior ──────────────────────────────────────────────────────────────────

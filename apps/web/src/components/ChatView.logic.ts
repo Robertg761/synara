@@ -1528,42 +1528,19 @@ export function deriveComposerSendState(options: {
 }
 
 /**
- * The effective per-chat computer-control flag.
- *
- * Desktop access is an explicit opt-in: a new chat gets computer control only
- * when the machine-wide default allows it and the backend is available. A
- * chat's own override always wins — a user can turn it on (or back off) for
- * one chat without touching anything global. When the backend is unavailable
- * the flag is forced off regardless of the machine default, because there is
- * nothing to grant. The machine default (`allowInNewChats`) is a plain
- * default, never rewritten by a per-chat choice.
- */
-export function resolveEffectiveComputerControl(input: {
-  readonly draftOverride: boolean | undefined;
-  readonly backendAvailable: boolean;
-  readonly allowInNewChats: boolean;
-}): boolean {
-  if (input.draftOverride !== undefined) {
-    return input.draftOverride;
-  }
-  return input.backendAvailable ? input.allowInNewChats : false;
-}
-
-/**
  * Everything a dispatched turn carries besides its message: the composer's model
  * choice, the provider start options, and the per-turn mode flags.
  *
  * ChatView assembles this once per render and every dispatch site spreads a
- * projection of it. Before, each site re-derived the same six values inline and
+ * projection of it. Before, each site re-derived the same values inline and
  * listed them one by one in its `useCallback` deps; a single missed dep shipped
- * a stale computer-control flag (commit ca0e72f3e) and cost React Compiler the
- * whole component. One object means one dep.
+ * a stale flag (commit ca0e72f3e) and cost React Compiler the whole component.
+ * One object means one dep.
  */
 export interface TurnDispatchSettings {
   readonly modelSelection: ModelSelection;
   /** Absent when the user has configured no provider overrides at all. */
   readonly providerOptions: ProviderStartOptions | undefined;
-  readonly enableComputerControl: boolean;
   readonly assistantDeliveryMode: AssistantDeliveryMode;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
@@ -1574,8 +1551,8 @@ export interface TurnDispatchSettings {
  * A queued turn froze its dispatch settings when it was queued, so dispatching
  * it later must replay those, not whatever the composer shows now. Every field
  * falls back to the live settings: queued turns restored from persisted drafts
- * predate some of these fields, and `enableComputerControl` /
- * `providerOptionsForDispatch` are optional even in the current shape.
+ * predate some of these fields, and `providerOptionsForDispatch` is optional
+ * even in the current shape.
  *
  * `interactionMode` is deliberately included here but overridden by the
  * plan-follow-up path, which decides the mode from the follow-up itself.
@@ -1591,7 +1568,6 @@ export function resolveQueuedTurnDispatchSettings(
     ...settings,
     modelSelection: queuedTurn.modelSelection ?? settings.modelSelection,
     providerOptions: queuedTurn.providerOptionsForDispatch ?? settings.providerOptions,
-    enableComputerControl: queuedTurn.enableComputerControl ?? settings.enableComputerControl,
     runtimeMode: queuedTurn.runtimeMode ?? settings.runtimeMode,
     interactionMode: queuedTurn.interactionMode ?? settings.interactionMode,
     // Plan follow-ups carry no environment of their own; they run wherever the
@@ -1604,7 +1580,6 @@ function turnDispatchIdentityFields(settings: TurnDispatchSettings) {
   return {
     modelSelection: settings.modelSelection,
     ...(settings.providerOptions ? { providerOptions: settings.providerOptions } : {}),
-    enableComputerControl: settings.enableComputerControl,
     assistantDeliveryMode: settings.assistantDeliveryMode,
   };
 }
@@ -1648,7 +1623,6 @@ export function queuedChatTurnDispatchFields(
   return {
     modelSelection: settings.modelSelection,
     ...(settings.providerOptions ? { providerOptionsForDispatch: settings.providerOptions } : {}),
-    enableComputerControl: settings.enableComputerControl,
     ...(sourceProposedPlan ? { sourceProposedPlan } : {}),
     ...turnDispatchModeFields(settings),
     envMode: settings.envMode,
@@ -1663,7 +1637,6 @@ export function queuedPlanFollowUpDispatchFields(settings: TurnDispatchSettings)
   return {
     modelSelection: settings.modelSelection,
     ...(settings.providerOptions ? { providerOptionsForDispatch: settings.providerOptions } : {}),
-    enableComputerControl: settings.enableComputerControl,
     runtimeMode: settings.runtimeMode,
   };
 }

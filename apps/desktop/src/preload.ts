@@ -206,10 +206,6 @@ contextBridge.exposeInMainWorld("desktopBridge", {
       return () => ipcRenderer.removeListener(IPC.appSnap.state, wrappedListener);
     },
   },
-  computerControl: {
-    getPermissionState: () => ipcRenderer.invoke(IPC.computerControl.getPermissionState),
-    requestPermissions: () => ipcRenderer.invoke(IPC.computerControl.requestPermissions),
-  },
   storageMigration: {
     readSnapshot: () => ipcRenderer.sendSync(IPC.storageMigration.read),
     acknowledgeSnapshot: () => ipcRenderer.invoke(IPC.storageMigration.acknowledge),

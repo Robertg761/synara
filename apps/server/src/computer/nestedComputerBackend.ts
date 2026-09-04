@@ -278,9 +278,9 @@ export class NestedComputerBackend extends KWinComputerBackend {
     }
     if (availability.kind !== "available") {
       throw new ComputerBackendError(
-        availability.kind === "backend-unavailable"
-          ? availability.message
-          : `Computer use is not supported on ${availability.platform}.`,
+        availability.kind === "unsupported-platform"
+          ? `Computer use is not supported on ${availability.platform}.`
+          : availability.message,
       );
     }
     steps.push("The agent's isolated desktop is running.");

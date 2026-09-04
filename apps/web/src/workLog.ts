@@ -1,7 +1,9 @@
 import {
-  COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
+  COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND,
   isToolLifecycleItemType,
   STUDIO_OUTPUTS_ACTIVITY_KIND,
+  type ComputerBuildSignature,
+  type ComputerPermission,
   type OrchestrationLatestTurnState,
   type OrchestrationThreadActivity,
   type ProviderKind,
@@ -71,9 +73,10 @@ export interface WorkLogEntry {
   subagentAction?: WorkLogSubagentAction;
   automation?: WorkLogAutomation;
   synaraThreadCreation?: WorkLogSynaraThreadCreation;
-  // Computer-control denial rows render as an actionable card (enable control
-  // and retry) instead of a plain error line; carry just what that card needs.
-  computerControlDenied?: WorkLogComputerControlDenied;
+  // Computer-setup rows render as an actionable card (grant the missing OS
+  // permission, then retry) instead of a plain error line; carry just what that
+  // card needs.
+  computerSetupRequired?: WorkLogComputerSetupRequired;
   // Source activity kind, kept so the timeline can pick a kind-specific icon
   // (e.g. user-input.requested -> question glyph) instead of the generic
   // tone fallback. Same rationale as `toolName` below.
@@ -112,8 +115,19 @@ export interface WorkLogAutomation {
   proposalState?: "pending" | "accepted" | "dismissed";
 }
 
-export interface WorkLogComputerControlDenied {
+export interface WorkLogComputerSetupRequired {
   toolName: string | null;
+  /**
+   * The grants the OS is withholding, so the card can name them. Empty when the
+   * backend refused without naming one — the card then says what it can.
+   */
+  missing: readonly ComputerPermission[];
+  /**
+   * How the running build is signed, when the backend could say. Only an
+   * `adhoc` build gets the stale-grant explanation, because only there can
+   * System Settings show the switch on while the grant does not apply.
+   */
+  buildSignature?: ComputerBuildSignature;
 }
 
 export interface WorkLogSynaraCreatedThread {
@@ -350,9 +364,9 @@ function shouldKeepActivityForWorkLog(
     return true;
   }
 
-  // A computer-control denial is the only actionable feedback for a desktop
-  // tool call rejected mid-turn; never let turn-visibility filtering hide it.
-  if (activity.kind === COMPUTER_CONTROL_DENIED_ACTIVITY_KIND) {
+  // A computer-setup prompt is the only actionable feedback for a desktop tool
+  // call the OS refused mid-turn; never let turn-visibility filtering hide it.
+  if (activity.kind === COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND) {
     return true;
   }
 
@@ -630,8 +644,13 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       entry.synaraThreadCreation = synaraThreadCreation;
     }
   }
-  if (activity.kind === COMPUTER_CONTROL_DENIED_ACTIVITY_KIND) {
-    entry.computerControlDenied = { toolName: asTrimmedString(payload?.toolName) };
+  if (activity.kind === COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND) {
+    const buildSignature = asComputerBuildSignature(payload?.buildSignature);
+    entry.computerSetupRequired = {
+      toolName: asTrimmedString(payload?.toolName),
+      missing: asComputerPermissions(payload?.missing),
+      ...(buildSignature ? { buildSignature } : {}),
+    };
   }
   const readableTitle =
     extractCollabActionTitle(payload) ??
@@ -1475,6 +1494,28 @@ function areToolLifecycleChangedFilesCompatible(
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+/**
+ * The permission names in an activity payload, ignoring anything this build does
+ * not recognise — a card that names one grant it understands is better than one
+ * that renders a server-side identifier at the user.
+ */
+function asComputerPermissions(value: unknown): readonly ComputerPermission[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (entry): entry is ComputerPermission =>
+      entry === "accessibility" || entry === "screenRecording",
+  );
+}
+
+/**
+ * The build signature an activity payload carries, or undefined for anything
+ * this build does not recognise — an unknown signature must never be read as
+ * `adhoc`, which is the one value that puts stale-grant advice on the card.
+ */
+function asComputerBuildSignature(value: unknown): ComputerBuildSignature | undefined {
+  return value === "adhoc" || value === "signed" ? value : undefined;
 }
 
 function asTrimmedString(value: unknown): string | null {

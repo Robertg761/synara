@@ -101,6 +101,7 @@ import {
 import { projectSearchEntriesQueryOptions } from "~/lib/projectReactQuery";
 import {
   hasReconciledServerProviderStatuses,
+  provisionComputer,
   serverConfigQueryOptions,
   serverQueryKeys,
   serverSettingsQueryOptions,
@@ -293,7 +294,6 @@ import {
   type WorktreeSetupResolutionAction,
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
-import { useThreadComputerStateSeed } from "../hooks/useThreadComputerStateSeed";
 import { useThreadWorkspaceHandoff } from "../hooks/useThreadWorkspaceHandoff";
 import {
   buildSearchableModelOptions,
@@ -378,7 +378,6 @@ import {
   useComposerThreadDraft,
   useEffectiveComposerModelState,
 } from "../composerDraftStore";
-import { selectThreadComputerState, useComputerStateStore } from "../computerStateStore";
 import { useTemporaryThreadStore } from "../temporaryThreadStore";
 import { useComposerFocusRequestStore } from "../composerFocusRequestStore";
 import { useWorkflowRunUiStore, useWorkflowRunUiThreadState } from "../workflowRunUiStore";
@@ -559,11 +558,6 @@ import {
   shouldComposerEnterUseOppositeFollowUp,
 } from "./chat/composerEnterBehavior";
 import { getComposerTraitSelection } from "./chat/composerTraits";
-import {
-  COMPUTER_CONTROL_HINT_EFFORT,
-  shouldShowComputerControlEffortHint,
-} from "./chat/composerComputerControlHint";
-import { ComposerComputerControlEffortHint } from "./chat/ComposerComputerControlEffortHint";
 import { resolveRuntimeModelDescriptor } from "./chat/runtimeModelCapabilities";
 import { ProjectPicker } from "./chat/ProjectPicker";
 import { FolderClosed } from "./FolderClosed";
@@ -609,7 +603,6 @@ import {
   queuedChatTurnDispatchFields,
   queuedPlanFollowUpDispatchFields,
   type QueuedSteerGate,
-  resolveEffectiveComputerControl,
   resolveQueuedSteerGateTransition,
   resolveQueuedTurnDispatchSettings,
   turnStartDispatchFields,
@@ -620,7 +613,7 @@ import {
   revokeUserMessagePreviewUrls,
 } from "./ChatView.logic";
 import { clearPendingTurnDispatch, markPendingTurnDispatch } from "../pendingTurnDispatch";
-import { preflightComputerControlPermissions } from "../lib/computerControlFirstUse";
+import { computerStatusNeedsSetup } from "./ComputerPanel.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerSlashCommands } from "../hooks/useComposerSlashCommands";
 import { useFeatureFlags } from "../featureFlags";
@@ -1292,26 +1285,6 @@ export default function ChatView({
   const composerPastedTexts = composerDraft.pastedTexts;
   const composerSkills = composerDraft.skills;
   const composerMentions = composerDraft.mentions;
-  // The computer-control toggle needs availability before the Computer pane has
-  // ever been opened, so the composer seeds the snapshot itself.
-  useThreadComputerStateSeed(threadId);
-  const computerThreadState = useComputerStateStore(selectThreadComputerState(threadId));
-  const computerControlAvailable = computerThreadState?.availability.kind === "available";
-  // An untouched chat gets computer control only when the machine-wide opt-in
-  // allows it and the backend is available; a per-chat override wins over both.
-  // Availability is required first, so this reads after it.
-  const enableComputerControl = resolveEffectiveComputerControl({
-    draftOverride: composerDraft.enableComputerControl,
-    backendAvailable: computerControlAvailable,
-    allowInNewChats: settings.allowComputerControlInNewChats,
-  });
-  const computerControlDisabledReason = computerThreadState
-    ? computerThreadState.availability.kind === "unsupported-platform"
-      ? `Computer control needs macOS, or a Wayland desktop on Linux (KWin or Hyprland, or Synara's own nested desktop). This server is ${computerThreadState.availability.platform}.`
-      : computerThreadState.availability.kind === "backend-unavailable"
-        ? computerThreadState.availability.message
-        : undefined
-    : "Checking computer availability.";
   const queuedComposerTurns = composerDraft.queuedTurns;
   const restoredSourceProposedPlan = composerDraft.restoredSourceProposedPlan;
   const composerSendState = useMemo(
@@ -1351,9 +1324,6 @@ export default function ChatView({
     (store) => store.setProviderModelOptions,
   );
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
-  const setComposerDraftComputerControl = useComposerDraftStore(
-    (store) => store.setEnableComputerControl,
-  );
   const setComposerDraftInteractionMode = useComposerDraftStore(
     (store) => store.setInteractionMode,
   );
@@ -5089,77 +5059,56 @@ export default function ChatView({
     },
     [persistRuntimeModeChange],
   );
-  // Ends any in-flight permission wait when this view goes away: the poll spawns
-  // a helper process per tick, and a System Settings pane can sit open far
-  // longer than the user stays on this chat.
-  const computerControlPreflightAbortRef = useRef<AbortController | null>(null);
-  useEffect(() => {
-    const controller = new AbortController();
-    computerControlPreflightAbortRef.current = controller;
-    return () => {
-      controller.abort();
-      if (computerControlPreflightAbortRef.current === controller) {
-        computerControlPreflightAbortRef.current = null;
-      }
-    };
-  }, []);
-  const handleComputerControlChange = useCallback(
-    (enabled: boolean) => {
-      // A per-chat override only. It never rewrites the machine-wide default —
-      // that sticky write is what silently disabled computer control for every
-      // later chat after a single per-chat "off".
-      setComposerDraftComputerControl(threadId, enabled);
-      scheduleComposerFocus();
-      if (!enabled) return;
-      // Turning it on is the consent, so this is where macOS gets asked — from
-      // the signed desktop process, so the grant is attributed to Synara rather
-      // than to whatever shell an agent happens to run in. The send path is
-      // never blocked on it: a missing grant comes back through the denial card
-      // like any other refused desktop action.
-      void preflightComputerControlPermissions(window.desktopBridge?.computerControl, {
-        signal: computerControlPreflightAbortRef.current?.signal,
-        onPermissionRequest: () =>
-          toastManager.add({
-            type: "info",
-            title: "Setting up computer control",
-            description: "macOS may ask for Screen Recording and Accessibility for Synara.",
-          }),
-      })
-        .then((preflight) => {
-          if (preflight.kind !== "permission-required") return;
+  // The thread whose setup card has since seen the grants land. Keyed by thread
+  // rather than a bare boolean so switching chats cannot carry one chat's
+  // "ready" confirmation onto another chat's card.
+  const [computerControlReadyThreadId, setComputerControlReadyThreadId] = useState<ThreadId | null>(
+    null,
+  );
+  // "Set up" on a computer-setup card.
+  //
+  // This is the same server-side provision the settings panel's Set up runs, and
+  // deliberately not a second mechanism: the server owns the helper that the
+  // grants are actually filed against, so it is the only place that can ask
+  // macOS at the moment an agent needs the grant *and* ask again for a user who
+  // dismissed the dialog. Once the grants are present the card confirms it and
+  // the composer is prefilled with a retry, deliberately not auto-sent: the user
+  // should see and approve what goes back to the agent.
+  const handleSetUpComputerControl = useCallback(() => {
+    scheduleComposerFocus();
+    const requestedThreadId = threadId;
+    toastManager.add({
+      type: "info",
+      title: "Setting up computer control",
+      description: "macOS may ask for Screen Recording and Accessibility for Synara.",
+    });
+    void provisionComputer()
+      .then((result) => {
+        // The call already returns the refreshed status, so every surface
+        // reading it repaints from this round trip rather than racing a refetch.
+        queryClient.setQueryData(serverQueryKeys.computerStatus(), result.status);
+        if (computerStatusNeedsSetup(result.status)) {
           toastManager.add({
             type: "warning",
-            title: "Finish enabling Synara in System Settings",
-            description:
-              preflight.state.message ??
-              "Allow Screen Recording and Accessibility for Synara, then try again.",
+            title: "Computer control still needs a permission",
+            description: result.summary,
           });
-        })
-        .catch((error: unknown) => {
-          toastManager.add({
-            type: "error",
-            title: "Couldn't check computer-control permissions",
-            description: error instanceof Error ? error.message : String(error),
-          });
+          return;
+        }
+        setComputerControlReadyThreadId(requestedThreadId);
+        if (prompt.trim().length === 0) {
+          setPrompt("Computer control is set up now — try again.");
+        }
+      })
+      .catch((error: unknown) => {
+        toastManager.add({
+          type: "error",
+          title: "Couldn't set up computer control",
+          description: error instanceof Error ? error.message : String(error),
         });
-    },
-    [
-      computerControlPreflightAbortRef,
-      scheduleComposerFocus,
-      setComposerDraftComputerControl,
-      threadId,
-    ],
-  );
-  // "Enable" on a computer-control denial card: switch control on for this chat
-  // and suggest a retry message when the composer is empty, so the user can just
-  // hit send. Deliberately not auto-sent: the user should see and approve what
-  // goes back to the agent.
-  const handleEnableComputerControlFromDenial = useCallback(() => {
-    handleComputerControlChange(true);
-    if (prompt.trim().length === 0) {
-      setPrompt("Computer control is on now — try again.");
-    }
-  }, [handleComputerControlChange, prompt, setPrompt]);
+      });
+  }, [prompt, queryClient, scheduleComposerFocus, setPrompt, threadId]);
+  const computerControlReady = computerControlReadyThreadId === threadId;
 
   useEffect(() => {
     if (
@@ -6059,7 +6008,6 @@ export default function ChatView({
     () => ({
       modelSelection: selectedModelSelection,
       providerOptions: providerOptionsForDispatch,
-      enableComputerControl,
       assistantDeliveryMode,
       runtimeMode,
       interactionMode,
@@ -6067,7 +6015,6 @@ export default function ChatView({
     }),
     [
       assistantDeliveryMode,
-      enableComputerControl,
       envMode,
       interactionMode,
       providerOptionsForDispatch,
@@ -7392,7 +7339,6 @@ export default function ChatView({
       setComposerDraftModelSelection(activeThread.id, queuedTurn.modelSelection);
       setComposerDraftRuntimeMode(activeThread.id, queuedTurn.runtimeMode);
       setComposerDraftInteractionMode(activeThread.id, queuedTurn.interactionMode);
-      setComposerDraftComputerControl(activeThread.id, queuedTurn.enableComputerControl === true);
       setComposerCursor(collapseExpandedComposerCursor(nextPrompt, nextPrompt.length));
       setComposerTrigger(detectComposerTrigger(nextPrompt, nextPrompt.length));
       scheduleComposerFocus();
@@ -7410,7 +7356,6 @@ export default function ChatView({
       scheduleComposerFocus,
       setDraftThreadContext,
       setRestoredQueuedSourceProposedPlan,
-      setComposerDraftComputerControl,
       setComposerDraftInteractionMode,
       setComposerDraftModelSelection,
       setComposerDraftPrompt,
@@ -7551,7 +7496,6 @@ export default function ChatView({
     );
     const selectedModelSelectionForSend = dispatchSettingsForSend.modelSelection;
     const providerOptionsForDispatchForSend = dispatchSettingsForSend.providerOptions;
-    const enableComputerControlForSend = dispatchSettingsForSend.enableComputerControl;
     const runtimeModeForSend = dispatchSettingsForSend.runtimeMode;
     let interactionModeForSend = dispatchSettingsForSend.interactionMode;
     const envModeForSend = dispatchSettingsForSend.envMode;
@@ -9902,35 +9846,6 @@ export default function ChatView({
     setComposerDraftProviderModelOptions,
     threadId,
   ]);
-  // Applies the computer-control hint through the picker's own commit path, so the
-  // trigger label and the Effort radio group reflect it immediately. Applying also
-  // records the dismissal: the user has answered the question once, everywhere.
-  const composerEffortOptionId = composerTraitSelection.primarySelectDescriptor?.id ?? "effort";
-  const applyComputerControlEffortHint = useCallback(() => {
-    setComposerDraftProviderModelOptions(
-      threadId,
-      selectedProvider,
-      buildNextProviderOptions(selectedProvider, selectedProviderModelOptions, {
-        [composerEffortOptionId]: COMPUTER_CONTROL_HINT_EFFORT,
-      }),
-      { model: selectedModelForPickerWithCustomFallback, persistSticky: true },
-    );
-    updateSettings({ dismissedComputerControlEffortHint: true });
-    scheduleComposerFocus();
-  }, [
-    composerEffortOptionId,
-    scheduleComposerFocus,
-    selectedModelForPickerWithCustomFallback,
-    selectedProvider,
-    selectedProviderModelOptions,
-    setComposerDraftProviderModelOptions,
-    threadId,
-    updateSettings,
-  ]);
-  const dismissComputerControlEffortHint = useCallback(() => {
-    updateSettings({ dismissedComputerControlEffortHint: true });
-    scheduleComposerFocus();
-  }, [scheduleComposerFocus, updateSettings]);
   const onEnvModeChange = useCallback(
     (mode: DraftThreadEnvMode) => {
       const nextBranch =
@@ -11261,10 +11176,6 @@ export default function ChatView({
     providerStatus: activeProviderStatus,
     runtimeMode,
     onRuntimeModeChange: handleRuntimeModeChange,
-    computerControlEnabled: enableComputerControl,
-    computerControlAvailable,
-    computerControlDisabledReason,
-    onComputerControlChange: handleComputerControlChange,
     contextWindow: runtimeUsageContextWindow,
     cumulativeCostUsd: activeCumulativeCostUsd,
     activeContextWindowLabel: contextWindowSelectionStatus.activeLabel,
@@ -11501,13 +11412,6 @@ export default function ChatView({
   const showComposerSubagentStrip = composerSubagentStripItems.length > 0;
   const activeThreadGoalText = activeThread?.goal?.trim() ?? "";
   const showComposerGoalHeader = activeThreadGoalText.length > 0;
-  const showComposerComputerControlEffortHint = shouldShowComputerControlEffortHint({
-    enableComputerControl,
-    computerControlAvailable,
-    dismissed: settings.dismissedComputerControlEffortHint,
-    provider: selectedProvider,
-    traits: composerTraitSelection,
-  });
   // The workflow card already lists its run and member agents, so the generic
   // "N background agents" footer only counts tasks outside the workflow.
   const composerBackgroundTaskCount = workflowRunState
@@ -11619,20 +11523,6 @@ export default function ChatView({
                     showComposerWorkflowRunCard ||
                     showComposerSubagentStrip ||
                     queuedComposerTurns.length > 0
-                  }
-                />
-              ) : null}
-              {showComposerComputerControlEffortHint ? (
-                <ComposerComputerControlEffortHint
-                  onApply={applyComputerControlEffortHint}
-                  onDismiss={dismissComputerControlEffortHint}
-                  attachedToPrevious={
-                    showComposerLiveChangesHeader ||
-                    showComposerActiveTaskListCard ||
-                    showComposerWorkflowRunCard ||
-                    showComposerSubagentStrip ||
-                    queuedComposerTurns.length > 0 ||
-                    showComposerGoalHeader
                   }
                 />
               ) : null}
@@ -12410,8 +12300,8 @@ export default function ChatView({
                     onOpenTurnDiff={onOpenTurnDiff}
                     onOpenThread={onNavigateToThread}
                     onOpenAutomation={onOpenAutomation}
-                    computerControlEnabled={enableComputerControl}
-                    onEnableComputerControl={handleEnableComputerControlFromDenial}
+                    computerControlReady={computerControlReady}
+                    onSetUpComputerControl={handleSetUpComputerControl}
                     revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
                     onRevertUserMessage={onRevertUserMessage}
                     onUndoTurnFiles={onUndoTurnFiles}

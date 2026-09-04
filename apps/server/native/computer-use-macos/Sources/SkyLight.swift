@@ -21,6 +21,16 @@
 // it is also what Codex's `SyntheticAppFocusEnforcer` amounts to (see
 // docs/computer-use-macos-reference.md §2.3). The gesture layer undoes it
 // afterwards so the human's app is left as it was found.
+//
+// Process-active is only half of it, and the missing half is what used to make
+// Chromium look impossible to reach in the background. An app can be active and
+// still have no *key window*, and a Chromium window that is not key drops a
+// pid-posted mouseDown on the floor — measured on this machine: the page saw no
+// `mousedown` at all. `makeKeyWindow` is the second record pair yabai posts
+// (`window_manager_make_key_window`), and sending it straight after the activate
+// is the difference between a background click into a web view landing and
+// vanishing. Native AppKit windows never needed it, which is why the gap looked
+// like a Chromium-only prohibition rather than a missing step.
 
 import AppKit
 import CoreGraphics
@@ -90,6 +100,19 @@ enum SkyLight {
   /// Stamps a window-local point on an event; nil when the symbol is gone.
   static var setWindowLocation: SetWindowLocation? { symbols.setWindowLocation }
 
+  /// Whether the key-window record may be posted on this OS. Evaluated once —
+  /// the answer cannot change while the process runs — and reported so a
+  /// dropped background gesture on Sonoma is explainable rather than mysterious.
+  private static let keyWindowRecordIsSafe: Bool = {
+    let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+    if major == 14 {
+      logDiagnostic(
+        "macOS 14 archives the key-window record unsafely; web input takes the visible rung")
+      return false
+    }
+    return true
+  }()
+
   /// Which entry points resolved on this OS, for `capabilities` and `--probe`.
   static func report() -> [String: Bool] {
     [
@@ -97,6 +120,7 @@ enum SkyLight {
       "focusWithoutRaise": symbols.postEventRecordTo != nil && symbols.getFrontProcess != nil
         && (symbols.getConnectionPSN != nil || symbols.getProcessForPID != nil),
       "setFrontProcess": symbols.setFrontProcessWithOptions != nil,
+      "keyWindowRecord": symbols.postEventRecordTo != nil && keyWindowRecordIsSafe,
     ]
   }
 
@@ -191,34 +215,122 @@ enum SkyLight {
     // being told about, so the deactivate carries the human app's own window,
     // not the target's. yabai's `window_manager_focus_window_without_raise`
     // does the same, and the asymmetry is why `restoreActivation` passes 0.
-    let deactivated = post(record(kind: .deactivate, windowID: previousWindowID), to: previous)
-    if !deactivated {
+    let outcome = postPair(
+      deactivateTo: (previous, previousWindowID),
+      activateTo: (target, windowID),
+      activateWhenDeactivateFails: false)
+    if !outcome.deactivated {
       logDiagnostic("focus prelude: deactivate record was refused by the front process")
       return FocusOutcome(activated: false, needsRestore: false)
     }
-    // The recipe this implements sleeps between the two posts; without it the
-    // activate can overtake the resign-active the deactivate started.
-    usleep(40_000)
-    let activated = post(record(kind: .activate, windowID: windowID), to: target)
-    if !activated {
+    if !outcome.activated {
       logDiagnostic("focus prelude: activate record was refused by the target process")
     }
+    let activated = outcome.activated
+    // Active is not the same as key, and Chromium needs both. Posted
+    // unconditionally rather than only when the activate reported success: the
+    // return above is WindowServer accepting the record, not the app having
+    // acted on it, and the key-window pair is harmless when the window already
+    // is key.
+    makeKeyWindow(windowID: windowID, in: target)
     return FocusOutcome(activated: activated, needsRestore: true)
+  }
+
+  /// Tell `psn`'s application that `windowID` is its key window.
+  ///
+  /// A separate record from the activate above, and not implied by it: the
+  /// activate flips the process's active state, this names which of its windows
+  /// owns the keyboard and is hit-tested as the frontmost one. The distinction
+  /// is invisible on native AppKit — a background TextEdit takes pid-posted
+  /// clicks and keys with the activate record alone — and decisive on Chromium,
+  /// where without it a pid-posted mouseDown into the page produces no
+  /// `mousedown` event whatsoever.
+  ///
+  /// The bytes are yabai's `window_manager_make_key_window`: the same 248-byte
+  /// envelope as `record`, but carrying event kinds 0x01 then 0x02 at 0x08,
+  /// 0x10 at 0x3A, and 0xFF through 0x20..<0x30. Measured, that pair moves key
+  /// status without generating any content-level click — the probe page's
+  /// `mousedown` counter does not move when only these are posted — and without
+  /// changing z-order, Space, or which application is frontmost.
+  ///
+  /// Skipped entirely on macOS 14. On Sonoma `SLPSPostEventRecordTo` runs the
+  /// record through `CGSEncodeEventRecord` → `NSKeyedArchiver`, which reads the
+  /// 0xFF fill at 0x20 as an Objective-C class pointer and aborts *the calling
+  /// process* — a helper crash, not a dropped gesture (paneru#123, with the
+  /// `objc_msgSend_uncached` → `_SLEventRecordCreateData` stack). The
+  /// activate/deactivate record has no such fill and is unaffected. Sonoma
+  /// therefore keeps the pre-existing behaviour: the target keeps whatever key
+  /// window it had, a background click into a web view is dropped, and
+  /// `DeliveryWatch` promotes that application to the visible rung the same way
+  /// it does for anything else that drops one.
+  private static func makeKeyWindow(windowID: CGWindowID, in psn: ProcessSerial) {
+    guard keyWindowRecordIsSafe else { return }
+    var bytes = [UInt8](repeating: 0, count: 0xF8)
+    bytes[0x04] = 0xF8
+    bytes[0x3A] = 0x10
+    bytes[0x3C] = UInt8(windowID & 0xFF)
+    bytes[0x3D] = UInt8((windowID >> 8) & 0xFF)
+    bytes[0x3E] = UInt8((windowID >> 16) & 0xFF)
+    bytes[0x3F] = UInt8((windowID >> 24) & 0xFF)
+    for index in 0x20..<0x30 { bytes[index] = 0xFF }
+    bytes[0x08] = 0x01
+    _ = post(bytes, to: psn)
+    bytes[0x08] = 0x02
+    _ = post(bytes, to: psn)
   }
 
   /// The inverse of `activateWithoutRaise`: hand AppKit-active state back to
   /// the app that had it. `windowID` is a window of the app being restored (0
   /// when none is known).
+  ///
+  /// Deliberately *not* symmetric: no `makeKeyWindow` is posted at the human's
+  /// application. It does not need one — measured both ways, a TextEdit and a
+  /// Helium window that were frontmost before a background gesture still
+  /// receive physical keystrokes after it — and every record posted into the
+  /// human's app is a record that could disturb it. The asymmetry is the safe
+  /// direction: the agent's target is made key on purpose, the human's window
+  /// keeps whatever it already had.
   static func restoreActivation(to previousPID: pid_t, windowID: CGWindowID, from targetPID: pid_t)
     -> Bool
   {
     guard let previous = process(owning: windowID, pid: previousPID),
       let target = process(owning: 0, pid: targetPID), previous != target
     else { return false }
-    let deactivated = post(record(kind: .deactivate, windowID: 0), to: target)
-    let activated = post(record(kind: .activate, windowID: windowID), to: previous)
-    return deactivated && activated
+    // The same pair, with the same settle. Posting the two back to back — which
+    // this used to do — let the activate overtake the resign-active the
+    // deactivate started, which is exactly the race the prelude sleeps to avoid;
+    // the human's application was the one paying for it.
+    //
+    // `activateWhenDeactivateFails` is the one asymmetry: the prelude bails if
+    // it cannot deactivate the human's app, because there is then nothing owed,
+    // while the restore must hand the app back whatever else happened.
+    let outcome = postPair(
+      deactivateTo: (target, 0),
+      activateTo: (previous, windowID),
+      activateWhenDeactivateFails: true)
+    return outcome.deactivated && outcome.activated
   }
+
+  /// The deactivate/activate pair, with the settle the recipe requires between
+  /// them. One definition, used by the prelude and by the restore.
+  private static func postPair(
+    deactivateTo: (process: ProcessSerial, windowID: CGWindowID),
+    activateTo: (process: ProcessSerial, windowID: CGWindowID),
+    activateWhenDeactivateFails: Bool
+  ) -> (deactivated: Bool, activated: Bool) {
+    let deactivated = post(
+      record(kind: .deactivate, windowID: deactivateTo.windowID), to: deactivateTo.process)
+    guard deactivated || activateWhenDeactivateFails else { return (false, false) }
+    // Without this the activate can overtake the resign-active the deactivate
+    // started, and the receiving app ends up believing the wrong one won.
+    usleep(focusRecordSettleMicroseconds)
+    let activated = post(
+      record(kind: .activate, windowID: activateTo.windowID), to: activateTo.process)
+    return (deactivated, activated)
+  }
+
+  /// How long WindowServer needs between the two halves of a focus pair.
+  private static let focusRecordSettleMicroseconds: useconds_t = 40_000
 
   /// The explicit foreground rung: genuinely make `pid` the front process, with
   /// only `windowID` ordered forward. This *does* move the human's active app —

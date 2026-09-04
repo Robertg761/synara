@@ -1,22 +1,40 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { MacComputerHelperClient, MacComputerHelperError } from "./macComputerHelperClient.ts";
+import {
+  HELPER_SHUTDOWN_GRACE_MS,
+  MAC_HELPER_METHODS,
+  MacComputerHelperClient,
+  MacComputerHelperError,
+} from "./macComputerHelperClient.ts";
 
 /**
  * A fake child process wired to real streams, so the client exercises the actual
  * JSON-RPC framing rather than a mock of it. `respond` maps a method to the
  * result the fake helper answers with; an unmapped method returns `{ok:true}`.
+ *
+ * `exitCode`/`signalCode` mirror the real child fields because `dispose()` reads
+ * them to decide whether it still has to wait for an exit: a fake that leaves
+ * them `undefined` makes every dispose take the already-exited shortcut and the
+ * grace timer is never exercised at all.
  */
 class FakeChild extends EventEmitter {
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
+  /** Every signal `dispose()` sent, in order, so a test can see the escalation. */
+  readonly signals: NodeJS.Signals[] = [];
   killed = false;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
 
-  constructor(private readonly respond: (method: string) => unknown) {
+  constructor(
+    private readonly respond: (method: string) => unknown,
+    /** A wedged helper answers no SIGTERM — the only reason the SIGKILL escalation exists. */
+    private readonly wedged = false,
+  ) {
     super();
     let buffer = "";
     this.stdin.on("data", (chunk: Buffer) => {
@@ -40,23 +58,55 @@ class FakeChild extends EventEmitter {
     setImmediate(() => this.stdout.write(response));
   }
 
-  kill(): void {
+  kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
     this.killed = true;
-    this.emit("exit", 0, null);
+    this.signals.push(signal);
+    if (this.wedged && signal !== "SIGKILL") return true;
+    this.exit(null, signal);
+    return true;
+  }
+
+  /** Ends the fake the way the OS would, leaving `exitCode`/`signalCode` consistent. */
+  exit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.exitCode !== null || this.signalCode !== null) return;
+    this.exitCode = code;
+    this.signalCode = signal;
+    this.emit("exit", code, signal);
   }
 }
 
-function clientWith(respond: (method: string) => unknown): {
+function clientWith(
+  respond: (method: string) => unknown,
+  options: {
+    readonly wedged?: boolean;
+    readonly maxControlLineBytes?: number;
+    readonly onDiagnostic?: (message: string) => void;
+  } = {},
+): {
   client: MacComputerHelperClient;
   child: FakeChild;
+  spawns: FakeChild[];
 } {
-  const child = new FakeChild(respond);
+  const child = new FakeChild(respond, options.wedged ?? false);
+  const spawns: FakeChild[] = [];
   const client = new MacComputerHelperClient({
     binaryPath: "/fake/computer-helper",
     // The client only touches stdin/stdout/stderr/on/kill, which the fake has.
-    spawn: () => child as unknown as ChildProcessWithoutNullStreams,
+    spawn: () => {
+      spawns.push(child);
+      return child as unknown as ChildProcessWithoutNullStreams;
+    },
+    ...(options.maxControlLineBytes === undefined
+      ? {}
+      : { maxControlLineBytes: options.maxControlLineBytes }),
+    ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
   });
-  return { client, child };
+  return { client, child, spawns };
+}
+
+/** Lets queued stream data and the client's handlers run before an assertion. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 describe("MacComputerHelperClient", () => {
@@ -66,6 +116,26 @@ describe("MacComputerHelperClient", () => {
     );
     const result = await client.request("capabilities");
     expect(result).toEqual({ screenRecording: true });
+    await client.dispose();
+  });
+
+  it("routes request-permissions to the helper under the name it serves", async () => {
+    // The wire name is the contract: the backend asks macOS for a missing grant
+    // through this method, and a typo here is a silent "method not found" that
+    // shows up as "Synara never prompted me".
+    const asked: string[] = [];
+    const { client } = clientWith((method) => {
+      asked.push(method);
+      return { accessibility: false, screenRecording: true, protocolVersion: 1 };
+    });
+
+    const result = await client.request(MAC_HELPER_METHODS.requestPermissions);
+
+    expect(MAC_HELPER_METHODS.requestPermissions).toBe("request-permissions");
+    expect(asked).toEqual(["request-permissions"]);
+    // It answers with a capability report, which is what lets the backend cache
+    // the post-prompt state instead of guessing at it.
+    expect(result).toMatchObject({ accessibility: false, screenRecording: true });
     await client.dispose();
   });
 
@@ -83,9 +153,91 @@ describe("MacComputerHelperClient", () => {
     // exit path is what settles it.
     const { client, child } = clientWith(() => undefined);
     const pending = client.request("list-windows");
-    setImmediate(() => child.emit("exit", 1, null));
+    setImmediate(() => child.exit(1, null));
     const error = await pending.catch((value: unknown) => value);
     expect(error).toBeInstanceOf(MacComputerHelperError);
     expect((error as MacComputerHelperError).code).toBe("helper_exited");
+  });
+
+  it("kills the child when dispose races the start that spawned it", async () => {
+    const { client, child } = clientWith(() => ({ ok: true }));
+    client.start();
+    await client.dispose();
+    expect(child.killed).toBe(true);
+    expect(client.running).toBe(false);
+  });
+
+  it("rejects a request after dispose instead of spawning a replacement helper", async () => {
+    const { client, spawns } = clientWith(() => ({ ok: true }));
+    await client.request("ping");
+    await client.dispose();
+    const error = await client.request("ping").catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(MacComputerHelperError);
+    expect((error as MacComputerHelperError).code).toBe("helper_disposed");
+    // A respawn here would leak a helper nothing owns or would ever shut down.
+    expect(spawns).toHaveLength(1);
+  });
+
+  it("fails in-flight requests and names them when a control line is oversized", async () => {
+    const diagnostics: string[] = [];
+    const { client, child } = clientWith(() => undefined, {
+      maxControlLineBytes: 64,
+      onDiagnostic: (message) => diagnostics.push(message),
+    });
+    const pending = client.request("list-windows");
+    const settled = pending.catch((value: unknown) => value);
+    child.stdout.write(`${"x".repeat(256)}\n`);
+    const error = await settled;
+    expect(error).toBeInstanceOf(MacComputerHelperError);
+    expect((error as MacComputerHelperError).code).toBe("helper_protocol_error");
+    // The dropped line took its id with it, so the log is the only record of
+    // which request died.
+    expect(diagnostics.join("\n")).toContain("list-windows#1");
+    expect(diagnostics.join("\n")).toContain("64");
+    await client.dispose();
+  });
+
+  it("reports an undecodable control line without failing in-flight requests", async () => {
+    const diagnostics: string[] = [];
+    const { client, child } = clientWith(() => undefined, {
+      onDiagnostic: (message) => diagnostics.push(message),
+    });
+    const pending = client.request("list-windows");
+    let settled = false;
+    const outcome = pending.then(
+      (value: unknown) => {
+        settled = true;
+        return value;
+      },
+      (error: unknown) => {
+        settled = true;
+        return error;
+      },
+    );
+    child.stdout.write(Buffer.from([0xff, 0xfe, 0x0a]));
+    await flush();
+    await flush();
+    expect(diagnostics.join("\n")).toContain("invalid-utf8");
+    // The framer resynchronized past that one line; the request is still live.
+    expect(settled).toBe(false);
+    await client.dispose();
+    expect((await outcome) as MacComputerHelperError).toBeInstanceOf(MacComputerHelperError);
+  });
+
+  it("escalates to SIGKILL when the helper ignores SIGTERM", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, child } = clientWith(() => ({ ok: true }), { wedged: true });
+      client.start();
+      const disposed = client.dispose();
+      expect(child.signals).toEqual(["SIGTERM"]);
+      await vi.advanceTimersByTimeAsync(HELPER_SHUTDOWN_GRACE_MS);
+      await disposed;
+      // A leaked helper holds the Accessibility grant and keeps drawing its cursor.
+      expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(child.exitCode === null && child.signalCode === "SIGKILL").toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

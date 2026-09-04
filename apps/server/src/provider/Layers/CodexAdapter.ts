@@ -54,11 +54,7 @@ import {
   resolveAcpTurnIdleTimeoutMs,
 } from "../acp/AcpTurnIdleWatchdog.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
-import {
-  acquireAgentGatewaySessionLease,
-  AGENT_GATEWAY_NO_CAPABILITIES,
-  captureAgentGatewayCapabilityInput,
-} from "../../agentGateway/sessionLease.ts";
+import { acquireAgentGatewaySessionLease } from "../../agentGateway/sessionLease.ts";
 import { filterProviderPromptImageAttachments } from "../promptAttachments.ts";
 import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import {
@@ -1785,15 +1781,10 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
                   agentGatewayMcp: {
                     endpointUrl: () => agentGatewayCredentials.mcpEndpointUrl,
                     // Codex leases inside the app-server manager, which owns
-                    // session restarts. The manager carries the start input's
-                    // capability facts; review runtimes request none.
-                    acquireSessionLease: (threadId, capabilityInput) =>
-                      acquireAgentGatewaySessionLease(
-                        agentGatewayCredentials,
-                        threadId,
-                        PROVIDER,
-                        capabilityInput ?? AGENT_GATEWAY_NO_CAPABILITIES,
-                      )!,
+                    // session restarts (and the fork boundary), so the manager
+                    // asks for the lease rather than the adapter.
+                    acquireSessionLease: (threadId) =>
+                      acquireAgentGatewaySessionLease(agentGatewayCredentials, threadId, PROVIDER)!,
                   },
                 }
               : {}),
@@ -1950,7 +1941,6 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           ? { forkSourceResumeCursor: input.forkSourceResumeCursor }
           : {}),
         ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
-        agentGatewayCapabilityInput: captureAgentGatewayCapabilityInput(input),
         runtimeMode: input.runtimeMode,
         ...codexModelSelectionOverrides(input.modelSelection),
       };

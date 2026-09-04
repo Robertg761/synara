@@ -26,26 +26,31 @@
 //     every dragged event and the up), and it means a click cannot deliver its
 //     down and its up to two different windows if something restacks in the
 //     middle of it.
-//   * **A background target is made to believe it is active, then put back.**
-//     AppKit hit-tests mouse events against the tracking state a window last
-//     saw and only routes keys to an app it thinks is active, so every gesture
-//     at a window whose app is not frontmost is wrapped in the focus record
-//     pair from SkyLight.swift, primed with a `mouseMoved`, and followed by the
-//     inverse record pair (or, if the click genuinely raised the app, by
-//     re-activating the human's previous app). WindowServer's z-order and the
-//     current Space are never changed by this.
+//   * **A background target is made to believe it is active *and* key, then put
+//     back.** AppKit hit-tests mouse events against the tracking state a window
+//     last saw and only routes keys to an app it thinks is active, so every
+//     gesture at a window whose app is not frontmost is wrapped in the focus
+//     records from SkyLight.swift — the activate/deactivate pair *and* the
+//     key-window pair — primed with a `mouseMoved`, and followed by the inverse
+//     pair (or, if the click genuinely raised the app, by re-activating the
+//     human's previous app). The key-window half is what makes this work on
+//     Chromium and Electron: with the activate record alone a background web
+//     page receives no `mousedown` at all, and with both it behaves like any
+//     other window. WindowServer's z-order and the current Space are never
+//     changed by any of it.
 //   * **Nothing stays held.** A mouse button or modifier that is logically down
 //     is tracked, and the unwind path posts the matching up on SIGTERM/SIGINT or
 //     when stdin closes. The classic failure is an agent dying between a
 //     modifier-down and its up, latching the modifier so every subsequent human
 //     keystroke becomes a shortcut.
 //
-// Typing is a ladder, best-effort-background first (the routing the cua-driver
-// ledger validated per toolkit): an accessibility `AXSelectedText` insert into
-// the focused text element, which lands in a background AppKit or web view and
-// can be read back; then pid-routed keystrokes; and, only when the caller asks
-// for `deliveryMode: "foreground"`, a brief real activation of the target that
-// is undone afterwards. The result names the rung that ran.
+// Typing is a ladder, invisible rungs first: an accessibility `AXSelectedText`
+// insert into the focused text element, which lands in a background AppKit view
+// and can be read back; then pid-routed keystrokes, which now reach a background
+// web view too; and, only when the caller asks for `deliveryMode: "foreground"`
+// or an application has already been caught dropping both, a brief real
+// activation of the target that is undone afterwards. The result names the rung
+// that ran.
 
 import AppKit
 import ApplicationServices
@@ -64,30 +69,6 @@ private let kWindowEventSubtype: Int64 = 3
 /// An undocumented flag bit real mouse events carry; the reference doc's
 /// click-fidelity list pairs it with `NonCoalesced`.
 private let kSyntheticClickFidelityFlag: UInt64 = 0x2000_0000
-
-/// Saturating `Double` → integer conversions.
-///
-/// Swift's `Int32(_: Double)` and `Int64(_: Double)` are trapping initialisers:
-/// a value outside the destination range, or a NaN, aborts the process. Every
-/// number these convert arrives over the wire, so an out-of-range scroll delta
-/// would be a repeatable way to kill the helper — and with it every desktop
-/// action — from a single tool call. Saturating is the right answer rather than
-/// rejecting: a scroll of ten million pixels means "as far as this goes".
-func clampToInt32(_ value: Double) -> Int32 {
-  guard value.isFinite else { return 0 }
-  let rounded = value.rounded()
-  if rounded <= Double(Int32.min) { return Int32.min }
-  if rounded >= Double(Int32.max) { return Int32.max }
-  return Int32(rounded)
-}
-
-func clampToInt64(_ value: Double) -> Int64 {
-  guard value.isFinite else { return 0 }
-  let rounded = value.rounded()
-  if rounded <= Double(Int64.min) { return Int64.min }
-  if rounded >= Double(Int64.max) { return Int64.max }
-  return Int64(rounded)
-}
 
 /// How far a keyboard or pointer action may go to reach its target.
 enum DeliveryMode: String {
@@ -124,10 +105,41 @@ enum PendingFocusRestore {
   case activation(previousPID: pid_t)
 }
 
-/// Which rung of the typing ladder delivered, and whether it could be checked.
+/// How well an action's effect could actually be observed.
+///
+/// Three states, not two: "we watched it land", "we watched and it did not
+/// land", and "there was nothing to watch". Collapsing the last two into one
+/// boolean made an unverifiable action indistinguishable from a failed one, and
+/// the Node side could only read the pessimistic meaning — so an agent retried
+/// text that had in fact been typed. Emitted on the wire as this raw string.
+enum Verification: String {
+  /// A read-back observed the effect.
+  case confirmed
+  /// A read-back was possible and showed no change: the app did not react.
+  case unconfirmed
+  /// Nothing about this target could be read back, so neither claim is honest.
+  case unverifiable
+}
+
+/// Which rung of the typing ladder delivered, and how well it could be checked.
 struct TypeOutcome {
   let path: String
-  let verified: Bool
+  let verified: Verification
+}
+
+/// The same report for a pointer gesture: the rung that actually ran, and what
+/// the delivery watch was able to observe.
+struct PointerOutcome {
+  let mode: DeliveryMode
+  let verified: Verification
+
+  var path: String { mode.rawValue }
+}
+
+/// The same report for a chord.
+struct KeyOutcome {
+  let path: String
+  let verified: Verification
 }
 
 final class InputController {
@@ -199,20 +211,20 @@ final class InputController {
     _ = try aim(at: point, named: window)
   }
 
+  @discardableResult
   func click(
     at point: CGPoint, button: CGMouseButton = .left, count: Int = 1,
     window: CGWindowID? = nil
-  ) throws {
+  ) throws -> PointerOutcome {
     try requireInputPermission()
     let target = try aim(at: point, named: window)
-    // Same ladder the keyboard uses. A target whose app refuses the synthetic
-    // active state hit-tests the click as a background window and drops it —
-    // measured: a Chromium page receives no mousedown at all that way. Bringing
-    // it genuinely forward for the gesture is what a person does, and the click
-    // still goes out pid-targeted so the human's physical pointer never moves.
+    // Same ladder the keyboard uses, and it now starts on the invisible rung for
+    // every surface including web content: the focus prelude makes the target
+    // window key as well as its app active, which is what a background Chromium
+    // page needs before it will hit-test a pid-posted mouseDown at all. The
+    // foreground rung is left only for an app already caught dropping one.
     // The previous application is restored by `focus.end()` either way.
-    let mode: DeliveryMode =
-      Focus.routesBackgroundInput(target, at: point) ? .background : .foreground
+    let mode: DeliveryMode = Focus.routesBackgroundInput(target) ? .background : .foreground
     let types = Self.eventTypes(for: button)
     let group = Self.newClickGroup()
     // Observed before the gesture so the background path can be checked. Only
@@ -260,16 +272,24 @@ final class InputController {
     // previous app — a retry that never brought the target forward and never
     // restored anything. The `defer` above re-reads `focus` at scope exit, so
     // the replacement is the one that gets ended.
-    if let watch, let target, watch.looksUndelivered() {
+    var verified = watch?.observe() ?? .unverifiable
+    if let watch, let target, verified == .unconfirmed {
       Self.rememberForegroundOnly(target.ownerPID)
       focus.end()
       focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: .foreground)
       try prime(at: point, target: target, group: group)
       try postClicks()
+      // The escalated replay is judged on the same expectation the first
+      // attempt armed: the failed attempt did not move focus, so the element
+      // the click was aimed at is still the one that should gain it.
+      verified = watch.renewedObservation()
+      return PointerOutcome(mode: .foreground, verified: verified)
     }
+    return PointerOutcome(mode: mode, verified: verified)
   }
 
-  func rightClick(at point: CGPoint, window: CGWindowID? = nil) throws {
+  @discardableResult
+  func rightClick(at point: CGPoint, window: CGWindowID? = nil) throws -> PointerOutcome {
     try click(at: point, button: .right, window: window)
   }
 
@@ -279,7 +299,7 @@ final class InputController {
   @discardableResult
   func drag(
     from: CGPoint, to: CGPoint, durationMs: Int, mode: DeliveryMode, window: CGWindowID? = nil
-  ) throws -> DeliveryMode {
+  ) throws -> PointerOutcome {
     try requireInputPermission()
     // Resolved once, at the mouse-down point, and reused for every dragged event
     // and the up — which is how macOS routes a real drag.
@@ -288,8 +308,7 @@ final class InputController {
     // A caller that did not ask for foreground still gets it when this app is
     // known to drop background gestures, the same rule `click` applies.
     let resolvedMode: DeliveryMode =
-      mode == .foreground || !Focus.routesBackgroundInput(target, at: from)
-      ? .foreground : .background
+      mode == .foreground || !Focus.routesBackgroundInput(target) ? .foreground : .background
     let focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: resolvedMode)
     defer { focus.end() }
     defer { releaseHeldButton() }
@@ -318,12 +337,15 @@ final class InputController {
       .leftMouseUp, at: to, button: .left, target: target, group: group, clickState: 1,
       held: false, delta: CGPoint(x: to.x - previous.x, y: to.y - previous.y))
     cursor.move(to: to)
-    return resolvedMode
+    // A drag has no equivalent of the click's focus probe: what a drop did to
+    // the target is application-specific and nothing generic can read it back.
+    return PointerOutcome(mode: resolvedMode, verified: .unverifiable)
   }
 
+  @discardableResult
   func scroll(
     at point: CGPoint?, deltaX: Double, deltaY: Double, window: CGWindowID? = nil
-  ) throws {
+  ) throws -> PointerOutcome {
     try requireInputPermission()
     // A named window is honoured or refused, never quietly swapped for another
     // one: a scroll aimed at a window that has closed must not spin the human's
@@ -339,8 +361,14 @@ final class InputController {
     } else {
       target = keyboardTarget
     }
-    let mode: DeliveryMode =
-      Focus.routesBackgroundInput(target, at: point) ? .background : .foreground
+    // Where the wheel turns. A window-scoped scroll with no point used to leave
+    // the event at its default (0,0) *and* unstamped with a window-local
+    // location, so it turned the wheel over the top-left corner of the desktop:
+    // the target scrolled nothing and the call reported success. The centre of
+    // the target is what "scroll this window" means.
+    let aimPoint = point ?? target.map { CGPoint(x: $0.bounds.midX, y: $0.bounds.midY) }
+    if point == nil, let aimPoint { cursor.glide(to: aimPoint) }
+    let mode: DeliveryMode = Focus.routesBackgroundInput(target) ? .background : .foreground
     let focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: mode)
     defer { focus.end() }
     // Scroll deltas are in pixels; a positive dy scrolls toward the content end,
@@ -350,13 +378,22 @@ final class InputController {
         scrollWheelEvent2Source: source,
         units: .pixel,
         wheelCount: 2,
-        wheel1: clampToInt32(-deltaY),
-        wheel2: clampToInt32(-deltaX),
+        wheel1: Geometry.clampToInt32(-deltaY),
+        wheel2: Geometry.clampToInt32(-deltaX),
         wheel3: 0)
     else { throw RPCError(.internalError, "could not build a scroll event") }
-    if let point { event.location = point }
+    if let aimPoint { event.location = aimPoint }
     event.flags.insert(.maskNonCoalesced)
-    try deliver(event, to: target, localPoint: point.map { localPoint($0, in: target) })
+    // A background window hit-tests a wheel event against the cursor-tracking
+    // state it last saw, the same way it does a click, so the scroll gets the
+    // same primed move.
+    if let aimPoint, target != nil {
+      try prime(at: aimPoint, target: target, group: Self.newClickGroup())
+    }
+    try deliver(event, to: target, localPoint: aimPoint.map { localPoint($0, in: target) })
+    // Scroll position is not something the helper can read back generically:
+    // nothing in AX reports "this view moved by 40 points".
+    return PointerOutcome(mode: mode, verified: .unverifiable)
   }
 
   // MARK: - Keyboard
@@ -370,13 +407,12 @@ final class InputController {
 
   func typeText(_ text: String, mode: DeliveryMode) throws -> TypeOutcome {
     try requireInputPermission()
-    let target = resolveKeyboardTarget()
-    // Whether the invisible rungs are worth attempting at all. A focused web
-    // control neither takes a verifiable accessibility write nor receives
-    // pid-posted keys, and an application already caught dropping background
-    // input has answered this question once already. Without the check every
-    // `type` into Chromium paid for two rungs of keystrokes that went nowhere
-    // before climbing to the one that works.
+    let target = try resolveKeyboardTarget()
+    // Whether the invisible rungs are worth attempting at all. Only an
+    // application already caught dropping background input answers yes: a web
+    // view no longer does, because rung 2 reaches one now. Rung 1 still declines
+    // web content on its own terms — an accessibility write into a page cannot
+    // be read back — and falls through to rung 2 rather than to the visible one.
     let skipInvisibleRungs = Self.needsForegroundKeyboard(target)
     if mode == .foreground || skipInvisibleRungs {
       // An explicitly requested foreground rung takes exactly the path rung 3
@@ -384,7 +420,7 @@ final class InputController {
       // this rung's one reason to exist on the wrong side of the activation:
       // Chromium ignores a key posted to a pid whether or not its app is front,
       // so the visible flicker bought nothing.
-      let valueBefore = target.flatMap { Accessibility.focusedValue(in: $0) }
+      let valueBefore = Accessibility.focusedValue(in: target)
       try withForeground(target) { try self.postTextThroughSessionTap(text) }
       return TypeOutcome(
         path: mode == .foreground ? "foreground" : "foreground-keys",
@@ -393,24 +429,22 @@ final class InputController {
     // Rung 1: an accessibility insert into the focused text element. It lands
     // in a background window without any activation dance and, for native
     // controls, its effect can often be read straight back.
-    if let target {
-      switch Accessibility.insertText(text, into: target) {
-      case .inserted(let verified):
-        // An insert a native control accepted but did not expose for reading is
-        // still a delivery, and typing the text again on the chance that it was
-        // not one is the more expensive mistake: a formatter or a secure field
-        // would then hold it twice. Web content — the case the rest of this
-        // ladder exists for — never arrives here at all, because `insertText`
-        // refuses it outright rather than reporting an unverifiable success.
-        return TypeOutcome(path: "ax-insert", verified: verified)
-      case .notApplicable, .refused:
-        break
-      }
+    switch Accessibility.insertText(text, into: target) {
+    case .inserted(let verification):
+      // An insert a native control accepted but did not expose for reading is
+      // still a delivery, and typing the text again on the chance that it was
+      // not one is the more expensive mistake: a formatter or a secure field
+      // would then hold it twice. Web content — the case the rest of this
+      // ladder exists for — never arrives here at all, because `insertText`
+      // refuses it outright rather than reporting an unverifiable success.
+      return TypeOutcome(path: "ax-insert", verified: verification)
+    case .notApplicable, .refused:
+      break
     }
 
     // Nil means the focused element exposes no readable value, which is the
     // difference between "this did not land" and "there is no way to tell".
-    let valueBefore = target.flatMap { Accessibility.focusedValue(in: $0) }
+    let valueBefore = Accessibility.focusedValue(in: target)
     // Rung 2: keystrokes addressed at the target process. This is the invisible
     // path and it works for AppKit, but only when the target's app accepts the
     // synthetic active state — `Focus` reports whether it did.
@@ -424,27 +458,31 @@ final class InputController {
       }
     }
     if routed {
-      guard let valueBefore else {
+      guard valueBefore != nil else {
         // Unverifiable is not failed. Climbing here retyped the whole string
         // into a field that already held it — the worse of the two errors, and
         // the common one, because a great many controls expose no `AXValue` at
         // all. The caller is told what actually happened instead.
-        return TypeOutcome(path: "keystrokes", verified: false)
+        return TypeOutcome(path: "keystrokes", verified: .unverifiable)
       }
-      if verifyText(text, reached: target, before: valueBefore) {
-        return TypeOutcome(path: "keystrokes", verified: true)
+      let verification = verifyText(text, reached: target, before: valueBefore)
+      if verification != .unconfirmed {
+        return TypeOutcome(path: "keystrokes", verified: verification)
       }
       // Readable, and it did not change: this application really does drop keys
       // posted to its pid, so remember it and stop paying for these rungs.
-      if let target { Self.rememberForegroundOnly(target.ownerPID) }
+      Self.rememberForegroundOnly(target.ownerPID)
     }
 
-    // Rung 3: what a real keyboard does. Chromium and Electron ignore key events
-    // posted to a pid — measured against a real page, which receives no keydown
-    // at all — while the same keys posted to the session tap land. Unlike a
-    // mouse event, a key event on that tap has no pointer component, so this
-    // cannot move the human's cursor; it only needs the target frontmost, which
-    // `withForeground` arranges and then undoes.
+    // Rung 3: what a real keyboard does. Reached only when rung 2 was posted,
+    // was readable, and demonstrably changed nothing — an application that
+    // really does drop keys addressed at its pid. Chromium is no longer such an
+    // application: with the window made key by the focus prelude a background
+    // page receives the keydown and its field gains the text, so this rung is
+    // now a genuine last resort rather than the web's default path. Unlike a
+    // mouse event, a key event on the session tap has no pointer component, so
+    // this cannot move the human's cursor; it only needs the target frontmost,
+    // which `withForeground` arranges and then undoes.
     try withForeground(target) { try self.postTextThroughSessionTap(text) }
     return TypeOutcome(
       path: "foreground-keys", verified: verifyText(text, reached: target, before: valueBefore))
@@ -453,12 +491,17 @@ final class InputController {
   /// Whether the target's focused element gained `text`. Compared against the
   /// value read before the attempt: asking only whether the value *contains* the
   /// text reported success when the field already held that string and the
-  /// keystrokes went nowhere. Web content exposes no usable value, so a false
-  /// answer means unproven rather than failed.
-  private func verifyText(_ text: String, reached target: DesktopWindow?, before: String?) -> Bool {
-    guard let target, let before else { return false }
-    guard let after = Accessibility.focusedValue(in: target) else { return false }
-    return after != before && after.contains(text)
+  /// keystrokes went nowhere.
+  ///
+  /// Empty text is unverifiable by construction — every string contains `""`,
+  /// so the comparison could only ever answer yes — and web content exposes no
+  /// usable value, which is unverifiable rather than failed.
+  private func verifyText(_ text: String, reached target: DesktopWindow?, before: String?)
+    -> Verification
+  {
+    guard !text.isEmpty, let target, let before else { return .unverifiable }
+    guard let after = Accessibility.focusedValue(in: target) else { return .unverifiable }
+    return after != before && after.contains(text) ? .confirmed : .unconfirmed
   }
 
   /// Key events on the session tap — the path a physical keyboard takes.
@@ -486,7 +529,7 @@ final class InputController {
         continue
       }
       let flags: CGEventFlags = stroke.shift ? [.maskShift] : []
-      let shift = stroke.shift ? KeyMap.modifierCodes(for: ["shift"]).first : nil
+      let shift = stroke.shift ? KeyMap.shiftModifier : nil
 
       if let shift { try postSessionTapKey(shift.code, down: true, flags: [.maskShift], units: nil) }
       for down in [true, false] {
@@ -511,15 +554,15 @@ final class InputController {
     usleep(2_000)
   }
 
-  func pressKey(_ key: String, modifiers: [String], mode: DeliveryMode) throws -> String {
+  func pressKey(_ key: String, modifiers: [String], mode: DeliveryMode) throws -> KeyOutcome {
     try requireInputPermission()
     guard let code = KeyMap.code(for: key) else {
       throw RPCError(.invalidParams, "unknown key '\(key)'")
     }
-    return try postChord(code, modifiers: KeyMap.modifierCodes(for: modifiers), mode: mode)
+    return try postChord(code, modifiers: try KeyMap.modifierCodes(for: modifiers), mode: mode)
   }
 
-  func hotkey(_ keys: [String], mode: DeliveryMode) throws -> String {
+  func hotkey(_ keys: [String], mode: DeliveryMode) throws -> KeyOutcome {
     try requireInputPermission()
     var modifiers: [String] = []
     var mainKeys: [String] = []
@@ -539,7 +582,7 @@ final class InputController {
     guard let code = KeyMap.code(for: mainKey) else {
       throw RPCError(.invalidParams, "unknown key '\(mainKey)'")
     }
-    return try postChord(code, modifiers: KeyMap.modifierCodes(for: modifiers), mode: mode)
+    return try postChord(code, modifiers: try KeyMap.modifierCodes(for: modifiers), mode: mode)
   }
 
   // MARK: - Unwind
@@ -611,13 +654,23 @@ final class InputController {
   /// no key routing — which is precisely the disruption this design exists to
   /// avoid, and it fired on every server restart that landed mid-gesture.
   private func restorePendingFocus() {
+    guard let pending = takePendingFocusRestore() else { return }
+    performFocusRestore(pending)
+  }
+
+  /// Claim the outstanding focus debt, atomically.
+  ///
+  /// `Focus.end()` on the input lane and `unwind()` from the signal source both
+  /// pay this debt, and both used to read it and clear it as two steps — so a
+  /// SIGTERM landing between them had them both post the inverse record pair,
+  /// deactivating the human's application a second time on the way out. Exactly
+  /// one caller can win this.
+  fileprivate func takePendingFocusRestore() -> PendingFocusRestore? {
     heldLock.lock()
+    defer { heldLock.unlock() }
     let pending = pendingFocusRestore
     pendingFocusRestore = nil
-    heldLock.unlock()
-
-    guard let pending else { return }
-    performFocusRestore(pending)
+    return pending
   }
 
   /// Hand the human's application back what a gesture took from it. The one
@@ -669,9 +722,10 @@ final class InputController {
     ///
     /// Cheap and decided before any event exists: an app that is already
     /// frontmost routes normally. Anything else consults what has been learned
-    /// about that application — see `requiresForegroundDelivery`. `point` is the
-    /// screen point the gesture is aimed at, or nil for a keyboard-only action.
-    static func routesBackgroundInput(_ target: DesktopWindow?, at point: CGPoint?) -> Bool {
+    /// about that application — see `requiresForegroundDelivery`. Nothing is
+    /// posted and no accessibility round trip is made, so it is free to ask on
+    /// every gesture.
+    static func routesBackgroundInput(_ target: DesktopWindow?) -> Bool {
       guard let target else { return true }
       let ownPID = ProcessInfo.processInfo.processIdentifier
       guard let front = SkyLight.frontmostPID(), front != ownPID else { return true }
@@ -683,10 +737,15 @@ final class InputController {
       // it posts nothing.
       guard SkyLight.canActivateWithoutRaise(pid: target.ownerPID, windowID: target.windowNumber)
       else { return false }
-      // Web content under the pointer is the one surface known in advance to
-      // drop this, and it is decided before any event exists.
-      if let point, Accessibility.pointIsWebContent(point, in: target) { return false }
-      // Anything else starts optimistic and is judged after the fact: an app
+      // Web content used to be excluded here, on the measurement that a
+      // pid-posted click into a background Chromium page produced no
+      // `mousedown`. That measurement was right and the conclusion was wrong:
+      // what the page was missing was key-window status, not a real activation.
+      // With `makeKeyWindow` now part of the focus prelude the same click lands
+      // in a background page, so web content takes the invisible rung like
+      // everything else and the AX round trip that used to decide this is gone.
+      //
+      // Every target starts optimistic and is judged after the fact: an app
       // caught dropping a background gesture is remembered and skips straight to
       // the visible rung from then on. This is the net that catches surfaces the
       // web-content rule cannot see, such as a canvas or game view.
@@ -703,14 +762,20 @@ final class InputController {
       mode: DeliveryMode = .background
     ) -> Focus {
       let ownPID = ProcessInfo.processInfo.processIdentifier
-      let previous = SkyLight.frontmostPID().flatMap { $0 == ownPID ? nil : $0 }
+      let front = SkyLight.frontmostPID()
+      let previous = front.flatMap { $0 == ownPID ? nil : $0 }
       guard let target, let previous, previous != target.ownerPID else {
-        // No previous app, or the target's app is already frontmost: its own
-        // key routing is live, so the invisible rung applies.
+        // Nothing to arrange — but "nothing to arrange" is not the same as
+        // "the target is active", and reporting the latter unconditionally is
+        // how `withForeground` came to post session-tap keys with nothing
+        // verified frontmost: with no target at all, or with no previous app,
+        // this branch used to claim success and the agent's text went into
+        // whatever the human was looking at. The flag is an observation now.
+        let believesItIsActive = target.map { front == $0.ownerPID } ?? false
         return Focus(
           target: target, previousPID: nil, previousWindowID: 0, activatedWithoutRaise: false,
           broughtForward: false, cursor: cursor, controller: controller,
-          targetBelievesItIsActive: true)
+          targetBelievesItIsActive: believesItIsActive)
       }
       if mode == .foreground {
         // A genuine activation, not the kCPSNoWindows variant. This rung's whole
@@ -741,14 +806,15 @@ final class InputController {
           logDiagnostic("foreground rung: target did not become frontmost within 400ms")
         }
         cursor.repin()
-        // `forward` is only the synchronous return of an asynchronous request.
-        // What this rung promises its callers is that the target really is
-        // frontmost — session-tap keys go wherever that is — so the settled
-        // observation, not the request's return, is the answer.
+        // `forward` is only the synchronous return of an asynchronous request,
+        // and `NSRunningApplication.activate` reports false for an activation
+        // that then happens anyway. What this rung promises its callers is that
+        // the target really is frontmost — session-tap keys go wherever that is
+        // — so the settled observation alone is the answer.
         return Focus(
           target: target, previousPID: previous, previousWindowID: 0,
           activatedWithoutRaise: false, broughtForward: forward, cursor: cursor,
-          controller: controller, targetBelievesItIsActive: forward && settled)
+          controller: controller, targetBelievesItIsActive: settled)
       }
       let previousWindowID =
         Windows.list().first { $0.ownerPID == previous && $0.onScreen }?.windowNumber ?? 0
@@ -802,9 +868,11 @@ final class InputController {
         owed = nil
       }
       controller.setPendingFocusRestore(owed)
-      guard let owed else { return }
-      controller.performFocusRestore(owed)
-      if case .activation = owed {
+      // Claimed rather than merely read: `unwind()` pays the same debt from the
+      // signal source, and whichever of the two takes it is the one that pays.
+      guard owed != nil, let claimed = controller.takePendingFocusRestore() else { return }
+      controller.performFocusRestore(claimed)
+      if case .activation = claimed {
         // Activation is asynchronous, and the next gesture on this serial lane
         // reads the frontmost pid to decide its own rung. Returning before the
         // human's app is actually front made that read see the target still in
@@ -817,7 +885,6 @@ final class InputController {
       }
       cursor.repin()
       Windows.invalidate()
-      controller.setPendingFocusRestore(nil)
     }
   }
 
@@ -855,7 +922,15 @@ final class InputController {
   /// deliver to a closed window landing in the human's editor instead. An
   /// unresolvable target is the caller's cue to re-read the window list.
   private func aim(at point: CGPoint, named: CGWindowID? = nil) throws -> DesktopWindow? {
-    cursor.move(to: point)
+    // Blocking, not fire-and-forget: every gesture that goes through `aim` posts
+    // its events immediately afterwards, and an overlay still gliding when the
+    // button goes down tells the human the agent clicked somewhere it had not
+    // reached yet. This runs on the input lane — a serial background queue — so
+    // the wait costs one gesture and never the main thread, and `glide` caps
+    // itself so a stalled main thread cannot wedge the lane. A drag's per-step
+    // updates deliberately keep the non-blocking `move`: they pace themselves at
+    // ~12 ms and the overlay follows them.
+    cursor.glide(to: point)
     if let named {
       guard let target = Windows.window(withNumber: named) else {
         throw RPCError(.targetMissing, "no window has id \(named)")
@@ -880,26 +955,52 @@ final class InputController {
   /// forever. A wrong "delivered" costs nothing; a wrong "undelivered" costs a
   /// permanent flicker, so this errs toward saying nothing.
   private struct DeliveryWatch {
-    private let target: DesktopWindow?
+    /// The whole watch — the expectation before the gesture and the look after
+    /// it — is capped at this many seconds of accessibility IPC. Past it the
+    /// probe stops asking and the click is reported as unverifiable, which is
+    /// the truthful answer and keeps a wedged application from holding the
+    /// serial input lane while every later click queues behind it.
+    private static let budgetSeconds: Double = 0.75
+    private let probe: Accessibility.GestureProbe?
     private let expected: String?
 
     init(target: DesktopWindow?, point: CGPoint) {
-      self.target = target
-      guard let target, let expectation = Accessibility.focusExpectation(at: point, in: target),
-        !expectation.alreadyFocused
+      // One handle for the whole gesture rather than one per question: the
+      // expectation, the look after the click, and the look after an escalated
+      // replay are all asked of this.
+      guard let target,
+        let probe = Accessibility.GestureProbe(window: target, budgetSeconds: Self.budgetSeconds)
       else {
+        self.probe = nil
+        self.expected = nil
+        return
+      }
+      self.probe = probe
+      guard let expectation = probe.expectation(at: point), !expectation.alreadyFocused else {
         self.expected = nil
         return
       }
       self.expected = expectation.element
     }
 
-    func looksUndelivered() -> Bool {
-      guard let target, let expected else { return false }
+    /// What the target did about the gesture: `confirmed` when the element the
+    /// click was aimed at now holds focus, `unconfirmed` when it demonstrably
+    /// does not, and `unverifiable` when there was never anything to check —
+    /// a click on a label, a click on the already-focused control, an app that
+    /// exposes no accessibility, or a probe that has spent its budget.
+    func observe() -> Verification {
+      guard let probe, let expected else { return .unverifiable }
+      defer { probe.restore() }
       // Give the app a beat to process the events it was just sent.
       usleep(120_000)
-      guard let after = Accessibility.focusedElementSignature(in: target) else { return false }
-      return after != expected
+      guard let after = probe.focusedSignature() else { return .unverifiable }
+      return after == expected ? .confirmed : .unconfirmed
+    }
+
+    /// A second look, with a fresh budget, after an escalated replay.
+    func renewedObservation() -> Verification {
+      probe?.renew(budgetSeconds: Self.budgetSeconds)
+      return observe()
     }
   }
 
@@ -923,6 +1024,12 @@ final class InputController {
     clickState: Int, source: CGEventSource?
   ) -> CGEvent? {
     if let target, let nsType = Self.appKitType(for: type) {
+      // `NSEvent.mouseEvent(with:…)` is a pure value constructor: it fills in an
+      // event record from its arguments and touches no window, view, or shared
+      // AppKit state, which is why it is safe on the input lane rather than
+      // needing a hop to main. (`NSScreen` is the AppKit API that does need one,
+      // and that read lives behind `Geometry`'s snapshot.)
+      //
       // AppKit window space: origin bottom-left of the window, y upwards.
       let local = CGPoint(
         x: point.x - target.bounds.origin.x,
@@ -978,11 +1085,12 @@ final class InputController {
 
   /// Applications observed to drop background pointer input, by bundle id.
   ///
-  /// Chromium and Electron accept a pid-posted click only once their app is
-  /// genuinely frontmost — measured directly, and consistent with the reference
-  /// doc's per-toolkit limits. Nothing about the target advertises this in
-  /// advance, so it is learned: the first gesture into an app takes the
-  /// invisible path and is checked, and a failure is remembered.
+  /// Empty for every application measured so far, Chromium and Electron
+  /// included: once the focus prelude makes the target window key, a pid-posted
+  /// click lands in a background web page. It stays because nothing about a
+  /// target advertises its event handling in advance, so this remains the net —
+  /// the first gesture into an app takes the invisible path and is checked, and
+  /// a failure is remembered.
   ///
   /// Keyed on bundle id rather than pid so the verdict survives the app being
   /// relaunched, and so two windows of one app share one answer. Reached only
@@ -1001,13 +1109,17 @@ final class InputController {
 
   /// Whether a keyboard action must take the visible rung before anything is
   /// posted: this application has already been caught dropping background
-  /// input, or the keys would go to a web view, which never receives a key
-  /// posted to a pid. Shared by the typing ladder and by chords so the two
-  /// cannot disagree about which surfaces need it.
+  /// input. Shared by the typing ladder and by chords so the two cannot
+  /// disagree about which surfaces need it.
+  ///
+  /// A focused web view used to answer yes here unconditionally, on the belief
+  /// that Chromium never receives a key posted to a pid. It does — with the
+  /// window made key by the focus prelude, a background page reports `keydown`
+  /// and its input element gains the text. Nothing about a target is known in
+  /// advance any more; the learning net below is the whole rule.
   private static func needsForegroundKeyboard(_ target: DesktopWindow?) -> Bool {
     guard let target else { return false }
     return requiresForegroundDelivery(target.ownerPID)
-      || Accessibility.focusedElementIsWebContent(in: target)
   }
 
   fileprivate static func rememberForegroundOnly(_ pid: pid_t) {
@@ -1086,8 +1198,8 @@ final class InputController {
     event.setIntegerValueField(kFieldButtonNumber, value: Int64(button.rawValue))
     event.setIntegerValueField(kFieldClickGroup, value: group)
     if let delta {
-      event.setIntegerValueField(.mouseEventDeltaX, value: clampToInt64(delta.x))
-      event.setIntegerValueField(.mouseEventDeltaY, value: clampToInt64(delta.y))
+      event.setIntegerValueField(.mouseEventDeltaX, value: Geometry.clampToInt64(delta.x))
+      event.setIntegerValueField(.mouseEventDeltaY, value: Geometry.clampToInt64(delta.y))
     }
     // Real hardware events carry it; some toolkits treat its absence as a
     // coalesced move they may drop. The reference doc's click-fidelity note
@@ -1109,7 +1221,6 @@ final class InputController {
       if end < units.count, units[end - 1] >= 0xD800, units[end - 1] <= 0xDBFF {
         end -= 1
       }
-      if end <= index { end = min(index + 21, units.count) }
       try postUnicode(Array(units[index..<end]), to: target)
       index = end
     }
@@ -1135,13 +1246,24 @@ final class InputController {
   /// are the classic example — and the real transitions cost nothing.
   private func postChord(
     _ code: CGKeyCode, modifiers: [(code: CGKeyCode, flags: CGEventFlags)], mode: DeliveryMode
-  ) throws -> String {
-    let target = resolveKeyboardTarget()
+  ) throws -> KeyOutcome {
+    let target = try resolveKeyboardTarget()
+    // What the target considered focused before the chord. A chord that edits
+    // or moves the selection changes this; one that copies, or opens a menu,
+    // legitimately does not — so an unchanged signature is `unverifiable`
+    // rather than a failure, and only an unreadable target is worse than that.
+    let signatureBefore = Accessibility.focusedElementSignature(in: target)
+    func verification() -> Verification {
+      guard let signatureBefore,
+        let signatureAfter = Accessibility.focusedElementSignature(in: target)
+      else { return .unverifiable }
+      return signatureAfter != signatureBefore ? .confirmed : .unverifiable
+    }
     // The chord itself, written once and parameterised on how a single
     // transition is posted. The two rungs differ in nothing else — pid-routed
-    // for the invisible path, session tap for the visible one, because Chromium
-    // ignores the first and honours the second — and a second copy of this would
-    // be a second place for a modifier to latch.
+    // for the invisible path, session tap for the visible one, which is reached
+    // only for an app already caught dropping background input — and a second
+    // copy of this would be a second place for a modifier to latch.
     let body: (
       _ post: (CGKeyCode, Bool, CGEventFlags) throws -> Void, _ onSessionTap: Bool
     ) throws -> Void = { post, onSessionTap in
@@ -1155,6 +1277,7 @@ final class InputController {
         }
         self.heldLock.lock()
         self.heldModifiers = []
+        self.heldModifierTarget = nil
         self.heldModifiersOnSessionTap = false
         self.heldLock.unlock()
       }
@@ -1182,7 +1305,7 @@ final class InputController {
     }
     if mode == .foreground || Self.needsForegroundKeyboard(target) {
       try withForeground(target) { try body(throughSessionTap, true) }
-      return "foreground"
+      return KeyOutcome(path: "foreground", verified: verification())
     }
     let focus = Focus.begin(for: target, cursor: cursor, controller: self)
     // The same rule the typing ladder follows: a target that will not take the
@@ -1192,11 +1315,11 @@ final class InputController {
     if !focus.targetBelievesItIsActive {
       focus.end()
       try withForeground(target) { try body(throughSessionTap, true) }
-      return "foreground"
+      return KeyOutcome(path: "foreground", verified: verification())
     }
     defer { focus.end() }
     try body(throughPid, false)
-    return "keystrokes"
+    return KeyOutcome(path: "keystrokes", verified: verification())
   }
 
   private func postKey(_ code: CGKeyCode, down: Bool, flags: CGEventFlags, to target: DesktopWindow?)
@@ -1213,15 +1336,25 @@ final class InputController {
 
   /// The window keys go to, plus the one nudge a background window needs: an app
   /// that is not the active app still routes keys to whichever of its windows it
-  /// considers main/focused, and a window that is neither drops them. Marking the
-  /// target main+focused over AX costs one round trip and is skipped entirely
-  /// when the target app is already frontmost.
-  private func resolveKeyboardTarget() -> DesktopWindow? {
-    let frontmost = Windows.frontmost()
-    let target = keyboardTarget ?? frontmost
-    guard let target else { return nil }
-    if frontmost?.ownerPID != target.ownerPID {
-      Accessibility.focusWindow(target)
+  /// considers focused, and a window that is not drops them. Setting `AXFocused`
+  /// costs one round trip, is skipped when the target's app is already frontmost,
+  /// and deliberately does *not* also set `AXMain` — many apps implement that as
+  /// `makeKeyAndOrderFront:`, so the old call raised the target window on every
+  /// keystroke into a background app.
+  ///
+  /// There is no frontmost fallback. It used to return "whatever is in front"
+  /// when no window had been aimed at, which meant a `type` with no preceding
+  /// click or `focus-window` wrote the agent's text into the human's own
+  /// document — including through the accessibility rung, which needs no
+  /// activation at all. An unaimed keyboard action is refused instead.
+  private func resolveKeyboardTarget() throws -> DesktopWindow {
+    guard let target = keyboardTarget else {
+      throw RPCError(
+        .targetMissing,
+        "no window is aimed for keyboard input; click, focus, or raise a window first")
+    }
+    if SkyLight.frontmostPID() != target.ownerPID {
+      Accessibility.focusWindowForKeyboard(target)
     }
     return target
   }
@@ -1237,26 +1370,26 @@ final class InputController {
   /// is refused instead, so the backend reports an unresolved target rather than
   /// hijacking the pointer.
   private func deliver(_ event: CGEvent, to target: DesktopWindow?, localPoint: CGPoint?) throws {
-    // The frontmost fallback belongs to keyboard events only. A key with no
-    // resolved target still lands where a person's keystroke would have. A
-    // *pointer* event does not: unstamped, it is posted at the frontmost app
-    // carrying the global coordinate the agent aimed at somewhere else, so it
-    // clicks that coordinate inside the human's own window. Refuse instead.
-    if target == nil, Self.isMouseEvent(event.type) {
-      throw RPCError(.targetMissing, "no window is available to receive this pointer event")
+    // There is no frontmost fallback for either kind of event. An unstamped
+    // pointer event is posted at the frontmost app carrying the global
+    // coordinate the agent aimed somewhere else, so it clicks that coordinate
+    // inside the human's own window; an unstamped *key* event is no better,
+    // because it types the agent's text into whatever the human is using.
+    // Both are refused, and the backend reports an unresolved target.
+    guard let destination = target else {
+      throw RPCError(
+        .targetMissing,
+        Self.isMouseEvent(event.type)
+          ? "no window is available to receive this pointer event"
+          : "no window is available to receive this event")
     }
-    guard let destination = target ?? Windows.frontmost() else {
-      throw RPCError(.targetMissing, "no window is available to receive this event")
-    }
-    if target != nil {
-      event.setIntegerValueField(kFieldSubtype, value: kWindowEventSubtype)
-      event.setIntegerValueField(kFieldTargetPID, value: Int64(destination.ownerPID))
-      event.setIntegerValueField(kFieldWindowNumber, value: Int64(destination.windowNumber))
-      event.setIntegerValueField(kFieldWindowIDLow, value: Int64(destination.windowNumber))
-      event.setIntegerValueField(kFieldWindowIDHigh, value: Int64(destination.windowNumber))
-      if let localPoint, let setWindowLocation = SkyLight.setWindowLocation {
-        setWindowLocation(event, localPoint)
-      }
+    event.setIntegerValueField(kFieldSubtype, value: kWindowEventSubtype)
+    event.setIntegerValueField(kFieldTargetPID, value: Int64(destination.ownerPID))
+    event.setIntegerValueField(kFieldWindowNumber, value: Int64(destination.windowNumber))
+    event.setIntegerValueField(kFieldWindowIDLow, value: Int64(destination.windowNumber))
+    event.setIntegerValueField(kFieldWindowIDHigh, value: Int64(destination.windowNumber))
+    if let localPoint, let setWindowLocation = SkyLight.setWindowLocation {
+      setWindowLocation(event, localPoint)
     }
     event.postToPid(destination.ownerPID)
   }
@@ -1323,12 +1456,28 @@ enum KeyMap {
     "fn": (63, .maskSecondaryFn),
   ]
 
+  /// Left shift, for the session-tap typing path, which asserts it directly
+  /// rather than going through the caller-supplied modifier list.
+  static let shiftModifier: (code: CGKeyCode, flags: CGEventFlags) = (56, .maskShift)
+
   static func isModifier(_ key: String) -> Bool {
     modifiers[key.lowercased()] != nil
   }
 
-  static func modifierCodes(for names: [String]) -> [(code: CGKeyCode, flags: CGEventFlags)] {
-    names.compactMap { modifiers[$0.lowercased()] }
+  /// Every named modifier, or an error naming the first one this map does not
+  /// know.
+  ///
+  /// Dropping the unknown ones — which `compactMap` did silently — turned
+  /// `["hyper", "cmd"] + "a"` into plain `cmd+a` and reported it as delivered,
+  /// so the agent believed a chord it never sent had run. A modifier the helper
+  /// cannot express is a bad request, not a smaller chord.
+  static func modifierCodes(for names: [String]) throws -> [(code: CGKeyCode, flags: CGEventFlags)] {
+    try names.map { name in
+      guard let modifier = modifiers[name.lowercased()] else {
+        throw RPCError(.invalidParams, "unknown modifier '\(name)'")
+      }
+      return modifier
+    }
   }
 
   /// A single character is looked up as itself; only a spelled-out key *name* is

@@ -33,6 +33,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Dispatch
 import Foundation
 
 enum Accessibility {
@@ -167,11 +168,11 @@ enum Accessibility {
 
   /// The outcome of the accessibility typing rung.
   enum TextInsertion {
-    /// The focused element accepted the text. `verified` is true only when its
-    /// value could be read back and contains the text — never for web content,
-    /// whose accessibility value is a renderer-side mirror the ledger treats as
-    /// untrusted.
-    case inserted(verified: Bool)
+    /// The focused element accepted the text. The verification is `confirmed`
+    /// only when the element's value could be read back before and after and
+    /// gained the text — never for web content, whose accessibility value is a
+    /// renderer-side mirror the ledger treats as untrusted.
+    case inserted(Verification)
     /// No focused text element in that app: this rung does not apply.
     case notApplicable
     /// The element exists but refused the write; the caller falls through.
@@ -214,6 +215,7 @@ enum Accessibility {
     // swiftlint:disable:next force_cast
     let focused = value as! AXUIElement
     AXUIElementSetMessagingTimeout(focused, windowMessagingTimeout)
+    let valueBefore = stringAttribute(focused, kAXValueAttribute)
     let role = stringAttribute(focused, kAXRoleAttribute) ?? ""
     let inWebArea = hasAncestor(focused, role: "AXWebArea")
     guard textRoles.contains(role) || inWebArea else { return .notApplicable }
@@ -231,8 +233,15 @@ enum Accessibility {
     // `inserted`, the reliable rungs below never ran. An unverifiable rung is
     // worse than no rung, so it declines and lets keystrokes do the work.
     if inWebArea { return .refused("accessibility writes into web content cannot be verified") }
-    let after = stringAttribute(focused, kAXValueAttribute) ?? ""
-    return .inserted(verified: after.contains(text))
+    // Compared against the value read before the write, the same rule the
+    // keystroke rungs follow. Asking only whether the value *contains* the text
+    // reported a confirmed insert for a field that already held that string —
+    // and for an empty insert, which every string contains — so the write could
+    // never be judged to have failed.
+    guard !text.isEmpty, let valueBefore,
+      let valueAfter = stringAttribute(focused, kAXValueAttribute)
+    else { return .inserted(.unverifiable) }
+    return .inserted(valueAfter != valueBefore && valueAfter.contains(text) ? .confirmed : .unconfirmed)
   }
 
   /// The target's focused element's current value, or nil when there is none to
@@ -262,92 +271,118 @@ enum Accessibility {
     return stringAttribute(focused, kAXValueAttribute)
   }
 
-  /// Whether what the target application currently considers focused lives in a
-  /// web view.
+  // There is deliberately no "is this web content?" probe here any more. Two of
+  // them existed only to route web content to the visible input rung, and that
+  // rule is gone: Chromium does not drop pid-posted input because it is web
+  // content, it drops input aimed at a window that is not key, which SkyLight's
+  // `makeKeyWindow` now fixes for every toolkit at once. Re-adding one would put
+  // a synchronous accessibility round trip back on the path of every gesture.
+
+  /// One gesture's accessibility probe: a single application handle, a tight
+  /// messaging timeout, and a wall-clock budget.
   ///
-  /// The typing ladder asks this before it spends anything on the invisible
-  /// rungs: a focused web control neither accepts a verifiable accessibility
-  /// write nor receives pid-posted keys, so both rungs are known in advance to
-  /// be wasted keystrokes into a page that will not see them. Distinct from
-  /// `pointIsWebContent`, which asks about the surface under the pointer — a
-  /// keyboard action has no pointer.
-  static func focusedElementIsWebContent(in window: DesktopWindow) -> Bool {
-    guard isTrusted() else { return false }
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false)
-    defer { application.restore() }
-    var raw: CFTypeRef?
-    guard
-      AXUIElementCopyAttributeValue(
-        application.element, kAXFocusedUIElementAttribute as CFString, &raw) == .success,
-      let value = raw, CFGetTypeID(value) == AXUIElementGetTypeID()
-    else { return false }
-    // swiftlint:disable:next force_cast
-    let focused = value as! AXUIElement
-    AXUIElementSetMessagingTimeout(focused, windowMessagingTimeout)
-    if stringAttribute(focused, kAXRoleAttribute) == "AXWebArea" { return true }
-    return hasAncestor(focused, role: "AXWebArea")
+  /// The click path used to build three separate `Application` handles and make
+  /// roughly ten AX round trips per background click, each one entitled to the
+  /// full one-second application timeout — on the *input* lane, which is serial,
+  /// so one hung application wedged every subsequent click and keystroke behind
+  /// it. This is the same measurement in one handle, with the per-window
+  /// timeout, and a deadline after which the probe stops asking and reports
+  /// that it could not tell rather than paying again.
+  final class GestureProbe {
+    private let application: Application
+    private var deadline: DispatchTime
+
+    init?(window: DesktopWindow, budgetSeconds: Double) {
+      guard isTrusted() else { return nil }
+      self.deadline = .now() + budgetSeconds
+      // The watch is an optimisation, not a delivery step: it may never cost
+      // more than a fraction of a gesture, so it takes the per-window timeout
+      // rather than the per-application one.
+      self.application = Application(
+        pid: window.ownerPID, enhanceUserInterface: false,
+        messagingTimeout: windowMessagingTimeout)
+    }
+
+    /// Whether the probe has already spent its budget. Every read checks this
+    /// first, so a hung application costs the budget once and never again.
+    var expired: Bool { DispatchTime.now() > deadline }
+
+    /// Give the probe a fresh budget for a second look — after an escalated
+    /// replay, which is a new question about the same expectation.
+    func renew(budgetSeconds: Double) {
+      deadline = .now() + budgetSeconds
+    }
+
+    /// The element under a screen point, and whether it is something a click
+    /// would be expected to focus — which is what entitles the watch to draw a
+    /// conclusion at all.
+    ///
+    /// Only an element that can actually *take* focus gives it an expectation to
+    /// test; a click on a label, a background, or a static image legitimately
+    /// moves nothing. Merely exposing `AXFocused` is not that test, and reading
+    /// it as one was a false-negative machine: Chromium publishes the attribute
+    /// on every node in a page, so a click on a plain `<div>` armed the probe
+    /// with that div, blurred the focused field to the document body, and the
+    /// mismatch was scored as a click that never arrived — which then condemned
+    /// the whole browser to the visible rung for the rest of the session.
+    /// Settability is the question that was meant, and it is one call not two.
+    func expectation(at point: CGPoint) -> (element: String, alreadyFocused: Bool)? {
+      guard !expired else { return nil }
+      var raw: AXUIElement?
+      guard
+        AXUIElementCopyElementAtPosition(
+          application.element, Float(point.x), Float(point.y), &raw) == .success,
+        let hit = raw, !expired
+      else { return nil }
+      AXUIElementSetMessagingTimeout(hit, windowMessagingTimeout)
+      var settable: DarwinBoolean = false
+      guard
+        AXUIElementIsAttributeSettable(hit, kAXFocusedAttribute as CFString, &settable) == .success,
+        settable.boolValue
+      else { return nil }
+      guard let hitSignature = signature(of: hit, isExpired: { self.expired }),
+        let focused = focusedSignature()
+      else { return nil }
+      return (hitSignature, hitSignature == focused)
+    }
+
+    /// Whatever the application currently considers focused, or nil when it
+    /// exposes nothing — or when the budget is gone, which is the same answer:
+    /// no evidence either way.
+    func focusedSignature() -> String? {
+      guard !expired else { return nil }
+      var raw: CFTypeRef?
+      guard
+        AXUIElementCopyAttributeValue(
+          application.element, kAXFocusedUIElementAttribute as CFString, &raw) == .success,
+        let value = raw, CFGetTypeID(value) == AXUIElementGetTypeID()
+      else { return nil }
+      // swiftlint:disable:next force_cast
+      let focused = value as! AXUIElement
+      AXUIElementSetMessagingTimeout(focused, windowMessagingTimeout)
+      return signature(of: focused, isExpired: { self.expired })
+    }
+
+    func restore() { application.restore() }
   }
 
-  /// Whether the surface under a screen point is web content.
+  /// A cheap identity for one element: role, title, value, frame.
   ///
-  /// This is the one property that reliably predicts a dropped background
-  /// gesture. Chromium and Electron accept pid-posted mouse input only once
-  /// their application is genuinely frontmost — measured directly — while native
-  /// AppKit surfaces accept it in the background. Verification cannot decide it
-  /// after the fact: a click on an already-focused field changes nothing
-  /// observable whether it landed or not, which is exactly the common case in a
-  /// form.
-  ///
-  /// It is deliberately asked of the element under the pointer rather than of
-  /// the process, because one process is often both: Chrome's tab strip and
-  /// omnibox are native AppKit in the same pid as the page, and only the page
-  /// needs the visible rung.
-  static func pointIsWebContent(_ point: CGPoint, in window: DesktopWindow) -> Bool {
-    guard isTrusted() else { return false }
-    // Explicitly without the enhanced-user-interface toggle. This runs before
-    // essentially every gesture, and the default would flip
-    // `AXEnhancedUserInterface` on the target and back again each time — a
-    // setting some applications relayout their whole window for.
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false)
-    defer { application.restore() }
-    var raw: AXUIElement?
-    guard
-      AXUIElementCopyElementAtPosition(
-        application.element, Float(point.x), Float(point.y), &raw) == .success,
-      let hit = raw
-    else { return false }
-    AXUIElementSetMessagingTimeout(hit, windowMessagingTimeout)
-    if stringAttribute(hit, kAXRoleAttribute) == "AXWebArea" { return true }
-    return hasAncestor(hit, role: "AXWebArea")
-  }
-
-  /// The element under a screen point, and whether it is something a click would
-  /// be expected to focus. Used to decide whether a delivery probe is entitled
-  /// to conclude anything at all.
-  static func focusExpectation(at point: CGPoint, in window: DesktopWindow)
-    -> (element: String, alreadyFocused: Bool)?
+  /// `isExpired` is consulted between the reads, not just before them. Each one
+  /// is synchronous IPC that can block for the messaging timeout, so a probe
+  /// with a wall-clock budget has to be able to give up part way through an
+  /// unresponsive application rather than paying four more timeouts to finish a
+  /// signature nobody will use.
+  fileprivate static func signature(of element: AXUIElement, isExpired: () -> Bool = { false })
+    -> String?
   {
-    guard isTrusted() else { return nil }
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false)
-    defer { application.restore() }
-    var raw: AXUIElement?
-    guard
-      AXUIElementCopyElementAtPosition(
-        application.element, Float(point.x), Float(point.y), &raw) == .success,
-      let hit = raw
-    else { return nil }
-    AXUIElementSetMessagingTimeout(hit, windowMessagingTimeout)
-    // Only a focusable element gives the probe an expectation to test. A click
-    // on a label, a background, or a static image legitimately moves nothing.
-    guard boolAttribute(hit, kAXFocusedAttribute as String) != nil else { return nil }
-    let signature = signature(of: hit)
-    return (signature, signature == focusedElementSignature(in: window))
-  }
-
-  private static func signature(of element: AXUIElement) -> String {
+    if isExpired() { return nil }
     let role = stringAttribute(element, kAXRoleAttribute) ?? ""
+    if isExpired() { return nil }
     let title = stringAttribute(element, kAXTitleAttribute) ?? ""
+    if isExpired() { return nil }
     let text = stringAttribute(element, kAXValueAttribute) ?? ""
+    if isExpired() { return nil }
     let box = frame(of: element).map { "\($0.origin.x),\($0.origin.y),\($0.width),\($0.height)" }
       ?? ""
     return "\(role)|\(title)|\(text)|\(box)"
@@ -402,6 +437,32 @@ enum Accessibility {
     AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
   }
 
+  /// The narrow version of the above, for the keyboard path.
+  ///
+  /// `focusWindow` sets `AXMain` as well, and a great many apps implement
+  /// `-setAccessibilityMain:` as `makeKeyAndOrderFront:` — a raise. Doing that
+  /// before *every* keystroke into a background app meant the helper reordered
+  /// the human's windows as a side effect of typing, which is the one thing the
+  /// background rung exists to avoid. Setting only `AXFocused`, and only when
+  /// the app does not already consider this its focused window, is enough to
+  /// route keys and moves nothing.
+  static func focusWindowForKeyboard(_ window: DesktopWindow) {
+    guard isTrusted() else { return }
+    let application = Application(
+      pid: window.ownerPID, enhanceUserInterface: false, messagingTimeout: windowMessagingTimeout)
+    defer { application.restore() }
+    guard let axWindow = application.match(window) else { return }
+    var raw: CFTypeRef?
+    if AXUIElementCopyAttributeValue(
+      application.element, kAXFocusedWindowAttribute as CFString, &raw) == .success,
+      let value = raw, CFGetTypeID(value) == AXUIElementGetTypeID(),
+      CFEqual(value, axWindow)
+    {
+      return
+    }
+    AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+  }
+
   // MARK: - Application handle
 
   /// One application element plus the bookkeeping that must be undone after the
@@ -412,9 +473,9 @@ enum Accessibility {
     private var previousEnhanced: Bool?
     private var enhanced = false
 
-    init(pid: pid_t, enhanceUserInterface: Bool = true) {
+    init(pid: pid_t, enhanceUserInterface: Bool = true, messagingTimeout: Float? = nil) {
       element = AXUIElementCreateApplication(pid)
-      AXUIElementSetMessagingTimeout(element, applicationMessagingTimeout)
+      AXUIElementSetMessagingTimeout(element, messagingTimeout ?? applicationMessagingTimeout)
       // Chromium/Electron expose no AX tree until asked; harmless elsewhere.
       AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
       guard enhanceUserInterface else { return }
@@ -473,10 +534,11 @@ enum Accessibility {
     path: [Int],
     budget: inout Budget
   ) -> [String: Any]? {
-    guard budget.remaining > 0 else {
-      budget.truncated = true
-      return nil
-    }
+    // Belt and braces: every caller checks the budget before descending — that
+    // is where truncation is *recorded*, because only the caller knows whether
+    // a node was actually left unemitted. Marking the tree truncated here as
+    // well claimed a cut whenever the budget merely ran out exactly.
+    guard budget.remaining > 0 else { return nil }
     let snapshot = read(element)
     let frame = snapshot.frame ?? .zero
     // Off-screen scroll content: a real frame that misses the window entirely is
@@ -492,6 +554,12 @@ enum Accessibility {
     var children: [[String: Any]] = []
     if depth < maxDepth {
       for (index, child) in snapshot.children.enumerated() {
+        // The cap cut this window's tree short exactly when a child still
+        // existed and there was no budget left to emit it.
+        guard budget.remaining > 0 else {
+          budget.truncated = true
+          break
+        }
         // The child's index is its real position among its siblings even when a
         // sibling was skipped, so `nodePath` stays a valid re-resolve route.
         if let childNode = node(
@@ -504,11 +572,6 @@ enum Accessibility {
           budget: &budget)
         {
           children.append(childNode)
-        }
-        if budget.remaining <= 0 {
-          // The cap cut this window's tree short only if there was more to emit.
-          if index < snapshot.children.count - 1 { budget.truncated = true }
-          break
         }
       }
     }

@@ -135,7 +135,8 @@ export function parseMacUiForest(
   screenSize: ComputerScreenSize | undefined,
   origin: ComputerPoint,
 ): ComputerUiNode | undefined {
-  const record = asRecord(payload);
-  const rootValue = record.root ?? payload;
-  return parseNode(rootValue, origin, screenSize, null, 0);
+  // The helper always wraps the desktop node in `root` (Accessibility.swift);
+  // an unwrapped payload was never a shape it could send, and accepting one
+  // meant a malformed reply got parsed as a node instead of degrading.
+  return parseNode(asRecord(payload).root, origin, screenSize, null, 0);
 }

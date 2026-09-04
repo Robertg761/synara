@@ -30,9 +30,28 @@ describe("Synara harness policy", () => {
     assert.include(policy, "OAuth popup requiring human action");
     assert.include(policy, "stop using tools and answer");
     assert.include(policy, "Use the computer_* tools");
+    // Computer use is no longer a mode a chat is switched into: the agent may
+    // reach for the desktop when a task needs it, not only when told to.
+    assert.include(policy, "whenever a task genuinely needs the desktop");
+    assert.include(policy, "You do not need permission to reach for them");
+    assert.notInclude(policy, "whenever the user explicitly asks you to use computer use");
+    // ...but the desktop is still the user's own screen, so a task with no GUI
+    // in it must stay in the shell.
+    assert.include(policy, "Keep preferring the shell, the filesystem, and code");
     assert.include(policy, "Never substitute shell-driven UI automation");
     assert.include(policy, "Terminal rather than Synara");
     assert.include(policy, "computer_list_windows or computer_get_state");
+    // Typing that reports success while nothing landed is the failure this
+    // clause exists for: the verdict is on the result, so the model must read
+    // it rather than resend the same keys.
+    assert.include(policy, "delivery.verified");
+    // The verdict is three-valued, and conflating two of the three is its own
+    // failure: an agent told that anything short of "confirmed" is suspect
+    // screenshots after every keystroke on the many native controls that expose
+    // no value to read back.
+    assert.include(policy, '"unverifiable" means the control exposes no value to read');
+    assert.include(policy, 'only "unconfirmed" means the backend looked and did not see');
+    assert.include(policy, "Never resend the same input blindly on any verdict");
     // The policy goes to Linux hosts too, so it must not assert that a desktop
     // permission failure is a macOS one.
     assert.notInclude(policy, "a macOS privacy grant");

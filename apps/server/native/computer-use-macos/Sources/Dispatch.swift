@@ -15,11 +15,18 @@
 //   * **perception** — concurrent. Captures, window lists, and pings are pure
 //     reads; a `ping` must answer while a capture is in flight, which is exactly
 //     what the watchdog on the Node side is measuring.
-//   * **accessibility** — its own serial queue. An AX walk is synchronous IPC
-//     into other processes and can take hundreds of milliseconds even bounded;
-//     the reference is explicit that it belongs off the capture path, and
-//     serialising it keeps one runaway app from multiplying into several
-//     blocked threads.
+//   * **accessibility** — its own serial queue, for the `describe-ui` walk. An
+//     AX walk is synchronous IPC into other processes and can take hundreds of
+//     milliseconds even bounded; the reference is explicit that it belongs off
+//     the capture path, and serialising it keeps one runaway app from
+//     multiplying into several blocked threads.
+//
+// This lane owns the *walk*, not accessibility in general. Bounded AX round
+// trips run on the input lane by design — the typing ladder's read-back, the
+// click's delivery watch, the keyboard focus nudge — because each one is part
+// of the action it belongs to and has to happen in that action's order. Every
+// one of them carries the per-window messaging timeout and a wall-clock budget
+// for exactly that reason.
 //
 // stdin stays on its own reader thread: it only parses and hands off, so a busy
 // lane never stops the helper from noticing the next request or a closed pipe.
@@ -42,6 +49,13 @@ enum Lanes {
 
   /// Which lane a method runs on. An unknown method takes the perception lane:
   /// it only produces a "method not found" error and must not sit behind input.
+  ///
+  /// `capabilities` and `request-permissions` both fall through to perception,
+  /// which is deliberate for the second one: raising a TCC prompt is a read of
+  /// the same state `capabilities` reports, and it can sit on screen until the
+  /// user answers. On the serial input lane that wait would hold every click and
+  /// keystroke behind a dialog; on the concurrent perception lane it holds
+  /// nothing at all.
   static func queue(for method: String) -> DispatchQueue {
     switch method {
     case "move", "click", "double-click", "right-click", "drag", "scroll", "type", "press-key",

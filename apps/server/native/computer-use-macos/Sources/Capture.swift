@@ -54,7 +54,15 @@ enum Capture {
   }
 
   /// Capture one desktop rect, in global top-left points.
-  static func region(_ rect: CGRect, maxDimension: Int, prefer: Source?) throws -> Result {
+  ///
+  /// The rect is clipped to the desktop before anything else happens. Both links
+  /// of the chain need that: ScreenCaptureKit rejects a `sourceRect` that misses
+  /// its display and falls through, and the `screencapture` arguments below are
+  /// integers — `Int(1e30)` is a trapping conversion, so a region far off the
+  /// desktop used to abort the helper outright and take every other in-flight
+  /// action with it.
+  static func region(_ requested: CGRect, maxDimension: Int, prefer: Source?) throws -> Result {
+    let rect = try Geometry.clampRectToWorkspace(requested)
     if prefer != .screencapture, #available(macOS 14.0, *) {
       if let capture = captureRegionWithSCK(rect, maxDimension: maxDimension) {
         return Result(
@@ -63,12 +71,16 @@ enum Capture {
           source: .screenCaptureKit)
       }
     }
+    let origin = (x: Geometry.clampToInt32(rect.origin.x), y: Geometry.clampToInt32(rect.origin.y))
+    let size = (
+      width: Geometry.clampToInt32(rect.width), height: Geometry.clampToInt32(rect.height)
+    )
     let args = [
       "-x",  // no capture sound
       "-o",  // no window shadow
       "-t", "png",
       "-R",
-      "\(Int(rect.origin.x)),\(Int(rect.origin.y)),\(Int(rect.width)),\(Int(rect.height))",
+      "\(origin.x),\(origin.y),\(size.width),\(size.height)",
     ]
     let png = try runScreencapture(extraArgs: args)
     return Result(
@@ -87,6 +99,19 @@ enum Capture {
   static func window(_ number: CGWindowID, maxDimension: Int, prefer: Source?) throws -> Result {
     guard let target = Windows.window(withNumber: number) else {
       throw RPCError(.targetMissing, "no window has id \(number)")
+    }
+    // A minimized or otherwise off-screen window has no composited pixels. Both
+    // links of the chain answer anyway — with the desktop behind it, or with a
+    // stale cached frame — and the reported region is then a rect the image
+    // does not cover, so every coordinate the agent reads off it maps to the
+    // wrong place. There is no honest image to return, so this refuses.
+    guard target.onScreen else {
+      throw RPCError(.targetMissing, "window \(number) is not on screen")
+    }
+    // A window whose bounds miss every display is the same trapping-conversion
+    // hazard as a region, and equally has nothing to show.
+    guard (try? Geometry.clampRectToWorkspace(target.bounds)) != nil else {
+      throw RPCError(.targetMissing, "window \(number) is not on any display")
     }
     if prefer != .screencapture, #available(macOS 14.0, *) {
       if let capture = captureWindowWithSCK(number, maxDimension: maxDimension) {
@@ -353,16 +378,21 @@ enum Capture {
     process.arguments = extraArgs + [file.path]
     let errorPipe = Pipe()
     process.standardError = errorPipe
+    // The file header promises this path "never hangs the way SCShareableContent
+    // can"; without a deadline that is only true of the OS's good behaviour, and
+    // a wedged subprocess would hold the perception lane open indefinitely.
+    //
+    // Armed before `run()`: a process that exits between the launch and the
+    // assignment never calls a handler installed afterwards, and the wait below
+    // would then have burned the whole deadline on a subprocess that had
+    // already finished.
+    let finished = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in finished.signal() }
     do {
       try process.run()
     } catch {
       throw RPCError(.internalError, "screencapture could not start: \(error.localizedDescription)")
     }
-    // The file header promises this path "never hangs the way SCShareableContent
-    // can"; without a deadline that is only true of the OS's good behaviour, and
-    // a wedged subprocess would hold the perception lane open indefinitely.
-    let finished = DispatchSemaphore(value: 0)
-    process.terminationHandler = { _ in finished.signal() }
     if finished.wait(timeout: .now() + captureDeadlineSeconds) == .timedOut {
       process.terminate()
       _ = finished.wait(timeout: .now() + 1)

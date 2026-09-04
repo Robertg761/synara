@@ -99,6 +99,9 @@ enum Windows {
   /// suffix so the development build is covered without a second constant.
   private static let hostBundlePrefix = "com.emanueledipietro.synara"
 
+  /// `NSRunningApplication` is documented as returning its properties
+  /// atomically, so this is safe from the enumeration whichever lane runs it;
+  /// it is the one piece of AppKit this file touches off the main thread.
   private static func isHostApplication(_ pid: pid_t) -> Bool {
     guard let bundle = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else {
       return false
@@ -151,11 +154,24 @@ enum Windows {
     list().first { $0.windowNumber == number }
   }
 
-  /// The frontmost on-screen window. `list()` also carries minimized windows,
-  /// which are reportable but can never be a focus or delivery target, so every
-  /// caller that means "the window in front" goes through this.
+  /// The focused application's frontmost on-screen window, or nil.
+  ///
+  /// This used to be "the first on-screen window in the list", which is the
+  /// *stacking*-topmost one — and that is not the same question. A floating
+  /// panel belonging to some other application sits above everything without
+  /// being focused at all, so with Terminal frontmost the helper reported a
+  /// ChatGPT window as the focused one, and every caller that used this to
+  /// decide "is my target the front app" or "where do unaimed keys go" was
+  /// answered with a window the human was not using.
+  ///
+  /// Focus is a property of the process, so the process is what is asked:
+  /// WindowServer's front pid, then that pid's frontmost on-screen window.
+  /// There is deliberately no fallback to the topmost window — a front
+  /// application with no window in this list (Synara itself, the helper, an app
+  /// showing only a panel) has no answer, and inventing one is the bug above.
   static func frontmost() -> DesktopWindow? {
-    list().first { $0.onScreen }
+    guard let pid = SkyLight.frontmostPID() else { return nil }
+    return list().first { $0.onScreen && $0.ownerPID == pid }
   }
 
   /// The topmost window whose bounds contain `point` — what an unscoped click at
@@ -177,14 +193,21 @@ enum Windows {
       .map { String($0.windowNumber) }
   }
 
-  static func dictionary(_ window: DesktopWindow, occluders: [String]) -> [String: Any] {
+  /// `focusedWindowID` is passed in rather than derived per window: it costs one
+  /// WindowServer round trip, and every window in a `list-windows` reply is
+  /// describing the same instant.
+  static func dictionary(
+    _ window: DesktopWindow, occluders: [String], focusedWindowID: CGWindowID?
+  ) -> [String: Any] {
     var payload: [String: Any] = [
       "id": String(window.windowNumber),
       "title": window.title,
       "appName": window.appName,
       "pid": Int(window.ownerPID),
       "bounds": Geometry.rectDictionary(window.bounds),
-      "focused": false,
+      // Truthful now. This was hard-coded false, so `list-windows` reported a
+      // desktop in which nothing at all was focused.
+      "focused": window.windowNumber == focusedWindowID,
       "minimized": window.minimized,
       "visible": window.onScreen,
       "stackingIndex": window.stackingIndex,

@@ -16,7 +16,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
-  COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
+  COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND,
   CommandId,
   EventId,
   SYNARA_GATEWAY_MAX_THREADS_PER_OPERATION,
@@ -24,6 +24,9 @@ import {
   THREAD_GOAL_MAX_CHARS,
   ThreadId,
   TurnId,
+  type ComputerBuildSignature,
+  type ComputerPermission,
+  type ComputerSetupRequiredPayload,
   type ProviderKind,
   type RuntimeMode,
   type ServerProviderStatus,
@@ -67,7 +70,7 @@ import {
   readRecordArg,
   readStringArg,
 } from "../toolInput.ts";
-import { WRITE_TOOL_ANNOTATIONS, type ToolEntry } from "../toolRuntime.ts";
+import { WRITE_TOOL_ANNOTATIONS, type ToolContext, type ToolEntry } from "../toolRuntime.ts";
 import { makeAgentGatewayMcpTransport } from "../mcpTransport.ts";
 import { recoverInterruptedAgentGatewayOperations } from "../startupRecovery.ts";
 import { makeCreateThreadsHandler } from "../creationCoordinator.ts";
@@ -75,7 +78,7 @@ import { makeAgentGatewayAutomationTools } from "../automationTools.ts";
 import { makeAgentGatewayBrowserTools } from "../browserTools.ts";
 import { makeAgentGatewayDeviceTools } from "../deviceTools.ts";
 import { DeviceService } from "../../device/Services/DeviceService.ts";
-import { COMPUTER_CONTROL_CAPABILITY, makeAgentGatewayComputerTools } from "../computerTools.ts";
+import { makeAgentGatewayComputerTools } from "../computerTools.ts";
 import { ComputerService } from "../../computer/Services/ComputerService.ts";
 import { BrowserAutomationHost } from "../../browserAutomation/Services/BrowserAutomationHost.ts";
 import { makeBrowserAutomationHost } from "../../browserAutomation/Layers/BrowserAutomationHost.ts";
@@ -723,6 +726,72 @@ export const makeAgentGateway = Effect.gen(function* () {
       }).pipe(Effect.orElseSucceed(() => null)),
   });
 
+  // One setup card per (thread, turn): an agent that hits a missing grant
+  // typically retries the same tool several times in a row, and repeated cards
+  // would bury the chat. The decider appends activities verbatim, so the dedupe
+  // lives here.
+  const surfacedComputerSetupPrompts = new Set<string>();
+  const SURFACED_SETUP_PROMPTS_MAX = 512;
+  const surfaceComputerSetupRequired = (input: {
+    readonly toolName: string;
+    readonly missing: readonly ComputerPermission[];
+    readonly buildSignature?: ComputerBuildSignature;
+    readonly context: ToolContext;
+  }): Effect.Effect<void> => {
+    const callerThreadId = input.context.callerThreadId;
+    const callerTurnId = input.context.callerTurnId;
+    const dedupeKey = `${callerThreadId}:${callerTurnId ?? "no-turn"}`;
+    if (surfacedComputerSetupPrompts.has(dedupeKey)) return Effect.void;
+    // FIFO eviction, not a wholesale clear: clearing forgets every live turn's
+    // dedupe key at once and would let each of them surface a duplicate card.
+    while (surfacedComputerSetupPrompts.size >= SURFACED_SETUP_PROMPTS_MAX) {
+      surfacedComputerSetupPrompts.delete(surfacedComputerSetupPrompts.keys().next().value!);
+    }
+    surfacedComputerSetupPrompts.add(dedupeKey);
+    const marker = stableGatewayDigest({
+      kind: "computer-setup-required",
+      threadId: callerThreadId,
+      turnId: callerTurnId,
+    });
+    const createdAt = isoNow();
+    return orchestrationEngine
+      .dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.makeUnsafe(`agent:${marker}:computer-setup-required`),
+        threadId: ThreadId.makeUnsafe(callerThreadId),
+        activity: {
+          id: EventId.makeUnsafe(`gateway:${marker}:computer-setup-required`),
+          tone: "error",
+          kind: COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND,
+          summary: "Computer control needs setup",
+          // The grant names ride along so the card can say which permission is
+          // missing rather than "a permission Synara needs"; an empty list is a
+          // backend that refused without naming one, and the card falls back.
+          // The build signature rides with them because on a locally built copy
+          // the switch in System Settings can already be on — its grant pinned
+          // to a binary a rebuild replaced — and the card has to say so.
+          payload: {
+            toolName: input.toolName,
+            missing: [...input.missing],
+            ...(input.buildSignature === undefined ? {} : { buildSignature: input.buildSignature }),
+          } satisfies ComputerSetupRequiredPayload,
+          turnId: callerTurnId === null ? null : TurnId.makeUnsafe(callerTurnId),
+          createdAt,
+        },
+        createdAt,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("agent gateway could not surface a computer setup prompt", {
+            callerThreadId,
+            toolName: input.toolName,
+            error: errorText(error),
+          }),
+        ),
+        Effect.asVoid,
+      );
+  };
+
   const tools: ReadonlyArray<ToolEntry> = [
     ...readTools,
     ...diagnosticTools,
@@ -739,61 +808,12 @@ export const makeAgentGateway = Effect.gen(function* () {
       ? makeAgentGatewayDeviceTools({ manager: deviceService.manager })
       : []),
     ...(computerService?.supported === true
-      ? makeAgentGatewayComputerTools({ manager: computerService.manager })
+      ? makeAgentGatewayComputerTools({
+          manager: computerService.manager,
+          onSetupRequired: surfaceComputerSetupRequired,
+        })
       : []),
   ];
-  // One denial activity per (thread, turn): agents typically retry the denied
-  // tool several times in a row, and repeated cards would bury the chat. The
-  // decider appends activities verbatim, so the dedupe lives here.
-  const surfacedComputerControlDenials = new Set<string>();
-  const SURFACED_DENIALS_MAX = 512;
-  const surfaceCapabilityDenial: NonNullable<
-    Parameters<typeof makeAgentGatewayMcpTransport>[0]["onCapabilityDenied"]
-  > = (denial) => {
-    // Only computer control has a user-facing switch to point at; other
-    // capability denials stay plain tool errors.
-    if (denial.requiredCapability !== COMPUTER_CONTROL_CAPABILITY) return Effect.void;
-    const dedupeKey = `${denial.callerThreadId}:${denial.callerTurnId ?? "no-turn"}`;
-    if (surfacedComputerControlDenials.has(dedupeKey)) return Effect.void;
-    // FIFO eviction, not a wholesale clear: clearing forgets every live turn's
-    // dedupe key at once and would let each of them surface a duplicate card.
-    while (surfacedComputerControlDenials.size >= SURFACED_DENIALS_MAX) {
-      surfacedComputerControlDenials.delete(surfacedComputerControlDenials.keys().next().value!);
-    }
-    surfacedComputerControlDenials.add(dedupeKey);
-    const marker = stableGatewayDigest({
-      kind: "computer-control-denied",
-      threadId: denial.callerThreadId,
-      turnId: denial.callerTurnId,
-    });
-    const createdAt = isoNow();
-    return orchestrationEngine
-      .dispatch({
-        type: "thread.activity.append",
-        commandId: CommandId.makeUnsafe(`agent:${marker}:computer-control-denied`),
-        threadId: ThreadId.makeUnsafe(denial.callerThreadId),
-        activity: {
-          id: EventId.makeUnsafe(`gateway:${marker}:computer-control-denied`),
-          tone: "error",
-          kind: COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
-          summary: "Computer control is off for this chat",
-          payload: { toolName: denial.toolName },
-          turnId: denial.callerTurnId === null ? null : TurnId.makeUnsafe(denial.callerTurnId),
-          createdAt,
-        },
-        createdAt,
-      })
-      .pipe(
-        Effect.catch((error) =>
-          Effect.logWarning("agent gateway could not surface computer-control denial", {
-            callerThreadId: denial.callerThreadId,
-            toolName: denial.toolName,
-            error: errorText(error),
-          }),
-        ),
-        Effect.asVoid,
-      );
-  };
 
   return {
     handleMcpPost: makeAgentGatewayMcpTransport({
@@ -802,7 +822,6 @@ export const makeAgentGateway = Effect.gen(function* () {
       tools,
       instructions: AGENT_GATEWAY_INSTRUCTIONS,
       requireThreadShell,
-      onCapabilityDenied: surfaceCapabilityDenial,
     }),
   } satisfies AgentGatewayShape;
 });

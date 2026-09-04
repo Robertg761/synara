@@ -120,6 +120,34 @@ describe("computer panel state helpers", () => {
     ).toMatchObject({ kind: "blocked", description: "KWin is off" });
   });
 
+  it("names the withheld grants in the blocked title", () => {
+    // The settings panel and the pane both title themselves from this, and
+    // "Computer control is unavailable" is the one thing a user with a missing
+    // grant cannot act on — the switch has a name, so the title uses it.
+    const view = resolveComputerAvailabilityView({
+      kind: "permission-required",
+      missing: ["accessibility", "screenRecording"],
+      message: "Synara needs Accessibility and Screen Recording to control this Mac.",
+      buildSignature: "signed",
+    });
+    expect(view.kind).toBe("blocked");
+    expect(view.title).toBe("Computer control needs Accessibility and Screen Recording");
+    expect(view.description).toContain("Screen Recording");
+  });
+
+  it("keeps the pre-availability and unsupported copy platform-neutral", () => {
+    // macOS reaches both of these, so neither may name Linux alone.
+    const checking = resolveComputerAvailabilityView(undefined);
+    expect(checking.description).not.toContain("Linux");
+    const unsupported = resolveComputerAvailabilityView({
+      kind: "unsupported-platform",
+      platform: "win32",
+    });
+    expect(unsupported.kind).toBe("blocked");
+    expect(unsupported.description).toContain("win32");
+    expect(unsupported.description).toContain("macOS");
+  });
+
   it("shows a reconnecting backend as checking rather than blocked", () => {
     expect(
       resolveComputerAvailabilityView(

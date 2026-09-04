@@ -66,6 +66,13 @@ export const COMPUTER_LABEL_MAX_LENGTH = 1_024;
  */
 export const COMPUTER_MESSAGE_MAX_LENGTH = 2_048;
 /**
+ * Caps `ComputerActionResult.delivery.path`. Exported because the name comes
+ * off a backend helper's reply verbatim, and the backend must clamp it before
+ * putting it on a result — an over-long name would fail the encode of an action
+ * that actually happened.
+ */
+export const COMPUTER_DELIVERY_PATH_MAX_LENGTH = 64;
+/**
  * Caps both a reported window list and one window's occluder list. Exported
  * because a backend enumerator must clamp its own list to this.
  */
@@ -79,10 +86,22 @@ export const COMPUTER_OCCLUDERS_MAX_LENGTH = 32;
 
 /**
  * Thread-activity kind appended by the agent gateway when a computer tool call
- * is rejected because the chat does not have computer control enabled. The web
- * app keys its actionable "enable computer control" chat card off this kind.
+ * failed because the OS has not granted Synara the privacy permissions the
+ * desktop backend needs. The web app keys its actionable "set up computer
+ * control" chat card off this kind, so the user can grant them from the chat
+ * instead of hunting through Settings.
+ *
+ * Only a missing-permission failure appends it: an ordinary action failure (a
+ * target that moved, an undelivered keystroke, bad arguments) is the agent's to
+ * recover from and needs no card.
+ *
+ * Payload: `ComputerSetupRequiredPayload` (below, where the permission and
+ * signature schemas it is built from are defined). The grant names travel with
+ * the activity so the card can say which permission is missing; an empty list
+ * means the backend reported a refusal without naming one, and the card falls
+ * back to the general wording.
  */
-export const COMPUTER_CONTROL_DENIED_ACTIVITY_KIND = "computer.control-denied";
+export const COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND = "computer.setup-required";
 
 /**
  * The backend name reported in `ComputerAvailability.backend` by the KWin
@@ -152,6 +171,53 @@ export const ComputerWindowId = TrimmedNonEmptyString.check(
 );
 export type ComputerWindowId = typeof ComputerWindowId.Type;
 
+/**
+ * An OS privacy grant desktop control needs and the user alone can give.
+ *
+ * Named rather than described so every surface says the same words: the chat's
+ * setup card, the settings panel, the desktop preflight and the tool result the
+ * agent reads all key off these two identifiers, and their user-facing labels
+ * live in one place (`@synara/shared/computerPermissions`).
+ *
+ * macOS is the only platform with such a model today. The two are not
+ * equivalent: without Accessibility nothing can be driven at all, while without
+ * Screen Recording the desktop is driveable but unseeable.
+ */
+export const ComputerPermission = Schema.Literals(["accessibility", "screenRecording"]);
+export type ComputerPermission = typeof ComputerPermission.Type;
+
+/**
+ * How the running build is code-signed, which decides whether a *stale* grant is
+ * a plausible explanation for a missing permission.
+ *
+ * macOS pins an ad-hoc signature's TCC grant to the binary's cdhash, so every
+ * local rebuild silently invalidates it while System Settings keeps showing the
+ * app switched on — the user sees "Synara: on" and the helper still reports the
+ * permission missing. A Developer ID signature keys on identifier plus team and
+ * survives rebuilds, so that advice must never be shown for one.
+ */
+export const ComputerBuildSignature = Schema.Literals(["adhoc", "signed"]);
+export type ComputerBuildSignature = typeof ComputerBuildSignature.Type;
+
+/**
+ * The payload the agent gateway attaches to a
+ * `COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND` activity, and the chat card reads back.
+ *
+ * `buildSignature` is optional because only a backend with a permission model
+ * reports one: it is what lets the card explain the case where System Settings
+ * already shows Synara switched on (an ad-hoc build's grant is pinned to a
+ * cdhash a rebuild replaced) instead of leaving the user staring at a switch
+ * that looks correct.
+ */
+export const ComputerSetupRequiredPayload = Schema.Struct({
+  /** The tool whose call raised the card; never empty. */
+  toolName: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  /** Empty means the backend refused without naming a grant, and the card falls back. */
+  missing: Schema.Array(ComputerPermission).check(Schema.isMaxLength(8)),
+  buildSignature: Schema.optional(ComputerBuildSignature),
+});
+export type ComputerSetupRequiredPayload = typeof ComputerSetupRequiredPayload.Type;
+
 export const ComputerAvailability = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("available"),
@@ -160,6 +226,26 @@ export const ComputerAvailability = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("unsupported-platform"),
     platform: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+  }),
+  /**
+   * The backend exists and works; the OS is withholding a grant it cannot run
+   * without. Its own kind rather than a `backend-unavailable` message because
+   * this is the one unavailability a user can fix in thirty seconds, and every
+   * surface has to be able to *act* on it — name the grants, offer the button,
+   * raise the chat's setup card — which reading English out of a message field
+   * cannot do.
+   *
+   * Only a grant whose absence blocks control is reported this way. A desktop
+   * that can be driven but not seen (Screen Recording alone) stays `available`
+   * with `health.captureAvailable` false, because refusing the whole feature
+   * over a blind spot would take away the half that still works.
+   */
+  Schema.Struct({
+    kind: Schema.Literal("permission-required"),
+    /** Every grant currently missing, not only the blocking one. Never empty. */
+    missing: Schema.Array(ComputerPermission).check(Schema.isMinLength(1), Schema.isMaxLength(8)),
+    message: TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH)),
+    buildSignature: ComputerBuildSignature,
   }),
   Schema.Struct({
     kind: Schema.Literal("backend-unavailable"),
@@ -209,6 +295,17 @@ export const ComputerHealth = Schema.Struct({
    * difference between a blank pane and a broken one.
    */
   captureAvailable: Schema.Boolean,
+  /**
+   * The connected backend can drive the desktop, but not without the human
+   * seeing it: one rung of its input delivery ladder is missing, so reaching a
+   * background window means briefly bringing that window forward.
+   *
+   * True today only on macOS releases where the helper cannot resolve the
+   * private SkyLight symbol that routes a key event into an unfocused web view.
+   * Optional because a backend with no delivery ladder has no answer to give,
+   * and absent is not the same claim as `false`.
+   */
+  backgroundInputDegraded: Schema.optional(Schema.Boolean),
 });
 export type ComputerHealth = typeof ComputerHealth.Type;
 
@@ -636,6 +733,18 @@ export const ComputerInputKeyInput = Schema.Struct({
 });
 export type ComputerInputKeyInput = typeof ComputerInputKeyInput.Type;
 
+/**
+ * What a backend could establish about an input it delivered. Named here rather
+ * than inlined so the server's backend contract and the agent-facing tool
+ * guidance both spell the three cases exactly once.
+ */
+export const ComputerDeliveryVerification = Schema.Literals([
+  "confirmed",
+  "unconfirmed",
+  "unverifiable",
+]);
+export type ComputerDeliveryVerification = typeof ComputerDeliveryVerification.Type;
+
 export const ComputerActionResult = Schema.Struct({
   computerId: ComputerId,
   action: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
@@ -658,6 +767,29 @@ export const ComputerActionResult = Schema.Struct({
       injected: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
       traveledY: Schema.optional(Schema.Number),
       gearing: Schema.optional(Schema.Number),
+    }),
+  ),
+  /**
+   * Input delivery telemetry: which rung of the backend's delivery ladder
+   * carried the input (`path`), and what the backend could establish about the
+   * outcome (`verified`).
+   *
+   * `verified` is three-valued on purpose, because the two things a boolean
+   * conflated are not the same failure. `confirmed` means the backend read the
+   * effect back. `unconfirmed` means it tried to read the effect back and could
+   * not see it — the one case where a caller must look at the screen before
+   * building on the action. `unverifiable` means the surface exposes no readable
+   * value at all, which is the ordinary answer for most native controls: the
+   * input was delivered, nothing about it is suspect, and a caller that treated
+   * it as a failure would take a screenshot after every keystroke for nothing.
+   *
+   * Optional because only backends with a delivery ladder answer it; the Linux
+   * backends never set it, and their results encode exactly as before.
+   */
+  delivery: Schema.optional(
+    Schema.Struct({
+      path: Schema.String.check(Schema.isMaxLength(COMPUTER_DELIVERY_PATH_MAX_LENGTH)),
+      verified: ComputerDeliveryVerification,
     }),
   ),
 });

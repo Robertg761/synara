@@ -53,10 +53,6 @@ import {
 
 import type { ContextMenuItem } from "@synara/contracts";
 import { isKeyboardShortcutsHelpChord } from "@synara/shared/browserShortcuts";
-import {
-  DesktopComputerControlPermissions,
-  registerComputerControlIpcHandlers,
-} from "./computerControlPermissions";
 import { getMacTrafficLightPosition } from "@synara/shared/desktopChrome";
 import { DEVICE_HELPER_SOURCE_DIR_ENV } from "@synara/shared/deviceHelperCache";
 import {
@@ -65,6 +61,8 @@ import {
   COMPUTER_HELPER_DEV_BUNDLE_SEGMENTS,
   COMPUTER_HELPER_DEV_RAW_SEGMENTS,
   COMPUTER_HELPER_PACKAGED_SEGMENTS,
+  COMPUTER_HELPER_SOURCE_DIR_ENV,
+  COMPUTER_HELPER_SOURCE_DIR_NAME,
 } from "@synara/shared/computerHelperPaths";
 import {
   SYNARA_DESKTOP_UPDATE_CHANNEL,
@@ -1802,13 +1800,6 @@ function macComputerHelperPathForBackend(): string | null {
   return resolveDesktopComputerHelperPath();
 }
 
-const computerControlPermissions = new DesktopComputerControlPermissions({
-  platform: process.platform,
-  resolveHelperPath: resolveDesktopComputerHelperPath,
-  systemPreferences,
-  openExternal: (url) => shell.openExternal(url),
-});
-
 function resolveAppSnapHelperPath(): string {
   if (app.isPackaged) {
     return Path.resolve(process.resourcesPath, "..", "Helpers", "synara-appsnap-helper");
@@ -3516,6 +3507,9 @@ function backendNodeArgs(): string[] {
 
 function backendEnv(): NodeJS.ProcessEnv {
   const servedStaticRoot = resolveServedStaticRoot();
+  // Resolved once: the lookup stats the filesystem, and asking twice for one
+  // env entry meant doing that work again to answer the same question.
+  const computerHelperPath = macComputerHelperPathForBackend();
   const env: NodeJS.ProcessEnv = {
     ...resolveBrowserHostPipeBackendEnv(
       process.env,
@@ -3535,8 +3529,21 @@ function backendEnv(): NodeJS.ProcessEnv {
     // is the thing this feature is designed around, so dev should exercise it
     // too. A Windows or Linux backend that saw this variable would stat a path
     // that cannot exist, hence the platform guard.
-    ...(macComputerHelperPathForBackend()
-      ? { [COMPUTER_HELPER_BINARY_PATH_ENV]: macComputerHelperPathForBackend() as string }
+    ...(computerHelperPath ? { [COMPUTER_HELPER_BINARY_PATH_ENV]: computerHelperPath } : {}),
+    // Where the backend's source-build fallback may compile from, and — just as
+    // importantly — where it may not. Packaging stages the Swift sources under
+    // `Resources` precisely because the copy the server would otherwise resolve
+    // relative to its own bundled module sits inside `app.asar`: a compiler
+    // cannot read an archive, so that path fails the build instead of declining
+    // it. Naming the staged directory keeps the fallback honest for the one
+    // case that still needs it — a shipped helper lost to quarantine.
+    ...(app.isPackaged && process.platform === "darwin"
+      ? {
+          [COMPUTER_HELPER_SOURCE_DIR_ENV]: Path.join(
+            process.resourcesPath,
+            COMPUTER_HELPER_SOURCE_DIR_NAME,
+          ),
+        }
       : {}),
     SYNARA_MODE: "desktop",
     SYNARA_NO_BROWSER: "1",
@@ -4200,8 +4207,6 @@ function registerIpcHandlers(): void {
   ipcMain.on(IPC.zoomFactor, (event: IpcMainEvent) => {
     event.returnValue = event.sender.getZoomFactor();
   });
-
-  registerComputerControlIpcHandlers(ipcMain, computerControlPermissions);
 
   ipcMain.removeHandler(IPC.remoteAccess.getState);
   ipcMain.handle(IPC.remoteAccess.getState, () => currentRemoteAccessState());

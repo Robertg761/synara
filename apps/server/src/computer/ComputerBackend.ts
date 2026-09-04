@@ -1,11 +1,15 @@
 import {
+  COMPUTER_DELIVERY_PATH_MAX_LENGTH,
   COMPUTER_MESSAGE_MAX_LENGTH,
   type ComputerActionResult,
   type ComputerAvailability,
+  type ComputerBuildSignature,
   type ComputerCapabilities,
+  type ComputerDeliveryVerification,
   type ComputerHealth,
   type ComputerId,
   type ComputerLaunchAppResult,
+  type ComputerPermission,
   type ComputerPoint,
   type ComputerRect,
   type ComputerScreenSize,
@@ -77,19 +81,25 @@ export interface ComputerBackendActionResult {
   readonly windowId?: string;
   readonly value?: string;
   /**
-   * Which rung of a backend's delivery ladder actually ran, and whether the
-   * backend could confirm the effect. The macOS helper answers both for every
-   * keyboard action (`ax-insert` | `keystrokes` | `foreground` |
-   * `foreground-keys`), and an unverified delivery is a materially different
-   * outcome from a verified one — a caller that must know the text landed can
-   * re-read the target instead of assuming.
+   * Which rung of a backend's delivery ladder actually ran, and what the backend
+   * could establish about the outcome.
    *
-   * Server-side only for now: the wire-level `ComputerActionResult` is a
-   * contracts schema shared with the Linux backends, and
-   * `computerBackendActionResult` projects only the fields that schema declares.
+   * The macOS helper answers both for every input it delivers — keyboard and
+   * pointer alike — naming the rung it took (`ax-insert`, `keystrokes`,
+   * `foreground`, and so on). `verified` is deliberately three-valued:
+   * `confirmed` means the effect was read back, `unconfirmed` means the read-back
+   * was attempted and did not show it, and `unverifiable` means the surface
+   * exposes no readable value to check against — the ordinary answer for most
+   * native controls, and not a sign that anything went wrong.
+   *
+   * `computerBackendActionResult` projects the pair onto the wire result's
+   * optional `delivery` (clamping the path there, so every backend that reports
+   * one is bounded by the same rule), so the agent reading a tool result sees
+   * the verdict too. Backends with no delivery ladder leave both unset and their
+   * results are unchanged.
    */
   readonly deliveryPath?: string;
-  readonly verified?: boolean;
+  readonly verified?: ComputerDeliveryVerification;
 }
 
 export type ComputerBackendEvent =
@@ -118,6 +128,15 @@ export class ComputerBackendError extends Error {
    * explain the miss instead of reporting a generic failure.
    */
   readonly rejectedOperation: string | undefined;
+  /**
+   * The desktop refused because the OS has not granted Synara a privacy
+   * permission it needs — macOS Screen Recording or Accessibility today. Only
+   * the backend can tell this apart from an ordinary action failure, so it is
+   * marked here rather than guessed from message text further up: the agent
+   * gateway turns exactly this flag into the chat's "needs setup" card, and a
+   * card raised for a window that merely moved would be noise.
+   */
+  readonly setupRequired: boolean;
 
   constructor(
     message: string,
@@ -126,6 +145,7 @@ export class ComputerBackendError extends Error {
       readonly dormant?: boolean;
       readonly cause?: unknown;
       readonly rejectedOperation?: string;
+      readonly setupRequired?: boolean;
     } = {},
   ) {
     super(message, options);
@@ -133,6 +153,7 @@ export class ComputerBackendError extends Error {
     this.retryable = options.retryable ?? false;
     this.dormant = options.dormant ?? false;
     this.rejectedOperation = options.rejectedOperation;
+    this.setupRequired = options.setupRequired ?? false;
   }
 }
 
@@ -212,11 +233,56 @@ export interface ComputerBackend {
    * `capabilities-changed`, so a caller may cache this until that event fires.
    */
   capabilities(): ComputerCapabilities;
+  /**
+   * OS privacy grants this backend needs and does not have, established rather
+   * than remembered.
+   *
+   * Asynchronous because the answer is only allowed to be stale in one
+   * direction. The tool surface consults this after every computer call to
+   * decide whether the user is owed a setup card, and the moment that matters
+   * most is the one just after the user granted something: a cached "missing"
+   * kept the card and the model's refusal on screen while the grant was already
+   * live, which is the exact failure this signature exists to prevent. A backend
+   * that knows nothing is missing answers from memory and costs nothing; one
+   * whose last look saw a gap has to look again (behind its own short cache, so
+   * a burst of calls still pays for one probe).
+   *
+   * Empty means either "nothing is missing" or "nothing has looked yet" — both
+   * are states in which no user action is owed, so they need not be told apart
+   * here.
+   *
+   * Optional because only macOS has a permission model at all; a backend that
+   * omits it is read as missing nothing. `availability()` reports the *blocking*
+   * subset of this as `permission-required`; a grant that only degrades the
+   * desktop (Screen Recording) shows up here and nowhere else.
+   */
+  missingPermissions?(): Promise<readonly ComputerPermission[]>;
+  /**
+   * How this build is code-signed, as the last probe read it, or undefined when
+   * nothing has looked yet or the backend has no permission model.
+   *
+   * Synchronous and free: it is a property of the binary, not a live reading.
+   * It travels beside `missingPermissions()` because a missing grant on an
+   * ad-hoc build has a second, invisible explanation — the grant is pinned to a
+   * cdhash a rebuild replaced — and the card cannot say so without knowing this.
+   */
+  buildSignature?(): ComputerBuildSignature | undefined;
   listWindows(): Promise<readonly ComputerWindow[]>;
   getScreenSize(): Promise<ComputerScreenSize>;
   getState(options: {
     readonly includeScreenshot?: boolean;
-    readonly includeText?: boolean;
+    /**
+     * Walk the accessibility tree and return it as `root`.
+     *
+     * Named for what it costs rather than for what one caller does with it: the
+     * agent tool surface needs the tree on every perception read (that is where
+     * the elements list comes from) and the text rendering almost never, and
+     * while this flag was called `includeText` every backend rendered the whole
+     * desktop to prose on each of those reads and the caller threw it away.
+     * Rendering now belongs to `ComputerManager`, which knows whether anyone
+     * asked for it.
+     */
+    readonly includeTree?: boolean;
   }): Promise<ComputerState>;
   /**
    * Zoomed perception. `getState` downscales the whole multi-monitor workspace
@@ -352,5 +418,18 @@ export function computerBackendActionResult(
     ...(result?.clampedTo ? { clampedTo: result.clampedTo } : {}),
     ...(result?.windowId ? { windowId: result.windowId } : {}),
     ...(result?.value !== undefined ? { value: result.value } : {}),
+    // Both halves or neither: a path with no verdict cannot tell a caller
+    // whether the input landed, which is the only question this field answers.
+    // The path is clamped here rather than in each backend, because it is copied
+    // verbatim out of a helper reply and an over-long one would otherwise fail
+    // the encode of an action that already happened.
+    ...(result?.deliveryPath !== undefined && result.verified !== undefined
+      ? {
+          delivery: {
+            path: result.deliveryPath.slice(0, COMPUTER_DELIVERY_PATH_MAX_LENGTH),
+            verified: result.verified,
+          },
+        }
+      : {}),
   } as ComputerActionResult;
 }

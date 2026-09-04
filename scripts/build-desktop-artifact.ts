@@ -18,6 +18,7 @@ import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
 import {
   createDesktopPlatformBuildConfig,
   MAC_APPSNAP_HELPER_STAGE_PATH,
+  MAC_COMPUTER_HELPER_BUNDLE_PATH,
   MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH,
   MAC_COMPUTER_HELPER_STAGE_PATH,
   MAC_DEVICE_HELPER_RESOURCE_PATH,
@@ -285,8 +286,12 @@ const BuildEnvConfig = Config.all({
   mockUpdateServerPort: Config.string("SYNARA_DESKTOP_MOCK_UPDATE_SERVER_PORT").pipe(Config.option),
 });
 
+// A CLI boolean flag is `Some(false)` when it is absent, not `None`, so the
+// environment variable each flag documents would never be read if the flag's
+// value simply won the merge. Both switches only ever turn a behaviour on, so
+// either one asking for it is enough.
 const resolveBooleanFlag = (flag: Option.Option<boolean>, envValue: boolean) =>
-  Option.getOrElse(flag, () => envValue);
+  Option.getOrElse(flag, () => false) || envValue;
 const mergeOptions = <A>(a: Option.Option<A>, b: Option.Option<A>, defaultValue: A) =>
   Option.getOrElse(a, () => Option.getOrElse(b, () => defaultValue));
 const resolveBooleanEnv = (name: string, value: Option.Option<string>) =>
@@ -893,7 +898,11 @@ const assertPackagedMacApp = Effect.fn("assertPackagedMacApp")(function* (option
   readonly missingMessage: string;
   readonly check: (
     appDir: string,
-  ) => Effect.Effect<boolean, PlatformError.PlatformError, FileSystem.FileSystem | Path.Path>;
+  ) => Effect.Effect<
+    boolean,
+    PlatformError.PlatformError | BuildScriptError,
+    FileSystem.FileSystem | Path.Path
+  >;
 }) {
   const path = yield* Path.Path;
   const fs = yield* FileSystem.FileSystem;
@@ -930,9 +939,44 @@ const assertPackagedMacDeviceHelper = Effect.fn("assertPackagedMacDeviceHelper")
   });
 });
 
+/**
+ * Why the nested helper bundle's signature is unusable, or null when it is fine.
+ *
+ * The helper ships as an app bundle of its own because a bundle is the unit
+ * macOS signs and notarizes, and this one has to carry the app's Team ID and the
+ * hardened runtime or Gatekeeper refuses it on a user's machine. (Its TCC grants
+ * are a separate matter and are filed against Synara, not against this bundle.)
+ * Nothing in the packaging config makes the signing happen on purpose —
+ * `@electron/osx-sign`
+ * collects nested `.app` directories while walking the packaged `Contents/`, so
+ * a change to the staging path, the asar globs, or the sign step could quietly
+ * drop the helper from the walk. The build would still succeed, ship the ad-hoc
+ * signature `build-computer-helper.mjs` writes, and fail on a user's machine at
+ * notarization or first launch. This is what notices instead.
+ */
+function nestedMacBundleSignatureIssue(bundlePath: string): string | null {
+  const result = spawnSync("codesign", ["-dvvv", bundlePath], { encoding: "utf8" });
+  // codesign writes its description to stderr; stdout is joined in so a future
+  // version that moves it cannot make this silently pass.
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+  if (result.status !== 0) {
+    return `codesign could not read ${bundlePath}: ${output || `exit ${result.status ?? "unknown"}`}`;
+  }
+  const teamIdentifier = /^TeamIdentifier=(.+)$/m.exec(output)?.[1]?.trim();
+  if (!teamIdentifier || teamIdentifier === "not set") {
+    return `${bundlePath} carries no TeamIdentifier — it is still ad-hoc signed and will not notarize.\n${output}`;
+  }
+  const flags = /^CodeDirectory .*\bflags=0x[0-9a-f]+\(([^)]*)\)/m.exec(output)?.[1] ?? "";
+  if (!flags.split(",").includes("runtime")) {
+    return `${bundlePath} is signed without the hardened runtime.\n${output}`;
+  }
+  return null;
+}
+
 const assertPackagedMacComputerHelper = Effect.fn("assertPackagedMacComputerHelper")(function* (
   stageDistDir: string,
   productName: string,
+  signed: boolean,
 ) {
   yield* assertPackagedMacApp({
     stageDistDir,
@@ -943,7 +987,18 @@ const assertPackagedMacComputerHelper = Effect.fn("assertPackagedMacComputerHelp
     check: Effect.fn(function* (appDir: string) {
       const path = yield* Path.Path;
       const fs = yield* FileSystem.FileSystem;
-      return yield* fs.exists(path.join(appDir, MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH));
+      if (!(yield* fs.exists(path.join(appDir, MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH)))) {
+        return false;
+      }
+      // Only a signed build has a real identity to assert; an unsigned local
+      // build legitimately carries the ad-hoc signature.
+      if (signed) {
+        const issue = nestedMacBundleSignatureIssue(
+          path.join(appDir, MAC_COMPUTER_HELPER_BUNDLE_PATH),
+        );
+        if (issue) return yield* new BuildScriptError({ message: issue });
+      }
+      return true;
     }),
   });
 });
@@ -1232,6 +1287,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     yield* assertPackagedMacComputerHelper(
       stageDistDir,
       desktopPackageJson.productName ?? "Synara",
+      options.signed,
     );
   }
 

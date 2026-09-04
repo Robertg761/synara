@@ -1,15 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { ComputerUiNode } from "@synara/contracts";
+import { COMPUTER_DELIVERY_PATH_MAX_LENGTH, type ComputerUiNode } from "@synara/contracts";
 
 import { MacComputerBackend } from "./MacComputerBackend.ts";
 import {
+  computerBackendActionResult,
   ComputerBackendError,
   type ComputerResolvedTarget,
   type ComputerStreamFrame,
 } from "./ComputerBackend.ts";
 import { MacComputerHelperError, type MacHelperTransport } from "./macComputerHelperClient.ts";
-import type { ProcessRunResult } from "./macComputerHelperProvisioning.ts";
+import { MacHelperBuildError, type ProcessRunResult } from "./macComputerHelperProvisioning.ts";
 
 /** A 1×1 PNG, so `screenshotFromPng` sees real dimensions. */
 const PNG_1X1 =
@@ -17,7 +18,36 @@ const PNG_1X1 =
 /** A different picture of the same desktop, for the still-frame dedupe. */
 const PNG_2X1 =
   "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4z8AARAAI/gH/xp559wAAAABJRU5ErkJggg==";
-const GRANTED = { screenRecording: true, accessibility: true };
+/**
+ * The helper's `capabilities` reply, spelled the way the helper actually
+ * answers it. `protocolVersion` is not optional decoration: the backend refuses
+ * to run against a helper whose wire contract it does not recognize, so a
+ * fixture that omits it is a fixture of a stale binary.
+ */
+function capabilitiesResponse(
+  overrides: {
+    readonly screenRecording?: boolean;
+    readonly accessibility?: boolean;
+    readonly protocolVersion?: number;
+    readonly keyWindowRecord?: boolean;
+    readonly signature?: "adhoc" | "signed";
+  } = {},
+): Record<string, unknown> {
+  return {
+    screenRecording: overrides.screenRecording ?? true,
+    accessibility: overrides.accessibility ?? true,
+    protocolVersion: overrides.protocolVersion ?? 1,
+    signature: overrides.signature ?? "signed",
+    skylight: {
+      setWindowLocation: true,
+      focusWithoutRaise: true,
+      setFrontProcess: true,
+      keyWindowRecord: overrides.keyWindowRecord ?? true,
+    },
+  };
+}
+
+const GRANTED = capabilitiesResponse();
 
 type ResponseValue = unknown | ((params: Record<string, unknown>) => unknown);
 
@@ -42,7 +72,12 @@ class FakeMacHelper implements MacHelperTransport {
     if (typeof response === "function") {
       return (response as (p: Record<string, unknown>) => unknown)(params);
     }
-    if (response === undefined) return { ok: true };
+    // Every helper start reads capabilities, and the backend refuses a helper
+    // whose protocol it does not recognize — so the unconfigured answer has to
+    // be a well-formed one, or every test would be testing the refusal.
+    if (response === undefined) {
+      return method === "capabilities" ? capabilitiesResponse() : { ok: true };
+    }
     if (response instanceof Error) throw response;
     return response;
   }
@@ -65,18 +100,25 @@ const XCODE_PRESENT: ProcessRunResult = {
 function makeBackend(
   helper: FakeMacHelper,
   options: {
-    readonly run?: () => Promise<ProcessRunResult>;
+    readonly run?: (command: string, args: readonly string[]) => Promise<ProcessRunResult>;
     readonly stillIntervalMs?: number;
+    /** A moving clock, for the capability cache's TTL. Frozen at 0 by default. */
+    readonly now?: () => number;
   } = {},
 ): MacComputerBackend {
   return new MacComputerBackend({
     platform: "darwin",
-    now: () => 0,
+    now: options.now ?? (() => 0),
     resolveBinary: async () => "/fake/computer-helper",
     makeHelperClient: () => helper,
     run: options.run ?? (async () => XCODE_PRESENT),
     ...(options.stillIntervalMs === undefined ? {} : { stillIntervalMs: options.stillIntervalMs }),
   });
+}
+
+/** Lets a `void`-fired request (and the reset it runs first) finish. */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 /**
@@ -158,23 +200,30 @@ describe("MacComputerBackend", () => {
   });
 
   it("establishing availability reads the helper's TCC grants into health", async () => {
-    const helper = new FakeMacHelper({
-      capabilities: { screenRecording: true, accessibility: true },
-    });
+    const helper = new FakeMacHelper({ capabilities: capabilitiesResponse() });
     const backend = makeBackend(helper);
     expect(await backend.availability()).toEqual({ kind: "available", backend: "mac" });
     expect(backend.health().captureAvailable).toBe(true);
     expect(backend.health().status).toBe("connected");
   });
 
-  it("provision names the grants still missing after building the helper", async () => {
+  it("provision asks macOS for the grants still missing after building the helper", async () => {
     const helper = new FakeMacHelper({
-      capabilities: { screenRecording: false, accessibility: true },
+      capabilities: capabilitiesResponse({ screenRecording: false }),
+      "request-permissions": capabilitiesResponse({ screenRecording: false }),
     });
     const backend = makeBackend(helper);
     const summary = await backend.provision();
     expect(summary).toContain("Screen Recording");
     expect(summary).not.toContain("Accessibility ");
+    // Pressing Set up is the user asking for the dialog, so the OS is asked and
+    // the sentence says so rather than sending them to System Settings first.
+    expect(helper.callsFor("request-permissions")).toHaveLength(1);
+    expect(summary).toContain("asked macOS for");
+    // Nothing was compiled — the binary was handed over ready-made — so the
+    // sentence the user reads must not claim a build happened.
+    expect(summary).toContain("Started the bundled");
+    expect(summary).not.toContain("Built");
   });
 
   it("spawns the helper when the backend brings it up", async () => {
@@ -190,30 +239,424 @@ describe("MacComputerBackend", () => {
     expect(helper.running).toBe(true);
   });
 
-  it("refuses availability while Accessibility is denied", async () => {
+  it("reports a permission state, not a dead backend, while Accessibility is denied", async () => {
     const helper = new FakeMacHelper({
-      capabilities: { screenRecording: true, accessibility: false },
+      capabilities: capabilitiesResponse({ accessibility: false }),
     });
     const backend = makeBackend(helper);
 
     // Without Accessibility every click and keystroke is dropped by
     // WindowServer, so "available" would open a pane onto a desktop nothing
-    // could be done to.
-    await expect(backend.availability()).resolves.toEqual({
-      kind: "backend-unavailable",
+    // could be done to. It is not `backend-unavailable` either: that shape sent
+    // the agent a well-formed answer with an English explanation in it and no
+    // card, which is exactly the failure this kind exists to end.
+    const availability = await backend.availability();
+    expect(availability).toEqual({
+      kind: "permission-required",
+      missing: ["accessibility"],
       message: expect.stringContaining("Accessibility"),
+      buildSignature: "signed",
     });
+    expect(await backend.missingPermissions()).toEqual(["accessibility"]);
+  });
+
+  it("names both grants when both are missing, and says nothing about stale grants on a signed build", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ accessibility: false, screenRecording: false }),
+    });
+    const backend = makeBackend(helper);
+
+    const availability = await backend.availability();
+    expect(availability).toMatchObject({
+      kind: "permission-required",
+      // Both, so one trip to System Settings covers everything — Screen
+      // Recording alone would never block, but the user is standing there.
+      missing: ["accessibility", "screenRecording"],
+      buildSignature: "signed",
+    });
+    const message = availability.kind === "permission-required" ? availability.message : "";
+    expect(message).toContain("Screen Recording");
+    expect(message).not.toContain("tccutil");
+  });
+
+  it("explains a stale grant only on an ad-hoc build", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ accessibility: false, signature: "adhoc" }),
+    });
+    const backend = makeBackend(helper);
+
+    const availability = await backend.availability();
+    expect(availability).toMatchObject({ kind: "permission-required", buildSignature: "adhoc" });
+    const message = availability.kind === "permission-required" ? availability.message : "";
+    // The whole point: System Settings shows Synara switched on and the helper
+    // still reports nothing, because TCC pinned the grant to a cdhash that a
+    // rebuild replaced. The server clears that row itself now, so the user's
+    // part is the dialog and the command is only the fallback.
+    expect(message).toContain("allow the dialog when it appears");
+    expect(message).toContain("tccutil reset Accessibility com.emanueledipietro.synara");
+  });
+
+  it("keeps the desktop available when only Screen Recording is missing", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ screenRecording: false }),
+    });
+    const backend = makeBackend(helper);
+
+    // Driveable but blind is still worth having, so the feature is not withdrawn
+    // — the missing grant travels on `missingPermissions()` instead, which is
+    // what still raises the chat's setup card for it.
+    expect(await backend.availability()).toEqual({ kind: "available", backend: "mac" });
+    expect(backend.health().captureAvailable).toBe(false);
+    expect(await backend.missingPermissions()).toEqual(["screenRecording"]);
+  });
+
+  it("reports no missing permission before anything has probed", async () => {
+    const helper = new FakeMacHelper({ capabilities: GRANTED });
+    const backend = makeBackend(helper);
+
+    // "Nobody has looked" is not "the user owes us a grant": answering with a
+    // guess here would raise a setup card on a machine that is perfectly fine.
+    expect(await backend.missingPermissions()).toEqual([]);
+    await backend.availability();
+    expect(await backend.missingPermissions()).toEqual([]);
+  });
+
+  it("re-reads a probe that saw a gap, so a grant the user just gave is noticed", async () => {
+    // The live failure: the tool surface read this after every call, the user
+    // granted Screen Recording between two calls, and the cached "missing" kept
+    // the setup card and the model's refusal on screen over a desktop that had
+    // already started working.
+    let clock = 0;
+    let report = capabilitiesResponse({ screenRecording: false });
+    const helper = new FakeMacHelper({
+      capabilities: () => report,
+      "request-permissions": () => report,
+    });
+    const backend = makeBackend(helper, { now: () => clock });
+
+    await backend.availability();
+    expect(await backend.missingPermissions()).toEqual(["screenRecording"]);
+    const probes = helper.callsFor("capabilities").length;
+
+    report = capabilitiesResponse();
+    clock += 3_000;
+    expect(await backend.missingPermissions()).toEqual([]);
+    expect(helper.callsFor("capabilities")).toHaveLength(probes + 1);
+    // The fresh report is the authority on health in both directions.
+    expect(backend.health().captureAvailable).toBe(true);
+  });
+
+  it("re-reads within the TTL at most once, however many calls ask", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ screenRecording: false }),
+      "request-permissions": capabilitiesResponse({ screenRecording: false }),
+    });
+    const backend = makeBackend(helper);
+
+    await backend.availability();
+    const probes = helper.callsFor("capabilities").length;
+    for (let index = 0; index < 5; index += 1) {
+      expect(await backend.missingPermissions()).toEqual(["screenRecording"]);
+    }
+    // A burst of tool calls is a burst of reads; the TTL is what keeps it one
+    // round trip rather than one per action.
+    expect(helper.callsFor("capabilities")).toHaveLength(probes);
+  });
+
+  it("costs nothing at all once the last probe saw every grant in place", async () => {
+    let clock = 0;
+    const helper = new FakeMacHelper({ capabilities: GRANTED });
+    const backend = makeBackend(helper, { now: () => clock });
+
+    await backend.availability();
+    const probes = helper.callsFor("capabilities").length;
+    // Nothing missing is the overwhelmingly common case, and it must stay free
+    // even long after the TTL: a revoked grant surfaces through the failure it
+    // causes and through `availability()`, not by polling TCC per tool call.
+    clock += 60_000;
+    for (let index = 0; index < 5; index += 1) {
+      expect(await backend.missingPermissions()).toEqual([]);
+    }
+    expect(helper.callsFor("capabilities")).toHaveLength(probes);
+  });
+
+  it("does not report a permission state from an availability probe older than the TTL", async () => {
+    let clock = 0;
+    let report = capabilitiesResponse({ accessibility: false });
+    const helper = new FakeMacHelper({
+      capabilities: () => report,
+      "request-permissions": () => report,
+    });
+    const backend = makeBackend(helper, { now: () => clock });
+
+    expect((await backend.availability()).kind).toBe("permission-required");
+    report = capabilitiesResponse();
+    clock += 3_000;
+    expect(await backend.availability()).toEqual({ kind: "available", backend: "mac" });
+  });
+
+  it("asks macOS for the grant the moment an agent path finds it missing", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ accessibility: false }),
+      "request-permissions": capabilitiesResponse({ accessibility: false }),
+    });
+    const backend = makeBackend(helper);
+
+    // The whole point of the feature: nothing in the agent's path used to ask
+    // the OS at all, so the user was told they needed a permission and never
+    // shown the dialog that grants it. The ask is fired, not awaited — the
+    // answer is a human at a dialog — so the test waits for the send instead.
+    await backend.availability();
+    await settle();
+    expect(helper.callsFor("request-permissions")).toHaveLength(1);
+  });
+
+  it("asks once per grant per helper process, however many calls read it", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ screenRecording: false }),
+      "request-permissions": capabilitiesResponse({ screenRecording: false }),
+    });
+    const backend = makeBackend(helper);
+
+    await backend.availability();
+    // `missingPermissions()` is consulted by the tool surface on every single
+    // computer call, and the Accessibility dialog reappears on every request —
+    // so without the throttle this is a dialog per agent action.
+    for (let index = 0; index < 5; index += 1) {
+      expect(await backend.missingPermissions()).toEqual(["screenRecording"]);
+    }
+    await backend.availability();
+    await settle();
+    expect(helper.callsFor("request-permissions")).toHaveLength(1);
+  });
+
+  it("asks again on a fresh helper process, which gets its own answer from macOS", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ accessibility: false }),
+      "request-permissions": capabilitiesResponse({ accessibility: false }),
+      "list-windows": new MacComputerHelperError("helper_exited", "computer helper exited"),
+    });
+    const backend = makeBackend(helper);
+
+    await backend.availability();
+    await settle();
+    expect(helper.callsFor("request-permissions")).toHaveLength(1);
+    // The helper dying drops every per-process fact with it, the spent prompt
+    // included: macOS decides the question again for the next process.
+    await expect(backend.listWindows()).rejects.toBeInstanceOf(ComputerBackendError);
+    await backend.availability();
+    await settle();
+    expect(helper.callsFor("request-permissions")).toHaveLength(2);
+  });
+
+  it("asks after a live refusal even when the last probe said both grants were present", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: GRANTED,
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      capture: new MacComputerHelperError("helper_-32000", "Screen Recording is not granted"),
+      "request-permissions": capabilitiesResponse({ screenRecording: false }),
+    });
+    const backend = makeBackend(helper);
+    await backend.availability();
+
+    await expect(
+      backend.captureScreenshot({ kind: "region", region: { x: 0, y: 0, width: 10, height: 10 } }),
+    ).rejects.toBeInstanceOf(ComputerBackendError);
+
+    // A refusal is proof the probe is wrong, and the helper only ever prompts
+    // for a grant it genuinely lacks — so both are offered and macOS decides.
+    await settle();
+    expect(helper.callsFor("request-permissions")).toHaveLength(1);
+  });
+
+  it("re-arms the ask when the user presses Set up", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ accessibility: false }),
+      "request-permissions": capabilitiesResponse({ accessibility: false }),
+    });
+    const backend = makeBackend(helper);
+
+    await backend.availability();
+    await settle();
+    expect(helper.callsFor("request-permissions")).toHaveLength(1);
+    // Dismissing the dialog leaves nothing on screen, so the button that says
+    // "Set up" has to be able to put it back.
+    await backend.provision();
+    expect(helper.callsFor("request-permissions")).toHaveLength(2);
+  });
+
+  /**
+   * A backend whose subprocess runner and helper share one timeline, so a test
+   * can assert that the stale TCC row is cleared *before* macOS is asked — the
+   * whole point of the reset, since a request made while the row stands is
+   * answered from the decision filed against the previous binary.
+   */
+  function makeAdhocBackend(
+    options: {
+      readonly missing?: { accessibility?: boolean; screenRecording?: boolean };
+      readonly signature?: "adhoc" | "signed";
+      readonly resetExit?: number;
+    } = {},
+  ) {
+    const report = capabilitiesResponse({
+      accessibility: options.missing?.accessibility !== true,
+      screenRecording: options.missing?.screenRecording !== true,
+      signature: options.signature ?? "adhoc",
+    });
+    const timeline: string[] = [];
+    const helper = new FakeMacHelper({
+      capabilities: report,
+      "request-permissions": () => {
+        timeline.push("request-permissions");
+        return report;
+      },
+    });
+    const backend = makeBackend(helper, {
+      run: async (command, args) => {
+        timeline.push([command, ...args].join(" "));
+        return { code: options.resetExit ?? 0, stdout: "", stderr: "" };
+      },
+    });
+    return { backend, helper, timeline };
+  }
+
+  it("clears the app's own stale TCC row before asking, on an ad-hoc build", async () => {
+    const { backend, timeline } = makeAdhocBackend({ missing: { screenRecording: true } });
+
+    await backend.provision();
+
+    // On an ad-hoc build a missing grant is either absent or pinned to a cdhash
+    // a rebuild replaced, and in the second case macOS answers the request from
+    // that dead decision without ever showing a dialog. Removing Synara's own
+    // row is the only thing that makes it prompt again.
+    expect(timeline).toEqual([
+      "tccutil reset ScreenCapture com.emanueledipietro.synara",
+      "request-permissions",
+    ]);
+  });
+
+  it("resets only the grants that are actually missing", async () => {
+    const { backend, timeline } = makeAdhocBackend({ missing: { accessibility: true } });
+
+    await backend.provision();
+
+    // `ScreenCapture` is granted here; throwing that row away would take a
+    // working permission off the user to re-ask for something else.
+    expect(timeline).toEqual([
+      "tccutil reset Accessibility com.emanueledipietro.synara",
+      "request-permissions",
+    ]);
+  });
+
+  it("never touches TCC on a signed build", async () => {
+    const { backend, timeline } = makeAdhocBackend({
+      missing: { accessibility: true },
+      signature: "signed",
+    });
+
+    await backend.provision();
+
+    // A Developer ID grant keys on identifier plus team and survives rebuilds,
+    // so a missing one is simply not granted — discarding a release user's real
+    // permission would be vandalism, not self-healing.
+    expect(timeline).toEqual(["request-permissions"]);
+  });
+
+  it("asks macOS anyway when the reset fails", async () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const { backend, timeline } = makeAdhocBackend({
+      missing: { accessibility: true },
+      resetExit: 1,
+    });
+
+    await backend.provision();
+
+    // The reset is a repair attempt, not a precondition: the grant may simply
+    // never have been given, in which case there is no row and the dialog is
+    // still worth raising.
+    expect(timeline).toEqual([
+      "tccutil reset Accessibility com.emanueledipietro.synara",
+      "request-permissions",
+    ]);
+    debug.mockRestore();
+  });
+
+  it("clears the stale row on the agent path too, not only from Set up", async () => {
+    const { backend, timeline } = makeAdhocBackend({ missing: { accessibility: true } });
+
+    // The agent path fires the request without waiting for the dialog, so the
+    // reset has to be part of that same sequence rather than a Set-up extra.
+    await backend.availability();
+    await settle();
+
+    expect(timeline).toEqual([
+      "tccutil reset Accessibility com.emanueledipietro.synara",
+      "request-permissions",
+    ]);
+  });
+
+  it("resets nothing when a live refusal contradicts a probe that saw both grants", async () => {
+    const timeline: string[] = [];
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ signature: "adhoc" }),
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      capture: new MacComputerHelperError("helper_-32000", "Screen Recording is not granted"),
+      "request-permissions": () => {
+        timeline.push("request-permissions");
+        return capabilitiesResponse({ signature: "adhoc" });
+      },
+    });
+    const backend = makeBackend(helper, {
+      run: async (command, args) => {
+        timeline.push([command, ...args].join(" "));
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await backend.availability();
+
+    await expect(
+      backend.captureScreenshot({ kind: "region", region: { x: 0, y: 0, width: 10, height: 10 } }),
+    ).rejects.toBeInstanceOf(ComputerBackendError);
+    await settle();
+
+    // A refusal with nothing named offers macOS both grants, and both are
+    // reported granted here — so there is no stale row to blame, and wiping the
+    // developer's working permissions to re-ask for them would be pure damage.
+    expect(timeline).toEqual(["request-permissions"]);
+  });
+
+  it("restarts the helper before a forced probe so a fresh grant is observed", async () => {
+    let report = capabilitiesResponse({ screenRecording: false });
+    const helper = new FakeMacHelper({
+      capabilities: () => report,
+      "request-permissions": () => report,
+    });
+    const backend = makeBackend(helper);
+
+    await backend.availability();
+    expect(await backend.missingPermissions()).toEqual(["screenRecording"]);
+
+    // macOS answers a TCC question once per process, so the running helper would
+    // keep reporting the refusal it was told at launch — which is exactly what
+    // made "grant it, then press Set up" report failure forever.
+    report = capabilitiesResponse();
+    const summary = await backend.provision();
+
+    expect(helper.startCount).toBe(2);
+    expect(await backend.missingPermissions()).toEqual([]);
+    expect(summary).toContain("are granted");
+    expect(backend.health().captureAvailable).toBe(true);
   });
 
   it("suppresses screenshots and stream frames until capture is granted", async () => {
     const helper = new FakeMacHelper({
-      capabilities: { screenRecording: false, accessibility: true },
+      capabilities: capabilitiesResponse({ screenRecording: false }),
       "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
     });
     const backend = makeBackend(helper);
     await backend.availability();
 
-    const state = await backend.getState({ includeScreenshot: true, includeText: false });
+    const state = await backend.getState({ includeScreenshot: true, includeTree: false });
     expect(state.screenshot).toBeUndefined();
     // No capture is even attempted: the grant is known to be missing.
     expect(helper.callsFor("capture")).toEqual([]);
@@ -238,7 +681,7 @@ describe("MacComputerBackend", () => {
 
     // The refusal is the live answer about the grant, so a later state read must
     // not try again and must not claim a screenshot it cannot take.
-    const state = await backend.getState({ includeScreenshot: true, includeText: false });
+    const state = await backend.getState({ includeScreenshot: true, includeTree: false });
     expect(state.screenshot).toBeUndefined();
   });
 
@@ -319,6 +762,254 @@ describe("MacComputerBackend", () => {
     expect(helper.callsFor("hotkey")[0]).toEqual({ keys: ["cmd", "v"] });
   });
 
+  it("reports an unconfirmed keystroke delivery all the way to the wire result", async () => {
+    const helper = new FakeMacHelper({
+      type: { ok: true, path: "keystrokes", verified: "unconfirmed" },
+    });
+    const backend = makeBackend(helper);
+    const result = await backend.typeText("hello");
+
+    // The backend keeps both halves...
+    expect(result).toMatchObject({
+      value: "hello",
+      deliveryPath: "keystrokes",
+      verified: "unconfirmed",
+    });
+    // ...and the projection puts them on the result the agent actually reads,
+    // which is the whole point: a call that says `ok` while nothing landed used
+    // to be indistinguishable from one that worked.
+    expect(computerBackendActionResult("mac", "computer_type_text", result).delivery).toEqual({
+      path: "keystrokes",
+      verified: "unconfirmed",
+    });
+  });
+
+  it("carries an unverifiable verdict through as its own answer, not as a failure", async () => {
+    // Most native controls expose no readable value, so this is the ordinary
+    // outcome — collapsing it into "not confirmed" would buy a screenshot after
+    // every keystroke for nothing.
+    const helper = new FakeMacHelper({
+      "press-key": { ok: true, path: "ax-insert", verified: "unverifiable" },
+      hotkey: { ok: true, path: "foreground-keys", verified: "confirmed" },
+    });
+    const backend = makeBackend(helper);
+
+    expect(
+      computerBackendActionResult("mac", "computer_press_key", await backend.pressKey("tab")),
+    ).toMatchObject({ delivery: { path: "ax-insert", verified: "unverifiable" } });
+    expect(
+      computerBackendActionResult("mac", "computer_hotkey", await backend.hotkey(["cmd", "v"])),
+    ).toMatchObject({ delivery: { path: "foreground-keys", verified: "confirmed" } });
+  });
+
+  it("drops a verdict this build does not recognize rather than failing the action", async () => {
+    // The action already happened; a `delivery` the contract cannot encode
+    // would fail the whole result of it.
+    const helper = new FakeMacHelper({
+      type: { ok: true, path: "keystrokes", verified: "probably" },
+    });
+    const backend = makeBackend(helper);
+    const result = await backend.typeText("hello");
+    expect(result).toMatchObject({ value: "hello", deliveryPath: "keystrokes" });
+    expect(result).not.toHaveProperty("verified");
+    expect(computerBackendActionResult("mac", "computer_type_text", result)).not.toHaveProperty(
+      "delivery",
+    );
+  });
+
+  it("surfaces the delivery a pointer action rode, alongside the point it landed on", async () => {
+    const helper = new FakeMacHelper({
+      click: (params: Record<string, unknown>) => ({
+        x: params.x,
+        y: params.y,
+        path: "window-post",
+        verified: "unverifiable",
+      }),
+      scroll: { ok: true, path: "window-post", verified: "confirmed" },
+      drag: { ok: true, path: "foreground", verified: "unconfirmed" },
+    });
+    const backend = makeBackend(helper);
+
+    expect(await backend.click({ x: 10, y: 20 })).toEqual({
+      point: { x: 10, y: 20 },
+      deliveryPath: "window-post",
+      verified: "unverifiable",
+    });
+    expect(await backend.scroll({ x: 5, y: 5 }, 0, 100)).toEqual({
+      point: { x: 5, y: 5 },
+      deliveryPath: "window-post",
+      verified: "confirmed",
+    });
+    expect(await backend.drag({ x: 0, y: 0 }, { x: 9, y: 9 }, 100)).toEqual({
+      point: { x: 9, y: 9 },
+      deliveryPath: "foreground",
+      verified: "unconfirmed",
+    });
+  });
+
+  it("clamps an over-long delivery path instead of failing the encode", async () => {
+    const helper = new FakeMacHelper({
+      type: { ok: true, path: "x".repeat(200), verified: "confirmed" },
+    });
+    const backend = makeBackend(helper);
+    const result = computerBackendActionResult(
+      "mac",
+      "computer_type_text",
+      await backend.typeText("hello"),
+    );
+    expect(result.delivery?.path).toHaveLength(COMPUTER_DELIVERY_PATH_MAX_LENGTH);
+  });
+
+  it("leaves delivery off a result the helper reported nothing about", async () => {
+    const helper = new FakeMacHelper();
+    const backend = makeBackend(helper);
+    const result = await backend.typeText("hello");
+    expect(result).not.toHaveProperty("deliveryPath");
+    expect(computerBackendActionResult("mac", "computer_type_text", result)).not.toHaveProperty(
+      "delivery",
+    );
+  });
+
+  it("delivers to a named window without restacking it, and focuses by id", async () => {
+    const helper = new FakeMacHelper();
+    const backend = makeBackend(helper);
+    // The manager reads this to skip the raise and the occlusion refusal, which
+    // is what stops every click stealing the human's frontmost application.
+    expect(backend.deliversToNamedWindowRegardlessOfStacking).toBe(true);
+    await backend.focusWindow("5");
+    expect(helper.callsFor("focus-window")).toEqual([{ windowId: "5" }]);
+    // The raise it would otherwise pair with is unreachable on this backend and
+    // no longer exists, so nothing must send one.
+    expect(helper.callsFor("raise-window")).toEqual([]);
+  });
+
+  it("marks a withheld TCC grant as setup-required, and other refusals as not", async () => {
+    const helper = new FakeMacHelper({
+      "press-key": new MacComputerHelperError("helper_-32000", "Accessibility is not granted"),
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+    });
+    const backend = makeBackend(helper);
+    const denied = await backend.pressKey("enter").catch((value: unknown) => value);
+    expect(denied).toBeInstanceOf(ComputerBackendError);
+    // The chat's "needs setup" card is raised off exactly this flag, so only a
+    // grant the user can give may carry it.
+    expect((denied as ComputerBackendError).setupRequired).toBe(true);
+
+    const notDelivered = makeBackend(
+      new FakeMacHelper({
+        "press-key": new MacComputerHelperError("helper_-32002", "nothing accepted the key"),
+      }),
+    );
+    const refused = await notDelivered.pressKey("enter").catch((value: unknown) => value);
+    expect((refused as ComputerBackendError).setupRequired).toBe(false);
+  });
+
+  it("turns a non-delivery into a refusal that names the call, not a generic fault", async () => {
+    const helper = new FakeMacHelper({
+      "press-key": new MacComputerHelperError("helper_-32002", "no delivery path accepted the key"),
+    });
+    const backend = makeBackend(helper);
+    const error = await backend.pressKey("enter").catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(ComputerBackendError);
+    // `ComputerManager.injectScoped` keys off this to say "refused, nothing
+    // injected" rather than leaving the caller to assume the control is broken.
+    expect((error as ComputerBackendError).rejectedOperation).toBe("press-key");
+  });
+
+  it("turns a missing target into the window-not-found answer the manager already speaks", async () => {
+    const helper = new FakeMacHelper({
+      capture: new MacComputerHelperError("helper_-32001", "window 5 is minimized"),
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+    });
+    const backend = makeBackend(helper);
+    await expect(backend.captureScreenshot({ kind: "window", windowId: "5" })).rejects.toThrow(
+      'No desktop window has id "5"',
+    );
+  });
+
+  it("explains an unaimed keyboard action instead of naming a window id nobody gave", async () => {
+    // The helper has no frontmost fallback on purpose — it used to type the
+    // agent's text into the human's own document — so this refusal is normal
+    // and needs an answer the model can act on, not a retry.
+    const helper = new FakeMacHelper({
+      type: new MacComputerHelperError(
+        "helper_-32001",
+        "no window is aimed for keyboard input; click, focus, or raise a window first",
+      ),
+    });
+    const backend = makeBackend(helper);
+    const error = await backend.typeText("hello").catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(ComputerBackendError);
+    const failure = error as ComputerBackendError;
+    expect(failure.message).toContain("No window is aimed for keyboard input");
+    expect(failure.message).toContain("pass its window_id");
+    // The generic window-not-found answer would name an id the caller never
+    // supplied, and retrying is guaranteed to refuse again.
+    expect(failure.message).not.toContain("No desktop window has id");
+    expect(failure.retryable).toBe(false);
+    expect(failure.rejectedOperation).toBe("type");
+  });
+
+  it("explains an argument the helper cannot act on instead of reporting a fault", async () => {
+    const helper = new FakeMacHelper({
+      hotkey: new MacComputerHelperError("helper_-32602", "unknown modifier: hyper"),
+    });
+    const backend = makeBackend(helper);
+    await expect(backend.hotkey(["hyper", "v"])).rejects.toThrow(
+      /rejected the arguments to hotkey: unknown modifier: hyper/,
+    );
+  });
+
+  it("refuses a helper whose wire protocol this build does not speak", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ protocolVersion: 2 }),
+    });
+    const backend = makeBackend(helper);
+    // A stale cached development build answering today's calls with yesterday's
+    // shapes fails as unexplainable desktop misbehaviour; saying so is cheaper.
+    await expect(backend.availability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("protocol 2"),
+    });
+    expect(helper.running).toBe(false);
+  });
+
+  it("reports degraded background input when the helper lost its key-window symbol", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ keyWindowRecord: false }),
+    });
+    const backend = makeBackend(helper);
+    await backend.availability();
+    // The user sees windows jumping to the front; without this the settings
+    // panel has nothing to explain that with.
+    expect(backend.health().backgroundInputDegraded).toBe(true);
+  });
+
+  it("reads the helper's capability probe once per burst of actions", async () => {
+    const helper = new FakeMacHelper({ capabilities: GRANTED });
+    const backend = makeBackend(helper);
+    await backend.availability();
+    const afterStart = helper.callsFor("capabilities").length;
+    // A publish follows every action and asks availability again; on macOS each
+    // of those was a helper round trip to re-read state that changes at human
+    // speed.
+    await backend.availability();
+    await backend.availability();
+    expect(helper.callsFor("capabilities")).toHaveLength(afterStart);
+  });
+
+  it("reports the helper's real backing-store scale rather than assuming 1", async () => {
+    const helper = new FakeMacHelper({
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      "screen-size": { x: 0, y: 0, width: 1440, height: 900, scale: 2 },
+    });
+    const backend = makeBackend(helper);
+    expect((await backend.getScreenSize()).scale).toBe(2);
+    // A Retina desktop reporting scale 1 tells every consumer the screenshot is
+    // pixel-for-pixel with the desktop, which it is not.
+    expect((await backend.getState({ includeTree: false })).screenSize.scale).toBe(2);
+  });
+
   it("round-trips the shared system clipboard through the helper", async () => {
     const helper = new FakeMacHelper({ "read-clipboard": { text: "copied" } });
     const backend = makeBackend(helper);
@@ -366,7 +1057,7 @@ describe("MacComputerBackend", () => {
     });
     const backend = makeBackend(helper);
     await backend.availability();
-    const state = await backend.getState({ includeScreenshot: true, includeText: true });
+    const state = await backend.getState({ includeScreenshot: true, includeTree: true });
     expect(issued).toHaveLength(2);
     // Both were in flight at once, not merely both eventually issued.
     expect(firstCompletionSawBoth).toBe(true);
@@ -383,7 +1074,7 @@ describe("MacComputerBackend", () => {
     });
     const backend = makeBackend(helper);
     await backend.availability();
-    const state = await backend.getState({ includeScreenshot: true, includeText: true });
+    const state = await backend.getState({ includeScreenshot: true, includeTree: true });
     expect(state.root).toBeUndefined();
     expect(state.windows).toHaveLength(1);
     expect(state.screenshot?.mimeType).toBe("image/png");
@@ -433,7 +1124,7 @@ describe("MacComputerBackend", () => {
   it("drops capture health when a capture is refused for a missing grant", async () => {
     let granted = true;
     const helper = new FakeMacHelper({
-      capabilities: () => ({ screenRecording: granted, accessibility: true }),
+      capabilities: () => capabilitiesResponse({ screenRecording: granted }),
       "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
       capture: () => {
         if (!granted) {
@@ -467,6 +1158,84 @@ describe("MacComputerBackend", () => {
     granted = true;
     await backend.availability();
     expect(backend.health().captureAvailable).toBe(true);
+  });
+
+  it("counts the capture path the helper actually used", async () => {
+    // The helper names the link that served each capture so the fallback rate is
+    // a metric; without a count on this side that claim was simply untrue.
+    const sources = ["screencapturekit", "screencapture-cli", "screencapturekit"];
+    let index = 0;
+    const helper = new FakeMacHelper({
+      capabilities: GRANTED,
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      capture: () => ({ base64: PNG_1X1, source: sources[index++] }),
+    });
+    const backend = makeBackend(helper);
+    await backend.availability();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await backend.captureScreenshot({
+        kind: "region",
+        region: { x: 0, y: 0, width: 10, height: 10 },
+      });
+    }
+    expect(backend.captureSourceCounts()).toEqual(
+      new Map([
+        ["screencapturekit", 2],
+        ["screencapture-cli", 1],
+      ]),
+    );
+  });
+
+  it("retries a build the toolchain failed once, rather than staying dead for the process", async () => {
+    let clock = 0;
+    let builds = 0;
+    const helper = new FakeMacHelper({ capabilities: GRANTED });
+    const backend = new MacComputerBackend({
+      platform: "darwin",
+      now: () => clock,
+      makeHelperClient: () => helper,
+      run: async () => XCODE_PRESENT,
+      resolveBinary: async () => {
+        builds += 1;
+        if (builds === 1) throw new MacHelperBuildError("Computer helper build failed: disk full");
+        return "/fake/computer-helper";
+      },
+    });
+
+    await expect(backend.availability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+    });
+    // Remembering the failure is what stops every action paying for a doomed
+    // five-minute compile...
+    expect(await backend.probeAvailability()).toMatchObject({ kind: "backend-unavailable" });
+
+    // ...but a transient failure must not disable desktop control for the life
+    // of the process, so the memory ages out.
+    clock = 120_000;
+    expect(await backend.probeAvailability()).toEqual({ kind: "available", backend: "mac" });
+    await backend.dispose();
+  });
+
+  it("clears a remembered build failure when the user explicitly provisions", async () => {
+    let builds = 0;
+    const helper = new FakeMacHelper({ capabilities: GRANTED });
+    const backend = new MacComputerBackend({
+      platform: "darwin",
+      now: () => 0,
+      makeHelperClient: () => helper,
+      run: async () => XCODE_PRESENT,
+      resolveBinary: async () => {
+        builds += 1;
+        if (builds === 1) throw new MacHelperBuildError("Computer helper build failed: disk full");
+        return "/fake/computer-helper";
+      },
+    });
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "backend-unavailable" });
+
+    // Pressing "Set up" is the user asking for another attempt; short-circuiting
+    // it on the remembered failure made the button do nothing at all.
+    await expect(backend.provision()).resolves.toContain("Started the bundled");
+    await backend.dispose();
   });
 
   it("turns a helper exit into a retryable error and drops the connection", async () => {

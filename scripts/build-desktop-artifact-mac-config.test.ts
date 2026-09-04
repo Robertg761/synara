@@ -9,6 +9,9 @@ import {
   MAC_COMPUTER_HELPER_ASAR_EXCLUSION,
   MAC_COMPUTER_HELPER_BUNDLE_PATH,
   MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH,
+  MAC_COMPUTER_HELPER_SOURCES_ASAR_EXCLUSION,
+  MAC_COMPUTER_HELPER_SOURCES_RESOURCE_PATH,
+  MAC_COMPUTER_HELPER_SOURCES_STAGE_PATH,
   MAC_COMPUTER_HELPER_STAGE_PATH,
   MAC_DEVICE_HELPER_RESOURCE_PATH,
   MAC_DEVICE_HELPER_STAGE_PATH,
@@ -22,10 +25,25 @@ import {
   WINDOWS_INSTALLER_GUID,
 } from "./lib/desktop-platform-build-config.ts";
 import {
+  COMPUTER_HELPER_BUNDLE_IDENTIFIER,
   COMPUTER_HELPER_BUNDLE_NAME,
   COMPUTER_HELPER_PACKAGED_EXECUTABLE_PATH,
 } from "@synara/shared/computerHelperPaths";
+import { SYNARA_PRODUCTION_BUNDLE_ID } from "@synara/shared/desktopIdentity";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+
+/** The desktop's plain-`node` helper build script, which ships no types. */
+async function loadComputerHelperBuildScript(): Promise<{
+  readonly computerHelperBundleIdentifier: string;
+}> {
+  const specifier = pathToFileURL(
+    join(import.meta.dirname, "../apps/desktop/scripts/build-computer-helper.mjs"),
+  ).href;
+  return (await import(specifier)) as { readonly computerHelperBundleIdentifier: string };
+}
 
 describe("createDesktopPlatformBuildConfig", () => {
   it("adds explicit microphone entitlements to macOS builds", () => {
@@ -59,9 +77,12 @@ describe("createDesktopPlatformBuildConfig", () => {
       MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH,
       COMPUTER_HELPER_PACKAGED_EXECUTABLE_PATH,
     );
+    // The signable unit for the computer-use helper is its `.app`, because that
+    // is the identity macOS files its Screen Recording and Accessibility grants
+    // under. The AppSnap helper is a bare executable and stays one.
     assert.deepStrictEqual(mac.binaries, [
       MAC_APPSNAP_HELPER_BUNDLE_PATH,
-      MAC_COMPUTER_HELPER_EXECUTABLE_BUNDLE_PATH,
+      MAC_COMPUTER_HELPER_BUNDLE_PATH,
     ]);
     // @electron/universal takes one glob; both helper paths must survive into it.
     assert.equal(mac.x64ArchFiles, MAC_HELPER_X64_ARCH_FILES);
@@ -81,10 +102,20 @@ describe("createDesktopPlatformBuildConfig", () => {
       MAC_COMPUTER_HELPER_STAGE_PATH,
       `apps/desktop/native/computer-use/build/${COMPUTER_HELPER_BUNDLE_NAME}`,
     );
+    // The helper's Swift sources are staged beside the app, never into the
+    // asar: a compiler cannot read an archive, so a source dir inside it makes
+    // the server's fallback fail rather than decline.
+    assert.equal(MAC_COMPUTER_HELPER_SOURCES_STAGE_PATH, "apps/server/dist/computer-use-macos");
+    assert.equal(MAC_COMPUTER_HELPER_SOURCES_RESOURCE_PATH, "Resources/computer-use-macos");
+    assert.equal(
+      MAC_COMPUTER_HELPER_SOURCES_ASAR_EXCLUSION,
+      "!apps/server/dist/computer-use-macos/**",
+    );
     assert.deepStrictEqual(config.files, [
       "**/*",
       MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
       MAC_COMPUTER_HELPER_ASAR_EXCLUSION,
+      MAC_COMPUTER_HELPER_SOURCES_ASAR_EXCLUSION,
     ]);
     assert.deepStrictEqual(config.extraFiles, [
       {
@@ -94,6 +125,10 @@ describe("createDesktopPlatformBuildConfig", () => {
       {
         from: MAC_COMPUTER_HELPER_STAGE_PATH,
         to: `Helpers/${COMPUTER_HELPER_BUNDLE_NAME}`,
+      },
+      {
+        from: MAC_COMPUTER_HELPER_SOURCES_STAGE_PATH,
+        to: MAC_COMPUTER_HELPER_SOURCES_RESOURCE_PATH,
       },
       {
         from: MAC_DEVICE_HELPER_STAGE_PATH,
@@ -226,6 +261,34 @@ describe("createDesktopPlatformBuildConfig", () => {
       hostArch: "arm64",
     });
     assert.ok(issue?.includes("Build mac/arm64 on macOS"));
+  });
+
+  it("derives the computer-use helper's bundle identifier from the app's own", async () => {
+    // One source. The helper's TCC grants live under this identifier, and the
+    // packaging config, the Node build script and the Swift helper each used to
+    // spell a piece of it out by hand.
+    assert.equal(
+      COMPUTER_HELPER_BUNDLE_IDENTIFIER,
+      `${SYNARA_PRODUCTION_BUNDLE_ID}.computer-use-helper`,
+    );
+    // `build-computer-helper.mjs` writes the helper's Info.plist under plain
+    // `node` and cannot import the TypeScript constant, so it re-derives the
+    // identifier. The two derivations must agree.
+    const { computerHelperBundleIdentifier } = await loadComputerHelperBuildScript();
+    assert.equal(computerHelperBundleIdentifier, COMPUTER_HELPER_BUNDLE_IDENTIFIER);
+  });
+
+  it("keeps the Swift helper's self-recognition guard on Synara's real bundle ID", () => {
+    // Windows.swift refuses to drive any window owned by Synara itself by
+    // matching this prefix. A rebrand that moved SYNARA_PRODUCTION_BUNDLE_ID
+    // without it would leave the agent able to click on Synara's own UI, so the
+    // Swift literal is pinned here rather than trusted to stay in step.
+    const windowsSwift = readFileSync(
+      join(import.meta.dirname, "../apps/server/native/computer-use-macos/Sources/Windows.swift"),
+      "utf8",
+    );
+    const hostBundlePrefix = /hostBundlePrefix\s*=\s*"([^"]+)"/.exec(windowsSwift)?.[1];
+    assert.equal(hostBundlePrefix, SYNARA_PRODUCTION_BUNDLE_ID);
   });
 
   it("keeps separate macOS sources for solid and rounded icons", () => {

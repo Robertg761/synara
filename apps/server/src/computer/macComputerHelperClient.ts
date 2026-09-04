@@ -26,6 +26,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import {
   JsonRpcStdioFramer,
+  type JsonRpcPendingRequest,
   JsonRpcStdioRequestRegistry,
   JsonRpcStdioTransportError,
   JsonRpcStdioWriter,
@@ -33,8 +34,14 @@ import {
 
 /** The methods the Swift helper serves. Kept in one place so the backend and its tests agree. */
 export const MAC_HELPER_METHODS = {
-  ping: "ping",
   capabilities: "capabilities",
+  /**
+   * Asks macOS for the TCC grants this helper is missing and answers with the
+   * same report `capabilities` does. The prompt is attributed to the responsible
+   * process — the Synara app — so this is how a missing grant is asked for at
+   * the moment an agent needs it, rather than only from a settings button.
+   */
+  requestPermissions: "request-permissions",
   listWindows: "list-windows",
   screenSize: "screen-size",
   describeUi: "describe-ui",
@@ -52,7 +59,6 @@ export const MAC_HELPER_METHODS = {
   setValue: "set-value",
   performAction: "perform-action",
   focusWindow: "focus-window",
-  raiseWindow: "raise-window",
   readClipboard: "read-clipboard",
   writeClipboard: "write-clipboard",
   setAgentCursor: "set-agent-cursor",
@@ -68,8 +74,8 @@ const REQUEST_TIMEOUT_MS = 15_000;
  * costs a third on top of the PNG, which the margin here accounts for.
  */
 const MAX_CONTROL_LINE_BYTES = 24 * 1024 * 1024;
-/** How long a helper gets to exit on its own before SIGKILL. */
-const HELPER_SHUTDOWN_GRACE_MS = 2_000;
+/** How long a helper gets to exit on its own before SIGKILL. Exported so a test can advance exactly this far. */
+export const HELPER_SHUTDOWN_GRACE_MS = 2_000;
 
 export class MacComputerHelperError extends Error {
   readonly code: string;
@@ -105,6 +111,14 @@ export interface MacComputerHelperClientOptions {
   readonly requestTimeoutMs?: number;
   readonly onExit?: (reason: string) => void;
   /**
+   * Where a transport-level diagnostic goes. A dropped stdout line is invisible
+   * to callers — the helper is still running and the next request still works —
+   * so without a sink the only symptom is a request that mysteriously times out
+   * fifteen seconds later. Injected so a test can assert on what was reported;
+   * production passes nothing and the message reaches the server log.
+   */
+  readonly onDiagnostic?: (message: string) => void;
+  /**
    * Spawns the child. Injected so a test can stand in a fake process without a
    * real binary on disk; production passes nothing and gets `child_process.spawn`.
    */
@@ -113,6 +127,13 @@ export interface MacComputerHelperClientOptions {
     args: readonly string[],
     env: NodeJS.ProcessEnv,
   ) => ChildProcessWithoutNullStreams;
+  /**
+   * Overrides the control-line byte budget. Test-only injection in the same
+   * spirit as `spawn`: the production ceiling sizes a whole-desktop capture, and
+   * a test cannot afford to build a 24 MB line just to reach the oversized-line
+   * path. Production passes nothing and gets `MAX_CONTROL_LINE_BYTES`.
+   */
+  readonly maxControlLineBytes?: number;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -131,6 +152,14 @@ export class MacComputerHelperClient implements MacHelperTransport {
   private stdoutFramer: JsonRpcStdioFramer | null = null;
   private stdinWriter: JsonRpcStdioWriter | null = null;
   private requestRegistry: JsonRpcStdioRequestRegistry | null = null;
+  /**
+   * The registry's own pending-request map, handed to it rather than read back
+   * out of it: when a line is dropped the ids it carried are already gone, and
+   * naming the requests that died with it is the only trace an operator gets.
+   * One map outlives every registry generation, which is safe because a registry
+   * is only replaced after its predecessor rejected and cleared its entries.
+   */
+  private readonly pendingRequests = new Map<string, JsonRpcPendingRequest>();
   private readonly requestTimeoutMs: number;
   private stderrTail = "";
   private exited = false;
@@ -157,11 +186,13 @@ export class MacComputerHelperClient implements MacHelperTransport {
     );
     this.process = child;
     this.exited = false;
-    this.stdoutFramer = new JsonRpcStdioFramer(MAX_CONTROL_LINE_BYTES, (error) =>
-      this.handleControlLineError(error),
+    this.stdoutFramer = new JsonRpcStdioFramer(
+      this.options.maxControlLineBytes ?? MAX_CONTROL_LINE_BYTES,
+      (error) => this.handleControlLineError(error),
     );
     this.stdinWriter = new JsonRpcStdioWriter(child.stdin);
     this.requestRegistry = new JsonRpcStdioRequestRegistry({
+      pending: this.pendingRequests,
       requestTimeoutMs: this.requestTimeoutMs,
       includeJsonRpcVersion: true,
       timeoutError: (method) =>
@@ -276,8 +307,35 @@ export class MacComputerHelperClient implements MacHelperTransport {
     }
   }
 
+  /**
+   * A line the framer had to drop. The framer has already resynchronized past
+   * it, so this only decides how loudly to react — the helper is still there and
+   * the next request has to be able to reach it, so neither branch touches the
+   * process or the write path.
+   *
+   * An oversized line is the loud case: the framer discards the offending bytes
+   * before reporting, so the JSON-RPC id that line carried is unrecoverable and
+   * there is no way to fail only the request it answered. Every in-flight
+   * request is rejected instead, so callers fail fast rather than sitting out
+   * the full timeout, and the diagnostic names them because it is the only
+   * record of what was lost. Any other reason — undecodable bytes, most often a
+   * helper log line that is not valid UTF-8 — costs exactly that line, so it is
+   * reported and nothing else: rejecting there would turn a stray log write into
+   * a failed agent action.
+   */
   private handleControlLineError(error: JsonRpcStdioTransportError): void {
-    if (error.reason !== "frame-too-large") return;
+    if (error.reason !== "frame-too-large") {
+      this.diagnostic(
+        `dropped a control line (${error.reason}, ${error.observedBytes} bytes): ${error.message}`,
+      );
+      return;
+    }
+    const dropped = [...this.pendingRequests.entries()].map(
+      ([id, request]) => `${request.method}#${id}`,
+    );
+    this.diagnostic(
+      `control line exceeded limit (${error.observedBytes}/${error.maxBytes} bytes); failing ${dropped.length} in-flight request(s): ${dropped.length > 0 ? dropped.join(", ") : "none"}`,
+    );
     this.rejectInFlight(
       new MacComputerHelperError(
         "helper_protocol_error",
@@ -312,6 +370,12 @@ export class MacComputerHelperClient implements MacHelperTransport {
           }
         : {}),
     });
+  }
+
+  private diagnostic(message: string): void {
+    (this.options.onDiagnostic ?? ((text: string) => console.warn(text)))(
+      `[computer] mac helper ${message}`,
+    );
   }
 
   private rejectInFlight(error: MacComputerHelperError): void {

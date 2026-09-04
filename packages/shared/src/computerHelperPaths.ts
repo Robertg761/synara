@@ -16,16 +16,30 @@
  * @module computerHelperPaths
  */
 import computerHelperBundle from "./computerHelperBundle.json" with { type: "json" };
+import { SYNARA_PRODUCTION_BUNDLE_ID } from "@synara/shared/desktopIdentity";
 
 /** The helper executable's file name, inside the bundle and in dev builds. */
 export const COMPUTER_HELPER_BINARY_NAME = computerHelperBundle.binaryName;
 
 /**
- * The helper's app bundle. It is a bundle, not a loose binary, because macOS
- * attributes TCC grants to a bundle identity: this is what the user sees and
- * approves in Privacy & Security.
+ * The helper's app bundle. It is a bundle, not a loose binary, because a bundle
+ * is the unit macOS signs and notarizes, and the helper has to carry the app's
+ * Team ID and hardened runtime of its own. (The TCC grants themselves are filed
+ * against the app, not against this bundle — see `computerPermissions`.)
  */
 export const COMPUTER_HELPER_BUNDLE_NAME = computerHelperBundle.bundleName;
+
+/**
+ * The helper's bundle identifier, derived rather than spelled out.
+ *
+ * It is the identity codesign and notarization see, and the Swift helper refuses
+ * to drive any window whose owner is Synara itself by matching the app's own
+ * identifier — so the helper's identity has to be a child of the app's, not an
+ * independently maintained constant that a rebrand could leave behind under the
+ * old name. Privacy & Security never shows this string: a TCC check made inside
+ * the helper is answered against its responsible process, which is Synara.
+ */
+export const COMPUTER_HELPER_BUNDLE_IDENTIFIER = `${SYNARA_PRODUCTION_BUNDLE_ID}.${computerHelperBundle.bundleIdentifierSuffix}`;
 
 /** Path of the executable within its own bundle. */
 export const COMPUTER_HELPER_BUNDLE_EXECUTABLE_SEGMENTS = [
@@ -69,6 +83,24 @@ export const COMPUTER_HELPER_DEV_RAW_SEGMENTS = [
 
 /** Signed macOS computer-use helper embedded by the desktop release build. */
 export const COMPUTER_HELPER_BINARY_PATH_ENV = "SYNARA_COMPUTER_HELPER_BINARY_PATH";
+
+/**
+ * Where the server's source-build fallback should compile from.
+ *
+ * A packaged desktop build must set this: without it the fallback resolves the
+ * sources relative to its own module, which in a packaged app is a path inside
+ * `app.asar` — visible to `stat`, unreadable to a compiler. The desktop points
+ * it at the copy staged beside the app instead.
+ */
+export const COMPUTER_HELPER_SOURCE_DIR_ENV = "SYNARA_COMPUTER_HELPER_SOURCE_DIR";
+
+/**
+ * The staged source directory's name inside a packaged app's `Resources`, and
+ * the name `apps/server/scripts/cli.ts` stages under `dist`. One name, so the
+ * packaging config, the desktop's environment and the server's resolver cannot
+ * drift apart.
+ */
+export const COMPUTER_HELPER_SOURCE_DIR_NAME = "computer-use-macos";
 
 /**
  * Joins segments with `/`. The packaging config and the electron-builder globs

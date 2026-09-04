@@ -57,10 +57,6 @@ export const DESKTOP_IPC_CHANNELS = {
     error: "desktop:appsnap-error",
     state: "desktop:appsnap-state",
   },
-  computerControl: {
-    getPermissionState: "desktop:computer-control-get-permission-state",
-    requestPermissions: "desktop:computer-control-request-permissions",
-  },
   browser: {
     state: "desktop:browser-state",
     open: "desktop:browser-open",

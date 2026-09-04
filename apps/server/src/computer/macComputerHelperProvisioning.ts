@@ -24,6 +24,8 @@ import * as path from "node:path";
 import {
   COMPUTER_HELPER_BINARY_NAME,
   COMPUTER_HELPER_BINARY_PATH_ENV,
+  COMPUTER_HELPER_SOURCE_DIR_ENV,
+  COMPUTER_HELPER_SOURCE_DIR_NAME,
 } from "@synara/shared/computerHelperPaths";
 import {
   deviceHelperCacheKey,
@@ -38,15 +40,11 @@ export const COMPUTER_HELPER_CACHE_SEGMENTS = [
   "computer-helper",
 ] as const;
 
-/**
- * Operator override for the helper source directory. Nothing in the product
- * sets it: packaged desktop builds ship the signed binary and point at it with
- * `COMPUTER_HELPER_BINARY_PATH_ENV`, and the CLI finds its staged sources
- * beside the bundle. This exists so a source tree in an unusual location can
- * still be built from.
- */
-export const COMPUTER_HELPER_SOURCE_DIR_ENV = "SYNARA_COMPUTER_HELPER_SOURCE_DIR";
-export { COMPUTER_HELPER_BINARY_NAME };
+// Re-exported rather than redeclared: the packaging config, the desktop main
+// process and this resolver all have to agree on the variable's name, and the
+// second spelling of it here was a rename waiting to silently disable the
+// source fallback.
+export { COMPUTER_HELPER_BINARY_NAME, COMPUTER_HELPER_SOURCE_DIR_ENV };
 
 export const COMPUTER_HELPER_CACHE_ROOT = path.join(homedir(), ...COMPUTER_HELPER_CACHE_SEGMENTS);
 
@@ -69,9 +67,33 @@ export function resolveComputerHelperSourceDir(
     const external = path.resolve(configuredDirectory);
     if (sourceExists(external)) return external;
   }
-  const bundled = path.resolve(moduleDirectory, "computer-use-macos");
+  const bundled = path.resolve(moduleDirectory, COMPUTER_HELPER_SOURCE_DIR_NAME);
   if (sourceExists(bundled)) return bundled;
-  return path.resolve(moduleDirectory, "..", "..", "native", "computer-use-macos");
+  return path.resolve(
+    moduleDirectory,
+    "..",
+    "..",
+    COMPUTER_HELPER_SOURCE_SEGMENT,
+    COMPUTER_HELPER_SOURCE_DIR_NAME,
+  );
+}
+
+/** The repository directory the development source tree lives under. */
+const COMPUTER_HELPER_SOURCE_SEGMENT = "native";
+
+/**
+ * Whether a resolved source directory sits inside the packaged app archive.
+ *
+ * `app.asar` is a single file that `stat` happily walks into and a compiler
+ * cannot read at all, so a build launched against a path inside it fails
+ * several minutes in with a Swift error about a missing file — the least
+ * informative possible way to say "this build has no source fallback". A
+ * packaged desktop build ships a signed helper and points at it with
+ * `COMPUTER_HELPER_BINARY_PATH_ENV`; if that binary is gone, compiling is not
+ * the remedy.
+ */
+export function isArchivedHelperSourceDir(directory: string): boolean {
+  return directory.split(path.sep).includes("app.asar");
 }
 
 export interface ProcessRunResult {
@@ -119,7 +141,19 @@ export class MacComputerHelperProvisioner {
   private readonly helperSourceDir: string;
   private readonly bundledBinaryPath: string | undefined;
   private readonly helperCacheRoot: string;
-  /** Memoized `xcodebuild -version`; the active toolchain cannot change here. */
+  /**
+   * How many times this provisioner has actually compiled the helper.
+   *
+   * Exposed because the settings card's sentence depends on it: a packaged build
+   * ships a signed helper and a warm cache serves an earlier compile, and
+   * telling the user Synara "built" the helper in either case is simply false.
+   */
+  private compiledCount = 0;
+  /**
+   * In-flight or successful `xcodebuild -version`; the active toolchain cannot
+   * change here. Cleared again when the read fails, so a failure is never the
+   * remembered answer.
+   */
   private xcodeVersionPromise: Promise<string | null> | undefined;
   private readonly run: MacHelperProvisionerOptions["run"];
   private readonly fileExists: (candidate: string) => Promise<boolean>;
@@ -148,23 +182,53 @@ export class MacComputerHelperProvisioner {
   }
 
   /**
-   * `xcodebuild -version`, run at most once per provisioner.
+   * `xcodebuild -version`, spawned at most once per provisioner once it answers,
+   * and retried on the next call while it does not.
    *
    * `probeAvailability()` calls this twice over — once directly and once through
    * the cache key — and it runs at boot for every user on every platform check.
    * The active toolchain cannot change under a running server without a restart
-   * (it is `xcode-select`'d machine state), so the spawn is memoized while the
-   * source hash below is deliberately left live: sources *do* change while a
-   * developer works, and a stale key there would serve a stale binary.
+   * (it is `xcode-select`'d machine state), so a successful read is memoized
+   * forever, while the source hash below is deliberately left live: sources *do*
+   * change while a developer works, and a stale key there would serve a stale
+   * binary.
+   *
+   * A *failure* is never memoized. Every way this read can fail is transient —
+   * the 20-second timeout firing under load, a first-run license prompt holding
+   * `xcodebuild`, a spawn that lost a race with an Xcode upgrade — and caching
+   * one would convince the backend that the machine has no toolchain until the
+   * server is restarted. Concurrent callers still share the single in-flight
+   * spawn; only once it settles as a failure is the memo dropped, so the next
+   * call after that starts a fresh probe.
+   *
+   * Never throws: a missing toolchain is an expected state, reported as `null`.
    */
   private async xcodeVersionOutput(): Promise<string | null> {
-    this.xcodeVersionPromise ??= this.run("xcodebuild", ["-version"], {
-      timeoutMs: 20_000,
-      env: this.env,
-    })
-      .then((value) => (value.code === 0 ? value.stdout : null))
-      .catch(() => null);
+    if (this.xcodeVersionPromise === undefined) {
+      const attempt: Promise<string | null> = this.run("xcodebuild", ["-version"], {
+        timeoutMs: 20_000,
+        env: this.env,
+      })
+        // Blank stdout is as useless as a non-zero exit: it cannot key a cache
+        // directory, so it counts as a failed read rather than a toolchain.
+        .then((value) => (value.code === 0 && value.stdout.trim() ? value.stdout : null))
+        .catch(() => null)
+        .then((output) => {
+          // Guarded against a later attempt having already replaced this one, so
+          // a slow failure cannot evict the successful read that followed it.
+          if (output === null && this.xcodeVersionPromise === attempt) {
+            this.xcodeVersionPromise = undefined;
+          }
+          return output;
+        });
+      this.xcodeVersionPromise = attempt;
+    }
     return await this.xcodeVersionPromise;
+  }
+
+  /** How many cold Swift compiles this provisioner has run. */
+  get compiledBuilds(): number {
+    return this.compiledCount;
   }
 
   /** Whether a full Xcode toolchain — not just the CLI tools — is present to build with. */
@@ -197,6 +261,12 @@ export class MacComputerHelperProvisioner {
     const cached = await this.cachedBinaryPath();
     if (cached) return cached;
 
+    if (isArchivedHelperSourceDir(this.helperSourceDir)) {
+      throw new MacHelperBuildError(
+        "The macOS computer-use helper is missing and this build ships a prebuilt helper; " +
+          "the source fallback is unavailable. Reinstall Synara.",
+      );
+    }
     const key = await this.buildKey().catch(() => null);
     if (key === null) {
       throw new MacHelperBuildError(
@@ -206,6 +276,7 @@ export class MacComputerHelperProvisioner {
     }
     const outputDirectory = path.join(this.helperCacheRoot, key);
     const buildScript = path.join(this.helperSourceDir, "build.sh");
+    this.compiledCount += 1;
     const result = await this.run("/bin/sh", [buildScript, outputDirectory], {
       // A cold Swift compile of the helper is minutes, not seconds; a false
       // timeout would throw away a build that was about to succeed.

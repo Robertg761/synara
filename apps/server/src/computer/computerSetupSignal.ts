@@ -1,0 +1,123 @@
+/**
+ * The one place that decides "this is the OS withholding a grant", and which
+ * grants those are.
+ *
+ * The same fact reaches the tool surface three different ways, and before this
+ * module only the first of them raised the chat's setup card:
+ *
+ *   1. A **thrown** `ComputerBackendError` marked `setupRequired` — the helper
+ *      refused an action with its permission-denied code.
+ *   2. A **successful** result whose availability is `permission-required` — a
+ *      perception read that completed and reported the desktop cannot be driven.
+ *      This is the shape the user hit: the agent received a well-formed answer
+ *      saying "Synara needs Accessibility", no card appeared, and the model was
+ *      left to explain TCC in prose.
+ *   3. A grant the backend knows is missing while nothing has failed yet —
+ *      Screen Recording, which leaves the desktop driveable but unseeable, so
+ *      the availability stays `available` and no call has to fail for the user
+ *      to be owed the card.
+ *
+ * Classifying in one place is what keeps those three answering identically, and
+ * what keeps an ordinary action failure — a window that moved, an undelivered
+ * keystroke, arguments the desktop refused — from raising a card the user cannot
+ * act on.
+ *
+ * @module computerSetupSignal
+ */
+import type {
+  ComputerAvailability,
+  ComputerBuildSignature,
+  ComputerPermission,
+} from "@synara/contracts";
+import { listComputerPermissions } from "@synara/shared/computerPermissions";
+
+import { ComputerBackendError } from "./ComputerBackend.ts";
+
+/**
+ * A missing-grant state worth putting in front of the user, with the grants
+ * named where the backend could name them. `missing` may be empty: a helper can
+ * refuse without saying which permission it wanted, and that is still a setup
+ * problem — the card simply falls back to the general wording.
+ */
+export interface ComputerSetupSignal {
+  readonly missing: readonly ComputerPermission[];
+  /**
+   * How the backend's build is signed, when it could say. Carried alongside the
+   * grants because an ad-hoc build has a second explanation for a missing one —
+   * the grant is pinned to a cdhash a rebuild replaced — and the card cannot
+   * offer it without this.
+   */
+  readonly buildSignature?: ComputerBuildSignature;
+}
+
+/**
+ * Whether this failure is the OS withholding a grant rather than the desktop
+ * misbehaving. Unwraps one level of `cause` so a failure that travelled inside
+ * another error is still recognised.
+ */
+export function computerFailureNeedsSetup(error: unknown): boolean {
+  if (error instanceof ComputerBackendError) return error.setupRequired;
+  const cause: unknown = (error as { readonly cause?: unknown } | null)?.cause;
+  return cause instanceof ComputerBackendError && cause.setupRequired;
+}
+
+/**
+ * The setup state behind a tool call, or undefined when there is nothing for
+ * the user to do.
+ *
+ * `availability` outranks the rest because it is the most specific answer
+ * available: it names every missing grant, including ones no call has tripped
+ * over yet.
+ */
+export function computerSetupSignal(input: {
+  /** A thrown failure, if the call failed. */
+  readonly error?: unknown;
+  /** Availability carried by a successful result, when it carries one. */
+  readonly availability?: ComputerAvailability | undefined;
+  /** Grants the backend currently lacks, freshly established. */
+  readonly missing?: readonly ComputerPermission[] | undefined;
+  /**
+   * How the backend's build is signed, when it has an answer. Used only when the
+   * availability did not carry one of its own, which it does whenever it reports
+   * a blocking grant.
+   */
+  readonly buildSignature?: ComputerBuildSignature | undefined;
+}): ComputerSetupSignal | undefined {
+  if (input.availability?.kind === "permission-required") {
+    return {
+      missing: input.availability.missing,
+      buildSignature: input.availability.buildSignature,
+    };
+  }
+  const signature =
+    input.buildSignature === undefined ? {} : { buildSignature: input.buildSignature };
+  const missing = input.missing ?? [];
+  if (input.error !== undefined && computerFailureNeedsSetup(input.error)) {
+    return { missing, ...signature };
+  }
+  return missing.length > 0 ? { missing, ...signature } : undefined;
+}
+
+/**
+ * What the *model* is told, as opposed to what the user is shown.
+ *
+ * Deliberately terse and free of instructions the model could try to follow: the
+ * remedy is a dialog the OS has already put in front of the human, so the
+ * agent's whole job here is to stop and say so. Handed the long user-facing
+ * availability message instead, models wrote paragraphs explaining macOS privacy
+ * to a user who was already looking at the prompt.
+ *
+ * The tense matters. Detecting a missing grant is now what asks the OS for it
+ * (`MacComputerBackend.requestMissingPermissions`), so by the time this note
+ * reaches the model the dialog is on screen — telling the model to instruct the
+ * user through System Settings would talk over it.
+ */
+export function computerSetupToolNote(signal: ComputerSetupSignal): string {
+  const labels = listComputerPermissions(signal.missing);
+  const needed = labels.length > 0 ? labels : "a macOS privacy permission";
+  return (
+    `macOS is asking the user right now for ${needed}, and Synara has shown them a setup card. ` +
+    "Stop desktop automation, say in one sentence that you are waiting for the user to grant it, " +
+    "and do not retry or work around it until the user says it is granted."
+  );
+}

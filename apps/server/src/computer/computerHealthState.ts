@@ -21,6 +21,12 @@ import { clampComputerMessage } from "./ComputerBackend.ts";
 export interface ComputerHealthStatusReading {
   readonly status: ComputerHealthStatus;
   readonly captureAvailable: boolean;
+  /**
+   * Set only by a backend that can tell its input delivery has lost a rung.
+   * Left absent everywhere else, so a backend with no such notion encodes
+   * exactly as it did before the field existed.
+   */
+  readonly backgroundInputDegraded?: boolean;
 }
 
 export interface ComputerHealthStateOptions {
@@ -80,6 +86,9 @@ export class ComputerHealthState {
       reconnects: this.reconnectsCount,
       ...(this.lastFailure ? { lastFailure: this.lastFailure } : {}),
       captureAvailable: reading.captureAvailable,
+      ...(reading.backgroundInputDegraded === undefined
+        ? {}
+        : { backgroundInputDegraded: reading.backgroundInputDegraded }),
     };
   }
 
@@ -130,6 +139,7 @@ export function sameComputerHealth(left: ComputerHealth, right: ComputerHealth):
     left.consecutiveFailures === right.consecutiveFailures &&
     left.reconnects === right.reconnects &&
     left.captureAvailable === right.captureAvailable &&
+    left.backgroundInputDegraded === right.backgroundInputDegraded &&
     left.lastFailure?.at === right.lastFailure?.at &&
     left.lastFailure?.message === right.lastFailure?.message
   );

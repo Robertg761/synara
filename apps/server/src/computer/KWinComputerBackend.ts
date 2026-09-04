@@ -53,6 +53,7 @@ import {
   parseJsonPayload,
   parseWindows,
   pointerClampResult,
+  WindowListChangeNotifier,
   windowsPayloadFingerprint,
   readPngDimensions,
   requireWindowBounds,
@@ -64,8 +65,7 @@ import {
   windowInAgentSpace,
   workspaceRectFromWindows,
 } from "./computerGeometry.ts";
-import { StillFrameDedupe } from "./stillFrameDedupe.ts";
-import { describeComputerUiTree } from "./uiTreeText.ts";
+import { StillFramePublisher } from "./stillFramePublisher.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
 import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./humanActivity.ts";
 import {
@@ -365,18 +365,14 @@ export class KWinComputerBackend implements ComputerBackend {
   private reconnecting = false;
   private readonly healthState: ComputerHealthState;
   private disposed = false;
-  private streamListener: ComputerFrameListener | undefined;
-  private streamTimer: ReturnType<typeof setInterval> | undefined;
-  private stillInFlight = false;
-  /** Suppresses stills identical to the one the pane already has. */
-  private readonly frameDedupe = new StillFrameDedupe();
+  /** The still-frame loop, shared with the macOS backend. */
+  private readonly stills: StillFramePublisher;
   private captureQueue: Promise<void> = Promise.resolve();
   private capturePending = 0;
   private startPromise: Promise<void> | undefined;
   private readonly spawnProcess: (app: string, args: readonly string[]) => ChildProcess;
   private readonly resolveApp: AppLaunchResolver;
   private readonly runClipboardCommand: ClipboardCommandRunner;
-  private nextSequence = 1;
   private currentPoint: ComputerPoint | null = null;
   /**
    * Where the workspace's top-left sat in global coordinates at the last
@@ -384,7 +380,7 @@ export class KWinComputerBackend implements ComputerBackend {
    * `readWindows` for why the agent speaks a 0-based space at all.
    */
   private lastAgentOrigin: ComputerPoint = { x: 0, y: 0 };
-  private previousWindowsFingerprint: string | undefined;
+  private readonly windowsChanges: WindowListChangeNotifier;
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
 
   constructor(options: KWinComputerBackendOptions = {}) {
@@ -407,6 +403,22 @@ export class KWinComputerBackend implements ComputerBackend {
     this.runClipboardCommand = options.runClipboardCommand ?? spawnClipboardCommand;
     this.glideDurationMs = Math.max(0, options.glideDurationMs ?? DEFAULT_GLIDE_DURATION_MS);
     this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
+    this.stills = new StillFramePublisher({
+      capture: () => this.captureStillFrame(),
+      // A plugin whose capture path is missing must never be asked twice a
+      // second to prove it: the still tick is skipped entirely, and a foreground
+      // screenshot in flight owns the capture path until it lands.
+      isCaptureAvailable: () => this.pluginHealth?.capture === true && this.capturePending === 0,
+      prepare: async () => {
+        await this.ensurePlugin();
+      },
+      emit: (frame) => this.emit({ type: "frame", frame }),
+      now: () => this.now(),
+      intervalMs: this.stillIntervalMs,
+    });
+    this.windowsChanges = new WindowListChangeNotifier((windows) =>
+      this.emit({ type: "windows-changed", windows }),
+    );
     this.captureMaxDimension = Math.max(
       1,
       Math.min(32_768, Math.floor(options.captureMaxDimension ?? DEFAULT_CAPTURE_MAX_DIMENSION)),
@@ -657,11 +669,10 @@ export class KWinComputerBackend implements ComputerBackend {
       // re-serializing the parsed list — on a call that runs several times per
       // action and per publish — buys nothing. The focus target rides along
       // because it decides `focused` without appearing in that document.
-      const fingerprint = windowsPayloadFingerprint(payload, state.targetWindowId ?? null);
-      if (fingerprint !== this.previousWindowsFingerprint) {
-        this.previousWindowsFingerprint = fingerprint;
-        this.emit({ type: "windows-changed", windows });
-      }
+      this.windowsChanges.observe(
+        windowsPayloadFingerprint(payload, state.targetWindowId ?? null),
+        windows,
+      );
       return [windows, origin];
     } catch (error) {
       throw this.reportPluginFailure(error);
@@ -685,7 +696,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async getState(options: {
     readonly includeScreenshot?: boolean;
-    readonly includeText?: boolean;
+    readonly includeTree?: boolean;
   }): Promise<ComputerState> {
     await this.ensurePlugin({ start: false });
     // One enumeration feeds the windows, the size, the tree fusion, and the
@@ -693,7 +704,7 @@ export class KWinComputerBackend implements ComputerBackend {
     const [windows, origin] = await this.readWindows();
     const screenSize = screenSizeFromWindows(windows, this.pluginHealth?.workspace);
     let root: ComputerUiNode | undefined;
-    if (options.includeText) {
+    if (options.includeTree) {
       try {
         // AT-SPI reports extents in global screen coordinates, so the trees
         // shift into agent space with everything else before fusing.
@@ -717,7 +728,6 @@ export class KWinComputerBackend implements ComputerBackend {
       windows,
       screenSize,
       ...(root ? { root } : {}),
-      ...(root && options.includeText ? { text: describeComputerUiTree(root) } : {}),
       ...(screenshot ? { screenshot } : {}),
       capturedAt: new Date(this.now()).toISOString(),
     };
@@ -985,37 +995,15 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async attachStream(listener: ComputerFrameListener): Promise<void> {
-    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
-    this.streamTimer = undefined;
-    await this.ensurePlugin();
-    // An overlapping attach (a second pane joining mid-attach) cleared the
-    // first interval above, but the await let the FIRST attach resume here and
-    // install its own interval — which nothing would ever clear again, because
-    // `streamTimer` now names the second one. Cleared once more so exactly the
-    // newest attach's interval survives.
-    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
-    this.streamListener = listener;
-    // A re-attached pane has seen nothing, so the memory of what the previous
-    // one saw must not suppress its first frame.
-    this.frameDedupe.reset();
-    await this.publishStillFrame({ force: true });
-    this.streamTimer = setInterval(() => {
-      void this.publishStillFrame();
-    }, this.stillIntervalMs);
-    this.streamTimer.unref?.();
+    await this.stills.attach(listener);
   }
 
   async detachStream(): Promise<void> {
-    this.streamListener = undefined;
-    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
-    this.streamTimer = undefined;
+    await this.stills.detach();
   }
 
   async requestKeyframe(): Promise<void> {
-    if (!this.streamListener) return;
-    // A keyframe is asked for because the receiver has nothing to draw, so it
-    // publishes even when the desktop is byte-identical to the last frame.
-    await this.publishStillFrame({ force: true });
+    await this.stills.requestKeyframe();
   }
 
   async captureWindow(
@@ -1711,49 +1699,18 @@ export class KWinComputerBackend implements ComputerBackend {
    * returned. The rect comes from the cached workspace geometry for the same
    * reason: a window enumeration per frame is a window enumeration per frame.
    */
-  private async publishStillFrame(options: { readonly force?: boolean } = {}): Promise<void> {
-    const listener = this.streamListener;
-    if (!listener || this.pluginHealth?.capture !== true || this.capturePending > 0) return;
-    if (this.stillInFlight) {
-      // A receiver with nothing to draw asked for this, so the request outlives
-      // the capture already running rather than being dropped into it.
-      if (options.force) this.frameDedupe.deferForce();
-      return;
-    }
-    this.stillInFlight = true;
-    const force = this.frameDedupe.takeForce(options.force === true);
-    try {
-      const region = await this.workspaceRect();
-      if (this.capturePending > 0) return;
-      const data = await this.captureRegion(region.x, region.y, region.width, region.height);
-      // Cheap header read, kept for the same reason the screenshot path has it:
-      // a payload that is not a PNG must fail here rather than in a decoder in
-      // the browser, where the only symptom is a blank pane.
-      readPngDimensions(data, { source: this.captureSource });
-      if (this.streamListener !== listener) return;
-      // An idle desktop encodes the same bytes twice a second; republishing
-      // them spends a megabyte of socket to convey nothing.
-      if (!this.frameDedupe.shouldPublish(data, force)) return;
-      const frame = {
-        sequence: this.nextSequence++,
-        timestampMs: this.now(),
-        // Every frame is a complete PNG still. There is no H.264 codec config
-        // or delta frame in Tier 1, so the envelope remains keyframe-only.
-        keyframe: true,
-        codecConfig: false,
-        data,
-      };
-      listener(frame);
-      this.emit({ type: "frame", frame });
-    } catch {
-      // A transient capture failure should not tear down a subscribed stream.
-      if (force) this.frameDedupe.deferForce();
-    } finally {
-      this.stillInFlight = false;
-      if (this.frameDedupe.forcePending && this.streamListener === listener) {
-        void this.publishStillFrame();
-      }
-    }
+  private async captureStillFrame(): Promise<Uint8Array | undefined> {
+    const region = await this.workspaceRect();
+    // A foreground screenshot claimed the capture path while the workspace rect
+    // was being read; that request is what the viewer is waiting on, so this
+    // tick steps aside instead of queueing behind it.
+    if (this.capturePending > 0) return undefined;
+    const data = await this.captureRegion(region.x, region.y, region.width, region.height);
+    // Cheap header read, kept for the same reason the screenshot path has it:
+    // a payload that is not a PNG must fail here rather than in a decoder in
+    // the browser, where the only symptom is a blank pane.
+    readPngDimensions(data, { source: this.captureSource });
+    return data;
   }
 
   private async pressButton(code: number): Promise<void> {

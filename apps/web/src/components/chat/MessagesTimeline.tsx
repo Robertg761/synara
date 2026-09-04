@@ -465,10 +465,10 @@ interface MessagesTimelineProps {
   onOpenThread?: (threadId: ThreadId) => void;
   /** Open an automation's detail page from a "created automation" transcript card. */
   onOpenAutomation?: (automationId: string) => void;
-  /** Whether the composer currently has computer control on; flips denial cards to their confirmed state. */
-  computerControlEnabled?: boolean;
-  /** Switch computer control on from a "computer control denied" transcript card. */
-  onEnableComputerControl?: () => void;
+  /** Whether the desktop permissions are now in place; flips setup cards to their confirmed state. */
+  computerControlReady?: boolean;
+  /** Grant the missing desktop permissions from a "computer control needs setup" transcript card. */
+  onSetUpComputerControl?: () => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
   onUndoTurnFiles?: (turnCounts: readonly number[]) => void;
@@ -551,8 +551,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onOpenTurnDiff,
   onOpenThread,
   onOpenAutomation,
-  computerControlEnabled,
-  onEnableComputerControl,
+  computerControlReady,
+  onSetUpComputerControl,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
   onUndoTurnFiles,
@@ -1361,8 +1361,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
               timestampFormat={timestampFormat}
               {...(onOpenAgentActivity ? { onOpenAgentActivity } : {})}
               {...(onOpenAutomation ? { onOpenAutomation } : {})}
-              {...(computerControlEnabled !== undefined ? { computerControlEnabled } : {})}
-              {...(onEnableComputerControl ? { onEnableComputerControl } : {})}
+              {...(computerControlReady !== undefined ? { computerControlReady } : {})}
+              {...(onSetUpComputerControl ? { onSetUpComputerControl } : {})}
             />
           );
           const isLiveGroup =
@@ -1377,7 +1377,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             keep: "last",
             // The capability-denied card carries the only affordance to unblock
             // the agent, so it must never disappear behind the "Show more" cap.
-            shouldCapEntry: (workEntry) => !workEntry.computerControlDenied,
+            shouldCapEntry: (workEntry) => !workEntry.computerSetupRequired,
           });
           const renderChunks = cappedRenderPlan.chunks;
           const hasCollapsedChunk = renderChunks.some((chunk) => chunk.summary !== null);
@@ -1876,8 +1876,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                 timestampFormat={timestampFormat}
                 {...(onOpenAgentActivity ? { onOpenAgentActivity } : {})}
                 {...(onOpenAutomation ? { onOpenAutomation } : {})}
-                {...(computerControlEnabled !== undefined ? { computerControlEnabled } : {})}
-                {...(onEnableComputerControl ? { onEnableComputerControl } : {})}
+                {...(computerControlReady !== undefined ? { computerControlReady } : {})}
+                {...(onSetUpComputerControl ? { onSetUpComputerControl } : {})}
                 {...(turnSummary?.turnId ? { turnId: turnSummary.turnId } : {})}
               />
             );
@@ -2004,10 +2004,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                         timestampFormat={timestampFormat}
                         {...(onOpenAgentActivity ? { onOpenAgentActivity } : {})}
                         {...(onOpenAutomation ? { onOpenAutomation } : {})}
-                        {...(computerControlEnabled !== undefined
-                          ? { computerControlEnabled }
-                          : {})}
-                        {...(onEnableComputerControl ? { onEnableComputerControl } : {})}
+                        {...(computerControlReady !== undefined ? { computerControlReady } : {})}
+                        {...(onSetUpComputerControl ? { onSetUpComputerControl } : {})}
                       />
                     ))}
                   </div>
@@ -2028,8 +2026,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                 timestampFormat={timestampFormat}
                 {...(onOpenAgentActivity ? { onOpenAgentActivity } : {})}
                 {...(onOpenAutomation ? { onOpenAutomation } : {})}
-                {...(computerControlEnabled !== undefined ? { computerControlEnabled } : {})}
-                {...(onEnableComputerControl ? { onEnableComputerControl } : {})}
+                {...(computerControlReady !== undefined ? { computerControlReady } : {})}
+                {...(onSetUpComputerControl ? { onSetUpComputerControl } : {})}
               />
             ) : (
               <div

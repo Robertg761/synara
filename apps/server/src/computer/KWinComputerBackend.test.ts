@@ -2525,8 +2525,11 @@ describe("KWinComputerBackend", () => {
       const dbus = new FakeDbus();
       const backend = makeBackend(dbus, { stillIntervalMs: 100 });
       await backend.attachStream(() => undefined);
-      const firstTimer = (backend as unknown as { streamTimer: ReturnType<typeof setInterval> })
-        .streamTimer;
+      // The timer moved into the shared `StillFramePublisher`; this test still
+      // guards the KWin wiring, so it reads it where it now lives.
+      const firstTimer = (
+        backend as unknown as { stills: { timer: ReturnType<typeof setInterval> } }
+      ).stills.timer;
 
       await backend.attachStream(() => undefined);
       expect(clearInterval).toHaveBeenCalledWith(firstTimer);

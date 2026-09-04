@@ -4,10 +4,13 @@ import { promisify } from "node:util";
 import {
   COMPUTER_MAC_BACKEND,
   type ComputerAvailability,
+  type ComputerBuildSignature,
   type ComputerCapabilities,
+  type ComputerDeliveryVerification,
   type ComputerHealth,
   type ComputerId,
   type ComputerLaunchAppResult,
+  type ComputerPermission,
   type ComputerPoint,
   type ComputerRect,
   type ComputerScreenshot,
@@ -16,6 +19,14 @@ import {
   type ComputerUiNode,
   type ComputerWindow,
 } from "@synara/contracts";
+import {
+  COMPUTER_PERMISSIONS,
+  computerPermissionSetupMessage,
+  computerStaleGrantAdvice,
+  listComputerPermissions,
+  TCC_SERVICE_NAMES,
+} from "@synara/shared/computerPermissions";
+import { SYNARA_PRODUCTION_BUNDLE_ID } from "@synara/shared/desktopIdentity";
 
 import {
   clampComputerMessage,
@@ -42,14 +53,14 @@ import {
   screenSizeFromWindows,
   screenshotFromPng,
   shiftRect,
-  windowsPayloadFingerprint,
+  WindowListChangeNotifier,
+  windowsDigestFingerprint,
   workspaceRectFromWindows,
   parseWindows,
   windowInAgentSpace,
 } from "./computerGeometry.ts";
-import { describeComputerUiTree } from "./uiTreeText.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
-import { StillFrameDedupe } from "./stillFrameDedupe.ts";
+import { StillFramePublisher } from "./stillFramePublisher.ts";
 import {
   MacComputerHelperClient,
   MAC_HELPER_METHODS,
@@ -79,8 +90,78 @@ const UNSUPPORTED_MACOS_MESSAGE =
  * capability probe.
  */
 const HELPER_PERMISSION_DENIED_CODE = "helper_-32000";
+/** `RPCError.targetMissing` — the named window is gone, minimized, or never existed. */
+const HELPER_TARGET_MISSING_CODE = "helper_-32001";
+/**
+ * `RPCError.notDelivered` — the helper walked its whole delivery ladder and no
+ * rung accepted the input, so nothing at all was injected. That is a refusal
+ * rather than a fault, and the distinction is the difference between "the
+ * control did not react" and "the keystroke never left this process".
+ */
+const HELPER_NOT_DELIVERED_CODE = "helper_-32002";
+/** JSON-RPC `invalidParams` — an argument this helper build cannot act on. */
+const HELPER_INVALID_PARAMS_CODE = "helper_-32602";
+
+/**
+ * The methods that carry no coordinate of their own, so the only thing deciding
+ * where they land is the window the helper was last aimed at.
+ *
+ * The helper has no frontmost fallback on purpose: returning "whatever is in
+ * front" meant a `type` with no preceding click wrote the agent's text into the
+ * human's own document, including through the accessibility rung that needs no
+ * activation at all. It refuses with `targetMissing` instead, and that refusal
+ * needs its own explanation here — the generic window-not-found answer names an
+ * id the caller never gave.
+ */
+const KEYBOARD_METHODS: ReadonlySet<string> = new Set<string>(["type", "press-key", "hotkey"]);
+
+/**
+ * The helper wire contract this server speaks. The helper and the server ship
+ * together, so a mismatch is not a version to negotiate — it is a stale binary
+ * (a cached development build from before a protocol change, most often) that
+ * would otherwise answer today's calls with yesterday's shapes and fail in ways
+ * that look like desktop bugs.
+ */
+const SUPPORTED_HELPER_PROTOCOL_VERSION = 1;
+
+/**
+ * How long a capability probe is trusted while the helper stays up.
+ *
+ * `ComputerManager.publish` asks `availability()` on every publish, and a
+ * publish follows every action — so on macOS each click paid three helper round
+ * trips to re-read TCC grants that change at human speed, if at all. Short
+ * enough that revoking Screen Recording in System Settings is noticed within a
+ * couple of actions, long enough that a burst of actions reads it once.
+ */
+const CAPABILITY_CACHE_TTL_MS = 2_000;
+
+/**
+ * How long a failed helper build disables the backend before it is retried.
+ *
+ * A build failure is usually permanent (no Xcode, an unaccepted licence) and
+ * remembering it is what stops every action paying for a doomed five-minute
+ * compile. But it is not always permanent — a killed build, a full disk, a
+ * toolchain the user has since fixed — and without a bound the first bad build
+ * disabled desktop control for the life of the process. An explicit `provision()`
+ * clears it outright, because that is the user saying "try again".
+ */
+const BUILD_FAILURE_TTL_MS = 60_000;
+
+/**
+ * How long a `tccutil reset` is given before it is abandoned. It is a local
+ * database write that finishes in milliseconds; anything longer is a machine in
+ * trouble, and the permission dialog behind it must not wait on it.
+ */
+const TCC_RESET_TIMEOUT_MS = 5_000;
 
 const execFileAsync = promisify(execFile);
+
+/** The tri-state verdicts the helper may report; anything else is dropped. */
+const DELIVERY_VERIFICATIONS = new Set<string>([
+  "confirmed",
+  "unconfirmed",
+  "unverifiable",
+] satisfies ComputerDeliveryVerification[]);
 
 /**
  * The helper's own error code behind a failure, whether it arrived raw or
@@ -121,6 +202,80 @@ const runProcess: MacHelperRun = async (command, args, options) => {
   }
 };
 
+/**
+ * The private-SPI symbols the helper resolved at runtime, as it reports them.
+ *
+ * These are the rungs of the delivery ladder. `keyWindowRecord` is the one that
+ * reaches a web view without bringing its window forward, and it is the one
+ * Apple moves between releases — when it is missing the helper still delivers,
+ * but only by raising the window first, which the human sees. The report
+ * therefore has to reach the settings panel rather than staying a helper
+ * internal, because "windows keep jumping to the front" is otherwise
+ * unexplainable to the person watching it happen.
+ */
+export interface MacHelperSkylightReport {
+  readonly setWindowLocation: boolean;
+  readonly focusWithoutRaise: boolean;
+  readonly setFrontProcess: boolean;
+  readonly keyWindowRecord: boolean;
+}
+
+interface MacHelperCapabilities {
+  readonly screenRecording: boolean;
+  readonly accessibility: boolean;
+  /** Absent when the helper predates protocol versioning, which is itself drift. */
+  readonly protocolVersion: number | undefined;
+  readonly skylight: MacHelperSkylightReport;
+  /**
+   * How this build is signed, as the helper read it off its own code signature.
+   *
+   * The one thing that separates "you have not granted this yet" from "you
+   * granted it to a build that no longer exists": macOS pins an ad-hoc
+   * signature's TCC grant to the binary's cdhash, so every local rebuild
+   * silently invalidates it while System Settings goes on showing Synara
+   * switched on. Only the helper can answer it, and only for the build actually
+   * running. Anything the helper cannot classify is read as `signed`, because
+   * telling a release user to reset their TCC database is worse than saying
+   * nothing.
+   */
+  readonly signature: ComputerBuildSignature;
+}
+
+/**
+ * The grants a capability report says are absent, in the order every surface
+ * names them. Both the blocking one and the merely degrading one, because a user
+ * sent to System Settings should be told everything to switch on while they are
+ * there rather than making the trip twice.
+ */
+function missingMacPermissions(capabilities: MacHelperCapabilities): readonly ComputerPermission[] {
+  const missing: ComputerPermission[] = [];
+  if (!capabilities.accessibility) missing.push("accessibility");
+  if (!capabilities.screenRecording) missing.push("screenRecording");
+  return missing;
+}
+
+/**
+ * A helper capability report, from `capabilities` or `request-permissions` —
+ * both answer with the same shape, and the second one is a probe as much as it
+ * is a request, so both feed the same cache.
+ */
+function parseMacCapabilities(payload: unknown): MacHelperCapabilities {
+  const record = asRecord(payload);
+  const skylightPayload = asRecord(record.skylight);
+  return {
+    screenRecording: record.screenRecording === true,
+    accessibility: record.accessibility === true,
+    protocolVersion: asFiniteNumber(record.protocolVersion),
+    signature: record.signature === "adhoc" ? "adhoc" : "signed",
+    skylight: {
+      setWindowLocation: skylightPayload.setWindowLocation === true,
+      focusWithoutRaise: skylightPayload.focusWithoutRaise === true,
+      setFrontProcess: skylightPayload.setFrontProcess === true,
+      keyWindowRecord: skylightPayload.keyWindowRecord === true,
+    },
+  };
+}
+
 type MacHelperRun = (
   command: string,
   args: readonly string[],
@@ -137,7 +292,11 @@ export interface MacComputerBackendOptions {
   readonly now?: () => number;
   readonly stillIntervalMs?: number;
   readonly captureMaxDimension?: number;
-  /** Subprocess runner for the toolchain probe and build; injected in tests. */
+  /**
+   * Subprocess runner for the toolchain probe, the helper build, and the
+   * `tccutil reset` that clears a stale ad-hoc grant; injected in tests, which
+   * must never spawn any of the three.
+   */
   readonly run?: MacHelperRun;
   /**
    * Builds the helper client around a binary path. Injected so a test can hand
@@ -181,6 +340,7 @@ export class MacComputerBackend implements ComputerBackend {
   private readonly stillIntervalMs: number;
   private readonly captureMaxDimension: number;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly run: MacHelperRun;
   private readonly provisioner: MacComputerHelperProvisioner;
   private readonly makeHelperClient: (
     options: MacComputerHelperClientOptions,
@@ -195,19 +355,38 @@ export class MacComputerBackend implements ComputerBackend {
   private drivingAgent: string | null = null;
   /** True once `capabilities` reports Screen Recording granted; drives `health.captureAvailable`. */
   private captureGranted = false;
-  private buildFailure: string | undefined;
+  private buildFailure: { readonly message: string; readonly at: number } | undefined;
+  private capabilityCache:
+    | { readonly value: MacHelperCapabilities; readonly at: number }
+    | undefined;
+  /**
+   * Grants macOS has already been asked for on the current helper process. See
+   * `requestMissingPermissions`: the Accessibility dialog reappears on every
+   * ask, and the tool surface consults `missingPermissions()` on every call.
+   */
+  private readonly permissionsAsked = new Set<ComputerPermission>();
+  /**
+   * True once the helper says it cannot deliver background input into a window
+   * without bringing it forward. Reported on health so the settings panel can
+   * say so plainly rather than leaving the user to notice windows raising.
+   */
+  private backgroundInputDegraded = false;
+  /** The desktop's backing-store scale as the helper reported it, not a guess. */
+  private screenScale = 1;
 
   /** Last known global-space workspace origin, so pointer/capture translate without a fresh read. */
   private lastOrigin: ComputerPoint = { x: 0, y: 0 };
   private lastWorkspaceGlobal: ComputerRect | undefined;
 
-  private streamListener: ComputerFrameListener | undefined;
-  private streamTimer: ReturnType<typeof setInterval> | undefined;
-  private stillInFlight = false;
-  private nextSequence = 1;
-  /** Suppresses stills identical to the one the pane already has. */
-  private readonly frameDedupe = new StillFrameDedupe();
-  private previousWindowsFingerprint: string | undefined;
+  /** The still-frame loop, shared with the KWin backend. */
+  private readonly stills: StillFramePublisher;
+  private readonly windowsChanges: WindowListChangeNotifier;
+  /**
+   * How many captures each ScreenCaptureKit path has served. The helper names
+   * the source it fell back to, and the only way "how often does the fast path
+   * miss?" is answerable is by counting the answers.
+   */
+  private readonly sourceCounts = new Map<string, number>();
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
 
   constructor(options: MacComputerBackendOptions = {}) {
@@ -224,6 +403,7 @@ export class MacComputerBackend implements ComputerBackend {
     );
     this.env = options.env ?? process.env;
     const run = options.run ?? runProcess;
+    this.run = run;
     const helperSourceDir =
       options.helperSourceDir ?? resolveComputerHelperSourceDir(import.meta.dirname);
     this.provisioner = new MacComputerHelperProvisioner({
@@ -239,11 +419,27 @@ export class MacComputerBackend implements ComputerBackend {
       readStatus: () => ({
         status: this.helper?.running ? "connected" : "unavailable",
         captureAvailable: this.captureGranted,
+        backgroundInputDegraded: this.backgroundInputDegraded,
       }),
       emit: (health) => this.emit({ type: "health-changed", health }),
       now: () => this.now(),
       failureFallbackMessage: "The Synara macOS computer backend failed without a message.",
     });
+    this.stills = new StillFramePublisher({
+      capture: () => this.captureStillFrame(),
+      // No Screen Recording grant means every capture would fail identically;
+      // the tick is skipped rather than spending a round trip to learn that.
+      isCaptureAvailable: () => this.captureGranted,
+      prepare: async () => {
+        await this.ensureHelper();
+      },
+      emit: (frame) => this.emit({ type: "frame", frame }),
+      now: () => this.now(),
+      intervalMs: this.stillIntervalMs,
+    });
+    this.windowsChanges = new WindowListChangeNotifier((windows) =>
+      this.emit({ type: "windows-changed", windows }),
+    );
   }
 
   /**
@@ -282,8 +478,9 @@ export class MacComputerBackend implements ComputerBackend {
     if (this.platform !== "darwin") {
       return { kind: "unsupported-platform", platform: this.platform };
     }
-    if (this.buildFailure) {
-      return { kind: "backend-unavailable", message: this.buildFailure };
+    const buildFailure = this.currentBuildFailure();
+    if (buildFailure) {
+      return { kind: "backend-unavailable", message: buildFailure };
     }
     if (await this.provisioner.bundledBinary().catch(() => null)) return this.availableNow();
     if (await this.provisioner.cachedBinaryPath().catch(() => null)) return this.availableNow();
@@ -308,12 +505,26 @@ export class MacComputerBackend implements ComputerBackend {
       // Accessibility is not optional for this backend: without it every click
       // and keystroke is dropped by WindowServer. Reporting "available" here
       // let the pane open onto a desktop nothing could be done to.
+      //
+      // Screen Recording alone does not reach this branch. A desktop that can be
+      // driven but not seen is still worth having, so it stays `available` with
+      // `health.captureAvailable` false — the missing grant is reported through
+      // `missingPermissions()`, which is what still raises the chat's setup card
+      // for it without taking the working half of the feature away.
       if (!capabilities.accessibility) {
+        const missing = missingMacPermissions(capabilities);
+        // Ask the OS here rather than only describing what is missing: this is
+        // an agent path, and the user is owed the dialog at the moment the
+        // desktop is needed. Not awaited — the dialog outlives this call.
+        void this.requestMissingPermissions(missing);
         return {
-          kind: "backend-unavailable",
-          message:
-            "Synara needs Accessibility access to control this Mac. Allow it for Synara in " +
-            "System Settings › Privacy & Security › Accessibility, then try again.",
+          kind: "permission-required",
+          missing,
+          message: clampComputerMessage(
+            computerPermissionSetupMessage(missing, capabilities.signature),
+            "Synara needs a macOS privacy permission to control this Mac.",
+          ),
+          buildSignature: capabilities.signature,
         };
       }
       return this.availableNow();
@@ -336,10 +547,75 @@ export class MacComputerBackend implements ComputerBackend {
   }
 
   /**
-   * The settings-panel "Set up" action: compile the native helper for this
-   * Xcode toolchain (a cold Swift build) and start it, so the first agent turn
-   * does not pay the build. Returns one sentence naming what happened and the
-   * grants still needed, which is exactly what the card that pressed it renders.
+   * The TCC grants this Mac is withholding right now.
+   *
+   * Empty before anything has probed, which is the honest answer: nobody has
+   * looked, so nobody is owed a permission card yet — and that is a free read,
+   * as is the case where the last probe saw everything granted.
+   *
+   * The one case that costs anything is the one that matters. A probe that saw
+   * a gap is the only kind of answer that can go stale in a way the user can
+   * see: they grant the permission, the tool surface reads this after the very
+   * next call, and a remembered "missing" keeps the setup card and the model's
+   * refusal on screen over a desktop that already works. So a probe that named a
+   * missing grant is re-read here rather than reused, through the same
+   * `CAPABILITY_CACHE_TTL_MS` window every other reader honours — a burst of
+   * calls still pays for one round trip, and a grant that lands is noticed on
+   * the next one.
+   */
+  async missingPermissions(): Promise<readonly ComputerPermission[]> {
+    const cached = this.capabilityCache?.value;
+    if (!cached || missingMacPermissions(cached).length === 0) return [];
+    // A probe failure leaves the last report standing: the caller is a tool
+    // call with its own outcome to report, and inventing a granted desktop out
+    // of an unreachable helper would drop the card the user is owed.
+    const capabilities = await this.readCapabilities().catch(() => cached);
+    const missing = missingMacPermissions(capabilities);
+    // The tool surface reads this on every computer call to decide whether the
+    // user is owed a setup card, which makes it the one place that sees a
+    // merely-degrading grant (Screen Recording) go missing without anything
+    // failing. Asking from here is what turns that card into an OS dialog; the
+    // per-grant throttle is what keeps a per-call read from stacking dialogs.
+    if (missing.length > 0) void this.requestMissingPermissions(missing);
+    return missing;
+  }
+
+  /**
+   * How this build is signed, as the last probe read it off the binary. Free,
+   * and undefined until something has probed. Rides beside `missingPermissions`
+   * so the chat's setup card can explain an ad-hoc build's stale grant rather
+   * than leaving the user looking at a switch that is already on.
+   */
+  buildSignature(): ComputerBuildSignature | undefined {
+    return this.capabilityCache?.value.signature;
+  }
+
+  /**
+   * What to ask macOS for after it has refused a live call. The last probe when
+   * it named something, and both grants when it did not: a refusal is proof the
+   * probe is wrong or absent, and the helper only ever prompts for a grant it
+   * genuinely lacks, so offering both cannot put a dialog on screen for
+   * something already granted.
+   */
+  private deniedPermissions(): readonly ComputerPermission[] {
+    const capabilities = this.capabilityCache?.value;
+    const missing = capabilities ? missingMacPermissions(capabilities) : [];
+    return missing.length > 0 ? missing : COMPUTER_PERMISSIONS;
+  }
+
+  /**
+   * The user pressing "Set up" — in settings, or on the chat's setup card.
+   *
+   * Compiles the native helper for this Xcode toolchain (a cold Swift build) and
+   * starts it, so the first agent turn does not pay the build, and then asks
+   * macOS for anything it is still withholding. That last part is why this is
+   * the same mechanism the agent path uses rather than a second one: pressing
+   * the button is an explicit request for the dialog, so it also re-arms the
+   * per-grant throttle and puts the prompt back on screen for a user who
+   * dismissed it.
+   *
+   * Returns one sentence naming what happened and the grants still needed, which
+   * is exactly what the card that pressed it renders.
    */
   async provision(): Promise<string> {
     if (this.platform !== "darwin") {
@@ -347,20 +623,70 @@ export class MacComputerBackend implements ComputerBackend {
         `The macOS computer backend cannot provision on ${this.platform}.`,
       );
     }
-    await this.ensureHelper();
-    const capabilities = await this.readCapabilities();
+    // The user pressing "Set up" is the user asking for another attempt, so a
+    // remembered build failure must not short-circuit it — that is what turned
+    // one bad build into a backend that stayed dead until the server restarted.
+    this.buildFailure = undefined;
+    // Re-arm before the probe: the ask this user just made outranks whatever
+    // an agent path already spent, and a dismissed dialog is exactly the case
+    // this button exists for.
+    this.permissionsAsked.clear();
+    const built = await this.ensureHelperBuilt();
+    let capabilities = await this.readCapabilities({ force: true });
+    let missing = missingMacPermissions(capabilities);
+    if (missing.length > 0) {
+      // Awaited, unlike the agent paths: the sentence this returns describes
+      // where the request left things, and the reply is a fresh report that may
+      // already say the user granted it.
+      capabilities = (await this.requestMissingPermissions(missing)) ?? capabilities;
+      missing = missingMacPermissions(capabilities);
+    }
     this.publishHealth();
-    const missing: string[] = [];
-    if (!capabilities.screenRecording) missing.push("Screen Recording");
-    if (!capabilities.accessibility) missing.push("Accessibility");
-    return missing.length === 0
-      ? "Built and started the macOS computer-use helper; Screen Recording and Accessibility are granted."
-      : `Built and started the macOS computer-use helper. Grant ${missing.join(" and ")} in System ` +
-          "Settings › Privacy & Security to finish enabling desktop control.";
+    // A packaged build ships a signed helper, so nothing is compiled and saying
+    // "Built" is simply untrue — and the sentence this returns is the whole
+    // content of the card the user is reading.
+    const started = built ? "Built and started" : "Started";
+    if (missing.length === 0) {
+      return `${started} the bundled macOS computer-use helper; Screen Recording and Accessibility are granted.`;
+    }
+    // The stale-grant sentence belongs here too: "Set up" is exactly where a user
+    // with an ad-hoc build sees Synara already switched on and concludes Synara
+    // is broken.
+    const advice = computerStaleGrantAdvice(missing, capabilities.signature);
+    return (
+      `${started} the bundled macOS computer-use helper and asked macOS for ` +
+      `${listComputerPermissions(missing)}. Allow it when macOS asks, or turn Synara on in ` +
+      `System Settings › Privacy & Security.${advice ? ` ${advice}` : ""}`
+    );
+  }
+
+  /**
+   * Brings the helper up and reports whether provisioning had to compile it.
+   * A packaged desktop build ships a signed universal binary and a warm cache
+   * serves an earlier compile; only a cold source build is a build.
+   */
+  private async ensureHelperBuilt(): Promise<boolean> {
+    const before = this.provisioner.compiledBuilds;
+    await this.ensureHelper();
+    return this.provisioner.compiledBuilds > before;
   }
 
   health(): ComputerHealth {
     return this.healthState.health();
+  }
+
+  /**
+   * Captures served per ScreenCaptureKit path, since this backend was
+   * constructed.
+   *
+   * The helper names the link that served each capture precisely so the
+   * fallback rate is a health metric rather than a guess (see
+   * `native/computer-use-macos/Sources/Capture.swift`). Reading the field was
+   * the missing half: without a count, "how often does the fast path miss?" had
+   * no answer at all.
+   */
+  captureSourceCounts(): ReadonlyMap<string, number> {
+    return new Map(this.sourceCounts);
   }
 
   async listWindows(): Promise<readonly ComputerWindow[]> {
@@ -385,11 +711,11 @@ export class MacComputerBackend implements ComputerBackend {
     this.lastOrigin = origin;
     this.lastWorkspaceGlobal = workspace;
     const windows = raw.map((window) => windowInAgentSpace(window, origin));
-    const fingerprint = windowsPayloadFingerprint(record.windows, focusedWindowId);
-    if (fingerprint !== this.previousWindowsFingerprint) {
-      this.previousWindowsFingerprint = fingerprint;
-      this.emit({ type: "windows-changed", windows });
-    }
+    // Digested from the parsed list rather than by re-encoding the helper's
+    // reply: the helper answers with a decoded object, so fingerprinting "the
+    // payload" would mean a full JSON encode on a call that runs several times
+    // per action.
+    this.windowsChanges.observe(windowsDigestFingerprint(raw, focusedWindowId), windows);
     return [windows, origin];
   }
 
@@ -410,25 +736,29 @@ export class MacComputerBackend implements ComputerBackend {
     const originY = asFiniteNumber(record.y) ?? this.lastOrigin.y;
     this.lastOrigin = { x: originX, y: originY };
     this.lastWorkspaceGlobal = { x: originX, y: originY, width, height };
+    // Remembered so `getState` can report a truthful scale without a round trip
+    // of its own: derived from the window bounding box it had no scale at all
+    // and reported 1, which on every Retina Mac is simply wrong.
+    if (scale !== undefined && scale > 0) this.screenScale = scale;
     return {
       width: Math.round(width),
       height: Math.round(height),
-      ...(scale && scale > 0 ? { scale } : { scale: 1 }),
+      scale: this.screenScale,
     };
   }
 
   async getState(options: {
     readonly includeScreenshot?: boolean;
-    readonly includeText?: boolean;
+    readonly includeTree?: boolean;
   }): Promise<ComputerState> {
     const [windows, origin] = await this.readWindows();
-    const screenSize = screenSizeFromWindows(windows, this.lastWorkspaceGlobal);
+    const screenSize = screenSizeFromWindows(windows, this.lastWorkspaceGlobal, this.screenScale);
     // The AX walk and the capture are independent reads of the same moment, and
     // the helper serves perception and pixels on separate queues, so they are
     // issued together: running them back to back doubled the latency of every
     // `computer_get_state` for nothing.
     const [uiPayload, screenshot] = await Promise.all([
-      options.includeText
+      options.includeTree
         ? // AX is an optional perception source: a window with no tree, a helper
           // restarting, or a missing Accessibility grant degrades to
           // windows-only rather than failing the state, as the KWin path does.
@@ -451,7 +781,6 @@ export class MacComputerBackend implements ComputerBackend {
       windows,
       screenSize,
       ...(root ? { root } : {}),
-      ...(root && options.includeText ? { text: describeComputerUiTree(root) } : {}),
       ...(screenshot ? { screenshot } : {}),
       capturedAt: new Date(this.now()).toISOString(),
     };
@@ -546,15 +875,23 @@ export class MacComputerBackend implements ComputerBackend {
     windowId?: string,
   ): Promise<ComputerBackendActionResult> {
     const origin = this.currentOrigin();
-    await this.call(MAC_HELPER_METHODS.drag, {
-      fromX: from.x + origin.x,
-      fromY: from.y + origin.y,
-      toX: to.x + origin.x,
-      toY: to.y + origin.y,
-      durationMs: durationMs > 0 ? durationMs : DEFAULT_DRAG_DURATION_MS,
-      ...(windowId ? { windowId } : {}),
-    });
-    return { point: to };
+    const payload = asRecord(
+      await this.call(MAC_HELPER_METHODS.drag, {
+        fromX: from.x + origin.x,
+        fromY: from.y + origin.y,
+        toX: to.x + origin.x,
+        toY: to.y + origin.y,
+        durationMs: durationMs > 0 ? durationMs : DEFAULT_DRAG_DURATION_MS,
+        ...(windowId ? { windowId } : {}),
+      }),
+    );
+    // A drag ends where the pointer ended, and the display server can clamp that
+    // endpoint just as it clamps a click's. Reporting the requested destination
+    // regardless told the caller the drop landed somewhere it did not.
+    return {
+      ...pointerClampResult(to, this.landedPoint(payload, origin)),
+      ...MacComputerBackend.deliveryReport(payload),
+    };
   }
 
   async scroll(
@@ -570,23 +907,38 @@ export class MacComputerBackend implements ComputerBackend {
       params.x = point.x + origin.x;
       params.y = point.y + origin.y;
     }
-    await this.call(MAC_HELPER_METHODS.scroll, params);
-    return point ? { point } : {};
+    const payload = asRecord(await this.call(MAC_HELPER_METHODS.scroll, params));
+    const delivery = MacComputerBackend.deliveryReport(payload);
+    // A scroll with no point is aimed by focus, so there is no requested
+    // coordinate for the helper's echo to disagree with.
+    if (!point) return delivery;
+    return { ...pointerClampResult(point, this.landedPoint(payload, origin)), ...delivery };
   }
 
   /**
-   * Every keyboard reply names the rung the helper took and whether it could
-   * confirm the effect — the whole point of the helper's delivery ladder — and
-   * this backend used to discard both, so an unverified delivery and a proven
-   * one were indistinguishable to everything above it.
+   * Every input reply — keyboard and pointer alike — names the rung the helper
+   * took and what it could establish about the outcome, which is the whole point
+   * of the helper's delivery ladder. This backend used to discard both, so an
+   * unconfirmed delivery and a proven one were indistinguishable to everything
+   * above it.
+   *
+   * The verdict is validated rather than trusted: a value this build does not
+   * recognize is dropped, because a `delivery` the contract cannot encode would
+   * fail the whole result of an action that already happened. Nothing here
+   * accommodates the older boolean form — the helper ships with the server, so
+   * there is no mixed-version pair to be compatible with.
    */
   private static deliveryReport(payload: unknown): ComputerBackendActionResult {
     const record = asRecord(payload);
     const deliveryPath = asString(record.path);
-    const verified = record.verified;
+    const reported = asString(record.verified);
+    const verified =
+      reported !== undefined && DELIVERY_VERIFICATIONS.has(reported)
+        ? (reported as ComputerDeliveryVerification)
+        : undefined;
     return {
       ...(deliveryPath !== undefined ? { deliveryPath } : {}),
-      ...(typeof verified === "boolean" ? { verified } : {}),
+      ...(verified !== undefined ? { verified } : {}),
     };
   }
 
@@ -694,10 +1046,6 @@ export class MacComputerBackend implements ComputerBackend {
     await this.call(MAC_HELPER_METHODS.focusWindow, { windowId });
   }
 
-  async raiseWindow(windowId: string): Promise<void> {
-    await this.call(MAC_HELPER_METHODS.raiseWindow, { windowId });
-  }
-
   async setDrivingAgent(name: string | null): Promise<void> {
     this.drivingAgent = name?.trim() ? name.trim() : null;
     if (!this.helper?.running) return;
@@ -714,32 +1062,15 @@ export class MacComputerBackend implements ComputerBackend {
   }
 
   async attachStream(listener: ComputerFrameListener): Promise<void> {
-    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
-    this.streamTimer = undefined;
-    await this.ensureHelper();
-    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
-    this.streamListener = listener;
-    // A re-attached pane has seen nothing, so the dedupe memory must not
-    // suppress its first frame.
-    this.frameDedupe.reset();
-    await this.publishStillFrame({ force: true });
-    this.streamTimer = setInterval(() => {
-      void this.publishStillFrame();
-    }, this.stillIntervalMs);
-    this.streamTimer.unref?.();
+    await this.stills.attach(listener);
   }
 
   async detachStream(): Promise<void> {
-    this.streamListener = undefined;
-    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
-    this.streamTimer = undefined;
+    await this.stills.detach();
   }
 
   async requestKeyframe(): Promise<void> {
-    if (!this.streamListener) return;
-    // A keyframe is asked for because the receiver has nothing to draw, so it
-    // publishes even when the desktop is byte-identical to the last frame.
-    await this.publishStillFrame({ force: true });
+    await this.stills.requestKeyframe();
   }
 
   async dispose(): Promise<void> {
@@ -785,13 +1116,23 @@ export class MacComputerBackend implements ComputerBackend {
     // The helper reports where the pointer actually landed when the display
     // clamped it (a coordinate in a gap between screens); shift back to agent
     // space and surface the mismatch through the same rule the KWin path uses.
-    const landedX = asFiniteNumber(payload.x);
-    const landedY = asFiniteNumber(payload.y);
-    const landed =
-      landedX !== undefined && landedY !== undefined
-        ? { x: landedX - origin.x, y: landedY - origin.y }
-        : null;
-    return pointerClampResult(point, landed);
+    return {
+      ...pointerClampResult(point, this.landedPoint(payload, origin)),
+      // A pointer action rides the same delivery ladder the keyboard does, and
+      // "the click was posted but nothing acknowledged it" is exactly as worth
+      // reporting as the keyboard equivalent.
+      ...MacComputerBackend.deliveryReport(payload),
+    };
+  }
+
+  /** The helper's echoed endpoint in agent space, or null when it reported none. */
+  private landedPoint(
+    payload: Record<string, unknown>,
+    origin: ComputerPoint,
+  ): ComputerPoint | null {
+    const x = asFiniteNumber(payload.x);
+    const y = asFiniteNumber(payload.y);
+    return x !== undefined && y !== undefined ? { x: x - origin.x, y: y - origin.y } : null;
   }
 
   private async captureWorkspaceScreenshot(origin: ComputerPoint): Promise<ComputerScreenshot> {
@@ -808,59 +1149,25 @@ export class MacComputerBackend implements ComputerBackend {
   }
 
   /**
-   * One workspace still onto the attached stream, unless it is the picture the
-   * pane already has. The timer pulls a full-desktop PNG twice a second, and an
-   * idle desktop encodes the same bytes every time; republishing them costs the
-   * socket a megabyte to convey nothing. `force` is for the cases where the
-   * receiver has no picture yet — a fresh attach, an explicit keyframe request.
+   * One whole-workspace still as raw PNG bytes, for the shared publisher.
+   *
+   * Nothing here builds a `ComputerScreenshot`: that payload is base64, and a
+   * frame carries the bytes the capture already returned. Round-tripping a
+   * multi-megabyte PNG through base64 twice a second, forever, while anyone
+   * watches the pane, would cost two copies and an encode per frame to arrive
+   * back where it started.
    */
-  private async publishStillFrame(options: { readonly force?: boolean } = {}): Promise<void> {
-    const listener = this.streamListener;
-    if (!listener || !this.captureGranted) return;
-    if (this.stillInFlight) {
-      // A keyframe asked for while a still is already in flight used to be
-      // dropped outright. The in-flight capture then deduped against the digest
-      // it had just published and sent nothing, so the receiver that asked
-      // precisely because it had no picture stayed blank until the desktop
-      // happened to change. The request is remembered instead.
-      if (options.force) this.frameDedupe.deferForce();
-      return;
-    }
-    this.stillInFlight = true;
-    const force = this.frameDedupe.takeForce(options.force === true);
-    try {
-      const global = await this.workspaceRect();
-      const captured = await this.callCapture({
-        kind: "region",
-        region: global,
-        maxDimension: this.captureMaxDimension,
-      });
-      // Fail here rather than in a browser decoder, whose only symptom is a
-      // blank pane: a payload that is not a PNG must be caught at the source.
-      readPngDimensions(captured.bytes, { source: "Synara macOS capture" });
-      if (this.streamListener !== listener) return;
-      if (!this.frameDedupe.shouldPublish(captured.bytes, force)) return;
-      const frame = {
-        sequence: this.nextSequence++,
-        timestampMs: this.now(),
-        keyframe: true,
-        codecConfig: false,
-        data: captured.bytes,
-      };
-      listener(frame);
-      this.emit({ type: "frame", frame });
-    } catch {
-      // A transient capture failure must not tear down a subscribed stream.
-      // The force request survives it: the receiver still has no picture.
-      if (force) this.frameDedupe.deferForce();
-    } finally {
-      this.stillInFlight = false;
-      // A forced request that arrived mid-flight is served now rather than
-      // waiting for the next timer tick.
-      if (this.frameDedupe.forcePending && this.streamListener === listener) {
-        void this.publishStillFrame();
-      }
-    }
+  private async captureStillFrame(): Promise<Uint8Array> {
+    const global = await this.workspaceRect();
+    const captured = await this.callCapture({
+      kind: "region",
+      region: global,
+      maxDimension: this.captureMaxDimension,
+    });
+    // Fail here rather than in a browser decoder, whose only symptom is a
+    // blank pane: a payload that is not a PNG must be caught at the source.
+    readPngDimensions(captured.bytes, { source: "Synara macOS capture" });
+    return captured.bytes;
   }
 
   private screenshot(bytes: Uint8Array, region: ComputerRect): ComputerScreenshot {
@@ -902,16 +1209,180 @@ export class MacComputerBackend implements ComputerBackend {
     return { x, y, width, height };
   }
 
-  private async readCapabilities(): Promise<{
-    readonly screenRecording: boolean;
-    readonly accessibility: boolean;
-  }> {
-    const payload = asRecord(await this.call(MAC_HELPER_METHODS.capabilities));
-    const screenRecording = payload.screenRecording === true;
+  /**
+   * The helper's capability probe, cached for `CAPABILITY_CACHE_TTL_MS`.
+   *
+   * The cache exists because `ComputerManager.publish` asks `availability()`
+   * after every action, and each of those asks was a helper round trip to
+   * re-read TCC grants and an OS version — state that changes when a human
+   * visits System Settings, not between two clicks. The TTL is short enough
+   * that a revoked grant still surfaces almost immediately, and the helper
+   * exiting drops the cache outright, because a fresh process has to be asked
+   * again from scratch.
+   *
+   * A forced read after a probe that saw a missing grant restarts the helper
+   * first. macOS decides a TCC question once per process and answers every
+   * later ask from that decision, so a helper that started before the user
+   * granted Screen Recording goes on reporting it missing for as long as it
+   * lives — which made "grant it, then press Set up" report failure forever.
+   * Nothing in the helper survives a restart that matters: every call names its
+   * own target and the agent-cursor badge is pushed back on start.
+   */
+  private async readCapabilities(
+    options: { readonly force?: boolean } = {},
+  ): Promise<MacHelperCapabilities> {
+    const cached = this.capabilityCache;
+    if (
+      !options.force &&
+      cached &&
+      this.helper?.running === true &&
+      this.now() - cached.at < CAPABILITY_CACHE_TTL_MS
+    ) {
+      return cached.value;
+    }
+    if (options.force && cached && this.helper && missingMacPermissions(cached.value).length > 0) {
+      // Clears the cache with the process, so the probe `startHelper` runs is
+      // itself the forced read and never recurses back into this branch.
+      this.invalidateHelper();
+      await this.ensureHelper();
+      const restarted = this.capabilityCache;
+      if (restarted) return restarted.value;
+    }
+    return this.recordCapabilities(
+      parseMacCapabilities(await this.call(MAC_HELPER_METHODS.capabilities)),
+    );
+  }
+
+  /**
+   * Asks macOS for the grants it is withholding, at most once per grant per
+   * helper process.
+   *
+   * This is the whole point of the feature: the OS dialog appears the moment an
+   * agent needs the grant, attributed to Synara (TCC files a helper's request
+   * against its responsible process — the app — see the helper's
+   * Capability.swift). Nothing waits for the answer, because the answer is a
+   * human deciding at a dialog and the tool call that triggered this has already
+   * failed.
+   *
+   * The throttle is not politeness. macOS shows the Screen Recording prompt once
+   * per app and silently returns false afterwards, but the Accessibility prompt
+   * reappears on *every* request — so an unthrottled ask from `missingPermissions()`,
+   * which the tool surface consults on every single call, would stack a dialog
+   * per action on top of the user. One ask per grant per helper process is
+   * enough for the first-need case, and pressing "Set up" re-arms it explicitly
+   * (as does a helper restart, which is a fresh process with fresh answers).
+   *
+   * On an ad-hoc build the ask is preceded by a `tccutil reset` of Synara's own
+   * rows for those grants — see `resetStaleAdhocGrants`, without which macOS
+   * answers a rebuilt binary's request from a decision it filed against the
+   * previous one and never puts a dialog on screen.
+   */
+  private async requestMissingPermissions(
+    missing: readonly ComputerPermission[],
+  ): Promise<MacHelperCapabilities | undefined> {
+    const pending = missing.filter((permission) => !this.permissionsAsked.has(permission));
+    if (pending.length === 0 || this.disposed) return undefined;
+    // Marked before the call, so the failure paths this request can travel
+    // through — including a `-32000` refusal answered by this same method —
+    // cannot loop back into a second ask.
+    for (const permission of pending) this.permissionsAsked.add(permission);
+    await this.resetStaleAdhocGrants(pending);
+    try {
+      const payload = asRecord(await this.call(MAC_HELPER_METHODS.requestPermissions));
+      // A reply this build cannot read is dropped rather than parsed: every
+      // absent field reads as a withheld grant, so believing one would invent
+      // missing permissions out of a malformed answer.
+      if (
+        typeof payload.accessibility !== "boolean" ||
+        typeof payload.screenRecording !== "boolean"
+      )
+        return undefined;
+      // Otherwise it is a fresh report, cached like any other probe: the user may
+      // have answered the dialog while the call was in flight.
+      return this.recordCapabilities(parseMacCapabilities(payload));
+    } catch {
+      // A helper that cannot be asked is already reported through health; the
+      // caller is an action that has its own failure to return.
+      return undefined;
+    }
+  }
+
+  /**
+   * Removes Synara's own TCC rows for the grants it is about to ask for, on an
+   * ad-hoc build only.
+   *
+   * On such a build a missing grant has exactly two possible causes, and both
+   * are cured by the same command: either the user has never granted it — in
+   * which case there is no row and the reset is a no-op — or they granted it to
+   * a *previous* binary, and macOS pinned that grant to a cdhash this build no
+   * longer has. In the second case System Settings shows Synara switched on, the
+   * helper reports the grant missing, and macOS will not prompt again while the
+   * row stands: the ask below silently returns false forever. Removing the row
+   * is the only thing that makes the dialog appear, and it can only remove a
+   * decision the user is being asked to make again anyway.
+   *
+   * Never on a signed build. A Developer ID signature keys on identifier plus
+   * team and survives rebuilds, so a missing grant there is simply not granted —
+   * and throwing away a release user's real permission to re-ask for it would be
+   * vandalism, not self-healing.
+   *
+   * `tccutil` needs no privilege for the caller's own bundle id (it refuses an
+   * unknown one with OSStatus -10814), and the service names are the command's,
+   * not the labels: Screen Recording is `ScreenCapture`. A failure is ignored —
+   * the ask that follows is still worth making, and this is a repair attempt,
+   * not a precondition.
+   */
+  private async resetStaleAdhocGrants(missing: readonly ComputerPermission[]): Promise<void> {
+    const cached = this.capabilityCache?.value;
+    if (cached?.signature !== "adhoc") return;
+    // Narrowed to what the probe actually reports missing, which is wider than
+    // it looks: a live refusal offers *both* grants when it cannot say which
+    // one it wanted, and resetting a row the helper can see is granted would
+    // take a working permission off a developer to fix a different one.
+    const stale = missingMacPermissions(cached);
+    for (const permission of missing.filter((candidate) => stale.includes(candidate))) {
+      const service = TCC_SERVICE_NAMES[permission];
+      try {
+        const result = await this.run("tccutil", ["reset", service, SYNARA_PRODUCTION_BUNDLE_ID], {
+          timeoutMs: TCC_RESET_TIMEOUT_MS,
+        });
+        if (result.code !== 0) {
+          console.debug(
+            `synara: tccutil reset ${service} exited ${result.code}: ${result.stderr.trim()}`,
+          );
+        }
+      } catch (error) {
+        console.debug(
+          `synara: tccutil reset ${service} could not run: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+
+  /** Caches a fresh report and folds it into health. */
+  private recordCapabilities(capabilities: MacHelperCapabilities): MacHelperCapabilities {
+    this.capabilityCache = { value: capabilities, at: this.now() };
     // The probe is the authority on the grant in both directions: it restores
     // capture health after a refusal the user has since fixed in System Settings.
-    this.setCaptureGranted(screenRecording);
-    return { screenRecording, accessibility: payload.accessibility === true };
+    this.setCaptureGranted(capabilities.screenRecording);
+    this.setBackgroundInputDegraded(!capabilities.skylight.keyWindowRecord);
+    return capabilities;
+  }
+
+  /** Records whether input can reach a background window, publishing on a change. */
+  private setBackgroundInputDegraded(degraded: boolean): void {
+    if (this.backgroundInputDegraded === degraded) return;
+    this.backgroundInputDegraded = degraded;
+    this.publishHealth();
+  }
+
+  /** The remembered build failure, unless it has aged out of its TTL. */
+  private currentBuildFailure(): string | undefined {
+    const failure = this.buildFailure;
+    if (!failure) return undefined;
+    if (this.now() - failure.at < BUILD_FAILURE_TTL_MS) return failure.message;
+    this.buildFailure = undefined;
+    return undefined;
   }
 
   private async callCapture(request: {
@@ -927,6 +1398,13 @@ export class MacComputerBackend implements ComputerBackend {
     if (request.kind === "window") params.windowId = request.windowId;
     if (request.region) params.region = request.region;
     const payload = asRecord(await this.callCaptureMethod(params));
+    // The helper names the ScreenCaptureKit path it actually used, and it falls
+    // back when the fast one is unavailable. Counting the answers is what makes
+    // the fallback rate a number somebody can look at instead of a guess.
+    const source = asString(payload.source);
+    if (source !== undefined) {
+      this.sourceCounts.set(source, (this.sourceCounts.get(source) ?? 0) + 1);
+    }
     const base64 = asString(payload.base64);
     if (!base64) {
       throw new ComputerBackendError("The macOS capture returned no image data.");
@@ -946,6 +1424,10 @@ export class MacComputerBackend implements ComputerBackend {
       return await this.call(MAC_HELPER_METHODS.capture, params);
     } catch (error) {
       if (helperErrorCode(error) === HELPER_PERMISSION_DENIED_CODE) {
+        // The refusal is a live contradiction of whatever the probe last said,
+        // so the cached probe has to go with it — otherwise a grant the user
+        // restores in System Settings stays invisible for the whole TTL.
+        this.capabilityCache = undefined;
         this.setCaptureGranted(false);
       }
       throw error;
@@ -988,9 +1470,61 @@ export class MacComputerBackend implements ComputerBackend {
         });
       }
       if (error instanceof ComputerBackendError) throw error;
-      throw new ComputerBackendError(error instanceof Error ? error.message : String(error), {
-        cause: error,
-      });
+      const message = error instanceof Error ? error.message : String(error);
+      if (code === HELPER_PERMISSION_DENIED_CODE) {
+        // The one failure the agent cannot recover from by trying something
+        // else: macOS is withholding Screen Recording or Accessibility from
+        // Synara, and only the human can grant it. Marking it is what raises
+        // the chat's setup card instead of burying the reason in a tool error.
+        //
+        // The refusal is also the most reliable moment to ask: a live call just
+        // proved the grant is absent. The helper prompts only for what it is
+        // actually missing, so when the last probe cannot say which grant that
+        // was — a refusal can arrive before any probe, or contradict one — both
+        // are offered and macOS decides.
+        void this.requestMissingPermissions(this.deniedPermissions());
+        throw new ComputerBackendError(message, { setupRequired: true, cause: error });
+      }
+      if (code === HELPER_NOT_DELIVERED_CODE) {
+        // The helper exhausted its ladder and injected nothing, which is a
+        // refusal rather than a fault. Naming the declined call is what lets
+        // `ComputerManager.injectScoped` say "refused, nothing injected"
+        // instead of leaving the caller to assume the control is broken.
+        throw new ComputerBackendError(message, { rejectedOperation: method, cause: error });
+      }
+      if (code === HELPER_TARGET_MISSING_CODE) {
+        const windowId = typeof params.windowId === "string" ? params.windowId : undefined;
+        if (windowId !== undefined) {
+          throw new ComputerBackendError(
+            `No desktop window has id ${JSON.stringify(windowId)}. ` +
+              "Call computer_list_windows for the current window ids.",
+            { cause: error },
+          );
+        }
+        if (KEYBOARD_METHODS.has(method)) {
+          // Nothing was typed, and repeating the call cannot change that — the
+          // caller has to aim first. Saying so plainly is the difference between
+          // one corrective action and a retry loop against a refusal that names
+          // a window id nobody supplied.
+          throw new ComputerBackendError(
+            "No window is aimed for keyboard input, so nothing was typed. Click into the " +
+              "window you mean, or pass its window_id with the keyboard action, and send the " +
+              "input again. Repeating it without aiming will refuse the same way.",
+            { rejectedOperation: method, cause: error },
+          );
+        }
+        throw new ComputerBackendError(message, { cause: error });
+      }
+      if (code === HELPER_INVALID_PARAMS_CODE) {
+        // An argument this helper cannot act on: an unknown modifier name, a
+        // region off every display. Retrying it verbatim can only fail again,
+        // so the message has to say what to change rather than read as a fault.
+        throw new ComputerBackendError(
+          `The macOS desktop rejected the arguments to ${method}: ${message}`,
+          { cause: error },
+        );
+      }
+      throw new ComputerBackendError(message, { cause: error });
     }
   }
 
@@ -1010,7 +1544,9 @@ export class MacComputerBackend implements ComputerBackend {
         this.binaryPromise = undefined;
       }));
     } catch (error) {
-      if (error instanceof MacHelperBuildError) this.buildFailure = error.message;
+      if (error instanceof MacHelperBuildError) {
+        this.buildFailure = { message: error.message, at: this.now() };
+      }
       this.recordHealthFailure(error);
       this.publishHealth();
       throw error instanceof ComputerBackendError
@@ -1042,7 +1578,25 @@ export class MacComputerBackend implements ComputerBackend {
     // that starts it knows whether capture is allowed. Learning this only from
     // `availability()` meant a stream attached through another path published
     // no frames at all, because `captureGranted` was still false.
-    await this.readCapabilities().catch(() => undefined);
+    const capabilities = await this.readCapabilities({ force: true }).catch(() => undefined);
+    // The helper and this server ship together, so a protocol mismatch is never
+    // a version to negotiate — it is a stale binary (a cached development build
+    // from before a wire change, most often) answering today's calls with
+    // yesterday's shapes. Failing here names that; letting it run would surface
+    // as unexplainable desktop misbehaviour instead.
+    if (capabilities && capabilities.protocolVersion !== SUPPORTED_HELPER_PROTOCOL_VERSION) {
+      await helper.dispose().catch(() => undefined);
+      if (this.helper === helper) this.helper = undefined;
+      this.capabilityCache = undefined;
+      const failure = new ComputerBackendError(
+        `The macOS computer-use helper speaks protocol ${capabilities.protocolVersion ?? "(none)"}, ` +
+          `but this build of Synara speaks ${SUPPORTED_HELPER_PROTOCOL_VERSION}. ` +
+          "Delete ~/Library/Caches/synara/computer-helper and try again, or reinstall Synara.",
+      );
+      this.recordHealthFailure(failure);
+      this.publishHealth();
+      throw failure;
+    }
     // Push the cached badge name onto the fresh session so a reconnect brings
     // the agent cursor back naming the same thread.
     if (this.drivingAgent) {
@@ -1057,6 +1611,13 @@ export class MacComputerBackend implements ComputerBackend {
   private invalidateHelper(): void {
     const helper = this.helper;
     this.helper = undefined;
+    // A fresh helper process has to answer the capability probe from scratch:
+    // the grants it can see are its own, not the dead process's.
+    this.capabilityCache = undefined;
+    // And it gets its own chance to ask. The throttle exists to stop a dialog
+    // per tool call within one process; a new process is a new decision by
+    // macOS, and re-arming here is what lets a restart-and-retry prompt again.
+    this.permissionsAsked.clear();
     void helper?.dispose().catch(() => undefined);
   }
 

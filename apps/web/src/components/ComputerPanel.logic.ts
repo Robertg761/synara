@@ -8,8 +8,10 @@ import {
   type ComputerPoint,
   type ComputerRect,
   type ComputerScreenSize,
+  type ComputerStatusResult,
   type ThreadComputerState,
 } from "@synara/contracts";
+import { listComputerPermissions } from "@synara/shared/computerPermissions";
 
 export interface ComputerFrameGateState {
   readonly lastSequence: number | null;
@@ -83,7 +85,7 @@ export function resolveComputerAvailabilityView(
     return {
       kind: "checking",
       title: "Checking computer availability",
-      description: "Waiting for the Linux desktop capture service.",
+      description: "Waiting for the desktop backend.",
     };
   }
   if (availability.kind === "available") {
@@ -97,7 +99,17 @@ export function resolveComputerAvailabilityView(
     return {
       kind: "blocked",
       title: "Computer control is unavailable",
-      description: `This server is running on ${availability.platform}. Linux computer control needs a Wayland compositor Synara has a plugin for (KWin or Hyprland), or its own nested desktop.`,
+      description: `This server is running on ${availability.platform}. Computer control needs macOS, or a Wayland desktop on Linux — KWin or Hyprland, or Synara's own nested desktop.`,
+    };
+  }
+  // A withheld grant is blocked like anything else, but it is the one blocked
+  // state with a name and a fix, so the title says which permission rather than
+  // making the user read the paragraph to find out.
+  if (availability.kind === "permission-required") {
+    return {
+      kind: "blocked",
+      title: `Computer control needs ${listComputerPermissions(availability.missing)}`,
+      description: availability.message,
     };
   }
   return {
@@ -105,6 +117,31 @@ export function resolveComputerAvailabilityView(
     title: "Computer control is unavailable",
     description: availability.message,
   };
+}
+
+/**
+ * Whether this desktop still needs something installed or granted — the test
+ * behind the settings panel's "Set up" button and behind the chat setup card's
+ * "did that work?" answer, which must agree.
+ *
+ * Keyed on live state, never on the static capability flags alone. Those
+ * describe what the backend *is able to* do — on macOS the helper advertises
+ * input and capture on a machine that has been granted neither, so a
+ * capabilities-only test never offers Set up at all. What separates "nothing to
+ * do" from "not ready" is whether a backend resolved, whether it can currently
+ * capture, and only then whether it claims the two abilities. A platform that
+ * can never run this is not a machine with something left to install.
+ */
+export function computerStatusNeedsSetup(status: ComputerStatusResult | undefined): boolean {
+  if (!status) return false;
+  if (status.availability.kind === "unsupported-platform") return false;
+  return (
+    status.availability.kind === "backend-unavailable" ||
+    status.availability.kind === "permission-required" ||
+    status.health.captureAvailable === false ||
+    !status.capabilities.input ||
+    !status.capabilities.capture
+  );
 }
 
 export interface ComputerHealthBadge {

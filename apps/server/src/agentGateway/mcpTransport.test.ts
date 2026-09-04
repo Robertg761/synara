@@ -9,13 +9,7 @@ import { makeAgentGatewaySessionRegistry } from "./Layers/AgentGatewaySessionReg
 import type { AgentGatewayCredentialsShape } from "./Services/AgentGatewayCredentials.ts";
 import { makeAgentGatewayInFlightRequestRegistry } from "./inFlightRequestRegistry.ts";
 import { makeAgentGatewayMcpTransport } from "./mcpTransport.ts";
-import {
-  acquireAgentGatewaySessionLease,
-  AGENT_GATEWAY_NO_CAPABILITIES,
-  type AgentGatewayCapabilityInput,
-  type AgentGatewaySessionLease,
-  type AgentGatewaySessionLeaseOptions,
-} from "./sessionLease.ts";
+import { acquireAgentGatewaySessionLease, type AgentGatewaySessionLease } from "./sessionLease.ts";
 import type { ToolEntry } from "./toolRuntime.ts";
 
 const NOW = "2026-07-22T03:00:00.000Z";
@@ -63,7 +57,6 @@ function makeThread(threadId: string): OrchestrationThreadShell {
 function makeTransport(input: {
   readonly tools: ReadonlyArray<ToolEntry>;
   readonly threads: ReadonlyArray<OrchestrationThreadShell>;
-  readonly leaseCapabilities?: AgentGatewayCapabilityInput;
 }) {
   const threads = new Map(input.threads.map((thread) => [String(thread.id), thread]));
   let nextSession = 0;
@@ -103,12 +96,8 @@ function makeTransport(input: {
       sessionRegistry.revoke(token);
       if (session) inFlightRequests.revokeSession(session.sessionKey);
     },
-    connectionForThread: (
-      threadId: ThreadId,
-      _provider: unknown,
-      options?: AgentGatewaySessionLeaseOptions,
-    ) => {
-      const issued = sessionRegistry.issue(threadId, "codex", options);
+    connectionForThread: (threadId: ThreadId) => {
+      const issued = sessionRegistry.issue(threadId, "codex");
       return {
         url: "http://127.0.0.1:48123/mcp",
         bearerToken: issued.token,
@@ -123,7 +112,6 @@ function makeTransport(input: {
       credentials,
       ThreadId.makeUnsafe(threadId),
       "codex",
-      input.leaseCapabilities ?? AGENT_GATEWAY_NO_CAPABILITIES,
     );
     if (!lease) throw new Error("Expected gateway session lease");
     tokenAliases.set(tokenAlias, lease.connection.bearerToken);
@@ -508,24 +496,40 @@ describe("makeAgentGatewayMcpTransport tools/list", () => {
 
   it.effect("omits tools the caller's session was never granted", () =>
     Effect.gen(function* () {
-      // A session without computer:control can never call these tools; listing
-      // them would cost the model prompt tokens and a guaranteed denial.
-      const transport = makeTransport({ threads: [makeThread("thread-plain")], tools: catalog });
+      // Listing a tool every call would deny costs the model prompt tokens for
+      // nothing. No capability a provider session holds is optional any more, so
+      // the guarantee is pinned with a capability nothing grants.
+      const transport = makeTransport({
+        threads: [makeThread("thread-plain")],
+        tools: [
+          ...catalog,
+          {
+            definition: {
+              name: "ungranted_tool",
+              description: "Never listed",
+              inputSchema: { type: "object" },
+            },
+            requiredCapability: "never:granted" as ToolEntry["requiredCapability"],
+            handler: ok,
+          },
+        ],
+      });
       const response = yield* post(transport, "token-1", listBody);
       assert.equal(response.status, 200);
       assert.deepEqual(
         listedTools(response.body).map((tool) => tool.name),
-        ["synara_read_thread"],
+        ["synara_read_thread", "computer_click"],
       );
     }),
   );
 
-  it.effect("passes tool _meta through verbatim to a caller that holds the capability", () =>
+  it.effect("lists the computer tools for every provider session, and passes _meta verbatim", () =>
     Effect.gen(function* () {
+      // Computer control is not a per-chat grant: any provider session may reach
+      // for the desktop, and consent lives in the provider's approval gate.
       const transport = makeTransport({
         threads: [makeThread("thread-computer")],
         tools: catalog,
-        leaseCapabilities: { enableComputerControl: true },
       });
       const response = yield* post(transport, "token-1", listBody);
       assert.equal(response.status, 200);

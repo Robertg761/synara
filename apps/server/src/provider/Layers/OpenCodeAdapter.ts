@@ -3567,12 +3567,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           // this exact Synara thread.
           const agentGatewaySessionLease = serverUrl
             ? undefined
-            : acquireAgentGatewaySessionLease(
-                agentGatewayCredentials,
-                input.threadId,
-                provider,
-                input,
-              );
+            : acquireAgentGatewaySessionLease(agentGatewayCredentials, input.threadId, provider);
           const agentGatewayConnection = agentGatewaySessionLease?.connection;
           const poolIsolationKey = agentGatewayConnection ? randomUUID() : undefined;
 

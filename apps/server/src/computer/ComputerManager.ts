@@ -8,6 +8,7 @@ import {
   ThreadId,
   type ComputerActionResult,
   type ComputerAvailability,
+  type ComputerBuildSignature,
   type ComputerCapabilities,
   type ComputerEvent,
   type ComputerHealth,
@@ -16,6 +17,7 @@ import {
   type ComputerListWindowsResult,
   type ComputerProvisionResult,
   type ComputerLaunchAppResult,
+  type ComputerPermission,
   type ComputerState,
   type ComputerStatusResult,
   type ComputerTarget,
@@ -49,6 +51,7 @@ import {
   resolveComputerSemanticTarget,
   resolveComputerWindowTarget,
 } from "./uiTreeTargeting.ts";
+import { describeComputerUiTree } from "./uiTreeText.ts";
 
 export const COMPUTER_FRAME_QUEUE_LIMIT = 8;
 export const COMPUTER_FRAME_SOCKET_BUDGET_BYTES = 2 * 1024 * 1024;
@@ -286,6 +289,18 @@ export class ComputerManager {
    * `capabilities-changed`, which is what republishes the thread states that
    * already read it.
    */
+  /**
+   * Whether input aimed at a named window reaches it without restacking.
+   *
+   * Exposed because the agent tool descriptions have to say what naming a
+   * window actually does, and the two answers differ in what the user sees:
+   * the Linux tiers bring the window to the front, the macOS helper posts to
+   * its process and leaves the stacking order alone.
+   */
+  get deliversToNamedWindowRegardlessOfStacking(): boolean {
+    return this.backend.deliversToNamedWindowRegardlessOfStacking === true;
+  }
+
   private get backendCapabilities(): ComputerCapabilities {
     return this.backend.capabilities();
   }
@@ -368,6 +383,37 @@ export class ComputerManager {
   }
 
   /**
+   * OS privacy grants the backend lacks *now*, not as of some earlier probe.
+   *
+   * Empty on backends with no permission model and before anything has looked.
+   * This is how a grant that only *degrades* the desktop — Screen Recording,
+   * which leaves it driveable but unseeable — still reaches the user, since
+   * nothing fails and availability stays `available`.
+   *
+   * A probe that fails answers "nothing missing" rather than throwing: the
+   * caller is a tool call that has its own result to return, and a backend that
+   * cannot be asked is a health problem reported through health, not a grant the
+   * user is being told to go and give.
+   */
+  async missingPermissions(): Promise<readonly ComputerPermission[]> {
+    try {
+      return (await this.backend.missingPermissions?.()) ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * How the backend's build is code-signed, when it knows. Free to read, and
+   * only meaningful next to a missing grant: on an ad-hoc build the grant may be
+   * pinned to a cdhash a rebuild replaced, which is why System Settings can show
+   * the switch on while the backend reports it missing.
+   */
+  buildSignature(): ComputerBuildSignature | undefined {
+    return this.backend.buildSignature?.();
+  }
+
+  /**
    * Thread-independent status for surfaces outside any conversation, such as
    * the settings screen. A probe failure becomes `backend-unavailable` rather
    * than an error: the caller is asking whether the desktop works, and "the
@@ -426,14 +472,36 @@ export class ComputerManager {
     return { computerId: this.computerId, windows, availability };
   }
 
+  /**
+   * One perception read, with the accessibility tree and its prose rendering
+   * asked for separately.
+   *
+   * They were one flag, and every caller that wanted the tree — which is every
+   * agent-facing perception read, because the elements list is built from it —
+   * also paid to render the whole desktop to text and then discarded it. The
+   * walk is the expensive part and is still opt-in; the rendering is cheap but
+   * not free, and now happens only for the callers that display it. It lives
+   * here rather than in each backend so both display servers benefit from one
+   * fix and answer with identically formatted text.
+   */
   async getState(
     options: {
       readonly includeScreenshot?: boolean;
+      /** Render `root` to accessibility text. Implies `includeTree`. */
       readonly includeText?: boolean;
+      /** Walk the accessibility tree. Defaults to whatever `includeText` asked for. */
+      readonly includeTree?: boolean;
     } = {},
   ): Promise<ComputerState> {
     this.engageBackend();
-    return await this.backend.getState(options);
+    const state = await this.backend.getState({
+      ...(options.includeScreenshot !== undefined
+        ? { includeScreenshot: options.includeScreenshot }
+        : {}),
+      includeTree: options.includeTree ?? options.includeText === true,
+    });
+    if (options.includeText !== true || !state.root) return state;
+    return { ...state, text: describeComputerUiTree(state.root) };
   }
 
   /** Zoomed capture of one window or desktop region, with its pixel mapping. */
@@ -971,7 +1039,7 @@ export class ComputerManager {
     ) {
       return this.resolvePointTarget(target);
     }
-    const state = await this.backend.getState({ includeText: false });
+    const state = await this.backend.getState({ includeTree: false });
     const match = state.root ? resolveComputerWindowTarget(state.root, windowId) : undefined;
     if (match) return { point: match.point, windowId };
     const windows = await this.backend.listWindows();
@@ -1498,7 +1566,7 @@ export class ComputerManager {
       if (!(error instanceof ComputerTargetError) || error.code !== "computer_target_offscreen") {
         throw error;
       }
-      const state = await this.backend.getState({ includeText: true }).catch(() => undefined);
+      const state = await this.backend.getState({ includeTree: true }).catch(() => undefined);
       throw new ComputerTargetError({
         code: error.code,
         message: error.message,
@@ -1665,7 +1733,7 @@ export class ComputerManager {
           "with the pointer tools. Only computer_scroll takes window_id alone, scrolling that window itself.",
       });
     }
-    const state = await this.backend.getState({ includeText: true });
+    const state = await this.backend.getState({ includeTree: true });
     if (!state.root) {
       throw new ComputerTargetError({
         code: "computer_target_not_found",
