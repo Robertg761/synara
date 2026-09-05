@@ -24,7 +24,11 @@ import { assert, describe, it } from "@effect/vitest";
 import { Effect, Exit, Fiber, Layer, Random, Stream } from "effect";
 
 import { attachmentRelativePath } from "../../attachmentStore.ts";
-import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
+import {
+  HARNESS_APPROVAL_CONSENT_CLAUSE,
+  HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+  SYNARA_HARNESS_POLICY_MARKER,
+} from "../../agentGateway/harnessPolicy.ts";
 import {
   AgentGatewayCredentials,
   type AgentGatewayCredentialsShape,
@@ -409,16 +413,33 @@ const RESUME_THREAD_ID = ThreadId.makeUnsafe("thread-claude-resume");
 
 describe("Claude Synara harness policy", () => {
   it("advertises scoped MCP additively when credentials are available", () => {
-    const text = buildEmbeddedClaudeSystemPromptAppend(true);
+    const text = buildEmbeddedClaudeSystemPromptAppend({ gatewayControlAvailable: true });
     assert.include(text, SYNARA_HARNESS_POLICY_MARKER);
     assert.include(text, "Use the synara_* tools");
     assert.notInclude(text, "Synara MCP control is unavailable");
   });
 
   it("stays truthful when scoped MCP credentials are absent", () => {
-    const text = buildEmbeddedClaudeSystemPromptAppend(false);
+    const text = buildEmbeddedClaudeSystemPromptAppend({ gatewayControlAvailable: false });
     assert.include(text, SYNARA_HARNESS_POLICY_MARKER);
     assert.include(text, "Synara MCP control is unavailable");
+  });
+
+  it("names the session's own runtime mode in the desktop-consent sentence", () => {
+    assert.include(
+      buildEmbeddedClaudeSystemPromptAppend({
+        gatewayControlAvailable: true,
+        runtimeMode: "full-access",
+      }),
+      HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+    );
+    assert.include(
+      buildEmbeddedClaudeSystemPromptAppend({
+        gatewayControlAvailable: true,
+        runtimeMode: "approval-required",
+      }),
+      HARNESS_APPROVAL_CONSENT_CLAUSE,
+    );
   });
 });
 

@@ -18,12 +18,25 @@ export interface SynaraHarnessCapabilities {
    * every provider auto-answers its own prompts and the gateway raises none, so
    * a computer action happens the moment the model calls it with nobody asked.
    *
-   * Optional because the render sites that build the policy statically do not
-   * carry a mode; an absent mode renders the sentence that is true either way
-   * rather than the one that flatters the permissive case.
+   * Optional because a caller may genuinely not know the mode yet; an absent
+   * mode renders the sentence that is true either way rather than the one that
+   * flatters the permissive case.
    */
   readonly runtimeMode?: RuntimeMode | undefined;
 }
+
+/**
+ * The clause that distinguishes each rendering of the desktop-consent sentence.
+ *
+ * Exported so callers and tests can assert which of the three a session was
+ * actually told, instead of re-typing a fragment of the prose that must then be
+ * kept in sync by hand.
+ */
+export const HARNESS_FULL_ACCESS_CONSENT_CLAUSE =
+  "nothing asks the user before a mutating desktop action";
+export const HARNESS_APPROVAL_CONSENT_CLAUSE =
+  "asks the user to approve each mutating desktop action before it runs";
+export const HARNESS_UNKNOWN_CONSENT_CLAUSE = "Do not assume a human is in the loop";
 
 /**
  * The one sentence about desktop consent, told truthfully for this session.
@@ -37,7 +50,7 @@ function computerConsentSentence(runtimeMode: RuntimeMode | undefined): string {
   if (runtimeMode === "full-access") {
     return (
       "You do not need permission to reach for them: they are always available. This session runs " +
-      "in full-access mode, so nothing asks the user before a mutating desktop action — the click, " +
+      `in full-access mode, so ${HARNESS_FULL_ACCESS_CONSENT_CLAUSE} — the click, ` +
       "the keystroke, and the clipboard write happen on their real screen the moment you call the " +
       "tool. Act as if unattended: prefer perception first, make the smallest change that answers " +
       "the request, and never take a destructive or irreversible desktop action the user did not ask for."
@@ -46,7 +59,7 @@ function computerConsentSentence(runtimeMode: RuntimeMode | undefined): string {
   if (runtimeMode === "approval-required" || runtimeMode === "auto") {
     return (
       "You do not need permission to reach for them: they are always available, and this session " +
-      "asks the user to approve each mutating desktop action before it runs. A refused approval is " +
+      `${HARNESS_APPROVAL_CONSENT_CLAUSE}. A refused approval is ` +
       "the user's answer, not an obstacle to route around."
     );
   }
@@ -54,8 +67,8 @@ function computerConsentSentence(runtimeMode: RuntimeMode | undefined): string {
     "You do not need permission to reach for them: they are always available. Whether the user is " +
     "asked before a mutating desktop action depends on this session's runtime mode — in " +
     "approval-required mode your provider asks first, and in full-access mode nothing asks and the " +
-    "action lands on their real screen the moment you call the tool. Do not assume a human is in " +
-    "the loop: act as if unattended, and never take a destructive or irreversible desktop action " +
+    `action lands on their real screen the moment you call the tool. ${HARNESS_UNKNOWN_CONSENT_CLAUSE}: ` +
+    "act as if unattended, and never take a destructive or irreversible desktop action " +
     "the user did not ask for."
   );
 }
@@ -119,14 +132,6 @@ export function renderSynaraHarnessPolicy(capabilities: SynaraHarnessCapabilitie
   ].join("\n");
 }
 
-export const SYNARA_GATEWAY_HARNESS_POLICY = renderSynaraHarnessPolicy({
-  gatewayControlAvailable: true,
-});
-
-export const SYNARA_IDENTITY_ONLY_HARNESS_POLICY = renderSynaraHarnessPolicy({
-  gatewayControlAvailable: false,
-});
-
 export interface SynaraHarnessPolicyDeliveryState {
   harnessPolicyDelivered?: boolean | undefined;
 }
@@ -168,28 +173,61 @@ export function takeSynaraHarnessPolicyForSession(
 }
 
 /**
+ * What one provider session knows about itself when the policy is rendered.
+ *
+ * `runtimeMode` is the same value that drives the provider's own permission
+ * wiring (Codex `approvalPolicy`, Claude `bypassPermissions`, ACP full-access,
+ * OpenCode allow-all). Passing it is what keeps the desktop-consent sentence
+ * honest, so every adapter should supply it rather than let the caller-unknown
+ * wording stand in.
+ */
+export interface SynaraHarnessPolicyProviderSessionInput {
+  readonly provider: ProviderKind;
+  readonly scopedGatewayConnectionAvailable: boolean;
+  readonly runtimeMode?: RuntimeMode | undefined;
+}
+
+/** The same input minus the provider, for a taker already bound to one. */
+export type SynaraHarnessPolicySessionInput = Omit<
+  SynaraHarnessPolicyProviderSessionInput,
+  "provider"
+>;
+
+/**
  * Provider-aware delivery guard. The transport flag must only become true
  * after a provider has installed thread-scoped gateway tools successfully.
  */
 export function takeSynaraHarnessPolicyForProviderSession(
   state: SynaraHarnessPolicyDeliveryState,
-  input: {
-    readonly provider: ProviderKind;
-    readonly scopedGatewayConnectionAvailable: boolean;
-  },
+  input: SynaraHarnessPolicyProviderSessionInput,
 ): string | null {
   return takeSynaraHarnessPolicyForSession(state, {
     gatewayControlAvailable: providerHasSynaraGatewayControl(input),
+    runtimeMode: input.runtimeMode,
   });
 }
 
 export function takeSynaraHarnessPolicyTextPartForProviderSession(
   state: SynaraHarnessPolicyDeliveryState,
-  input: {
-    readonly provider: ProviderKind;
-    readonly scopedGatewayConnectionAvailable: boolean;
-  },
+  input: SynaraHarnessPolicyProviderSessionInput,
 ): { readonly type: "text"; readonly text: string } | null {
   const text = takeSynaraHarnessPolicyForProviderSession(state, input);
   return text === null ? null : { type: "text", text };
+}
+
+/**
+ * Bind the text-part taker to one provider.
+ *
+ * Every ACP adapter needs the identical one-line wrapper; defining it once here
+ * keeps the delivery contract — including the runtime mode the consent sentence
+ * depends on — in a single place instead of copied per adapter.
+ */
+export function makeProviderHarnessPolicyTextPartTaker(
+  provider: ProviderKind,
+): (
+  state: SynaraHarnessPolicyDeliveryState,
+  input: SynaraHarnessPolicySessionInput,
+) => { readonly type: "text"; readonly text: string } | null {
+  return (state, input) =>
+    takeSynaraHarnessPolicyTextPartForProviderSession(state, { provider, ...input });
 }

@@ -65,10 +65,9 @@ enum Lanes {
 
   static func queue(for method: String) -> DispatchQueue {
     switch method {
-    case "move", "click", "double-click", "right-click", "drag", "scroll", "type", "press-key",
-      "hotkey", "set-value", "perform-action", "focus-window", "raise-window", "read-clipboard",
-      "write-clipboard",
-      "set-agent-cursor", "launch-app":
+    case "move", "click", "double-click", "triple-click", "right-click", "drag", "scroll",
+      "type", "press-key", "hotkey", "set-value", "perform-action", "focus-window",
+      "raise-window", "read-clipboard", "write-clipboard", "set-agent-cursor", "launch-app":
       // `launch-app` is an action with the same ordering expectation as the
       // rest: "open the app, then click in it" has to happen in that order.
       return input

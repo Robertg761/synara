@@ -3887,6 +3887,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           {
             provider,
             scopedGatewayConnectionAvailable: context.gatewayControlAvailable,
+            runtimeMode: context.session.runtimeMode,
           },
         );
         const providerText = [harnessPolicy, text].filter(Boolean).join("\n\n");

@@ -793,7 +793,13 @@ export class MacComputerBackend implements ComputerBackend {
     // content of the card the user is reading.
     const started = built ? "Built and started" : "Started";
     if (missing.length === 0) {
-      return `${started} the bundled macOS computer-use helper; Screen Recording and Accessibility are granted.`;
+      // Named through the shared list so this sentence agrees with every other
+      // surface: a hand-written "Screen Recording and Accessibility" here read
+      // as a different pair of grants from the "Accessibility and Screen
+      // Recording" the very next message uses.
+      return `${started} the bundled macOS computer-use helper; ${listComputerPermissions(
+        COMPUTER_PERMISSIONS,
+      )} are granted.`;
     }
     // The stale-grant sentence belongs here too: "Set up" is exactly where a user
     // with an ad-hoc build sees Synara already switched on and concludes Synara

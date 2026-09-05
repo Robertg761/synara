@@ -13,6 +13,10 @@ import { describe, expect, it } from "vitest";
 
 import { ServerConfig } from "../../config";
 import {
+  HARNESS_APPROVAL_CONSENT_CLAUSE,
+  HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+} from "../../agentGateway/harnessPolicy";
+import {
   AgentGatewayCredentials,
   type AgentGatewayCredentialsShape,
 } from "../../agentGateway/Services/AgentGatewayCredentials";
@@ -439,6 +443,21 @@ describe("Antigravity CLI integration helpers", () => {
       SYNARA_ANTIGRAVITY_EVENTS: "/tmp/thread-a-hooks.ndjson",
       SYNARA_ANTIGRAVITY_HOOK_DECISION: "allow",
     });
+  });
+
+  it("names the session's own runtime mode in the desktop-consent sentence", () => {
+    expect(
+      buildAntigravityTurnPrompt(
+        {},
+        { prompt: "Go", hasGatewaySessionLease: true, runtimeMode: "full-access" },
+      ),
+    ).toContain(HARNESS_FULL_ACCESS_CONSENT_CLAUSE);
+    expect(
+      buildAntigravityTurnPrompt(
+        {},
+        { prompt: "Go", hasGatewaySessionLease: true, runtimeMode: "approval-required" },
+      ),
+    ).toContain(HARNESS_APPROVAL_CONSENT_CLAUSE);
   });
 
   it("advertises canonical browser tools only while the session owns a gateway lease", () => {

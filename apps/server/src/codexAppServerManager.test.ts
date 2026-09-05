@@ -27,10 +27,9 @@ import {
   SYNARA_COMPETING_BROWSER_PLUGIN_SECTION_HEADERS,
 } from "./codexProcessEnv";
 import {
+  buildCodexDeveloperInstructions,
   buildCodexInitializeParams,
   buildCodexThreadOpenRequest,
-  CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
-  CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
   __codexCliVersionGateTesting,
   CodexAppServerManager,
   classifyCodexStderrLine,
@@ -46,7 +45,11 @@ import {
 } from "./codexWorkingDirectory";
 import { CodexJsonlFramer, CodexJsonlWriter } from "./codexAppServerTransport";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces";
-import { SYNARA_HARNESS_POLICY_MARKER } from "./agentGateway/harnessPolicy.ts";
+import {
+  HARNESS_APPROVAL_CONSENT_CLAUSE,
+  HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+  SYNARA_HARNESS_POLICY_MARKER,
+} from "./agentGateway/harnessPolicy.ts";
 import {
   AGENT_GATEWAY_TURN_AUTHORITY_RETIRED,
   acquireAgentGatewaySessionLease,
@@ -73,8 +76,8 @@ const autoTurnOverrides = {
 describe("Codex Synara harness policy", () => {
   it("keeps the same host policy exactly once in default and plan instructions", () => {
     for (const instructions of [
-      CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
-      CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
+      buildCodexDeveloperInstructions({ nativeMode: "default", runtimeMode: "full-access" }),
+      buildCodexDeveloperInstructions({ nativeMode: "plan", runtimeMode: "full-access" }),
     ]) {
       expect(instructions).toContain(SYNARA_HARNESS_POLICY_MARKER);
       expect(instructions.split(SYNARA_HARNESS_POLICY_MARKER)).toHaveLength(2);
@@ -87,6 +90,41 @@ describe("Codex Synara harness policy", () => {
       expect(instructions).toContain("Do not search or filter \`ALL_TOOLS\`");
       expect(instructions).toContain("sequentially in one \`functions.exec\` invocation");
     }
+  });
+
+  it("names the thread's own runtime mode in the desktop-consent sentence", () => {
+    for (const nativeMode of ["default", "plan"] as const) {
+      expect(
+        buildCodexDeveloperInstructions({ nativeMode, runtimeMode: "full-access" }),
+        nativeMode,
+      ).toContain(HARNESS_FULL_ACCESS_CONSENT_CLAUSE);
+      expect(
+        buildCodexDeveloperInstructions({ nativeMode, runtimeMode: "approval-required" }),
+        nativeMode,
+      ).toContain(HARNESS_APPROVAL_CONSENT_CLAUSE);
+    }
+  });
+
+  it("sends the turn's runtime mode into the collaboration preset", async () => {
+    const { manager, context, sendRequest } = createSendTurnHarness("approval-required");
+
+    await manager.sendTurn({
+      threadId: asThreadId("thread_1"),
+      input: "Investigate the crash",
+      interactionMode: "default",
+    });
+
+    expect(sendRequest).toHaveBeenCalledWith(
+      context,
+      "turn/start",
+      expect.objectContaining({
+        collaborationMode: expect.objectContaining({
+          settings: expect.objectContaining({
+            developer_instructions: expect.stringContaining(HARNESS_APPROVAL_CONSENT_CLAUSE),
+          }),
+        }),
+      }),
+    );
   });
 
   it("resolves the gateway endpoint when each session environment is built", async () => {
@@ -1839,7 +1877,10 @@ describe("sendTurn", () => {
         settings: {
           model: "gpt-5.3-codex",
           reasoning_effort: "medium",
-          developer_instructions: CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
+          developer_instructions: buildCodexDeveloperInstructions({
+            nativeMode: "plan",
+            runtimeMode: "full-access",
+          }),
         },
       },
     });
@@ -1871,7 +1912,10 @@ describe("sendTurn", () => {
         settings: {
           model: "gpt-5.3-codex",
           reasoning_effort: "medium",
-          developer_instructions: CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
+          developer_instructions: buildCodexDeveloperInstructions({
+            nativeMode: "default",
+            runtimeMode: "full-access",
+          }),
         },
       },
     });
@@ -1903,7 +1947,10 @@ describe("sendTurn", () => {
         settings: {
           model: "gpt-5.3-codex",
           reasoning_effort: "medium",
-          developer_instructions: CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
+          developer_instructions: buildCodexDeveloperInstructions({
+            nativeMode: "default",
+            runtimeMode: "full-access",
+          }),
         },
       },
     });
@@ -1955,7 +2002,10 @@ describe("sendTurn", () => {
         settings: {
           model: "gpt-5.2-codex",
           reasoning_effort: "medium",
-          developer_instructions: CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
+          developer_instructions: buildCodexDeveloperInstructions({
+            nativeMode: "plan",
+            runtimeMode: "full-access",
+          }),
         },
       },
     });
@@ -2012,7 +2062,10 @@ describe("sendTurn", () => {
         settings: {
           model: "gpt-5.4",
           reasoning_effort: "high",
-          developer_instructions: CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
+          developer_instructions: buildCodexDeveloperInstructions({
+            nativeMode: "plan",
+            runtimeMode: "full-access",
+          }),
         },
       },
     });

@@ -12,6 +12,7 @@ import {
   type ProviderRuntimeEvent,
   type ProviderSession,
   RuntimeItemId,
+  type RuntimeMode,
   RuntimeTaskId,
   ThreadId,
   TurnId,
@@ -544,11 +545,13 @@ export function buildAntigravityTurnPrompt(
   input: {
     readonly prompt: string;
     readonly hasGatewaySessionLease: boolean;
+    readonly runtimeMode?: RuntimeMode | undefined;
   },
 ): string {
   const harnessPolicy = takeSynaraHarnessPolicyForProviderSession(state, {
     provider: PROVIDER,
     scopedGatewayConnectionAvailable: input.hasGatewaySessionLease,
+    runtimeMode: input.runtimeMode,
   });
   return [harnessPolicy, input.prompt].filter(Boolean).join("\n\n");
 }
@@ -2043,6 +2046,7 @@ const makeAntigravityAdapter = (dependencies: AntigravityAdapterDependencies = {
         const providerPrompt = buildAntigravityTurnPrompt(context, {
           prompt: normalizedPrompt,
           hasGatewaySessionLease: canBootstrapGateway,
+          runtimeMode: context.session.runtimeMode,
         });
         const promptIssue = antigravityPromptCommandLineIssue(providerPrompt);
         if (promptIssue) {

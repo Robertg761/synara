@@ -169,18 +169,44 @@ func handle(method: String, params: Params) throws -> Any {
   case "click":
     let point = try point(from: params)
     return pointerResult(
-      point, try input.click(at: point, window: try optionalWindowId(from: params)))
+      point,
+      try input.click(
+        at: point, window: try optionalWindowId(from: params),
+        modifiers: try pointerModifiers(from: params)))
 
   case "double-click":
     let point = try point(from: params)
     return pointerResult(
       point,
-      try input.click(at: point, count: 2, window: try optionalWindowId(from: params)))
+      try input.click(
+        at: point, count: 2, window: try optionalWindowId(from: params),
+        modifiers: try pointerModifiers(from: params)))
+
+  case "triple-click":
+    // Three clicks the target reads as *one* triple-click. The click state is
+    // pinned at 3 through the down and the up of all three pairs rather than
+    // counting 1, 2, 3: a text view that reads the count off each pair would
+    // otherwise place a caret, then select a word, then select the line — three
+    // visible intermediate states for one gesture — and a toolkit that reads it
+    // off only the down, or only the up, would see three unrelated clicks. What
+    // the agent asked for is the end state, so every event of the gesture says
+    // so. Everything else is `click`: the same input lane, the same clamp and
+    // echo, the same aim (it points the keyboard at the window it hit), the same
+    // targetMissing and invalidParams rules, and the same delivery verdict.
+    let point = try point(from: params)
+    return pointerResult(
+      point,
+      try input.click(
+        at: point, count: 3, clickState: 3, window: try optionalWindowId(from: params),
+        modifiers: try pointerModifiers(from: params)))
 
   case "right-click":
     let point = try point(from: params)
     return pointerResult(
-      point, try input.rightClick(at: point, window: try optionalWindowId(from: params)))
+      point,
+      try input.rightClick(
+        at: point, window: try optionalWindowId(from: params),
+        modifiers: try pointerModifiers(from: params)))
 
   case "drag":
     let from = Geometry.clampToWorkspace(
@@ -205,7 +231,8 @@ func handle(method: String, params: Params) throws -> Any {
       (x != nil && y != nil) ? Geometry.clampToWorkspace(CGPoint(x: x!, y: y!)) : nil
     let scrolled = try input.scroll(
       at: point, deltaX: try params.double("deltaX"), deltaY: try params.double("deltaY"),
-      window: try optionalWindowId(from: params))
+      window: try optionalWindowId(from: params),
+      modifiers: try pointerModifiers(from: params))
     return ["ok": true, "path": scrolled.path, "verified": scrolled.verified.rawValue]
 
   case "type":
@@ -309,6 +336,30 @@ func optionalWindowId(from params: Params) throws -> CGWindowID? {
     throw RPCError(.invalidParams, "windowId must be a numeric CGWindowID")
   }
   return id
+}
+
+/// The modifier keys a pointer gesture holds down for its duration.
+///
+/// Read before the gesture reaches `InputController`, so an unreadable name is
+/// `invalidParams` with nothing posted — not a modifier silently dropped from a
+/// gesture that then runs as something else. Absent, null and `[]` all mean the
+/// same thing and produce the same event stream the method produced before the
+/// parameter existed.
+func pointerModifiers(from params: Params) throws -> [(code: CGKeyCode, flags: CGEventFlags)] {
+  guard let raw = params.raw["modifiers"], !(raw is NSNull) else { return [] }
+  guard let entries = raw as? [Any] else {
+    throw RPCError(.invalidParams, "modifiers must be an array of modifier names")
+  }
+  // `stringArray` would `compactMap` a non-string entry away, which is the same
+  // silent narrowing the window-id readers were fixed for: `[1]` would arrive as
+  // "no modifiers" and the gesture would run unmodified.
+  let names = try entries.map { entry -> String in
+    guard let name = entry as? String else {
+      throw RPCError(.invalidParams, "modifiers must be an array of modifier names")
+    }
+    return name
+  }
+  return try KeyMap.pointerModifiers(for: names)
 }
 
 /// One reading of a window id, whatever shape JSON delivered it in, and it is

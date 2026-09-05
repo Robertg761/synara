@@ -231,10 +231,25 @@ final class InputController {
     cursor.glide(to: point)
   }
 
+  /// One pointer gesture of `count` clicks at `point`.
+  ///
+  /// `fixedClickState` pins the click state every click of the gesture carries
+  /// instead of letting it count up. `double-click` wants the count (1 then 2,
+  /// which is what a hand produces); `triple-click` wants 3 on all three pairs,
+  /// so the target reads one triple-click rather than a caret, then a word
+  /// selection, then a line selection — see the `triple-click` case in
+  /// main.swift.
+  ///
+  /// `modifiers` are held down for the whole gesture, exactly as a hand holds
+  /// Shift while it clicks: real key transitions posted to the target pid before
+  /// the first event and released in reverse after the last, with their flag
+  /// bits on every mouse event in between. An empty list posts the same events
+  /// this method posted before the parameter existed.
   @discardableResult
   func click(
     at point: CGPoint, button: CGMouseButton = .left, count: Int = 1,
-    window: CGWindowID? = nil
+    clickState fixedClickState: Int? = nil, window: CGWindowID? = nil,
+    modifiers: [(code: CGKeyCode, flags: CGEventFlags)] = []
   ) throws -> PointerOutcome {
     try requireInputPermission()
     let target = try aim(at: point, named: window)
@@ -247,6 +262,10 @@ final class InputController {
     let mode: DeliveryMode = Focus.routesBackgroundInput(target) ? .background : .foreground
     let types = Self.eventTypes(for: button)
     let group = Self.newClickGroup()
+    // What every mouse event of this gesture carries in its flags. Empty for a
+    // plain click, and `formUnion` with the empty set changes nothing, so an
+    // unmodified click is byte-for-byte the event stream it always was.
+    let modifierFlags = Self.combinedFlags(modifiers)
     // Observed before the gesture so the background path can be checked. Only
     // meaningful on the invisible rung: the foreground rung is already the
     // fallback, so there is nothing to learn from it.
@@ -260,26 +279,33 @@ final class InputController {
     // One definition of the gesture, run under whichever focus is current. The
     // escalation below replays exactly these events rather than a second,
     // drifting copy of them.
-    let postClicks = {
-      for index in 0..<max(1, count) {
-        // Click state counts up across the clicks of one gesture and is stamped
-        // on the up as well as the down; a toolkit that reads it only on one of
-        // the two sees a pair of single clicks instead of a double click.
-        let clickState = index + 1
-        try self.postMouse(
-          types.down, at: point, button: button, target: target, group: group,
-          clickState: clickState, held: true)
-        usleep(1_000)
-        try self.postMouse(
-          types.up, at: point, button: button, target: target, group: group,
-          clickState: clickState, held: false)
-        // Under the system double-click interval, clear of coalescing into pair
-        // N.
-        if index + 1 < count { usleep(80_000) }
+    let postGesture = {
+      // The modifiers are pressed inside the attempt rather than around both of
+      // them: an escalated replay runs under a different focus arrangement, and
+      // holding Command across the activation in between would leave it down
+      // while the human's application came back.
+      try self.withPointerModifiers(modifiers, target: target) {
+        try self.prime(at: point, target: target, group: group, modifierFlags: modifierFlags)
+        for index in 0..<max(1, count) {
+          // Click state is stamped on the up as well as the down; a toolkit that
+          // reads it only on one of the two sees a pair of single clicks instead
+          // of a double click. It counts up across the gesture unless the caller
+          // pinned it — see `fixedClickState`.
+          let clickState = fixedClickState ?? (index + 1)
+          try self.postMouse(
+            types.down, at: point, button: button, target: target, group: group,
+            clickState: clickState, held: true, modifierFlags: modifierFlags)
+          usleep(1_000)
+          try self.postMouse(
+            types.up, at: point, button: button, target: target, group: group,
+            clickState: clickState, held: false, modifierFlags: modifierFlags)
+          // Under the system double-click interval, clear of coalescing into pair
+          // N.
+          if index + 1 < count { usleep(80_000) }
+        }
       }
     }
-    try prime(at: point, target: target, group: group)
-    try postClicks()
+    try postGesture()
 
     // Did the invisible rung actually reach the app? An unchanged target is
     // only evidence of failure when the click should have changed something,
@@ -297,8 +323,7 @@ final class InputController {
       Self.rememberForegroundOnly(target.ownerPID)
       focus.end()
       focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: .foreground)
-      try prime(at: point, target: target, group: group)
-      try postClicks()
+      try postGesture()
       // The escalated replay is judged on the same expectation the first
       // attempt armed: the failed attempt did not move focus, so the element
       // the click was aimed at is still the one that should gain it.
@@ -309,8 +334,11 @@ final class InputController {
   }
 
   @discardableResult
-  func rightClick(at point: CGPoint, window: CGWindowID? = nil) throws -> PointerOutcome {
-    try click(at: point, button: .right, window: window)
+  func rightClick(
+    at point: CGPoint, window: CGWindowID? = nil,
+    modifiers: [(code: CGKeyCode, flags: CGEventFlags)] = []
+  ) throws -> PointerOutcome {
+    try click(at: point, button: .right, window: window, modifiers: modifiers)
   }
 
   /// Returns the rung that actually ran, which is not always the one asked for:
@@ -373,7 +401,8 @@ final class InputController {
 
   @discardableResult
   func scroll(
-    at point: CGPoint?, deltaX: Double, deltaY: Double, window: CGWindowID? = nil
+    at point: CGPoint?, deltaX: Double, deltaY: Double, window: CGWindowID? = nil,
+    modifiers: [(code: CGKeyCode, flags: CGEventFlags)] = []
   ) throws -> PointerOutcome {
     try requireInputPermission()
     // A named window is honoured or refused, never quietly swapped for another
@@ -413,13 +442,25 @@ final class InputController {
     else { throw RPCError(.internalError, "could not build a scroll event") }
     if let aimPoint { event.location = aimPoint }
     event.flags.insert(.maskNonCoalesced)
-    // A background window hit-tests a wheel event against the cursor-tracking
-    // state it last saw, the same way it does a click, so the scroll gets the
-    // same primed move.
-    if let aimPoint, target != nil {
-      try prime(at: aimPoint, target: target, group: Self.newClickGroup())
+    // The held modifiers ride the wheel event as well as going down as real key
+    // transitions. Both halves are load-bearing: a Command-scroll is a zoom in
+    // most applications, and a wheel event that arrives without the flag bits is
+    // an ordinary scroll however the modifier keys were posted. Empty leaves the
+    // event exactly as it was.
+    let modifierFlags = Self.combinedFlags(modifiers)
+    event.flags.formUnion(modifierFlags)
+    try withPointerModifiers(modifiers, target: target) {
+      // A background window hit-tests a wheel event against the cursor-tracking
+      // state it last saw, the same way it does a click, so the scroll gets the
+      // same primed move.
+      if let aimPoint, target != nil {
+        try self.prime(
+          at: aimPoint, target: target, group: Self.newClickGroup(),
+          modifierFlags: modifierFlags)
+      }
+      try self.deliver(
+        event, to: target, localPoint: aimPoint.map { self.localPoint($0, in: target) })
     }
-    try deliver(event, to: target, localPoint: aimPoint.map { localPoint($0, in: target) })
     // Scroll position is not something the helper can read back generically:
     // nothing in AX reports "this view moved by 40 points".
     return PointerOutcome(mode: mode, verified: .unverifiable)
@@ -593,6 +634,59 @@ final class InputController {
       clearHeldModifiers()
     }
     try body()
+  }
+
+  /// Hold `modifiers` down at `target` for the duration of `body` — the way a
+  /// hand holds Shift while it clicks, or Command while it turns the wheel.
+  ///
+  /// Same shape and the same bookkeeping as `postChord`, deliberately: each
+  /// modifier goes down as a real key transition posted to the *target pid*
+  /// (never the session tap — a mouse-path gesture must not put session-wide
+  /// state on the human's keyboard, and `deliver` is the only stream any of this
+  /// uses), accumulating flags as it goes; every press is recorded through
+  /// `recordHeldModifiers` while it is down, so a throw between the down and the
+  /// up, or a SIGTERM mid-gesture, runs `unwind()` with something to release
+  /// instead of latching Command on the human's desktop; and the releases go out
+  /// in reverse carrying the flags that remain.
+  ///
+  /// The empty case is a contract, not a fast path: a gesture with no modifiers
+  /// must post exactly the events it posted before this parameter existed.
+  private func withPointerModifiers(
+    _ modifiers: [(code: CGKeyCode, flags: CGEventFlags)], target: DesktopWindow?,
+    _ body: () throws -> Void
+  ) throws {
+    guard !modifiers.isEmpty else {
+      try body()
+      return
+    }
+    var flags = CGEventFlags()
+    var pressed: [(code: CGKeyCode, flags: CGEventFlags)] = []
+    // Runs on a throw as well as on the ordinary path, so the only window in
+    // which a modifier is held without being releasable is the one `unwind()`
+    // covers.
+    defer {
+      for modifier in pressed.reversed() {
+        flags.remove(modifier.flags)
+        try? postKey(modifier.code, down: false, flags: flags, to: target)
+        usleep(8_000)
+      }
+      clearHeldModifiers()
+    }
+    for modifier in modifiers {
+      flags.insert(modifier.flags)
+      try postKey(modifier.code, down: true, flags: flags, to: target)
+      pressed.append(modifier)
+      recordHeldModifiers(pressed, target: target, onSessionTap: false)
+      usleep(8_000)
+    }
+    try body()
+  }
+
+  /// The flag bits a set of held modifiers asserts, as one mask.
+  private static func combinedFlags(_ modifiers: [(code: CGKeyCode, flags: CGEventFlags)])
+    -> CGEventFlags
+  {
+    modifiers.reduce(CGEventFlags()) { $0.union($1.flags) }
   }
 
   /// Note that `modifiers` are logically down, so `unwind()` can release them on
@@ -1265,13 +1359,21 @@ final class InputController {
   /// control against the cursor-tracking state its window last saw; a background
   /// window that never received a move has stale state, so the synthetic
   /// mouseDown lands "outside" the control and `-mouseDown:` never fires.
-  private func prime(at point: CGPoint, target: DesktopWindow?, group: Int64) throws {
+  ///
+  /// It carries the gesture's modifier flags too: the move a hand makes while it
+  /// holds Shift carries them, and a tracking update that disagreed with the
+  /// clicks that follow it is a state the target never sees from real hardware.
+  private func prime(
+    at point: CGPoint, target: DesktopWindow?, group: Int64, modifierFlags: CGEventFlags = []
+  ) throws {
     guard target != nil else { return }
     guard
       let event = Self.mouseEvent(
         type: .mouseMoved, at: point, button: .left, target: target, clickState: 0, source: source)
     else { throw RPCError(.internalError, "could not build a mouse event") }
-    stamp(event, button: .left, group: group, clickState: 0, delta: nil)
+    stamp(
+      event, button: .left, group: group, clickState: 0, delta: nil,
+      modifierFlags: modifierFlags)
     try deliver(event, to: target, localPoint: localPoint(point, in: target))
     usleep(15_000)
   }
@@ -1284,14 +1386,17 @@ final class InputController {
     group: Int64,
     clickState: Int,
     held: Bool,
-    delta: CGPoint? = nil
+    delta: CGPoint? = nil,
+    modifierFlags: CGEventFlags = []
   ) throws {
     guard
       let event = Self.mouseEvent(
         type: type, at: point, button: button, target: target, clickState: clickState,
         source: source)
     else { throw RPCError(.internalError, "could not build a mouse event") }
-    stamp(event, button: button, group: group, clickState: clickState, delta: delta)
+    stamp(
+      event, button: button, group: group, clickState: clickState, delta: delta,
+      modifierFlags: modifierFlags)
     heldLock.lock()
     heldButton = held ? HeldButton(button: button, point: point, target: target, group: group) : nil
     heldLock.unlock()
@@ -1299,7 +1404,8 @@ final class InputController {
   }
 
   private func stamp(
-    _ event: CGEvent, button: CGMouseButton, group: Int64, clickState: Int, delta: CGPoint?
+    _ event: CGEvent, button: CGMouseButton, group: Int64, clickState: Int, delta: CGPoint?,
+    modifierFlags: CGEventFlags = []
   ) {
     event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
     // Must match the button encoded in the event type: a right-down stamped as
@@ -1316,6 +1422,9 @@ final class InputController {
     // carry — without it a Chromium web view ignores the event entirely.
     event.flags.insert(.maskNonCoalesced)
     event.flags = CGEventFlags(rawValue: event.flags.rawValue | kSyntheticClickFidelityFlag)
+    // Whatever the gesture is holding down. A union, so the empty set — every
+    // gesture that names no modifiers — leaves the flags untouched.
+    event.flags.formUnion(modifierFlags)
   }
 
   /// Text as Unicode-string key events, 20 UTF-16 units per chunk (delivery
@@ -1617,6 +1726,46 @@ enum KeyMap {
       }
       return modifier
     }
+  }
+
+  /// The names a *pointer* gesture may hold, and only these four.
+  ///
+  /// Deliberately narrower than `modifierCodes`: the wire contract for a gesture
+  /// modifier (`ComputerInputModifier`, packages/contracts/src/computer.ts) is
+  /// exactly `ctrl | alt | shift | meta`, so an alias the chord path accepts —
+  /// `cmd`, `option`, `fn` — is a name no legitimate caller of a pointer method
+  /// sends, and quietly honouring it would let two spellings of one request
+  /// drift apart. The keycodes still come from the one table above, so there is
+  /// no second copy of them to go stale.
+  private static let pointerModifierNames: Set<String> = ["ctrl", "alt", "shift", "meta"]
+
+  /// Every named pointer modifier, or an error naming the first one this map
+  /// does not know.
+  ///
+  /// An unknown name is a bad request rather than a smaller gesture that quietly
+  /// runs — the same rule `modifierCodes` follows for chords, and for the same
+  /// reason: a Command-click silently demoted to a plain click is a *different*
+  /// action on almost every surface, and the agent would be told the one it
+  /// asked for had happened. Duplicates are dropped instead, because
+  /// `["shift", "shift"]` is one key however many times it was named, and
+  /// pressing it twice would leave one down after the release.
+  static func pointerModifiers(for names: [String]) throws -> [(
+    code: CGKeyCode, flags: CGEventFlags
+  )] {
+    var seen: Set<CGKeyCode> = []
+    var strokes: [(code: CGKeyCode, flags: CGEventFlags)] = []
+    for name in names {
+      let lowered = name.lowercased()
+      guard pointerModifierNames.contains(lowered), let modifier = modifiers[lowered] else {
+        throw RPCError(
+          .invalidParams,
+          "'\(name)' is not a pointer modifier this helper knows; "
+            + "use ctrl, alt, shift or meta")
+      }
+      guard seen.insert(modifier.code).inserted else { continue }
+      strokes.append(modifier)
+    }
+    return strokes
   }
 
   /// A single character is looked up as itself; only a spelled-out key *name* is

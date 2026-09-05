@@ -2513,6 +2513,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
         const harnessPolicy = takeSynaraHarnessPolicyForProviderSession(context, {
           provider: PROVIDER,
           scopedGatewayConnectionAvailable: context.gatewayControlAvailable,
+          runtimeMode: context.session.runtimeMode,
         });
         const providerText = [harnessPolicy, payload.text].filter(Boolean).join("\n\n");
         void context.runtime.session
@@ -2534,6 +2535,7 @@ const makePiAdapter = (options?: PiAdapterLiveOptions) =>
         const harnessPolicy = takeSynaraHarnessPolicyForProviderSession(context, {
           provider: PROVIDER,
           scopedGatewayConnectionAvailable: context.gatewayControlAvailable,
+          runtimeMode: context.session.runtimeMode,
         });
         const providerText = [harnessPolicy, payload.text].filter(Boolean).join("\n\n");
         const turnId = context.activeTurnId ?? TurnId.makeUnsafe(crypto.randomUUID());

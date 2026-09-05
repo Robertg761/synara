@@ -40,10 +40,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import type * as Acp from "@agentclientprotocol/sdk";
 
 import { buildAcpSynaraMcpServers } from "../../agentGateway/mcpInjection.ts";
-import {
-  type SynaraHarnessPolicyDeliveryState,
-  takeSynaraHarnessPolicyTextPartForProviderSession,
-} from "../../agentGateway/harnessPolicy.ts";
+import { makeProviderHarnessPolicyTextPartTaker } from "../../agentGateway/harnessPolicy.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
 import { PROVIDER_ADAPTER_RUNTIME_EVENT_BUFFER_CAPACITY } from "../Services/ProviderAdapter.ts";
 import {
@@ -124,14 +121,8 @@ import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogg
 
 const PROVIDER = "droid" as const;
 
-export const takeDroidSynaraHarnessPolicyTextPart = (
-  state: SynaraHarnessPolicyDeliveryState,
-  scopedGatewayConnectionAvailable: boolean,
-) =>
-  takeSynaraHarnessPolicyTextPartForProviderSession(state, {
-    provider: PROVIDER,
-    scopedGatewayConnectionAvailable,
-  });
+export const takeDroidSynaraHarnessPolicyTextPart =
+  makeProviderHarnessPolicyTextPartTaker(PROVIDER);
 const DROID_RESUME_VERSION = 1 as const;
 const DROID_ACP_TRANSPORT_DEBUG_MARKER = "droid-acp-meta-stripper-v2";
 const DROID_ACP_LOG_PAYLOAD_LIMIT = 4_000;
@@ -1581,10 +1572,10 @@ export function makeDroidAdapter(
             issue: "Turn requires non-empty text or attachments.",
           });
         }
-        const harnessPolicy = takeDroidSynaraHarnessPolicyTextPart(
-          ctx,
-          agentGatewayCredentials !== undefined,
-        );
+        const harnessPolicy = takeDroidSynaraHarnessPolicyTextPart(ctx, {
+          scopedGatewayConnectionAvailable: agentGatewayCredentials !== undefined,
+          runtimeMode: ctx.session.runtimeMode,
+        });
         if (harnessPolicy) {
           promptParts.unshift(harnessPolicy);
         }

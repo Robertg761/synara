@@ -6,7 +6,11 @@
 import { TurnId } from "@synara/contracts";
 import { Schema } from "effect";
 import { describe, expect, it } from "vitest";
-import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
+import {
+  HARNESS_APPROVAL_CONSENT_CLAUSE,
+  HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+  SYNARA_HARNESS_POLICY_MARKER,
+} from "../../agentGateway/harnessPolicy.ts";
 import {
   extractGrokUserInputQuestions,
   extractGrokExitPlanMarkdown,
@@ -61,10 +65,27 @@ describe("Grok runtime model settings", () => {
 describe("Grok Synara harness policy", () => {
   it("delivers private scoped host context once", () => {
     const state: { harnessPolicyDelivered?: boolean } = {};
-    expect(takeGrokSynaraHarnessPolicyTextPart(state, true)?.text).toContain(
-      SYNARA_HARNESS_POLICY_MARKER,
-    );
-    expect(takeGrokSynaraHarnessPolicyTextPart(state, true)).toBeNull();
+    expect(
+      takeGrokSynaraHarnessPolicyTextPart(state, { scopedGatewayConnectionAvailable: true })?.text,
+    ).toContain(SYNARA_HARNESS_POLICY_MARKER);
+    expect(
+      takeGrokSynaraHarnessPolicyTextPart(state, { scopedGatewayConnectionAvailable: true }),
+    ).toBeNull();
+  });
+
+  it("names the session's own runtime mode in the desktop-consent sentence", () => {
+    expect(
+      takeGrokSynaraHarnessPolicyTextPart(
+        {},
+        { scopedGatewayConnectionAvailable: true, runtimeMode: "full-access" },
+      )?.text,
+    ).toContain(HARNESS_FULL_ACCESS_CONSENT_CLAUSE);
+    expect(
+      takeGrokSynaraHarnessPolicyTextPart(
+        {},
+        { scopedGatewayConnectionAvailable: true, runtimeMode: "approval-required" },
+      )?.text,
+    ).toContain(HARNESS_APPROVAL_CONSENT_CLAUSE);
   });
 });
 

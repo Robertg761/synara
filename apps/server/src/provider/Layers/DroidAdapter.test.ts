@@ -1,6 +1,10 @@
 import { TurnId } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
-import { SYNARA_HARNESS_POLICY_MARKER } from "../../agentGateway/harnessPolicy.ts";
+import {
+  HARNESS_APPROVAL_CONSENT_CLAUSE,
+  HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+  SYNARA_HARNESS_POLICY_MARKER,
+} from "../../agentGateway/harnessPolicy.ts";
 
 import {
   classifyDroidPromptTurnCompletion,
@@ -18,10 +22,27 @@ import {
 describe("Droid Synara harness policy", () => {
   it("delivers private scoped host context once", () => {
     const state: { harnessPolicyDelivered?: boolean } = {};
-    expect(takeDroidSynaraHarnessPolicyTextPart(state, true)?.text).toContain(
-      SYNARA_HARNESS_POLICY_MARKER,
-    );
-    expect(takeDroidSynaraHarnessPolicyTextPart(state, true)).toBeNull();
+    expect(
+      takeDroidSynaraHarnessPolicyTextPart(state, { scopedGatewayConnectionAvailable: true })?.text,
+    ).toContain(SYNARA_HARNESS_POLICY_MARKER);
+    expect(
+      takeDroidSynaraHarnessPolicyTextPart(state, { scopedGatewayConnectionAvailable: true }),
+    ).toBeNull();
+  });
+
+  it("names the session's own runtime mode in the desktop-consent sentence", () => {
+    expect(
+      takeDroidSynaraHarnessPolicyTextPart(
+        {},
+        { scopedGatewayConnectionAvailable: true, runtimeMode: "full-access" },
+      )?.text,
+    ).toContain(HARNESS_FULL_ACCESS_CONSENT_CLAUSE);
+    expect(
+      takeDroidSynaraHarnessPolicyTextPart(
+        {},
+        { scopedGatewayConnectionAvailable: true, runtimeMode: "approval-required" },
+      )?.text,
+    ).toContain(HARNESS_APPROVAL_CONSENT_CLAUSE);
   });
 });
 

@@ -55,7 +55,7 @@ import {
   buildCodexMcpConfigToml,
   SYNARA_AGENT_GATEWAY_TOKEN_ENV,
 } from "./agentGateway/mcpInjection.ts";
-import { SYNARA_GATEWAY_HARNESS_POLICY } from "./agentGateway/harnessPolicy.ts";
+import { renderSynaraHarnessPolicy } from "./agentGateway/harnessPolicy.ts";
 import {
   AGENT_GATEWAY_TURN_AUTHORITY_RETIRED,
   type AgentGatewaySessionLease,
@@ -443,7 +443,7 @@ Use \`Computer Use\` only when at least one of these is true:
 
 Do not choose \`Computer Use\` first for ordinary browser inspection, browser screenshots, or browser navigation when the in-app browser can handle the request.`;
 
-export const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS = `<collaboration_mode># Plan Mode (Conversational)
+const CODEX_PLAN_MODE_COLLABORATION_BLOCK = `<collaboration_mode># Plan Mode (Conversational)
 
 You work in 3 phases, and you should *chat your way* to a great plan before finalizing it. A great plan is very detailed-intent- and implementation-wise-so that it can be handed to another engineer or agent to be implemented right away. It must be **decision complete**, where the implementer does not need to make any decisions.
 
@@ -563,9 +563,9 @@ plan content should be human and agent digestible. The final plan must be plan-o
 Do not ask "should I proceed?" in the final output. The user can easily switch out of Plan mode and request implementation if you have included a \`<proposed_plan>\` block in your response. Alternatively, they can decide to stay in Plan mode and continue refining the plan.
 
 Only produce at most one \`<proposed_plan>\` block per turn, and only when you are presenting a complete spec.
-</collaboration_mode>${CODEX_BROWSER_TOOL_ROUTING_INSTRUCTIONS}\n\n${SYNARA_GATEWAY_HARNESS_POLICY}`;
+</collaboration_mode>${CODEX_BROWSER_TOOL_ROUTING_INSTRUCTIONS}`;
 
-export const CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS = `<collaboration_mode># Collaboration Mode: Default
+const CODEX_DEFAULT_MODE_COLLABORATION_BLOCK = `<collaboration_mode># Collaboration Mode: Default
 
 You are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.
 
@@ -576,7 +576,28 @@ Your active mode changes only when new developer instructions with a different \
 The \`request_user_input\` tool is unavailable in Default mode. If you call it while in Default mode, it will return an error.
 
 In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.
-</collaboration_mode>${CODEX_BROWSER_TOOL_ROUTING_INSTRUCTIONS}\n\n${SYNARA_GATEWAY_HARNESS_POLICY}`;
+</collaboration_mode>${CODEX_BROWSER_TOOL_ROUTING_INSTRUCTIONS}`;
+
+/**
+ * Developer instructions for one Codex collaboration mode.
+ *
+ * The harness policy is appended per call rather than baked into a module
+ * constant because its desktop-consent sentence depends on the thread's runtime
+ * mode: a full-access thread must be told that nothing asks the user first.
+ */
+export function buildCodexDeveloperInstructions(input: {
+  readonly nativeMode: "default" | "plan";
+  readonly runtimeMode?: RuntimeMode | undefined;
+}): string {
+  const collaborationBlock =
+    input.nativeMode === "plan"
+      ? CODEX_PLAN_MODE_COLLABORATION_BLOCK
+      : CODEX_DEFAULT_MODE_COLLABORATION_BLOCK;
+  return `${collaborationBlock}\n\n${renderSynaraHarnessPolicy({
+    gatewayControlAvailable: true,
+    runtimeMode: input.runtimeMode,
+  })}`;
+}
 
 // Maps Synara's simple runtime toggle to Codex thread-level permission overrides.
 function mapCodexRuntimeMode(runtimeMode: RuntimeMode): {
@@ -763,6 +784,7 @@ function buildCodexCollaborationMode(input: {
   readonly interactionMode?: ProviderInteractionMode;
   readonly model?: string;
   readonly effort?: string;
+  readonly runtimeMode?: RuntimeMode | undefined;
 }):
   | {
       mode: "default" | "plan";
@@ -783,10 +805,10 @@ function buildCodexCollaborationMode(input: {
     settings: {
       model,
       reasoning_effort: input.effort ?? "medium",
-      developer_instructions:
-        nativeMode === "plan"
-          ? CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS
-          : CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
+      developer_instructions: buildCodexDeveloperInstructions({
+        nativeMode,
+        runtimeMode: input.runtimeMode,
+      }),
     },
   };
 }
@@ -1361,6 +1383,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
       ...(normalizedModel !== undefined ? { model: normalizedModel } : {}),
       ...(input.effort !== undefined ? { effort: input.effort } : {}),
+      runtimeMode: context.session.runtimeMode,
     });
     if (collaborationMode) {
       if (!turnStartParams.model) {

@@ -42,15 +42,19 @@ describe("computerSetupSignal", () => {
       }),
     ).toEqual({
       missing: ["accessibility"],
+      blocking: true,
       buildSignature: "adhoc",
       bundleId: "com.emanueledipietro.synara.dev",
     });
     expect(computerSetupSignal({ error: setupError, missing: [] })).toEqual({
       missing: [],
+      blocking: true,
       bundleId: "com.emanueledipietro.synara.dev",
     });
+    // Screen Recording alone degrades perception without stopping input.
     expect(computerSetupSignal({ missing: ["screenRecording"] })).toEqual({
       missing: ["screenRecording"],
+      blocking: false,
       bundleId: "com.emanueledipietro.synara.dev",
     });
   });
@@ -60,7 +64,7 @@ describe("computerSetupSignal", () => {
     // makes the card withhold the Terminal command rather than guess.
     delete process.env[SYNARA_DESKTOP_BUNDLE_ID_ENV];
     const signal = computerSetupSignal({ error: setupError, missing: ["accessibility"] });
-    expect(signal).toEqual({ missing: ["accessibility"] });
+    expect(signal).toEqual({ missing: ["accessibility"], blocking: true });
     expect(signal && "bundleId" in signal).toBe(false);
   });
 

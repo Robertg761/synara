@@ -753,6 +753,8 @@ export const makeAgentGateway = Effect.gen(function* () {
     readonly toolName: string;
     readonly missing: readonly ComputerPermission[];
     readonly buildSignature?: ComputerBuildSignature;
+    /** The app macOS holds responsible for the grants, when the desktop shell reported one. */
+    readonly bundleId?: string;
     readonly context: ToolContext;
   }): Effect.Effect<void> => {
     const callerThreadId = input.context.callerThreadId;
@@ -801,6 +803,7 @@ export const makeAgentGateway = Effect.gen(function* () {
             toolName: input.toolName,
             missing: [...input.missing],
             ...(input.buildSignature === undefined ? {} : { buildSignature: input.buildSignature }),
+            ...(input.bundleId === undefined ? {} : { bundleId: input.bundleId }),
           } satisfies ComputerSetupRequiredPayload,
           turnId: callerTurnId === null ? null : TurnId.makeUnsafe(callerTurnId),
           createdAt,

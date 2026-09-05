@@ -135,6 +135,8 @@ export interface AgentGatewayComputerToolsOptions {
      * about stale grants without it, and must not on a signed build.
      */
     readonly buildSignature?: ComputerBuildSignature;
+    /** The app macOS holds responsible for the grants, when the desktop shell reported one. */
+    readonly bundleId?: string;
     readonly context: ToolContext;
   }) => Effect.Effect<void>;
 }
@@ -904,6 +906,7 @@ export function makeAgentGatewayComputerTools(
       toolName: name,
       missing: signal.missing,
       ...(signal.buildSignature === undefined ? {} : { buildSignature: signal.buildSignature }),
+      ...(signal.bundleId === undefined ? {} : { bundleId: signal.bundleId }),
       context,
     }).pipe(Effect.as(result));
   };

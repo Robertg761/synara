@@ -1,6 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  HARNESS_APPROVAL_CONSENT_CLAUSE,
+  HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+  HARNESS_UNKNOWN_CONSENT_CLAUSE,
+  makeProviderHarnessPolicyTextPartTaker,
   renderSynaraHarnessPolicy,
   SYNARA_HARNESS_POLICY_MARKER,
   takeSynaraHarnessPolicyForProviderSession,
@@ -62,6 +66,64 @@ describe("Synara harness policy", () => {
     assert.include(policy, "notifying the user versus staying silent");
     assert.include(policy, 'later manual follow-up such as "continue"');
     assert.include(policy, "Never call this tool for a manual follow-up turn");
+  });
+
+  it("tells each runtime mode the truth about who is asked before a desktop action", () => {
+    const fullAccess = renderSynaraHarnessPolicy({
+      gatewayControlAvailable: true,
+      runtimeMode: "full-access",
+    });
+    assert.include(fullAccess, HARNESS_FULL_ACCESS_CONSENT_CLAUSE);
+    assert.notInclude(fullAccess, HARNESS_APPROVAL_CONSENT_CLAUSE);
+    assert.notInclude(fullAccess, HARNESS_UNKNOWN_CONSENT_CLAUSE);
+
+    for (const runtimeMode of ["approval-required", "auto"] as const) {
+      const approval = renderSynaraHarnessPolicy({
+        gatewayControlAvailable: true,
+        runtimeMode,
+      });
+      assert.include(approval, HARNESS_APPROVAL_CONSENT_CLAUSE, runtimeMode);
+      assert.notInclude(approval, HARNESS_FULL_ACCESS_CONSENT_CLAUSE, runtimeMode);
+      assert.notInclude(approval, HARNESS_UNKNOWN_CONSENT_CLAUSE, runtimeMode);
+    }
+
+    // An absent mode must not borrow the permissive wording.
+    const unknown = renderSynaraHarnessPolicy({ gatewayControlAvailable: true });
+    assert.include(unknown, HARNESS_UNKNOWN_CONSENT_CLAUSE);
+    assert.notInclude(unknown, HARNESS_APPROVAL_CONSENT_CLAUSE);
+  });
+
+  it("carries the session's runtime mode through the provider-session takers", () => {
+    assert.include(
+      takeSynaraHarnessPolicyForProviderSession(
+        {},
+        { provider: "codex", scopedGatewayConnectionAvailable: true, runtimeMode: "full-access" },
+      ) ?? "",
+      HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+    );
+    assert.include(
+      takeSynaraHarnessPolicyTextPartForProviderSession(
+        {},
+        {
+          provider: "codex",
+          scopedGatewayConnectionAvailable: true,
+          runtimeMode: "approval-required",
+        },
+      )?.text ?? "",
+      HARNESS_APPROVAL_CONSENT_CLAUSE,
+    );
+
+    const takeForCursor = makeProviderHarnessPolicyTextPartTaker("cursor");
+    assert.include(
+      takeForCursor({}, { scopedGatewayConnectionAvailable: true, runtimeMode: "full-access" })
+        ?.text ?? "",
+      HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
+    );
+    assert.include(
+      takeForCursor({}, { scopedGatewayConnectionAvailable: true, runtimeMode: "auto" })?.text ??
+        "",
+      HARNESS_APPROVAL_CONSENT_CLAUSE,
+    );
   });
 
   it("never advertises gateway mutation to providers without scoped MCP", () => {

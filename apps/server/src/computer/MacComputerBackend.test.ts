@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { COMPUTER_DELIVERY_PATH_MAX_LENGTH, type ComputerUiNode } from "@synara/contracts";
+import { COMPUTER_PERMISSIONS, listComputerPermissions } from "@synara/shared/computerPermissions";
 import {
   SYNARA_DESKTOP_BUNDLE_ID_ENV,
   SYNARA_DEVELOPMENT_BUNDLE_ID,
@@ -682,7 +683,11 @@ describe("MacComputerBackend", () => {
 
     expect(helper.startCount).toBe(2);
     expect(await backend.missingPermissions()).toEqual([]);
-    expect(summary).toContain("are granted");
+    // Named through the shared list, so the grants appear in the same order
+    // every other surface uses rather than in whichever order this sentence was
+    // once typed in.
+    expect(summary).toContain(`${listComputerPermissions(COMPUTER_PERMISSIONS)} are granted`);
+    expect(summary).toContain("Accessibility and Screen Recording are granted");
     expect(backend.health().captureAvailable).toBe(true);
   });
 

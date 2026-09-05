@@ -13,6 +13,8 @@ import { describe, it, expect, vi } from "vitest";
 
 import { ServerConfig } from "../../config.ts";
 import {
+  HARNESS_APPROVAL_CONSENT_CLAUSE,
+  HARNESS_FULL_ACCESS_CONSENT_CLAUSE,
   SYNARA_HARNESS_POLICY_MARKER,
   SYNARA_HARNESS_POLICY_VERSION,
 } from "../../agentGateway/harnessPolicy.ts";
@@ -543,6 +545,42 @@ describe("normalizeOpenCodeTokenUsage", () => {
 
 describe("OpenCode host policy delivery", () => {
   const modelSelection = { provider: "opencode", model: "openai/gpt-5" } as const;
+
+  it("names the session's own runtime mode in the desktop-consent sentence", async () => {
+    for (const [runtimeMode, clause] of [
+      ["full-access", HARNESS_FULL_ACCESS_CONSENT_CLAUSE],
+      ["approval-required", HARNESS_APPROVAL_CONSENT_CLAUSE],
+    ] as const) {
+      const runtime = createMockOpenCodeRuntime();
+      const gateway = makeGatewayCredentials();
+      const threadId = asThreadId(`thread-host-policy-consent-${runtimeMode}`);
+
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const adapter = yield* OpenCodeAdapter;
+          yield* adapter.startSession({ provider: "opencode", threadId, runtimeMode });
+          yield* adapter.sendTurn({
+            threadId,
+            input: "first turn",
+            attachments: [],
+            modelSelection,
+          });
+        }).pipe(
+          Effect.provide(
+            makeOpenCodeAdapterLive({ runtime: runtime.runtime }).pipe(
+              Layer.provide(Layer.succeed(AgentGatewayCredentials, gateway.credentials)),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), { prefix: "opencode-adapter-test-" }),
+              ),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ),
+        ),
+      );
+
+      expect(JSON.stringify(runtime.promptCalls[0]), runtimeMode).toContain(clause);
+    }
+  });
 
   it("injects the host policy exactly once for a new native session", async () => {
     const runtime = createMockOpenCodeRuntime();

@@ -41,10 +41,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import type * as Acp from "@agentclientprotocol/sdk";
 
 import { buildAcpSynaraMcpServers } from "../../agentGateway/mcpInjection.ts";
-import {
-  type SynaraHarnessPolicyDeliveryState,
-  takeSynaraHarnessPolicyTextPartForProviderSession,
-} from "../../agentGateway/harnessPolicy.ts";
+import { makeProviderHarnessPolicyTextPartTaker } from "../../agentGateway/harnessPolicy.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
 import { PROVIDER_ADAPTER_RUNTIME_EVENT_BUFFER_CAPACITY } from "../Services/ProviderAdapter.ts";
 import {
@@ -130,14 +127,8 @@ import { discoverCursorSkills } from "../cursorSkillsDiscovery.ts";
 
 const PROVIDER = "cursor" as const;
 
-export const takeCursorSynaraHarnessPolicyTextPart = (
-  state: SynaraHarnessPolicyDeliveryState,
-  scopedGatewayConnectionAvailable: boolean,
-) =>
-  takeSynaraHarnessPolicyTextPartForProviderSession(state, {
-    provider: PROVIDER,
-    scopedGatewayConnectionAvailable,
-  });
+export const takeCursorSynaraHarnessPolicyTextPart =
+  makeProviderHarnessPolicyTextPartTaker(PROVIDER);
 const CURSOR_RESUME_VERSION = 1 as const;
 const CURSOR_MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 // Forking a dead source session must first resume it, which may replay
@@ -1242,10 +1233,10 @@ export function makeCursorAdapter(
             issue: "Turn requires non-empty text or attachments.",
           });
         }
-        const harnessPolicy = takeCursorSynaraHarnessPolicyTextPart(
-          ctx,
-          agentGatewayCredentials !== undefined,
-        );
+        const harnessPolicy = takeCursorSynaraHarnessPolicyTextPart(ctx, {
+          scopedGatewayConnectionAvailable: agentGatewayCredentials !== undefined,
+          runtimeMode: ctx.session.runtimeMode,
+        });
         if (harnessPolicy) {
           promptParts.unshift(harnessPolicy);
         }

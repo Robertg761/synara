@@ -323,7 +323,10 @@ left holding an unmatched deactivate, with no caret and no key routing. There is
 nothing to deactivate in that case, so only the activate half is posted.
 
 **Held modifiers are recorded on whichever stream took the press.** `postChord`
-has always done this; the session-tap typing path now does too. It presses
+has always done this; the session-tap typing path and the pointer gestures'
+`modifiers` now do too — three writers, one pair of helpers
+(`recordHeldModifiers`/`clearHeldModifiers`), so `unwind()` has exactly one
+thing to read on the way out. The typing path presses
 left-Shift for every capital and shifted symbol, and that press used to be
 invisible to the unwind bookkeeping — a throw part way through a string, or a
 SIGTERM mid-`type`, ran `unwind()` with nothing to release and left the human
@@ -364,11 +367,12 @@ into the protocol stream. On start the helper emits
 | `capture`             | `kind` (`window`\|`region`), `windowId`\|`region`, `maxDimension?` (2048), `source?` | `{base64, region, source}`                                                        |
 | `launch-app`          | `app`, `arguments?`                                                                  | `{resolvedCommand}`                                                               |
 | `move`                | `x`, `y`, `windowId?`                                                                | `{x, y}` (where the agent cursor moved; posts no event, and does not aim)         |
-| `click`               | `x`, `y`, `windowId?`                                                                | `{x, y, path, verified}` (landing point)                                          |
-| `double-click`        | `x`, `y`, `windowId?`                                                                | `{x, y, path, verified}`                                                          |
-| `right-click`         | `x`, `y`, `windowId?`                                                                | `{x, y, path, verified}`                                                          |
+| `click`               | `x`, `y`, `windowId?`, `modifiers?`                                                  | `{x, y, path, verified}` (landing point)                                          |
+| `double-click`        | `x`, `y`, `windowId?`, `modifiers?`                                                  | `{x, y, path, verified}`                                                          |
+| `triple-click`        | `x`, `y`, `windowId?`, `modifiers?`                                                  | `{x, y, path, verified}`                                                          |
+| `right-click`         | `x`, `y`, `windowId?`, `modifiers?`                                                  | `{x, y, path, verified}`                                                          |
 | `drag`                | `fromX`, `fromY`, `toX`, `toY`, `durationMs?` (220), `windowId?`, `foreground?`      | `{ok, path, verified}`                                                            |
-| `scroll`              | `deltaX`, `deltaY`, `x?`, `y?`, `windowId?`                                          | `{ok, path, verified}`                                                            |
+| `scroll`              | `deltaX`, `deltaY`, `x?`, `y?`, `windowId?`, `modifiers?`                            | `{ok, path, verified}`                                                            |
 | `type`                | `text`, `deliveryMode?`                                                              | `{ok, path, verified}`                                                            |
 | `press-key`           | `key`, `modifiers?`, `deliveryMode?`                                                 | `{ok, path, verified}`                                                            |
 | `hotkey`              | `keys` (modifiers + one key), `deliveryMode?`                                        | `{ok, path, verified}`                                                            |
@@ -400,7 +404,7 @@ silently dropped filter term, which narrowed `describe-ui` to the ids that
 happened to parse.
 
 **Which methods aim the keyboard.** Only the gestures that actually post an event
-(`click`, `double-click`, `right-click`, `drag`, `scroll`) and the two explicit
+(`click`, `double-click`, `triple-click`, `right-click`, `drag`, `scroll`) and the two explicit
 aiming methods (`focus-window`, and `raise-window` once its raise is observed).
 `move` deliberately does **not**: it moves the agent's overlay and nothing else.
 It used to aim, so hovering over the human's editor and then calling `type`
@@ -440,6 +444,40 @@ older caller that omits them gets the previous behaviour.
 - `type`/`press-key`/`hotkey` `deliveryMode` — `background` (default) or
   `foreground` (briefly front the target, then restore the previous app).
 - `drag.foreground` — `true` runs the drag in the foreground rung.
+- `click`/`double-click`/`triple-click`/`right-click`/`scroll` `modifiers` — an
+  array of `ctrl` | `alt` | `shift` | `meta` (`meta` is Command) held down for
+  the gesture. Deliberately narrower than the chord vocabulary: `press-key` and
+  `hotkey` accept `cmd`, `option`, `fn` and friends, a gesture accepts exactly
+  the four names the wire contract has (`ComputerInputModifier`), and any other
+  name — `hyper`, and `cmd` too — is `invalidParams` before a single event is
+  posted, because a Command-click silently demoted to a plain click is a
+  different action on almost every surface. Duplicates are dropped rather than
+  pressed twice. Omitted, `null` and `[]` are the same request the method took
+  before the parameter existed, down to the bytes of the event stream.
+
+  The mechanism is the one a hand uses, and both halves of it matter: each
+  modifier goes down as a **real key transition posted to the target pid** —
+  never the session tap, which is session-wide state a pid-targeted release
+  could not clear — before the gesture's first event, its flag bits ride every
+  mouse and wheel event of the gesture (the priming `mouseMoved`, the down and
+  the up of every click, the wheel event), and the releases go out in reverse
+  with the flags that remain. Each press is recorded in the same
+  `heldModifiers` bookkeeping `postChord` writes, so a throw mid-gesture or a
+  SIGTERM between the down and the up runs `unwind()` with something to release
+  instead of leaving the human a latched Command key. An escalated replay
+  presses them again inside the rung it runs on rather than holding them across
+  the activation in between.
+
+- `triple-click` — three clicks the target reads as **one** triple-click. Click
+  state is pinned at 3 through the down _and_ the up of all three pairs instead
+  of counting 1, 2, 3: a text view that reads the count off each pair would
+  otherwise place a caret, then select a word, then select the line — three
+  visible intermediate states for one gesture — and a toolkit that reads it off
+  only the down, or only the up, would see three unrelated clicks. Everything
+  else is `click`: the same input lane, the same clamping and echo, the same
+  aim (it points the keyboard at the window it hit), the same `targetMissing`
+  (-32001) and `invalidParams` (-32602) rules, and the same delivery verdict
+  from the same `GestureProbe`.
 - `drag.durationMs` is clamped to `[0, 30 000]` — the same ceiling the contract
   puts on it, restated here because the per-step sleep feeds `useconds_t` and
   Swift's conversion **traps**: a large duration aborted the process between the
@@ -448,8 +486,8 @@ older caller that omits them gets the previous behaviour.
 - `type` result `path` — `ax-insert` | `keystrokes` | `foreground-keys` (the
   visible rung, reached by escalation) | `foreground` (the visible rung, asked
   for).
-- `click`/`double-click`/`right-click`/`scroll`/`drag` result `path` — the rung
-  that ran, `background` or `foreground`.
+- `click`/`double-click`/`triple-click`/`right-click`/`scroll`/`drag` result
+  `path` — the rung that ran, `background` or `foreground`.
 - `press-key`/`hotkey` result `path` — `keystrokes` or `foreground`.
 - Every input result carries `verified`, a **string**, never a boolean:
   - `confirmed` — a read-back observed the effect (the focused element's value
@@ -578,7 +616,11 @@ but not delivered). What actually reaches each one:
   a bad request, not a smaller chord that quietly runs, and it is reported as
   "`hyper` is not a key or a modifier this helper knows" rather than as "got 2
   non-modifier keys", which is what the split on `isModifier` used to make it
-  look like.
+  look like; and a pointer `modifiers` entry that is not one of the four names
+  a gesture takes (including a chord alias such as `cmd`, and including any
+  entry that is not a string at all — dropping those would be the same silent
+  narrowing the window-id readers were fixed for), refused before any event is
+  built.
 - **`-32001` targetMissing** — a named window that no longer exists (for
   `capture`, `focus-window`, `raise-window`, `set-value`, `perform-action`,
   `move`, and every pointer gesture that named one); a window capture whose
@@ -679,6 +721,19 @@ single display, Accessibility and Screen Recording granted.
 - **Multi-display reconfiguration** — wired (`Geometry`'s snapshot refreshes on
   `didChangeScreenParametersNotification`, and a region spanning two displays
   takes the `screencapture` path), **not** exercised on a second display.
+
+`triple-click` and the pointer `modifiers` parameter (2026-09-05) are a third
+band, narrower again. Exercised live on an **ungranted** helper: `triple-click`
+is routed on the input lane (it answers the `-32000` permission refusal, not
+`unknown method`, while a genuinely unknown method still answers `-32601`), an
+unreadable `modifiers` entry answers `-32602` _before_ the permission check the
+gesture would otherwise hit, an empty or absent list reaches that check
+unchanged, and perception is unaffected — with the human's frontmost application
+and real cursor position sampled unchanged on both sides. The event stream
+itself — the modifier key transitions, the flag bits on the mouse events, the
+pinned click state — is **compiled and reasoned, not measured**, for the same
+reason everything else on the input path is: it lives behind
+`requireInputPermission`, and the grants belong to Synara.
 
 The 2026-09-04 audit fixes are a second, narrower band of verification, and the
 distinction matters. Exercised live on an **ungranted** helper (run from a shell,

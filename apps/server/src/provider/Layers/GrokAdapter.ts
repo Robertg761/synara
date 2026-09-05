@@ -47,10 +47,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import type * as Acp from "@agentclientprotocol/sdk";
 
 import { buildAcpSynaraMcpServers } from "../../agentGateway/mcpInjection.ts";
-import {
-  type SynaraHarnessPolicyDeliveryState,
-  takeSynaraHarnessPolicyTextPartForProviderSession,
-} from "../../agentGateway/harnessPolicy.ts";
+import { makeProviderHarnessPolicyTextPartTaker } from "../../agentGateway/harnessPolicy.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
 import { PROVIDER_ADAPTER_RUNTIME_EVENT_BUFFER_CAPACITY } from "../Services/ProviderAdapter.ts";
 import {
@@ -133,14 +130,7 @@ import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogg
 
 const PROVIDER = "grok" as const;
 
-export const takeGrokSynaraHarnessPolicyTextPart = (
-  state: SynaraHarnessPolicyDeliveryState,
-  scopedGatewayConnectionAvailable: boolean,
-) =>
-  takeSynaraHarnessPolicyTextPartForProviderSession(state, {
-    provider: PROVIDER,
-    scopedGatewayConnectionAvailable,
-  });
+export const takeGrokSynaraHarnessPolicyTextPart = makeProviderHarnessPolicyTextPartTaker(PROVIDER);
 const GROK_RESUME_VERSION = 1 as const;
 const GROK_MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 // Forking a dead source session must first resume it, which replays history,
@@ -1876,10 +1866,10 @@ export function makeGrokAdapter(
             issue: "Turn requires non-empty text or attachments.",
           });
         }
-        const harnessPolicy = takeGrokSynaraHarnessPolicyTextPart(
-          ctx,
-          agentGatewayCredentials !== undefined,
-        );
+        const harnessPolicy = takeGrokSynaraHarnessPolicyTextPart(ctx, {
+          scopedGatewayConnectionAvailable: agentGatewayCredentials !== undefined,
+          runtimeMode: ctx.session.runtimeMode,
+        });
         if (harnessPolicy) {
           promptParts.unshift(harnessPolicy);
         }
