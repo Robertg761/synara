@@ -20,9 +20,30 @@ export const MICROPHONE_USAGE_DESCRIPTION =
  */
 export const SCREEN_RECORDING_USAGE_DESCRIPTION =
   computerHelperBundle.screenRecordingUsageDescription;
+/**
+ * The oldest macOS the app declares support for.
+ *
+ * Read from the helper manifest rather than written twice: the Swift helper is
+ * built against a `macosx12.3` target because ScreenCaptureKit needs 12.3, and
+ * an app that installs on 12.0 ships a helper that cannot launch there. One
+ * number, and `probeAvailability` uses the same one as its floor.
+ */
+export const MAC_MINIMUM_SYSTEM_VERSION = computerHelperBundle.minimumMacosVersion;
 export const MAC_ENTITLEMENTS_PATH = "apps/desktop/resources/entitlements.mac.plist";
 export const MAC_INHERITED_ENTITLEMENTS_PATH =
   "apps/desktop/resources/entitlements.mac.inherit.plist";
+/**
+ * The entitlements the nested computer-use helper is re-signed against — an
+ * empty dict. See the plist's own comment and `scripts/lib/mac-after-sign.cjs`.
+ */
+export const MAC_HELPER_ENTITLEMENTS_PATH = "apps/desktop/resources/entitlements.mac.helper.plist";
+/** Where `build-desktop-artifact.ts` stages the `afterSign` hook inside the app stage. */
+export const MAC_AFTER_SIGN_HOOK_DIR = "build-hooks";
+export const MAC_AFTER_SIGN_HOOK_PATH = `${MAC_AFTER_SIGN_HOOK_DIR}/mac-after-sign.cjs`;
+export const MAC_AFTER_SIGN_CONFIG_PATH = `${MAC_AFTER_SIGN_HOOK_DIR}/mac-after-sign.json`;
+/** electron-builder resolves hook modules relative to the project dir and requires a `./` prefix. */
+export const MAC_AFTER_SIGN_HOOK_REFERENCE = `./${MAC_AFTER_SIGN_HOOK_PATH}`;
+export const MAC_AFTER_SIGN_HOOK_ASAR_EXCLUSION = `!${MAC_AFTER_SIGN_HOOK_DIR}/**`;
 export const MAC_APPSNAP_HELPER_STAGE_PATH =
   "apps/desktop/native/appsnap/build/synara-appsnap-helper";
 export const MAC_APPSNAP_HELPER_ASAR_EXCLUSION = "!apps/desktop/native/appsnap/build/**";
@@ -66,11 +87,27 @@ export const MAC_HELPER_X64_ARCH_FILES = [
 
 export const MAC_DEVICE_HELPER_STAGE_PATH = "apps/server/dist/device-helper";
 export const MAC_DEVICE_HELPER_RESOURCE_PATH = "Resources/device-helper";
+/**
+ * The device helper's sources are staged under `Resources/device-helper` by
+ * `extraFiles`, and the desktop points the backend at exactly that copy
+ * (`DEVICE_HELPER_SOURCE_DIR_ENV`). Left in the asar as well they were shipped
+ * twice — once as a directory a compiler can read and once inside an archive
+ * where nothing can — for no gain but the bytes.
+ */
+export const MAC_DEVICE_HELPER_ASAR_EXCLUSION = `!${MAC_DEVICE_HELPER_STAGE_PATH}/**`;
+/**
+ * The macOS computer-use helper's Swift sources and its `HEADER.md` exist for
+ * the source-build fallback, which is macOS-only. A Windows or Linux artifact
+ * carrying them ships a compiler input for an OS it will never run on.
+ */
+export const NON_MAC_FILES = ["**/*", MAC_COMPUTER_HELPER_SOURCES_ASAR_EXCLUSION] as const;
 export const WINDOWS_INSTALLER_GUID = "368107a8-afe6-5db5-ab3b-d4f331684868";
 const MAC_DMG_ICON_PATH = "icon.icns";
 export const NODE_PTY_ASAR_UNPACK_GLOBS = ["node_modules/node-pty/**"] as const;
 
 export interface DesktopPlatformBuildConfig {
+  /** electron-builder hook module, relative to the staged project directory. */
+  readonly afterSign?: string;
   readonly asarUnpack?: ReadonlyArray<string>;
   readonly dmg?: Record<string, unknown>;
   readonly extraFiles?: ReadonlyArray<Record<string, string>>;
@@ -84,6 +121,12 @@ export interface DesktopPlatformBuildConfig {
 export interface CreateDesktopPlatformBuildConfigInput {
   readonly platform: "linux" | "mac" | "win";
   readonly target: string;
+  /**
+   * Sign the artifact with whatever identity is discoverable (`CSC_NAME`,
+   * `CSC_LINK`, or the login keychain). Independent of `notarize`: a locally
+   * signed build wants a stable designated requirement so TCC grants survive a
+   * rebuild, and has no Developer ID to notarize with.
+   */
   readonly signed?: boolean;
   readonly windowsAzureSignOptions?: Record<string, string>;
 }
@@ -126,8 +169,16 @@ export function createDesktopPlatformBuildConfig(
       target: input.target === "dmg" ? [input.target, "zip"] : [input.target],
       icon: MAC_DMG_ICON_PATH,
       category: "public.app-category.developer-tools",
+      minimumSystemVersion: MAC_MINIMUM_SYSTEM_VERSION,
       hardenedRuntime: input.signed === true,
-      notarize: input.signed === true,
+      // Never electron-builder's, on any build. `notarizeIfProvided` runs
+      // inside its signing step, i.e. before `afterSign`, and the hook re-signs
+      // the nested helper and re-seals the app there — so a ticket stapled by
+      // electron-builder would describe a code directory hash the shipped app
+      // no longer has. The hook submits instead, once the app is final; whether
+      // it does so at all is carried in its own JSON sidecar, which is why
+      // notarization is not a parameter of this function.
+      notarize: false,
       entitlements: MAC_ENTITLEMENTS_PATH,
       entitlementsInherit: MAC_INHERITED_ENTITLEMENTS_PATH,
       // The AppSnap helper is a bare executable; the computer-use helper is an
@@ -151,6 +202,11 @@ export function createDesktopPlatformBuildConfig(
 
     return {
       ...nativePackaging,
+      // Strips the inherited entitlements from `Contents/Helpers/<helper>.app`,
+      // re-seals the app around the new helper signature, and — because that
+      // re-seal happens after electron-builder's own notarization point —
+      // performs the notarization too.
+      afterSign: MAC_AFTER_SIGN_HOOK_REFERENCE,
       dmg: {
         sign: input.signed === true,
         // The signed release flow notarizes and staples the DMG after electron-builder exits.
@@ -163,6 +219,8 @@ export function createDesktopPlatformBuildConfig(
         MAC_APPSNAP_HELPER_ASAR_EXCLUSION,
         MAC_COMPUTER_HELPER_ASAR_EXCLUSION,
         MAC_COMPUTER_HELPER_SOURCES_ASAR_EXCLUSION,
+        MAC_DEVICE_HELPER_ASAR_EXCLUSION,
+        MAC_AFTER_SIGN_HOOK_ASAR_EXCLUSION,
       ],
       extraFiles: [
         {
@@ -189,6 +247,7 @@ export function createDesktopPlatformBuildConfig(
   if (input.platform === "linux") {
     return {
       ...nativePackaging,
+      files: [...NON_MAC_FILES],
       linux: {
         target: [input.target],
         executableName: "synara",
@@ -205,6 +264,7 @@ export function createDesktopPlatformBuildConfig(
 
   return {
     ...nativePackaging,
+    files: [...NON_MAC_FILES],
     // Keep the Windows product registration stable while the public app ID changes.
     // This lets NSIS updates replace the existing installation and own its uninstaller.
     nsis: {

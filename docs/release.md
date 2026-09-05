@@ -130,6 +130,83 @@ Notes:
 
 - `APPLE_API_KEY` is stored as raw key text in secrets.
 - The workflow writes it to a temporary `AuthKey_<id>.p8` file at runtime.
+- Notarization of the `.app` is performed by the `afterSign` hook
+  (`scripts/lib/mac-after-sign.cjs`), not by electron-builder's `mac.notarize`,
+  which is pinned to `false`. electron-builder notarizes inside its signing
+  step; the hook runs after that and re-signs the nested computer-use helper
+  without Electron's inherited entitlements, then re-seals the app — so a ticket
+  stapled before the hook would describe a code directory hash the shipped app
+  no longer has. The DMG is still notarized and stapled separately after
+  electron-builder exits (`scripts/lib/mac-dmg-finalize.ts`).
+
+## 2a) Locally signed builds (macOS, no Apple account)
+
+`--signed` and `--notarize` are separate flags. `--signed` signs with whatever
+identity is discoverable — `CSC_NAME`, `CSC_LINK`, or the login keychain — and
+turns on the hardened runtime and DMG signing. `--notarize` implies `--signed`
+and additionally submits the app to Apple's notary service; it needs a real
+Developer ID and the `APPLE_API_*` credentials. Release CI passes `--notarize`.
+
+### Why you want a local identity
+
+macOS pins a TCC grant made to an **ad-hoc** signed app to that build's cdhash.
+Every rebuild produces a new cdhash, so the Accessibility and Screen Recording
+grants the computer-use helper depends on stop applying the moment you rebuild —
+while System Settings goes on showing Synara switched on. A real signing
+identity, self-signed included, gives the app a stable designated requirement
+(identifier plus certificate) and TCC keys the grant on that instead: grant it
+once, keep it across every rebuild. This is the difference between iterating on
+computer use and re-granting two privacy toggles every few minutes.
+
+### One-time setup
+
+```bash
+bash scripts/create-local-signing-identity.sh          # creates "Synara Dev"
+```
+
+The script creates and imports a self-signed code-signing certificate into your
+login keychain, and is safe to re-run. It cannot complete the last step for you:
+trusting the certificate needs your login password in a Keychain Access dialog.
+Do one of these, then re-run the script to confirm:
+
+- Keychain Access → "login" keychain → "My Certificates" → double-click
+  **Synara Dev** → expand **Trust** → set **Code Signing** to **Always Trust** →
+  close the window and enter your password.
+- Or, from a terminal (also prompts for your password):
+
+  ```bash
+  sudo security add-trusted-cert -d -r trustRoot \
+    -p codeSign -k /Library/Keychains/System.keychain \
+    <(security find-certificate -c "Synara Dev" -p "$(security default-keychain | tr -d '"' | xargs)")
+  ```
+
+Verify:
+
+```bash
+security find-identity -v -p codesigning | grep "Synara Dev"
+```
+
+### Building
+
+```bash
+CSC_NAME="Synara Dev" bun run dist:desktop:dmg:arm64 -- --signed
+```
+
+Environment equivalents: `CSC_NAME` selects the identity, `SYNARA_DESKTOP_SIGNED=1`
+replaces `--signed`, and `SYNARA_DESKTOP_NOTARIZE=1` replaces `--notarize`.
+Setting `CSC_NAME` alone is also enough — an explicit identity is honoured even
+without `--signed`, which is the one case where identity discovery is not
+disabled for an otherwise unsigned build.
+
+Notes:
+
+- A self-signed identity has no Team ID and cannot be notarized. The packaged
+  artifact will not pass Gatekeeper on another Mac; it is for your own machine.
+- The build always verifies the nested `Contents/Helpers/Synara Computer Use.app`
+  with `codesign --verify --strict` and asserts it carries **no** entitlements.
+  Team ID and hardened-runtime checks apply only to `--notarize` builds.
+- Grants still reset if you change the app's bundle identifier — a `.dev` or
+  `.canary` flavor is a different TCC subject from production Synara.
 
 ## 3) Azure Trusted Signing setup (Windows)
 

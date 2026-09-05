@@ -22,6 +22,17 @@ import { SYNARA_PRODUCTION_BUNDLE_ID } from "@synara/shared/desktopIdentity";
 export const COMPUTER_HELPER_BINARY_NAME = computerHelperBundle.binaryName;
 
 /**
+ * The oldest macOS the helper can run on.
+ *
+ * `build.sh` targets `macosx12.3` because ScreenCaptureKit needs 12.3, so a
+ * helper launched on anything older fails in dyld with nothing an operator can
+ * act on. Three places have to agree about that number — the app's
+ * `LSMinimumSystemVersion`, the compiler triples, and the backend's passive
+ * availability probe — and this is the one they read.
+ */
+export const COMPUTER_HELPER_MINIMUM_MACOS_VERSION = computerHelperBundle.minimumMacosVersion;
+
+/**
  * The helper's app bundle. It is a bundle, not a loose binary, because a bundle
  * is the unit macOS signs and notarizes, and the helper has to carry the app's
  * Team ID and hardened runtime of its own. (The TCC grants themselves are filed
@@ -83,6 +94,19 @@ export const COMPUTER_HELPER_DEV_RAW_SEGMENTS = [
 
 /** Signed macOS computer-use helper embedded by the desktop release build. */
 export const COMPUTER_HELPER_BINARY_PATH_ENV = "SYNARA_COMPUTER_HELPER_BINARY_PATH";
+
+/**
+ * Set by a packaged desktop build to say "a helper binary ships with this app".
+ *
+ * `COMPUTER_HELPER_BINARY_PATH_ENV` is only set when the file is actually
+ * there, so its absence cannot distinguish "this build never had a helper"
+ * (a development checkout, the CLI) from "this build shipped one and it is
+ * gone" (quarantine, a partial install, a broken signature). Those want
+ * opposite advice: the first is told how to build one, the second is told to
+ * reinstall Synara — and telling a user of a packaged app to install Xcode is
+ * the wrong end of a support conversation. This flag is what tells them apart.
+ */
+export const COMPUTER_HELPER_BUNDLED_EXPECTED_ENV = "SYNARA_COMPUTER_HELPER_BUNDLED";
 
 /**
  * Where the server's source-build fallback should compile from.

@@ -104,17 +104,26 @@ const helperInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 `;
 
+/**
+ * The deployment target every triple carries, from the same manifest the app's
+ * `LSMinimumSystemVersion` and the backend's availability floor read. Building
+ * lower than the app claims to support ships a helper that cannot launch on a
+ * Mac the installer accepted.
+ */
+const MINIMUM_MACOS_VERSION = bundle.minimumMacosVersion;
+const MACHINE_TRIPLE_PREFIX = { arm64: "arm64", x64: "x86_64" };
+
+function computerHelperTarget(arch) {
+  return { arch, triple: `${MACHINE_TRIPLE_PREFIX[arch]}-apple-macosx${MINIMUM_MACOS_VERSION}` };
+}
+
 export function computerHelperTargetsForArch(arch) {
   switch (arch) {
     case "arm64":
-      return [{ arch: "arm64", triple: "arm64-apple-macosx12.3" }];
     case "x64":
-      return [{ arch: "x64", triple: "x86_64-apple-macosx12.3" }];
+      return [computerHelperTarget(arch)];
     case "universal":
-      return [
-        { arch: "arm64", triple: "arm64-apple-macosx12.3" },
-        { arch: "x64", triple: "x86_64-apple-macosx12.3" },
-      ];
+      return [computerHelperTarget("arm64"), computerHelperTarget("x64")];
     default:
       throw new Error(`Unsupported computer helper architecture: ${arch}`);
   }

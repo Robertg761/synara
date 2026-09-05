@@ -68,6 +68,7 @@ import {
   type MacHelperTransport,
 } from "./macComputerHelperClient.ts";
 import {
+  MACOS_BELOW_HELPER_FLOOR_MESSAGE,
   MacComputerHelperProvisioner,
   MacHelperBuildError,
   resolveComputerHelperSourceDir,
@@ -79,7 +80,7 @@ const DEFAULT_COMPUTER_ID = "desktop";
 const DEFAULT_STILL_INTERVAL_MS = 500;
 const DEFAULT_DRAG_DURATION_MS = 220;
 const UNSUPPORTED_MACOS_MESSAGE =
-  "This Synara build does not include its macOS computer-control helper, and no Xcode " +
+  "This Synara build does not include its macOS computer-control helper, and no Swift " +
   "toolchain is available for the development fallback. Update or reinstall Synara.";
 
 /**
@@ -605,9 +606,16 @@ export class MacComputerBackend implements ComputerBackend {
 
   /** The uncached passive probe: the three cheap-to-expensive ways to be available. */
   private async readProbeAvailability(): Promise<ComputerAvailability> {
+    // The floor comes first because it outranks every other answer: a shipped
+    // helper on macOS 12.2 is still a binary that cannot launch, and reporting
+    // "available" there costs the user a dyld failure instead of a sentence
+    // naming the actual reason.
+    if (await this.provisioner.macosBelowFloor().catch(() => false)) {
+      return { kind: "backend-unavailable", message: MACOS_BELOW_HELPER_FLOOR_MESSAGE };
+    }
     if (await this.provisioner.bundledBinary().catch(() => null)) return this.availableNow();
     if (await this.provisioner.cachedBinaryPath().catch(() => null)) return this.availableNow();
-    if (await this.provisioner.xcodeToolchainPresent().catch(() => false))
+    if (await this.provisioner.swiftToolchainPresent().catch(() => false))
       return this.availableNow();
     return { kind: "backend-unavailable", message: UNSUPPORTED_MACOS_MESSAGE };
   }

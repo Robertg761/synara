@@ -27,10 +27,9 @@ fi
 
 # The command line tools are enough to *compile*: unlike the device helper this
 # links no private framework, only public Quartz/AppKit/ScreenCaptureKit, and
-# resolves its private symbols at runtime. Note the server's provisioner is
-# stricter than this script — it gates the source-build fallback on a full Xcode
-# — so a CLT-only machine can run build.sh by hand but will not have the helper
-# built for it automatically.
+# resolves its private symbols at runtime. The server's source-build fallback
+# gates on the same thing this script does — `xcrun swiftc` answering — so a
+# CLT-only machine gets the helper built for it automatically.
 DEVELOPER_DIR_PATH="${DEVELOPER_DIR:-}"
 if [ -z "$DEVELOPER_DIR_PATH" ]; then
   DEVELOPER_DIR_PATH="$(xcode-select -p 2>/dev/null || true)"
@@ -51,6 +50,13 @@ trap 'rm -f "$TMP_BINARY"' EXIT
 # ScreenCaptureKit needs macOS 12.3; the input path's window-targeted posting is
 # unchanged back to there. Codex ships a 14.4 floor for its own reasons; we build
 # lower and let the capability probe report what the running OS actually allows.
+#
+# This number is also the app's LSMinimumSystemVersion and the backend's
+# availability floor, both of which read it from
+# `packages/shared/src/computerHelperBundle.json` (`minimumMacosVersion`). A
+# staged copy of these sources has no `packages/` beside it, so the literal
+# stays here rather than being read out of the JSON; the packaging config test
+# pins the two together so they cannot drift apart silently.
 TARGET_TRIPLE="${SYNARA_COMPUTER_HELPER_TARGET:-$(uname -m)-apple-macosx12.3}"
 
 # Release is the default and what packaging asks for. A debug build skips

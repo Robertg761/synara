@@ -58,6 +58,7 @@ import { DEVICE_HELPER_SOURCE_DIR_ENV } from "@synara/shared/deviceHelperCache";
 import {
   COMPUTER_HELPER_BINARY_PATH_ENV,
   COMPUTER_HELPER_BUNDLE_EXECUTABLE_SEGMENTS,
+  COMPUTER_HELPER_BUNDLED_EXPECTED_ENV,
   COMPUTER_HELPER_DEV_BUNDLE_SEGMENTS,
   COMPUTER_HELPER_DEV_RAW_SEGMENTS,
   COMPUTER_HELPER_PACKAGED_SEGMENTS,
@@ -3531,6 +3532,15 @@ function backendEnv(): NodeJS.ProcessEnv {
     // too. A Windows or Linux backend that saw this variable would stat a path
     // that cannot exist, hence the platform guard.
     ...(computerHelperPath ? { [COMPUTER_HELPER_BINARY_PATH_ENV]: computerHelperPath } : {}),
+    // Whether a helper was *supposed* to be there, which the variable above
+    // cannot say: it is only set when the file exists, so its absence reads the
+    // same for a development checkout that never built one and for an installed
+    // app whose signed helper is gone. Only the second should be told to
+    // reinstall Synara — the first is told how to build one — and a packaged
+    // macOS build always ships a helper, so `app.isPackaged` is the answer.
+    ...(app.isPackaged && process.platform === "darwin"
+      ? { [COMPUTER_HELPER_BUNDLED_EXPECTED_ENV]: "1" }
+      : {}),
     // Where the backend's source-build fallback may compile from, and — just as
     // importantly — where it may not. Packaging stages the Swift sources under
     // `Resources` precisely because the copy the server would otherwise resolve

@@ -95,9 +95,10 @@ class FakeMacHelper implements MacHelperTransport {
   }
 }
 
-const XCODE_PRESENT: ProcessRunResult = {
+const TOOLCHAIN_PRESENT: ProcessRunResult = {
   code: 0,
-  stdout: "Xcode 26.2\nBuild version 17C52\n",
+  stdout:
+    "swift-driver version: 1.127.8 Apple Swift version 6.2 (swiftlang-6.2.0.19.9)\nTarget: arm64-apple-macosx26.0\n",
   stderr: "",
 };
 
@@ -122,7 +123,7 @@ function makeBackend(
     env: options.env ?? {},
     resolveBinary: async () => "/fake/computer-helper",
     makeHelperClient: () => helper,
-    run: options.run ?? (async () => XCODE_PRESENT),
+    run: options.run ?? (async () => TOOLCHAIN_PRESENT),
     ...(options.stillIntervalMs === undefined ? {} : { stillIntervalMs: options.stillIntervalMs }),
   });
 }
@@ -186,7 +187,7 @@ describe("MacComputerBackend", () => {
       platform: "linux",
       run: async () => {
         ran = true;
-        return XCODE_PRESENT;
+        return TOOLCHAIN_PRESENT;
       },
     });
     expect(await backend.probeAvailability()).toEqual({
@@ -196,7 +197,7 @@ describe("MacComputerBackend", () => {
     expect(ran).toBe(false);
   });
 
-  it("passive probe reports available when the Xcode toolchain is present", async () => {
+  it("passive probe reports available when a Swift toolchain is present", async () => {
     const backend = makeBackend(new FakeMacHelper());
     expect(await backend.probeAvailability()).toEqual({ kind: "available", backend: "mac" });
   });
@@ -204,7 +205,7 @@ describe("MacComputerBackend", () => {
   it("passive probe reports unavailable when no toolchain and no cached binary exist", async () => {
     const backend = new MacComputerBackend({
       platform: "darwin",
-      run: async () => ({ code: 127, stdout: "", stderr: "xcodebuild: not found" }),
+      run: async () => ({ code: 127, stdout: "", stderr: "xcrun: no swiftc" }),
       // Hermetic: with the ambient environment the packaged desktop's
       // SYNARA_COMPUTER_HELPER_BINARY_PATH would satisfy `bundledBinary()` and
       // this would report available on a developer's own machine.
@@ -1213,7 +1214,7 @@ describe("MacComputerBackend", () => {
       platform: "darwin",
       now: () => clock,
       makeHelperClient: () => helper,
-      run: async () => XCODE_PRESENT,
+      run: async () => TOOLCHAIN_PRESENT,
       resolveBinary: async () => {
         builds += 1;
         if (builds === 1) throw new MacHelperBuildError("Computer helper build failed: disk full");
@@ -1242,7 +1243,7 @@ describe("MacComputerBackend", () => {
       platform: "darwin",
       now: () => 0,
       makeHelperClient: () => helper,
-      run: async () => XCODE_PRESENT,
+      run: async () => TOOLCHAIN_PRESENT,
       resolveBinary: async () => {
         builds += 1;
         if (builds === 1) throw new MacHelperBuildError("Computer helper build failed: disk full");
@@ -1297,7 +1298,7 @@ describe("MacComputerBackend", () => {
       now: () => 0,
       env: {},
       makeHelperClient: () => helper,
-      run: async () => XCODE_PRESENT,
+      run: async () => TOOLCHAIN_PRESENT,
       resolveBinary: async () => {
         builds += 1;
         throw new MacHelperBuildError("Computer helper build failed: disk full");
@@ -1351,7 +1352,7 @@ describe("MacComputerBackend", () => {
       env: {},
       resolveBinary: async () => "/fake/computer-helper",
       makeHelperClient: () => helper,
-      run: async () => XCODE_PRESENT,
+      run: async () => TOOLCHAIN_PRESENT,
     });
 
     const availability = await backend.availability();
@@ -1375,7 +1376,7 @@ describe("MacComputerBackend", () => {
       now: () => 0,
       env: {},
       resolveBinary: async () => "/fake/computer-helper",
-      run: async () => XCODE_PRESENT,
+      run: async () => TOOLCHAIN_PRESENT,
       makeHelperClient: () => {
         const helper = new FakeMacHelper({
           capabilities: GRANTED,
@@ -1489,7 +1490,7 @@ describe("MacComputerBackend", () => {
       makeHelperClient: () => new FakeMacHelper({ capabilities: GRANTED }),
       run: async () => {
         spawns += 1;
-        return { code: 127, stdout: "", stderr: "xcodebuild: not found" };
+        return { code: 127, stdout: "", stderr: "xcrun: no swiftc" };
       },
     });
 
@@ -1498,7 +1499,7 @@ describe("MacComputerBackend", () => {
     expect(afterFirst).toBeGreaterThan(0);
 
     // This runs on every publish, on every host, at boot. On a source-build Mac
-    // it costs an `xcodebuild -version` spawn and a digest of every Swift source
+    // it costs an `xcrun swiftc -version` spawn and a digest of every Swift source
     // in the helper, to re-derive machine state that changes when somebody
     // installs Xcode.
     for (let publish = 0; publish < 5; publish += 1) {
@@ -1562,7 +1563,7 @@ describe("MacComputerBackend", () => {
         now: () => 0,
         env: {},
         makeHelperClient: () => new FakeMacHelper({ capabilities: GRANTED }),
-        run: async () => XCODE_PRESENT,
+        run: async () => TOOLCHAIN_PRESENT,
         resolveBinary: (signal) =>
           new Promise<string>((_resolve, reject) => {
             buildStarted();
