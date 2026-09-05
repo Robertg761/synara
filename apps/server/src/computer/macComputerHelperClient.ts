@@ -163,6 +163,15 @@ export class MacComputerHelperClient implements MacHelperTransport {
   private readonly requestTimeoutMs: number;
   private stderrTail = "";
   private exited = false;
+  /**
+   * Why this helper stopped being usable, kept so a request that arrives
+   * afterwards can be told the real reason instead of a generic "not running".
+   *
+   * The first one wins: a spawn failure is followed by a `close` whose only
+   * content is "code=null", and answering `spawn ENOENT` with that would throw
+   * away the one line that says what to fix.
+   */
+  private terminalError: MacComputerHelperError | undefined;
   /** Terminal. `dispose()` is not a pause: a later request must not respawn. */
   private disposed = false;
 
@@ -186,6 +195,7 @@ export class MacComputerHelperClient implements MacHelperTransport {
     );
     this.process = child;
     this.exited = false;
+    this.terminalError = undefined;
     this.stdoutFramer = new JsonRpcStdioFramer(
       this.options.maxControlLineBytes ?? MAX_CONTROL_LINE_BYTES,
       (error) => this.handleControlLineError(error),
@@ -215,14 +225,16 @@ export class MacComputerHelperClient implements MacHelperTransport {
     child.on("error", (error) =>
       this.fail(new MacComputerHelperError("helper_spawn_failed", error.message)),
     );
-    child.on("exit", (code, signal) => {
-      this.exited = true;
-      const reason = `computer helper exited (code=${code ?? "null"}, signal=${signal ?? "null"})${
-        this.stderrTail.trim() ? `: ${this.stderrTail.trim()}` : ""
-      }`;
-      this.fail(new MacComputerHelperError("helper_exited", reason));
-      this.options.onExit?.(reason);
-    });
+    child.on("exit", (code, signal) => this.terminate("exited", code, signal));
+    // `exit` alone is not enough. A spawn that never produced a process — a
+    // missing binary, a quarantined helper — emits `error` and then `close`, and
+    // no `exit` at all, so a client listening only for `exit` went on reporting
+    // itself as running over a child that does not exist: the next request
+    // reached a closed stdin and failed as `helper_write_failed`, a fault code
+    // that says nothing about the actual `spawn ENOENT`. `close` is the one
+    // event both paths always deliver; the guard inside `terminate` keeps the
+    // ordinary case (exit, then close) from being counted twice.
+    child.on("close", (code, signal) => this.terminate("closed", code, signal));
   }
 
   async request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -235,7 +247,13 @@ export class MacComputerHelperClient implements MacHelperTransport {
     if (!this.process) this.start();
     const child = this.process;
     if (!child || this.exited) {
-      throw new MacComputerHelperError("helper_unavailable", "Computer helper is not running");
+      // The recorded cause where there is one: "not running" is true of a
+      // helper that died of `spawn ENOENT` and of one that crashed on an AX
+      // call, and only the recorded error tells the two apart.
+      throw (
+        this.terminalError ??
+        new MacComputerHelperError("helper_unavailable", "Computer helper is not running")
+      );
     }
     const registry = this.requestRegistry;
     const writer = this.stdinWriter;
@@ -382,7 +400,25 @@ export class MacComputerHelperClient implements MacHelperTransport {
     this.requestRegistry?.rejectAll(error);
   }
 
+  /**
+   * The child is gone, whichever event said so. Runs once: `exit` and `close`
+   * both fire for an ordinary termination, and reporting that twice would put a
+   * second `onExit` through the backend's invalidation for a helper it has
+   * already replaced.
+   */
+  private terminate(verb: "exited" | "closed", code: number | null, signal: string | null): void {
+    if (this.exited) return;
+    this.exited = true;
+    const tail = this.stderrTail.trim();
+    const reason = `computer helper ${verb} (code=${code ?? "null"}, signal=${signal ?? "null"})${
+      tail ? `: ${tail}` : ""
+    }`;
+    this.fail(new MacComputerHelperError("helper_exited", reason));
+    this.options.onExit?.(reason);
+  }
+
   private fail(error: MacComputerHelperError): void {
+    this.terminalError ??= error;
     this.requestRegistry?.processExited(error);
     this.stdinWriter?.close(error);
   }

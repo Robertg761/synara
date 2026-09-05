@@ -88,11 +88,48 @@ no subprocess, and no second decode, and it takes the caller's `maxDimension`
 budget as the output size so the downscale happens at the source. The
 `SCShareableContent` call it needs is the one API in this helper that can hang
 (radar FB12114396), so it is cached (~2 s), single-flighted, and deadlined at
-3 s — a hung call holds its own permit and every later request fails fast to the
-CLI. `/usr/sbin/screencapture` is the fallback: same Screen Recording grant, no
-hang, and it composites across displays, which is why a region spanning two of
-them takes that path. It is also the whole path below macOS 14. Each result says
-which link served it (`source`), so the backend can track the fallback rate.
+3 s. Callers that lose the single-flight race **wait on the request already in
+flight**, against that request's own deadline rather than a fresh one. They used
+to be handed the (often nil) warm copy immediately and fall to the CLI, and since
+the perception lane is concurrent and the pane opens with a burst of captures, a
+cold helper served one image through ScreenCaptureKit and every other one through
+`screencapture`. A call that never returns still costs nothing extra: the
+in-flight flag is cleared only by the completion handler, waiters past the shared
+deadline fall through to the warm copy at once, and no second request is ever
+started behind it.
+
+`/usr/sbin/screencapture` is the fallback: same Screen Recording grant, no hang,
+and it composites across displays, which is why a region spanning two of them
+takes that path. It is also the whole path below macOS 14. Each result says which
+link served it (`source`), so the backend can track the fallback rate.
+
+For `kind: "window"` the fallback takes its **origin from `SCWindow.frame`**, not
+from `CGWindowList`. `screencapture -l` composites the window's whole surface,
+which is not the rect the window list reports — measured against a Terminal
+window the image began 32 pt above the enumerated origin, so every coordinate an
+agent read off it mapped 32 pt low on the desktop. `SCShareableContent` is
+macOS 12.3, so that measurement is available on every OS this helper supports,
+including the ones with no `SCScreenshotManager`; when the window cannot be found
+there the capture is **refused** (`-32001`) rather than described with a rect its
+pixels do not cover. The extent is then checked against that surface as well: a
+disagreement is unknowable rather than correctable — nothing says whether the
+extra pixels are above or below — so it is refused (`-32603`) instead of
+described. Measured on one machine (macOS 27, 6 windows across AppKit, Chromium
+and Finder) `SCWindow.frame`, `CGWindowList` bounds and the CLI's own extent all
+agree exactly, so the audit's 32 pt case did not reproduce there; the guard is
+what makes it a refusal rather than a silent misreport wherever it does.
+
+**Synara's own windows are cut out of every display capture.** The whole-desktop
+still that feeds the Computer pane is a region capture, so with nothing excluded
+the pane photographed itself: an infinite mirror, and — because the pane redraws
+on every frame — a guarantee that no two stills were ever byte-identical, which
+defeated the Node side's dedupe and cost an SCK capture, a PNG encode and a ~1 MB
+JSON line twice a second for as long as the pane was open. The filter excludes
+exactly the pids `Windows.enumerate` excludes as the host (`Windows.isHostOwned`:
+the parent chain plus the bundle-id match), so what the agent is shown and what
+the agent may act on stay the same set. The helper's **own** overlay is
+deliberately not excluded — the agent cursor is the one thing the still exists to
+show, and its window is `.readOnly` precisely so it composites into captures.
 
 **The helper's own windows, and Synara's, are never targets.** The Software
 Cursor overlay is a normal-level window parked exactly where the agent is about
@@ -239,18 +276,37 @@ assumed in advance. A pointer gesture on the invisible rung is watched by
 `DeliveryWatch` (`Input.swift`), which asks one `Accessibility.GestureProbe` —
 a single `Application` handle for the whole gesture, at the **0.35 s per-window**
 messaging timeout, under a **0.75 s** wall budget — for the element under the
-click point _before_ posting, and for the application's focused element
-afterwards. It draws a conclusion only when it is entitled to one: the element
-must be settable-focusable and must not already hold focus, or the answer is
-`unverifiable`. An expired budget is `unverifiable` too, never an escalation:
-a wrong "delivered" costs nothing, a wrong "undelivered" costs a permanent
-flicker. Only an `unconfirmed` — read back, and demonstrably unchanged — puts the
-application's **bundle id** into `foregroundOnlyBundles`, after which every
-gesture and keystroke into that app skips straight to the visible rung. The set
-is keyed on bundle id so the verdict survives a relaunch and two windows of one
-app share one answer, it is touched only from the serial input lane, and it is
-empty for every application measured so far — Chromium and Electron included,
-since the key-window record landed.
+click point _before_ posting, for the application's focused element at that same
+moment, and for its focused element afterwards. It draws a conclusion only when
+it is entitled to one: the element must be settable-focusable and must not
+already hold focus, or the answer is `unverifiable`. An expired budget is
+`unverifiable` too, never an escalation: a wrong "delivered" costs nothing, a
+wrong "undelivered" costs a permanent flicker.
+
+The three-way split is what keeps the escalation honest, because `unconfirmed`
+is not merely a report — `click` **replays the whole gesture** on the visible
+rung when it sees one, and a replay is a second real click on the user's
+desktop. Focus that has moved to the element the click was aimed at is
+`confirmed`; focus that has not moved **at all** from where it was before the
+gesture is `unconfirmed`; focus that has moved somewhere neither predicted nor
+previous is `unverifiable`, because the click plainly arrived and merely landed
+focus somewhere the hit test did not foresee. Only the middle case may cost a
+duplicate click, and only it puts the application's **bundle id** into
+`foregroundOnlyBundles`, after which every gesture and keystroke into that app
+skips straight to the visible rung. The set is keyed on bundle id so the verdict
+survives a relaunch and two windows of one app share one answer, it is touched
+only from the serial input lane, and it is empty for every application measured
+so far — Chromium and Electron included, since the key-window record landed.
+
+`press-key`/`hotkey` answer the same three states from the focused element's
+_signature_, sampled on both sides of the chord and **inside** whatever focus
+arrangement the rung made. A change is `confirmed`, no change is `unverifiable`
+(a chord that copies, or opens a menu, legitimately moves nothing), and an
+unreadable target is `unverifiable` as well. Bracketing only the keystrokes is
+the point: sampling `before` outside the focus scope put the foreground rung's
+own activation between the two samples, and activating an application moves its
+focused element, so every chord on the visible rung reported `confirmed` whether
+or not the keys did anything.
 
 **The focus debt is paid exactly once.** `Focus.begin` records what the gesture
 is about to take (`PendingFocusRestore.recordPair` for the invisible rung,
@@ -260,6 +316,33 @@ from the signal source both pay it, and both claim it through the same
 `takePendingFocusRestore()`, which reads and clears under one lock — the two used
 to be separate steps, and a SIGTERM landing between them had both post the
 inverse pair, deactivating the human's application a second time on the way out.
+The restore also survives the target: `SkyLight.restoreActivation` used to
+require the target's process serial to resolve before posting anything, so an app
+the gesture had quit took the human's focus with it — the human's application
+left holding an unmatched deactivate, with no caret and no key routing. There is
+nothing to deactivate in that case, so only the activate half is posted.
+
+**Held modifiers are recorded on whichever stream took the press.** `postChord`
+has always done this; the session-tap typing path now does too. It presses
+left-Shift for every capital and shifted symbol, and that press used to be
+invisible to the unwind bookkeeping — a throw part way through a string, or a
+SIGTERM mid-`type`, ran `unwind()` with nothing to release and left the human
+with a latched Shift on the session tap, which is the one stream a pid-targeted
+release cannot clear. `withSessionTapShift` records it while it is down and
+releases it on every exit from the character, ordinary or not.
+
+**The overlay hides itself when the agent is idle.** A helper is alive for as
+long as the backend wants one, which on a Mac with the Computer pane open is the
+whole session, and an overlay that is never ordered out is a permanent second
+arrow pointing at wherever the agent last clicked hours ago. It starts hidden,
+`retarget` wakes it (so the first action brings it back at the human's own
+pointer and glides away from it), and it is ordered out `AgentCursor.idleHideDelay`
+— 3 s — after the last **action** completes. Per action, not per request: the
+pane polls perception twice a second, and arming the hide off any request would
+hold the arrow on screen forever. `repin()` will not resurrect a hidden overlay;
+only motion does. `shutdown()` orders it out too, best effort — that hop is
+synchronous for a signal, and from the stdin reader the `exit` that follows takes
+the window down anyway.
 
 ## Protocol
 
@@ -275,12 +358,12 @@ into the protocol stream. On start the helper emits
 | `ping`                | –                                                                                    | `{ok, pid}`                                                                       |
 | `capabilities`        | –                                                                                    | `{arch, macosVersion, screenRecording, accessibility, skylight, protocolVersion}` |
 | `request-permissions` | –                                                                                    | Same report as `capabilities`, after prompting for whatever is missing            |
-| `list-windows`        | –                                                                                    | `{windows: [...], workspace, focusedWindowId}`                                    |
+| `list-windows`        | –                                                                                    | `{windows: [...], workspace, focusedWindowId, titlesUnavailable?}`                |
 | `screen-size`         | –                                                                                    | `{x, y, width, height, scale}`                                                    |
 | `describe-ui`         | `maxDepth?` (40), `windowIds?`                                                       | `{root}` — desktop AX forest, agent-addressable                                   |
 | `capture`             | `kind` (`window`\|`region`), `windowId`\|`region`, `maxDimension?` (2048), `source?` | `{base64, region, source}`                                                        |
 | `launch-app`          | `app`, `arguments?`                                                                  | `{resolvedCommand}`                                                               |
-| `move`                | `x`, `y`, `windowId?`                                                                | `{x, y}` (where the agent cursor moved; posts no event, so no `path`/`verified`)  |
+| `move`                | `x`, `y`, `windowId?`                                                                | `{x, y}` (where the agent cursor moved; posts no event, and does not aim)         |
 | `click`               | `x`, `y`, `windowId?`                                                                | `{x, y, path, verified}` (landing point)                                          |
 | `double-click`        | `x`, `y`, `windowId?`                                                                | `{x, y, path, verified}`                                                          |
 | `right-click`         | `x`, `y`, `windowId?`                                                                | `{x, y, path, verified}`                                                          |
@@ -306,12 +389,38 @@ landing point — it may be aimed by `windowId` alone, in which case it turns th
 wheel over the centre of that window.
 
 A `windowId` is a decimal `CGWindowID` string; the _optional_ one on the pointer
-methods also accepts a JSON number in `UInt32` range, because a caller that has
-the id as a number should not have to stringify it to be understood. Present but
-unreadable — a typo, a negative, an out-of-range number — is an `invalidParams`
-error, never a silent fall back to "whatever is topmost at this point": that
-fallback quietly re-aimed a window-scoped click at whatever was drawn over the
-coordinate.
+methods, and every entry of `describe-ui.windowIds`, also accepts a JSON number,
+because a caller that has the id as a number should not have to stringify it to
+be understood. That reading is strict: a non-integral number, a negative, one out
+of `UInt32` range, or a JSON boolean (which arrives as an `NSNumber` and used to
+resolve as window 1) is an `invalidParams` error. Never a silent fall back to
+"whatever is topmost at this point" — that fallback quietly re-aimed a
+window-scoped click at whatever was drawn over the coordinate — and never a
+silently dropped filter term, which narrowed `describe-ui` to the ids that
+happened to parse.
+
+**Which methods aim the keyboard.** Only the gestures that actually post an event
+(`click`, `double-click`, `right-click`, `drag`, `scroll`) and the two explicit
+aiming methods (`focus-window`, and `raise-window` once its raise is observed).
+`move` deliberately does **not**: it moves the agent's overlay and nothing else.
+It used to aim, so hovering over the human's editor and then calling `type`
+without a `windowId` typed the agent's text into the human's editor — a
+read-only-looking hover silently re-pointing the keyboard.
+
+**The aim is re-resolved, not merely remembered.** `type`/`press-key`/`hotkey`
+look the aimed window up again on every call and refuse with `targetMissing` when
+it is gone, or when its id now belongs to another process. The cached struct used
+to be trusted, so once the aimed window closed the keys went to a stale (or
+recycled) pid, WindowServer dropped them silently, and the helper answered
+`ok: true, verified: "unverifiable"` — telling the agent its keystrokes were
+merely unobservable when there was nothing left to observe them in.
+
+`focus-window` is **keyboard-only** and moves nothing on screen. It used to also
+write `AXMain`, which a great many apps implement as `makeKeyAndOrderFront:` — a
+raise — and `ComputerManager.prepareResolvedTarget` calls it before _every_
+window-targeted action, so every scoped click reordered the human's windows.
+Nothing in the helper writes `AXMain` any more; `raise-window` is the one method
+allowed to move a window forward and it says so in its name.
 
 `raise-window` is served but **no Synara caller invokes it**:
 `MAC_HELPER_METHODS` omits it, and `ComputerManager.prepareResolvedTarget` skips
@@ -331,6 +440,11 @@ older caller that omits them gets the previous behaviour.
 - `type`/`press-key`/`hotkey` `deliveryMode` — `background` (default) or
   `foreground` (briefly front the target, then restore the previous app).
 - `drag.foreground` — `true` runs the drag in the foreground rung.
+- `drag.durationMs` is clamped to `[0, 30 000]` — the same ceiling the contract
+  puts on it, restated here because the per-step sleep feeds `useconds_t` and
+  Swift's conversion **traps**: a large duration aborted the process between the
+  mouse-down and the mouse-up, leaving the human a latched button and a phantom
+  drag and killing every other in-flight action with it.
 - `type` result `path` — `ax-insert` | `keystrokes` | `foreground-keys` (the
   visible rung, reached by escalation) | `foreground` (the visible rung, asked
   for).
@@ -369,6 +483,25 @@ older caller that omits them gets the previous behaviour.
   window: a floating panel of some other application sits above everything
   without being focused at all. Null when the front application owns no window
   the agent may drive (Synara itself, the helper, an app showing only a panel).
+- `list-windows` — `minimized` is the owning application's own
+  `kAXMinimizedAttribute`, asked only about windows WindowServer is not
+  compositing (an on-screen window is never minimized), one AX handle per owning
+  pid, under a 0.75 s wall budget. It used to be `!visible`, which is a different
+  question — a window on another Space is off screen and perfectly un-minimized —
+  so on an ordinary multi-Space desktop most windows were reported minimized, and
+  an agent told a window is minimized stops trying to use it. A window whose app
+  cannot be asked (no Accessibility grant, no matching AX window, budget spent) is
+  reported **not** minimized: a real minimized window described as ordinary costs
+  one failed capture that says so, while the reverse is a window the agent never
+  touches.
+- `list-windows` — `titlesUnavailable: true` is present, and only present, when
+  Screen Recording is not granted. `CGWindowListCopyWindowInfo` simply omits
+  window names without it, and since an untitled off-screen window is
+  unaddressable and therefore dropped, every minimized or off-Space window
+  disappears from the list too. That is a degraded answer, not an empty desktop.
+  When the list would be empty **and** the grant is missing, the call is a
+  `-32000` instead, because an empty desktop is the one shape a caller cannot
+  distinguish from a broken one.
 - `capabilities.skylight` — four booleans: `setWindowLocation` (the
   window-local stamp), `focusWithoutRaise` (`SLPSPostEventRecordTo` plus a way
   to resolve the target's process serial), `setFrontProcess`, and
@@ -383,9 +516,12 @@ older caller that omits them gets the previous behaviour.
   backend counts the answers (`MacComputerBackend.captureSourceCounts()`) so the
   fallback rate is a measured health metric rather than a guess.
 - `capture` refuses rather than returning pixels it cannot describe: a region
-  that intersects no display is `invalidParams`, and a window that is not on
-  screen is `targetMissing` — its composited pixels do not exist, so any region
-  reported for them would be a rect the image never covered.
+  that intersects no display is `invalidParams`; a window that is not on screen
+  is `targetMissing` — its composited pixels do not exist, so any region reported
+  for them would be a rect the image never covered; and a window whose surface
+  frame cannot be read from `SCShareableContent` is `targetMissing` on the
+  `screencapture` fallback, because that path's origin comes from `SCWindow.frame`
+  and there is nothing else honest to report.
 - `describe-ui` marks a window node whose subtree hit the node cap with
   `"truncated": true`.
 
@@ -394,15 +530,33 @@ forward inside its own application without activating that application. There is
 deliberately no activation fallback: if the window is still not frontmost
 afterwards it reports `notDelivered` (-32002) rather than pulling the human's
 active application out from under them, and the caller decides whether the
-target is genuinely occluded. Keyboard actions (`type`, `press-key`, `hotkey`)
-need a window to have been aimed at first — by a pointer gesture, `focus-window`
-or `raise-window` — and report `targetMissing` (-32001) otherwise, rather than
-typing into whatever the human happens to be using.
+target is genuinely occluded. "Frontmost" is asked of `Windows.frontmost()` — the
+focused application's front window — not of the stacking order, which is the
+heuristic that method exists to avoid: a floating panel of another application
+sits above everything without being focused, so a raise that changed nothing
+reported success whenever the target was such a panel, and a raise that worked
+reported failure whenever one was in the way. The keyboard is aimed at the window
+only once the raise has been **observed**; aiming first, before either check
+could fail, left the keyboard pointed at a window this call then refused.
+Keyboard actions (`type`, `press-key`, `hotkey`) need a window to have been aimed
+at first — by a pointer gesture, `focus-window` or a successful `raise-window` —
+and report `targetMissing` (-32001) otherwise, rather than typing into whatever
+the human happens to be using.
+
+An AX window is matched to a `CGWindow` by `_AXUIElementGetWindow` where the OS
+will answer, then by an unambiguous title, then by frame overlap — and the
+overlap must be **real**. That last search used to start from a sentinel below
+zero, so the first candidate with a readable frame won even when it shared no
+pixel with the window being matched: an app whose AX window list and
+`CGWindowList` disagree had one AX window answer for two `CGWindow`s,
+`describe-ui` emitted the same tree twice under two ids, and a `set-value` at the
+phantom id wrote into the other window (reproduced live). No overlap is now no
+answer.
 
 The AX walk is bounded on every axis so one unresponsive app cannot stall
 perception: a 1 s messaging timeout per application and 0.35 s per window, one
 batched IPC per node instead of seven, 2048 nodes per window and ~6000 per
-desktop, minimized/off-screen windows skipped, and subtrees whose frame lies
+desktop, windows WindowServer is not compositing skipped, and subtrees whose frame lies
 entirely outside their window skipped (zero-size layout containers are still
 descended). Skipped children keep their sibling index, so `nodePath` stays the
 real child-index route that `set-value`/`perform-action` re-resolve against.
@@ -413,25 +567,40 @@ Standard JSON-RPC codes, plus `-32000` (permission denied — a TCC grant is
 missing), `-32001` (target window/node missing), and `-32002` (input accepted
 but not delivered). What actually reaches each one:
 
-- **`-32602` invalidParams** — a `windowId` that is present but not a decimal
-  `CGWindowID` (never a silent fall back to "whatever is topmost at this
-  point"); a `capture` `kind` that is neither `window` nor `region`; a region
-  that is non-finite or intersects no display (`Geometry.clampRectToWorkspace`);
-  a `deliveryMode` other than `background`/`foreground`; a `hotkey` with zero or
-  more than one non-modifier key; an unknown key name; an unknown modifier name
-  — `["hyper", "cmd"]` is a bad request, not a smaller chord that quietly runs.
+- **`-32602` invalidParams** — a `windowId` that is present but not an exact,
+  in-range, non-negative `CGWindowID` (never a silent fall back to "whatever is
+  topmost at this point"); a `describe-ui.windowIds` entry that is not one
+  (never a silently narrowed filter); a `capture` `kind` that is neither `window`
+  nor `region`; a region that is non-finite or intersects no display
+  (`Geometry.clampRectToWorkspace`); a `deliveryMode` other than
+  `background`/`foreground`; a `hotkey` with zero or more than one non-modifier
+  key; an unknown key name; an unknown modifier name — `["hyper", "cmd", "a"]` is
+  a bad request, not a smaller chord that quietly runs, and it is reported as
+  "`hyper` is not a key or a modifier this helper knows" rather than as "got 2
+  non-modifier keys", which is what the split on `isModifier` used to make it
+  look like.
 - **`-32001` targetMissing** — a named window that no longer exists (for
-  `capture`, `focus-window`, `raise-window`, `set-value`, `perform-action`, and
-  every pointer gesture that named one); a window capture whose window is not on
-  screen or is on no display, because its composited pixels do not exist and any
-  region reported for them would be a rect the image never covered; a keyboard
-  action (`type`, `press-key`, `hotkey`) with no window aimed at yet; an event
-  with no resolvable destination, since there is no frontmost fallback on any
-  path; and `launch-app` when `open` reports no such application.
+  `capture`, `focus-window`, `raise-window`, `set-value`, `perform-action`,
+  `move`, and every pointer gesture that named one); a window capture whose
+  window is not on screen, is on no display, or cannot be measured through
+  `SCShareableContent` for the CLI fallback, because any region reported for it
+  would be a rect the image never covered; a keyboard action (`type`,
+  `press-key`, `hotkey`) with no window aimed at yet, **or whose aimed window has
+  since closed**; an event with no resolvable destination, since there is no
+  frontmost fallback on any path; and `launch-app` when `open` reports no such
+  application.
 - **`-32002` notDelivered** — `raise-window` when `AXRaise` left the window
   short of frontmost, and the foreground keyboard rung when the target was not
   _observed_ to become frontmost within 400 ms (`withForeground`), because a
   session-tap key goes wherever focus actually is.
+- **`-32000` permissionDenied** — any synthetic input without the Accessibility
+  grant (`requireInputPermission`, checked up front because `CGEventPostToPid`
+  returns void and WindowServer drops the event silently for an untrusted
+  client); a `describe-ui` without it; a capture that failed with Screen
+  Recording actually missing; and a `list-windows` that came back **empty**
+  without Screen Recording, since an empty desktop is the one shape a caller
+  cannot distinguish from a broken one. A `list-windows` that is merely degraded
+  answers with `titlesUnavailable: true` instead.
 - **`-32603` internalError** — an event the helper could not construct, a
   `screencapture` fallback that failed or blew its 3 s deadline, and
   `launch-app` past its **10 s** deadline (`launchDeadlineSeconds`), which is
@@ -510,6 +679,19 @@ single display, Accessibility and Screen Recording granted.
 - **Multi-display reconfiguration** — wired (`Geometry`'s snapshot refreshes on
   `didChangeScreenParametersNotification`, and a region spanning two displays
   takes the `screencapture` path), **not** exercised on a second display.
+
+The 2026-09-04 audit fixes are a second, narrower band of verification, and the
+distinction matters. Exercised live on an **ungranted** helper (run from a shell,
+so the responsible process holds neither grant): the strict window-id readers,
+the `titlesUnavailable` flag, the CLI window fallback's refusal, and a concurrent
+cold-cache capture burst answering without deadlock while `ping` stayed responsive
+— with the human's frontmost application and real cursor position sampled
+unchanged on both sides. Everything on the input path (`focus-window` no longer
+raising, the keyboard-aim revalidation, `move` no longer aiming, the session-tap
+Shift bookkeeping, the chord verdict, the replay gate, the overlay's idle hide,
+the drag clamp) is **compiled and reasoned, not measured**: every one of those
+paths is behind `requireInputPermission`, and the grants belong to Synara, so
+they can only be exercised by a helper the app itself spawned.
 
 Release builds ship the helper as a signed nested app bundle; source development
 retains the build-and-cache fallback. It never runs on the Linux CI host, where

@@ -143,6 +143,11 @@ struct KeyOutcome {
 }
 
 final class InputController {
+  /// The ceiling `drag` clamps `durationMs` to, matching the contract's own cap.
+  /// See `drag`: past this the per-step sleep overflows `useconds_t` and the
+  /// conversion traps mid-gesture.
+  static let maximumDragDurationMs = 30_000
+
   private let source: CGEventSource?
   private let cursor: AgentCursor
 
@@ -206,9 +211,24 @@ final class InputController {
 
   // MARK: - Pointer
 
+  /// Move the *agent's* overlay. Posts no event, and — deliberately — does not
+  /// aim.
+  ///
+  /// This used to go through `aim`, which writes `keyboardTarget`. So hovering
+  /// over the human's editor and then calling `type` without a `windowId` typed
+  /// the agent's text into the human's editor: a read-only-looking hover had
+  /// silently re-pointed the keyboard. Only the gestures that actually post an
+  /// event (click/double/right/drag/scroll) and the two explicit aiming
+  /// methods (`focus-window`, `raise-window`) may change where keys go.
+  ///
+  /// A named window is still resolved, and refused when it is gone, so the reply
+  /// is not a claim about a window that no longer exists.
   func move(to point: CGPoint, window: CGWindowID? = nil) throws {
     try requireInputPermission()
-    _ = try aim(at: point, named: window)
+    if let window, Windows.window(withNumber: window) == nil {
+      throw RPCError(.targetMissing, "no window has id \(window)")
+    }
+    cursor.glide(to: point)
   }
 
   @discardableResult
@@ -301,6 +321,15 @@ final class InputController {
     from: CGPoint, to: CGPoint, durationMs: Int, mode: DeliveryMode, window: CGWindowID? = nil
   ) throws -> PointerOutcome {
     try requireInputPermission()
+    // Clamped before anything is pressed. The contract caps `durationMs` at 30 s
+    // on the Node side, but the arithmetic below feeds `useconds_t` — a 32-bit
+    // unsigned — and `useconds_t(20_000_000 / 3 * 1000)` is a *trapping*
+    // conversion, so a caller that reached the helper with a large duration
+    // aborted the process between the mouse-down and the mouse-up: the human is
+    // left with a latched button and a phantom drag, and every other in-flight
+    // action dies with it. Defence in depth for the one path where a trap is
+    // worse than a wrong answer.
+    let duration = min(max(durationMs, 0), Self.maximumDragDurationMs)
     // Resolved once, at the mouse-down point, and reused for every dragged event
     // and the up — which is how macOS routes a real drag.
     let target = try aim(at: from, named: window)
@@ -318,7 +347,7 @@ final class InputController {
       held: true)
     // At least a few intermediate dragged events, or a drag silently degrades to
     // a click in many toolkits (reference §4.4).
-    let steps = max(3, min(60, durationMs / 12))
+    let steps = max(3, min(60, duration / 12))
     var previous = from
     for step in 1...steps {
       let t = CGFloat(step) / CGFloat(steps)
@@ -331,7 +360,7 @@ final class InputController {
         clickState: 1, held: true,
         delta: CGPoint(x: point.x - previous.x, y: point.y - previous.y))
       previous = point
-      usleep(useconds_t(max(1, durationMs / steps) * 1000))
+      usleep(useconds_t(max(1, min(duration / steps, Self.maximumDragDurationMs)) * 1000))
     }
     try postMouse(
       .leftMouseUp, at: to, button: .left, target: target, group: group, clickState: 1,
@@ -529,15 +558,64 @@ final class InputController {
         continue
       }
       let flags: CGEventFlags = stroke.shift ? [.maskShift] : []
-      let shift = stroke.shift ? KeyMap.shiftModifier : nil
-
-      if let shift { try postSessionTapKey(shift.code, down: true, flags: [.maskShift], units: nil) }
-      for down in [true, false] {
-        try postSessionTapKey(stroke.code, down: down, flags: flags, units: units)
+      try withSessionTapShift(stroke.shift) {
+        for down in [true, false] {
+          try self.postSessionTapKey(stroke.code, down: down, flags: flags, units: units)
+        }
       }
-      if let shift { try postSessionTapKey(shift.code, down: false, flags: [], units: nil) }
       usleep(6_000)
     }
+  }
+
+  /// Hold left-Shift on the session tap for the duration of `body`, and record
+  /// it as held while it is down.
+  ///
+  /// The recording is the whole point. This is the one stream a pid-targeted
+  /// release cannot clear — a modifier pressed on the session tap is session-wide
+  /// state WindowServer holds — and the press used to be invisible to
+  /// `heldModifiers`/`heldModifiersOnSessionTap`, so a throw part way through a
+  /// string, or a SIGTERM mid-`type`, ran `unwind()` with nothing to release and
+  /// left the human with a latched Shift: every subsequent keystroke of theirs
+  /// arriving capitalised or as a shortcut. `postChord` has always recorded its
+  /// modifiers this way; this is the same bookkeeping for the typing path.
+  private func withSessionTapShift(_ needed: Bool, _ body: () throws -> Void) throws {
+    guard needed else {
+      try body()
+      return
+    }
+    let shift = KeyMap.shiftModifier
+    try postSessionTapKey(shift.code, down: true, flags: [.maskShift], units: nil)
+    recordHeldModifiers([shift], target: nil, onSessionTap: true)
+    // Runs on a throw as well as on the ordinary path, so the only window in
+    // which Shift is held without being releasable is the one `unwind()` covers.
+    defer {
+      try? postSessionTapKey(shift.code, down: false, flags: [], units: nil)
+      clearHeldModifiers()
+    }
+    try body()
+  }
+
+  /// Note that `modifiers` are logically down, so `unwind()` can release them on
+  /// whichever stream took the press.
+  private func recordHeldModifiers(
+    _ modifiers: [(code: CGKeyCode, flags: CGEventFlags)], target: DesktopWindow?,
+    onSessionTap: Bool
+  ) {
+    heldLock.lock()
+    heldModifiers = modifiers
+    heldModifierTarget = target
+    heldModifiersOnSessionTap = onSessionTap
+    heldLock.unlock()
+  }
+
+  /// Forget the held modifiers. Only ever called once their release has been
+  /// posted — clearing without releasing is how a latched modifier escapes.
+  private func clearHeldModifiers() {
+    heldLock.lock()
+    heldModifiers = []
+    heldModifierTarget = nil
+    heldModifiersOnSessionTap = false
+    heldLock.unlock()
   }
 
   private func postSessionTapKey(
@@ -572,6 +650,20 @@ final class InputController {
       } else {
         mainKeys.append(key)
       }
+    }
+    // A name this helper knows as neither a modifier nor a key is reported as
+    // exactly that. `hotkey` splits its input on `KeyMap.isModifier`, so an
+    // unknown *modifier* — `["hyper", "cmd", "a"]` — falls into `mainKeys` and
+    // used to come back as "takes exactly one non-modifier key, got 2", which
+    // sends the caller looking for a second key it did not send instead of at
+    // the word the helper could not read. `press-key` has always named it
+    // (`KeyMap.modifierCodes`); this makes the two agree.
+    let unknown = mainKeys.filter { KeyMap.code(for: $0) == nil }
+    if let first = unknown.first {
+      throw RPCError(
+        .invalidParams,
+        "'\(first)' is not a key or a modifier this helper knows"
+          + (unknown.count > 1 ? " (\(unknown.count) unknown names in \(keys))" : ""))
     }
     // Silently keeping only the last one turned `cmd+k+v` into `cmd+v` and
     // reported success, so the agent believed a chord it never sent had run.
@@ -963,6 +1055,9 @@ final class InputController {
     private static let budgetSeconds: Double = 0.75
     private let probe: Accessibility.GestureProbe?
     private let expected: String?
+    /// What the application considered focused *before* the gesture. Focus that
+    /// has not moved from this is the only thing that means "nothing arrived".
+    private let focusedBefore: String?
 
     init(target: DesktopWindow?, point: CGPoint) {
       // One handle for the whole gesture rather than one per question: the
@@ -973,28 +1068,42 @@ final class InputController {
       else {
         self.probe = nil
         self.expected = nil
+        self.focusedBefore = nil
         return
       }
       self.probe = probe
       guard let expectation = probe.expectation(at: point), !expectation.alreadyFocused else {
         self.expected = nil
+        self.focusedBefore = nil
         return
       }
       self.expected = expectation.element
+      self.focusedBefore = expectation.focused
     }
 
     /// What the target did about the gesture: `confirmed` when the element the
-    /// click was aimed at now holds focus, `unconfirmed` when it demonstrably
-    /// does not, and `unverifiable` when there was never anything to check —
-    /// a click on a label, a click on the already-focused control, an app that
+    /// click was aimed at now holds focus, `unconfirmed` when focus has not moved
+    /// at all, and `unverifiable` when there was never anything to check — a
+    /// click on a label, a click on the already-focused control, an app that
     /// exposes no accessibility, or a probe that has spent its budget.
+    ///
+    /// The three-way split matters because `unconfirmed` is not just a report:
+    /// `click` replays the entire gesture on the visible rung when it sees one,
+    /// and a replayed click is a **second** click on the user's desktop, not a
+    /// flicker. This used to answer `unconfirmed` for any focus that was not the
+    /// predicted element — but focus landing somewhere neither predicted nor
+    /// previous is proof the click *did* arrive and merely moved focus somewhere
+    /// the hit test did not foresee (a container took it, the app moved it on).
+    /// Only focus that is exactly where it was before is evidence of a gesture
+    /// that went nowhere, and only that may cost a duplicate click.
     func observe() -> Verification {
       guard let probe, let expected else { return .unverifiable }
       defer { probe.restore() }
       // Give the app a beat to process the events it was just sent.
       usleep(120_000)
       guard let after = probe.focusedSignature() else { return .unverifiable }
-      return after == expected ? .confirmed : .unconfirmed
+      if after == expected { return .confirmed }
+      return after == focusedBefore ? .unconfirmed : .unverifiable
     }
 
     /// A second look, with a fresh budget, after an escalated replay.
@@ -1248,15 +1357,23 @@ final class InputController {
     _ code: CGKeyCode, modifiers: [(code: CGKeyCode, flags: CGEventFlags)], mode: DeliveryMode
   ) throws -> KeyOutcome {
     let target = try resolveKeyboardTarget()
-    // What the target considered focused before the chord. A chord that edits
-    // or moves the selection changes this; one that copies, or opens a menu,
-    // legitimately does not — so an unchanged signature is `unverifiable`
-    // rather than a failure, and only an unreadable target is worse than that.
-    let signatureBefore = Accessibility.focusedElementSignature(in: target)
+    // What the target considered focused on either side of the chord. A chord
+    // that edits or moves the selection changes this; one that copies, or opens
+    // a menu, legitimately does not — so an unchanged signature is
+    // `unverifiable` rather than a failure, and only an unreadable target is
+    // worse than that.
+    //
+    // Both reads happen **inside** the focus scope, bracketing the keystrokes
+    // and nothing else. Reading `before` outside it — which this used to do —
+    // meant the foreground rung's own activation sat between the two samples:
+    // activating an application moves its focused element, so every chord that
+    // took the visible rung reported `confirmed` whether or not the keys did
+    // anything at all. A change is only evidence when the keystrokes are the
+    // only thing that could have caused it.
+    var signatureBefore: String?
+    var signatureAfter: String?
     func verification() -> Verification {
-      guard let signatureBefore,
-        let signatureAfter = Accessibility.focusedElementSignature(in: target)
-      else { return .unverifiable }
+      guard let signatureBefore, let signatureAfter else { return .unverifiable }
       return signatureAfter != signatureBefore ? .confirmed : .unverifiable
     }
     // The chord itself, written once and parameterised on how a single
@@ -1267,6 +1384,9 @@ final class InputController {
     let body: (
       _ post: (CGKeyCode, Bool, CGEventFlags) throws -> Void, _ onSessionTap: Bool
     ) throws -> Void = { post, onSessionTap in
+      // Sampled here, after whichever focus arrangement the caller made and
+      // before the first transition of the chord.
+      signatureBefore = Accessibility.focusedElementSignature(in: target)
       var flags = CGEventFlags()
       var pressed: [(code: CGKeyCode, flags: CGEventFlags)] = []
       defer {
@@ -1275,21 +1395,18 @@ final class InputController {
           try? post(modifier.code, false, flags)
           usleep(8_000)
         }
-        self.heldLock.lock()
-        self.heldModifiers = []
-        self.heldModifierTarget = nil
-        self.heldModifiersOnSessionTap = false
-        self.heldLock.unlock()
+        self.clearHeldModifiers()
+        // The closing sample: the chord is complete, the modifiers are up, and
+        // the caller's focus arrangement is still in place (every rung restores
+        // it after `body` returns). Nothing but the keystrokes has happened
+        // between this and `signatureBefore`.
+        signatureAfter = Accessibility.focusedElementSignature(in: target)
       }
       for modifier in modifiers where !pressed.contains(where: { $0.code == modifier.code }) {
         flags.insert(modifier.flags)
         try post(modifier.code, true, flags)
         pressed.append(modifier)
-        self.heldLock.lock()
-        self.heldModifiers = pressed
-        self.heldModifierTarget = target
-        self.heldModifiersOnSessionTap = onSessionTap
-        self.heldLock.unlock()
+        self.recordHeldModifiers(pressed, target: target, onSessionTap: onSessionTap)
         usleep(8_000)
       }
       try post(code, true, flags)
@@ -1347,16 +1464,38 @@ final class InputController {
   /// click or `focus-window` wrote the agent's text into the human's own
   /// document — including through the accessibility rung, which needs no
   /// activation at all. An unaimed keyboard action is refused instead.
+  ///
+  /// The aim is also **re-resolved**, not merely remembered. `keyboardTarget` is
+  /// a struct captured whenever the last gesture ran, and `window_id` is optional
+  /// on all three keyboard methods, so the cached aim is the common path. Once
+  /// the aimed window closed, `postToPid` addressed a dead pid — or a recycled
+  /// one, which is worse — WindowServer dropped the event silently, and the
+  /// helper answered `ok: true, verified: "unverifiable"`: the agent was told its
+  /// keystrokes were merely unobservable when in fact there was nothing left to
+  /// observe them in. A window that is gone, or whose id now belongs to another
+  /// process, is `targetMissing` and the aim is dropped so the next call cannot
+  /// inherit it. Re-resolving also refreshes the bounds the window-local stamp
+  /// is computed from.
   private func resolveKeyboardTarget() throws -> DesktopWindow {
-    guard let target = keyboardTarget else {
+    guard let aimed = keyboardTarget else {
       throw RPCError(
         .targetMissing,
         "no window is aimed for keyboard input; click, focus, or raise a window first")
     }
-    if SkyLight.frontmostPID() != target.ownerPID {
-      Accessibility.focusWindowForKeyboard(target)
+    guard let current = Windows.window(withNumber: aimed.windowNumber),
+      current.ownerPID == aimed.ownerPID
+    else {
+      keyboardTarget = nil
+      throw RPCError(
+        .targetMissing,
+        "the window keyboard input was aimed at (\(aimed.windowNumber)) no longer exists; "
+          + "click, focus, or raise a window again")
     }
-    return target
+    keyboardTarget = current
+    if SkyLight.frontmostPID() != current.ownerPID {
+      Accessibility.focusWindowForKeyboard(current)
+    }
+    return current
   }
 
   /// Stamp the window fields and window-local location, then post to the target

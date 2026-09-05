@@ -214,6 +214,14 @@ final class AgentCursor {
   /// cost one late click, never a wedged input lane.
   static let maximumGlideWait: TimeInterval = 0.45
 
+  /// How long the overlay stays on screen after the last action completes.
+  ///
+  /// Long enough that the human can see where the agent's last click went and
+  /// that a sequence of actions never blinks between them (the input lane is
+  /// serial, and even a slow gesture is well inside this), short enough that an
+  /// idle helper is not leaving a second arrow on the desktop.
+  static let idleHideDelay: TimeInterval = 3
+
   // MARK: - State (main thread only, except the semaphores)
 
   private var window: NSWindow?
@@ -244,6 +252,17 @@ final class AgentCursor {
   private var arcSign: CGFloat = 1
   private var ticker: DisplayTicker?
   private var arrivalWaiters: [DispatchSemaphore] = []
+  /// Whether the overlay is currently ordered out.
+  ///
+  /// It starts that way and goes back to it a short while after the agent stops
+  /// acting. A helper is alive for as long as the backend wants one — which on a
+  /// Mac with the Computer pane open is the whole session — and an overlay that
+  /// is never ordered out is a permanent second arrow on the human's desktop
+  /// pointing at wherever the agent last clicked, hours ago. Codex hides its
+  /// Software Cursor when idle for the same reason.
+  private var hidden = true
+  /// The pending hide, cancelled by the next action.
+  private var idleHide: DispatchWorkItem?
   /// Per-frame tip trace to stderr, off unless `SYNARA_CURSOR_TRACE` is set.
   /// This is how the motion is measured (speed profile, overshoot, settling)
   /// without a debug RPC that would have to exist in the shipped protocol.
@@ -333,7 +352,9 @@ final class AgentCursor {
     layoutBadge()
     place(position)
     applyScale(window.screen?.backingScaleFactor ?? 2)
-    window.orderFrontRegardless()
+    // Deliberately not ordered in here. An installed-but-idle helper shows the
+    // human nothing; the first action wakes the overlay at the human's pointer
+    // and glides away from it, which reads as the agent picking the pointer up.
   }
 
   // MARK: - Public API
@@ -374,9 +395,39 @@ final class AgentCursor {
 
   /// Re-order the overlay front without moving it. Changing another app's
   /// AppKit-active state (the focus prelude in Input.swift) can drop the overlay
-  /// behind that app's windows. Safe during a glide: it touches ordering only.
+  /// behind that app's windows. Safe during a glide: it touches ordering only,
+  /// and it will not bring back an overlay that has gone idle.
   func repin() {
-    onMain { self.window?.orderFrontRegardless() }
+    onMain { self.presentFront() }
+  }
+
+  /// The agent has stopped acting: hide the overlay after a short grace, unless
+  /// something else happens first. Called once per completed action.
+  ///
+  /// The grace is what keeps the arrow on screen long enough for the human to
+  /// see where the last click went, and long enough that a sequence of actions
+  /// — which arrive one after another on the serial input lane — never blinks.
+  func markIdle() {
+    onMain {
+      self.idleHide?.cancel()
+      let hide = DispatchWorkItem { [weak self] in self?.hide() }
+      self.idleHide = hide
+      DispatchQueue.main.asyncAfter(deadline: .now() + Self.idleHideDelay, execute: hide)
+    }
+  }
+
+  /// Order the overlay out now. Also called on the way out of the process, where
+  /// it is best effort: `shutdown()` runs on the main queue for a signal, so the
+  /// hop is synchronous there, and from the stdin reader the `exit()` that
+  /// follows takes the window down anyway.
+  func hide() {
+    onMain {
+      self.idleHide?.cancel()
+      self.idleHide = nil
+      guard !self.hidden else { return }
+      self.hidden = true
+      self.window?.orderOut(nil)
+    }
   }
 
   func setName(_ name: String) {
@@ -398,11 +449,14 @@ final class AgentCursor {
   /// it is going, so a mid-flight redirect curves into the new target and a
   /// gesture issued while the previous one is still settling never stops.
   private func retarget(to global: CGPoint) {
-    guard let window else {
+    guard window != nil else {
       // No overlay (install failed): never leave a caller parked on `glide`.
       signalArrival()
       return
     }
+    // Any motion is activity: bring the overlay back if it had gone idle, and
+    // cancel whatever hide was pending.
+    wake()
     // The destination screen decides the raster scale, not the current one —
     // `window.screen` still reports where the overlay *was*, so reading it here
     // would re-render one move too late on every crossing between a Retina and a
@@ -432,7 +486,7 @@ final class AgentCursor {
       velocity = .zero
       place(position)
       stopTicker()
-      window.orderFrontRegardless()
+      presentFront()
       signalArrival()
       return
     }
@@ -453,7 +507,7 @@ final class AgentCursor {
       bowNormal = .zero
     }
 
-    window.orderFrontRegardless()
+    presentFront()
     startTicker()
   }
 
@@ -490,7 +544,7 @@ final class AgentCursor {
     }
     if settled {
       stopTicker()
-      window?.orderFrontRegardless()
+      presentFront()
     }
   }
 
@@ -570,6 +624,24 @@ final class AgentCursor {
   /// Release everything parked in `glide`. Called from the main thread only, and
   /// the list is emptied before the signals go out so a waiter that immediately
   /// asks for another move cannot be handed a stale semaphore.
+  /// Order the overlay front, but only if it is meant to be on screen. Every
+  /// re-pin in this file goes through here, so a hidden overlay is never
+  /// resurrected by the focus prelude's `repin()` or by the integrator's last
+  /// frame. Main thread only.
+  private func presentFront() {
+    guard !hidden, let window else { return }
+    window.orderFrontRegardless()
+  }
+
+  /// Activity: cancel any pending hide and bring the overlay back. Main thread
+  /// only; called from `retarget`, which every move and glide goes through.
+  private func wake() {
+    idleHide?.cancel()
+    idleHide = nil
+    hidden = false
+    window?.orderFrontRegardless()
+  }
+
   private func signalArrival() {
     guard !arrivalWaiters.isEmpty else { return }
     let waiters = arrivalWaiters

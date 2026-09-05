@@ -76,21 +76,47 @@ func handle(method: String, params: Params) throws -> Any {
     // The helper's own overlay is not in this list, and must not be: see
     // Windows.swift.
     let windows = Windows.list()
+    // Window *titles* come from the Screen Recording grant, and without it
+    // `CGWindowListCopyWindowInfo` simply omits them. The list is then a set of
+    // untitled rectangles — and because an untitled off-screen window is
+    // unaddressable and therefore dropped, every minimized or off-Space window
+    // disappears from it too. That is a degraded answer, not an empty desktop,
+    // and it used to be reported as if it were the truth.
+    let screenRecording = CGPreflightScreenCaptureAccess()
+    if windows.isEmpty && !screenRecording {
+      throw RPCError(
+        .permissionDenied,
+        "Screen Recording is not granted to this app, so no windows can be enumerated")
+    }
     // The focused application's front window — asked once, and the same answer
     // fills every window's `focused` flag, so the two can never disagree. Nil
     // when the front application owns no window the agent may drive (Synara
     // itself, or an app showing only a panel).
     let focused = Windows.frontmost()
+    // `minimized` is the owning application's own answer, and it is only asked
+    // about windows WindowServer is not compositing — an on-screen window is
+    // never minimized. See `Accessibility.minimizedWindowIDs`: deriving it from
+    // `!onScreen`, which is what this used to report, called every window on
+    // another Space minimized.
+    let minimized = Accessibility.minimizedWindowIDs(among: windows.filter { !$0.onScreen })
     let payload = windows.map { window in
       Windows.dictionary(
         window, occluders: Windows.occluders(of: window, in: windows),
-        focusedWindowID: focused?.windowNumber)
+        focusedWindowID: focused?.windowNumber,
+        minimized: minimized.contains(window.windowNumber))
     }
-    return [
+    var result: [String: Any] = [
       "windows": payload,
       "workspace": Geometry.rectDictionary(Geometry.workspaceRect()),
       "focusedWindowId": focused.map { String($0.windowNumber) } as Any? ?? NSNull(),
     ]
+    if !screenRecording {
+      // Additive and only present when it is true, so an older caller is
+      // unaffected: this list has no titles and is missing every window that is
+      // not currently composited.
+      result["titlesUnavailable"] = true
+    }
+    return result
 
   case "screen-size":
     let rect = Geometry.workspaceRect()
@@ -101,7 +127,7 @@ func handle(method: String, params: Params) throws -> Any {
   case "describe-ui":
     return try Accessibility.describeDesktop(
       maxDepth: params.optionalInt("maxDepth", default: 40),
-      windowIds: windowIdSet(from: params, key: "windowIds"))
+      windowIds: try windowIdSet(from: params, key: "windowIds"))
 
   case "capture":
     let maxDimension = params.optionalInt("maxDimension", default: 2048)
@@ -218,12 +244,20 @@ func handle(method: String, params: Params) throws -> Any {
     // window, and the keys must go there whatever the last pointer gesture
     // aimed at — but wanting to type into a window is not a reason to pull it
     // in front of whatever the human is looking at.
+    //
+    // Keyboard-only, and that is load-bearing. This used to call a wider
+    // `Accessibility.focusWindow` that also wrote `AXMain`, which a great many
+    // apps implement as `makeKeyAndOrderFront:` — a raise — and
+    // `ComputerManager.prepareResolvedTarget` calls `focus-window` before
+    // *every* window-targeted action, so every scoped click reordered the
+    // human's windows. `raise-window` is the one method allowed to move a
+    // window forward, and it says so in its name.
     let focusId = try windowId(from: params)
     guard let focusTarget = Windows.window(withNumber: focusId) else {
       throw RPCError(.targetMissing, "no window has id \(focusId)")
     }
     input.setKeyboardTarget(focusTarget)
-    Accessibility.focusWindow(focusTarget)
+    Accessibility.focusWindowForKeyboard(focusTarget)
     return ["ok": true]
 
   case "raise-window":
@@ -271,11 +305,36 @@ func handle(method: String, params: Params) throws -> Any {
 /// window landed in whatever was drawn over it.
 func optionalWindowId(from params: Params) throws -> CGWindowID? {
   guard let raw = params.raw["windowId"], !(raw is NSNull) else { return nil }
-  if let text = raw as? String, let number = UInt32(text) { return CGWindowID(number) }
-  if let value = raw as? NSNumber, value.int64Value >= 0, value.int64Value <= Int64(UInt32.max) {
-    return CGWindowID(value.uint32Value)
+  guard let id = windowIdentifier(from: raw) else {
+    throw RPCError(.invalidParams, "windowId must be a numeric CGWindowID")
   }
-  throw RPCError(.invalidParams, "windowId must be a numeric CGWindowID")
+  return id
+}
+
+/// One reading of a window id, whatever shape JSON delivered it in, and it is
+/// deliberately strict.
+///
+/// The two readers this replaces were both loose in ways that turn a bad request
+/// into a wrong action. `int64Value` on an `NSNumber` truncates, so `12.7`
+/// resolved to window 12 — a real, different window; `true` is an `NSNumber`
+/// too, and resolved to window 1. And the `describe-ui` reader took
+/// `number.uint32Value` with no range check at all, so `-1` wrapped to
+/// 4294967295 and a filter the caller thought named one window silently named
+/// none. A value that is not an exact, in-range, non-negative integer is a bad
+/// request; the caller finds out.
+func windowIdentifier(from raw: Any) -> CGWindowID? {
+  if let text = raw as? String {
+    return UInt32(text).map { CGWindowID($0) }
+  }
+  guard let value = raw as? NSNumber else { return nil }
+  // `JSONSerialization` hands booleans back as `NSNumber`s wrapping
+  // `CFBoolean`; without this `true` reads as window 1.
+  if CFGetTypeID(value) == CFBooleanGetTypeID() { return nil }
+  let double = value.doubleValue
+  guard double.isFinite, double >= 0, double <= Double(UInt32.max),
+    double == double.rounded(.towardZero)
+  else { return nil }
+  return CGWindowID(value.uint32Value)
 }
 
 /// A requested point, clamped onto the desktop.
@@ -312,14 +371,26 @@ func windowId(from params: Params) throws -> CGWindowID {
 }
 
 /// An optional window-id filter: absent means "every window".
-func windowIdSet(from params: Params, key: String) -> Set<CGWindowID>? {
-  guard let raw = params.raw[key] as? [Any] else { return nil }
-  let ids = raw.compactMap { entry -> CGWindowID? in
-    if let text = entry as? String, let number = UInt32(text) { return CGWindowID(number) }
-    if let number = entry as? NSNumber { return CGWindowID(number.uint32Value) }
-    return nil
+///
+/// An entry that cannot be read is an error, not a dropped filter term. Dropping
+/// it silently narrowed the walk to the ids that happened to parse — or, when
+/// every entry was unreadable, to the empty set, which `describe-ui` serves as
+/// "no windows at all" rather than as the whole desktop the caller thought it
+/// had asked for.
+func windowIdSet(from params: Params, key: String) throws -> Set<CGWindowID>? {
+  guard let raw = params.raw[key] else { return nil }
+  if raw is NSNull { return nil }
+  guard let entries = raw as? [Any] else {
+    throw RPCError(.invalidParams, "\(key) must be an array of numeric CGWindowIDs")
   }
-  return Set(ids)
+  var ids: Set<CGWindowID> = []
+  for entry in entries {
+    guard let id = windowIdentifier(from: entry) else {
+      throw RPCError(.invalidParams, "\(key) contains an entry that is not a numeric CGWindowID")
+    }
+    ids.insert(id)
+  }
+  return ids
 }
 
 func intArray(_ params: Params, _ key: String) -> [Int] {
@@ -383,9 +454,6 @@ func raiseWindow(windowId: CGWindowID) throws {
   guard let window = Windows.window(withNumber: windowId) else {
     throw RPCError(.targetMissing, "no window has id \(windowId)")
   }
-  // The Node side raises the window the agent named right before typing into
-  // it, so the keys must go there whatever the last pointer gesture aimed at.
-  input.setKeyboardTarget(window)
   // AXRaise brings the window to the front of its own application without
   // activating that application, which is as far as this is willing to go.
   guard Accessibility.raise(window) else {
@@ -396,9 +464,21 @@ func raiseWindow(windowId: CGWindowID) throws {
   // window list.
   usleep(20_000)
   Windows.invalidate()
-  if Windows.fresh().first(where: { $0.onScreen })?.windowNumber == windowId { return }
-  throw RPCError(
-    .notDelivered, "window \(windowId) is raised within its app but is not frontmost")
+  // The *focused application's* front window, not the stacking-topmost one.
+  // Asking the stacking order was the heuristic `Windows.frontmost()` was
+  // rewritten to avoid: a floating panel belonging to some other application
+  // sits above everything without being focused, so a raise that changed nothing
+  // reported success whenever such a panel happened to be the target, and a raise
+  // that worked reported failure whenever one was in the way.
+  guard Windows.frontmost()?.windowNumber == windowId else {
+    throw RPCError(
+      .notDelivered, "window \(windowId) is raised within its app but is not frontmost")
+  }
+  // Aimed only once the raise has actually been observed. Aiming first — which
+  // this used to do, before either check could fail — left the keyboard pointed
+  // at a window this call then refused, so the next unqualified `type` went
+  // somewhere the caller had been told was unreachable.
+  input.setKeyboardTarget(window)
 }
 
 // MARK: - Shutdown
@@ -406,6 +486,10 @@ func raiseWindow(windowId: CGWindowID) throws {
 /// Never leave a button or a modifier latched for the human: whatever the reason
 /// this process is going away, the matching up events go out first.
 func shutdown(_ code: Int32) -> Never {
+  // Best effort, and only meaningful when this runs on the main queue (the
+  // signal sources do). From the stdin reader the `exit` below takes the window
+  // down before the hop could run, which is the same outcome.
+  cursor.hide()
   input.unwind()
   exit(code)
 }
@@ -435,6 +519,12 @@ func handleLine(_ line: Data) {
   // Parsing happens on the reader thread; the work itself goes to the lane that
   // owns this method so a capture never queues behind a click, or vice versa.
   Lanes.queue(for: method).async {
+    // The overlay hides itself a few seconds after the agent stops acting, so
+    // an idle helper — which on a Mac with the Computer pane open means most of
+    // the session — is not leaving a second arrow on the human's desktop. Armed
+    // per completed *action*: a perception call must not keep it alive, or the
+    // pane's own 2 Hz polling would hold the arrow on screen forever.
+    defer { if Lanes.isAction(method) { cursor.markIdle() } }
     do {
       let result = try handle(method: method, params: params)
       writeResult(id: id, result: result)

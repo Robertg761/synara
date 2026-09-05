@@ -26,7 +26,7 @@ import {
   listComputerPermissions,
   TCC_SERVICE_NAMES,
 } from "@synara/shared/computerPermissions";
-import { SYNARA_PRODUCTION_BUNDLE_ID } from "@synara/shared/desktopIdentity";
+import { SYNARA_DESKTOP_BUNDLE_ID_ENV } from "@synara/shared/desktopIdentity";
 
 import {
   clampComputerMessage,
@@ -103,6 +103,29 @@ const HELPER_NOT_DELIVERED_CODE = "helper_-32002";
 const HELPER_INVALID_PARAMS_CODE = "helper_-32602";
 
 /**
+ * The transport failures that mean "this helper connection is finished", as
+ * opposed to "the desktop refused this request".
+ *
+ * Every one of them is answered the same way: drop the connection, record the
+ * outage, and report a retryable failure, because the next call spawns a fresh
+ * process and a fresh process is very often all it takes. The three that were
+ * missing are the three that left the backend stuck against a helper it could
+ * never talk to again — a write to a closed stdin, a client that had already
+ * been shut down, and, worst of all, a timeout: a helper wedged in a
+ * synchronous AX or capture call went on being asked and went on timing out
+ * every fifteen seconds for the life of the server, because nothing ever
+ * concluded that the process itself was the problem.
+ */
+const HELPER_CONNECTION_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "helper_exited",
+  "helper_unavailable",
+  "helper_spawn_failed",
+  "helper_write_failed",
+  "helper_disposed",
+  "helper_timeout",
+]);
+
+/**
  * The methods that carry no coordinate of their own, so the only thing deciding
  * where they land is the window the helper was last aimed at.
  *
@@ -154,7 +177,55 @@ const BUILD_FAILURE_TTL_MS = 60_000;
  */
 const TCC_RESET_TIMEOUT_MS = 5_000;
 
+/**
+ * How long a passive availability answer is reused.
+ *
+ * `ComputerManager.publish` asks `probeAvailability()` on every publish while
+ * nothing has engaged the desktop, and on a source-build Mac that answer costs
+ * an `xcodebuild -version` spawn and a digest of every Swift source in the
+ * helper — boot-path work, repeated per publish, to re-derive machine state
+ * that changes when somebody installs Xcode. Long enough that a burst of
+ * publishes pays once; short enough that a helper the user just built is
+ * noticed without restarting the server. An explicit `provision()` drops it
+ * outright, because that is the user saying "look again".
+ */
+const PROBE_CACHE_TTL_MS = 10_000;
+
+/**
+ * How long the remembered workspace rectangle is trusted.
+ *
+ * Every capture region is expressed against it, and the only things that
+ * refresh it are a window enumeration and a screen-size read — both of which an
+ * action performs and a still-frame loop does not. So a pane left streaming
+ * across a display change (a monitor unplugged, a resolution switch) went on
+ * asking for a rectangle that no longer exists, which the helper refuses with
+ * `invalidParams`, once per tick, forever. Re-read on the same cadence the
+ * capability probe uses: cheap relative to the capture it precedes, and a
+ * display change is visible within one interval.
+ */
+const WORKSPACE_GEOMETRY_TTL_MS = 2_000;
+
+/**
+ * How long `dispose()` waits for an in-flight helper start before it stops
+ * being polite about it.
+ *
+ * The start it is waiting on can be a cold Swift build: five minutes of
+ * compiler, holding server shutdown open, for a binary nothing will ever run.
+ * After the grace the shutdown signal is raised, which aborts the build
+ * subprocess itself rather than merely abandoning the promise in front of it.
+ * Exported so a test can advance exactly this far.
+ */
+export const MAC_HELPER_DISPOSE_GRACE_MS = 2_000;
+
 const execFileAsync = promisify(execFile);
+
+/** A timer that never keeps the process alive on its own. */
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
 
 /** The tri-state verdicts the helper may report; anything else is dropped. */
 const DELIVERY_VERIFICATIONS = new Set<string>([
@@ -187,6 +258,9 @@ const runProcess: MacHelperRun = async (command, args, options) => {
       timeout: options.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       ...(options.env ? { env: options.env } : {}),
+      // Aborting kills the child. Without it a disposed backend left a five
+      // minute Swift compile running against a cache nobody would read.
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     return { code: 0, stdout: stdout.toString(), stderr: stderr.toString() };
   } catch (error) {
@@ -218,6 +292,18 @@ export interface MacHelperSkylightReport {
   readonly focusWithoutRaise: boolean;
   readonly setFrontProcess: boolean;
   readonly keyWindowRecord: boolean;
+}
+
+/**
+ * One capture as the helper answered it: the decoded PNG (the frame pipeline
+ * and the header read both need bytes), the encoding it arrived in (a
+ * screenshot payload needs exactly that string back), and the region the helper
+ * says the pixels cover.
+ */
+interface MacCapturedImage {
+  readonly bytes: Uint8Array;
+  readonly base64: string;
+  readonly region: ComputerRect | undefined;
 }
 
 interface MacHelperCapabilities {
@@ -279,7 +365,12 @@ function parseMacCapabilities(payload: unknown): MacHelperCapabilities {
 type MacHelperRun = (
   command: string,
   args: readonly string[],
-  options: { readonly timeoutMs: number; readonly env?: NodeJS.ProcessEnv },
+  options: {
+    readonly timeoutMs: number;
+    readonly env?: NodeJS.ProcessEnv;
+    /** Raised when the backend is disposed; kills the child rather than orphaning it. */
+    readonly signal?: AbortSignal;
+  },
 ) => Promise<ProcessRunResult>;
 
 export interface MacComputerBackendOptions {
@@ -307,8 +398,13 @@ export interface MacComputerBackendOptions {
   /**
    * Resolves the binary the helper client will spawn. Injected so tests skip
    * the compile entirely; the default is the provisioner's build-or-cache.
+   *
+   * Handed the backend's shutdown signal, which is raised when `dispose()` has
+   * waited out its grace on a resolution still in flight. The default resolver
+   * needs no argument — the same signal reaches its build subprocess through
+   * the injected runner — but a caller standing in for it can honour it.
    */
-  readonly resolveBinary?: () => Promise<string>;
+  readonly resolveBinary?: (signal: AbortSignal) => Promise<string>;
   readonly env?: NodeJS.ProcessEnv;
 }
 
@@ -345,8 +441,14 @@ export class MacComputerBackend implements ComputerBackend {
   private readonly makeHelperClient: (
     options: MacComputerHelperClientOptions,
   ) => MacHelperTransport;
-  private readonly resolveBinary: () => Promise<string>;
+  private readonly resolveBinary: (signal: AbortSignal) => Promise<string>;
   private readonly healthState: ComputerHealthState;
+  /**
+   * Raised by `dispose()`. Every subprocess this backend starts — the toolchain
+   * probe, the helper build, the TCC reset — runs under it, so shutdown can
+   * reclaim them instead of waiting on them.
+   */
+  private readonly shutdown = new AbortController();
 
   private helper: MacHelperTransport | undefined;
   private helperPromise: Promise<MacHelperTransport> | undefined;
@@ -359,6 +461,8 @@ export class MacComputerBackend implements ComputerBackend {
   private capabilityCache:
     | { readonly value: MacHelperCapabilities; readonly at: number }
     | undefined;
+  /** The last passive availability answer, reused for `PROBE_CACHE_TTL_MS`. */
+  private probeCache: { readonly value: ComputerAvailability; readonly at: number } | undefined;
   /**
    * Grants macOS has already been asked for on the current helper process. See
    * `requestMissingPermissions`: the Accessibility dialog reappears on every
@@ -377,6 +481,8 @@ export class MacComputerBackend implements ComputerBackend {
   /** Last known global-space workspace origin, so pointer/capture translate without a fresh read. */
   private lastOrigin: ComputerPoint = { x: 0, y: 0 };
   private lastWorkspaceGlobal: ComputerRect | undefined;
+  /** When that rectangle was last read from the desktop, for `WORKSPACE_GEOMETRY_TTL_MS`. */
+  private workspaceReadAt = 0;
 
   /** The still-frame loop, shared with the KWin backend. */
   private readonly stills: StillFramePublisher;
@@ -402,7 +508,12 @@ export class MacComputerBackend implements ComputerBackend {
       ),
     );
     this.env = options.env ?? process.env;
-    const run = options.run ?? runProcess;
+    const configuredRun = options.run ?? runProcess;
+    // Every subprocess is enrolled in the shutdown signal here rather than at
+    // each call site, so nothing this backend spawns can outlive it — including
+    // the build the provisioner starts, which this class never sees a handle to.
+    const run: MacHelperRun = (command, args, runOptions) =>
+      configuredRun(command, args, { ...runOptions, signal: this.shutdown.signal });
     this.run = run;
     const helperSourceDir =
       options.helperSourceDir ?? resolveComputerHelperSourceDir(import.meta.dirname);
@@ -482,6 +593,18 @@ export class MacComputerBackend implements ComputerBackend {
     if (buildFailure) {
       return { kind: "backend-unavailable", message: buildFailure };
     }
+    // A helper that is up right now is a stronger answer than anything on disk,
+    // and it is free — no stat, no digest, no spawn.
+    if (this.helper?.running) return this.availableNow();
+    const cached = this.probeCache;
+    if (cached && this.now() - cached.at < PROBE_CACHE_TTL_MS) return cached.value;
+    const answer = await this.readProbeAvailability();
+    this.probeCache = { value: answer, at: this.now() };
+    return answer;
+  }
+
+  /** The uncached passive probe: the three cheap-to-expensive ways to be available. */
+  private async readProbeAvailability(): Promise<ComputerAvailability> {
     if (await this.provisioner.bundledBinary().catch(() => null)) return this.availableNow();
     if (await this.provisioner.cachedBinaryPath().catch(() => null)) return this.availableNow();
     if (await this.provisioner.xcodeToolchainPresent().catch(() => false))
@@ -500,7 +623,14 @@ export class MacComputerBackend implements ComputerBackend {
     }
     try {
       const capabilities = await this.readCapabilities();
-      this.healthState.recordConnected();
+      // Deliberately not a `recordConnected()`. The manager asks this on every
+      // publish and a publish follows every action, so counting each ask as a
+      // connection turned `reconnects` into a publish counter and put two
+      // `health-changed` events — hence two thread-state broadcasts per thread —
+      // on the wire for every click. The connection is recorded where a
+      // connection is actually made, in `startHelper`, exactly as the KWin
+      // backend records one per connect. Publishing stays: it is change-gated,
+      // so an unchanged warm path emits nothing at all.
       this.publishHealth();
       // Accessibility is not optional for this backend: without it every click
       // and keystroke is dropped by WindowServer. Reporting "available" here
@@ -627,6 +757,9 @@ export class MacComputerBackend implements ComputerBackend {
     // remembered build failure must not short-circuit it — that is what turned
     // one bad build into a backend that stayed dead until the server restarted.
     this.buildFailure = undefined;
+    // Same reasoning for the passive answer: the user pressing the button is
+    // the user saying the machine may have changed since it was last looked at.
+    this.probeCache = undefined;
     // Re-arm before the probe: the ask this user just made outranks whatever
     // an agent path already spent, and a dismissed dialog is exactly the case
     // this button exists for.
@@ -707,9 +840,7 @@ export class MacComputerBackend implements ComputerBackend {
     const focusedWindowId = asString(record.focusedWindowId) ?? null;
     const raw = parseWindows(record.windows, focusedWindowId);
     const workspace = this.parseWorkspace(record.workspace) ?? workspaceRectFromWindows(raw);
-    const origin = { x: workspace.x, y: workspace.y };
-    this.lastOrigin = origin;
-    this.lastWorkspaceGlobal = workspace;
+    const origin = this.rememberWorkspace(workspace);
     const windows = raw.map((window) => windowInAgentSpace(window, origin));
     // Digested from the parsed list rather than by re-encoding the helper's
     // reply: the helper answers with a decoded object, so fingerprinting "the
@@ -734,8 +865,7 @@ export class MacComputerBackend implements ComputerBackend {
     // second round trip; the helper reports the workspace top-left alongside.
     const originX = asFiniteNumber(record.x) ?? this.lastOrigin.x;
     const originY = asFiniteNumber(record.y) ?? this.lastOrigin.y;
-    this.lastOrigin = { x: originX, y: originY };
-    this.lastWorkspaceGlobal = { x: originX, y: originY, width, height };
+    this.rememberWorkspace({ x: originX, y: originY, width, height });
     // Remembered so `getState` can report a truthful scale without a round trip
     // of its own: derived from the window bounding box it had no scale at all
     // and reported 1, which on every Retina Mac is simply wrong.
@@ -807,7 +937,7 @@ export class MacComputerBackend implements ComputerBackend {
       const globalRegion =
         captured.region ??
         shiftRect(requireWindowBounds(window, "a window screenshot"), origin.x, origin.y);
-      return this.screenshot(captured.bytes, shiftRect(globalRegion, -origin.x, -origin.y));
+      return this.screenshot(captured, shiftRect(globalRegion, -origin.x, -origin.y));
     }
 
     const requested = request.region;
@@ -836,7 +966,7 @@ export class MacComputerBackend implements ComputerBackend {
     }
     const captured = await this.callCapture({ kind: "region", region: global, maxDimension });
     const region = captured.region ?? global;
-    return this.screenshot(captured.bytes, shiftRect(region, -origin.x, -origin.y));
+    return this.screenshot(captured, shiftRect(region, -origin.x, -origin.y));
   }
 
   async launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult> {
@@ -1080,7 +1210,25 @@ export class MacComputerBackend implements ComputerBackend {
     // A helper still being spawned owns a child process that nothing else will
     // ever reach: `this.helper` is not assigned until the start resolves, so
     // disposing only what is already assigned leaked the process.
-    await this.helperPromise?.catch(() => undefined);
+    //
+    // But that start is allowed to be a cold Swift build, and waiting it out
+    // held the whole server's shutdown open for up to five minutes to finish
+    // compiling a binary nothing would ever run. So it gets a grace and then
+    // the shutdown signal, which kills the build subprocess itself rather than
+    // walking away from the promise in front of it; the second race is only
+    // there so a runner that ignores the signal cannot block shutdown either.
+    const starting = this.helperPromise?.catch(() => undefined);
+    if (starting) {
+      const finished = await Promise.race([
+        starting.then(() => true),
+        delay(MAC_HELPER_DISPOSE_GRACE_MS).then(() => false),
+      ]);
+      if (!finished) {
+        this.shutdown.abort();
+        await Promise.race([starting, delay(MAC_HELPER_DISPOSE_GRACE_MS)]);
+      }
+    }
+    this.shutdown.abort();
     await this.helper?.dispose().catch(() => undefined);
     this.helper = undefined;
     this.eventListeners.clear();
@@ -1142,10 +1290,7 @@ export class MacComputerBackend implements ComputerBackend {
       region: global,
       maxDimension: this.captureMaxDimension,
     });
-    return this.screenshot(
-      captured.bytes,
-      shiftRect(captured.region ?? global, -origin.x, -origin.y),
-    );
+    return this.screenshot(captured, shiftRect(captured.region ?? global, -origin.x, -origin.y));
   }
 
   /**
@@ -1170,25 +1315,64 @@ export class MacComputerBackend implements ComputerBackend {
     return captured.bytes;
   }
 
-  private screenshot(bytes: Uint8Array, region: ComputerRect): ComputerScreenshot {
+  /**
+   * A capture as a contract screenshot. The helper's own base64 is handed
+   * straight through: it is already the exact string the payload carries, and
+   * re-encoding the bytes it was decoded from cost a second copy of a
+   * multi-megabyte image to arrive back where it started.
+   */
+  private screenshot(captured: MacCapturedImage, region: ComputerRect): ComputerScreenshot {
     return screenshotFromPng({
-      bytes,
+      bytes: captured.bytes,
+      bytesBase64: captured.base64,
       region,
       capturedAt: new Date(this.now()).toISOString(),
       source: "Synara macOS capture",
     });
   }
 
-  /** Workspace geometry in GLOBAL coordinates, from cache when the helper reported one. */
+  /**
+   * Records the workspace the desktop just reported, and answers with its
+   * origin. The single write path for both halves of the cache, so the origin
+   * every coordinate is translated through and the rectangle every capture is
+   * clipped to cannot describe two different moments.
+   */
+  private rememberWorkspace(workspace: ComputerRect): ComputerPoint {
+    const origin = { x: workspace.x, y: workspace.y };
+    this.lastOrigin = origin;
+    this.lastWorkspaceGlobal = workspace;
+    this.workspaceReadAt = this.now();
+    return origin;
+  }
+
+  /**
+   * Workspace geometry in GLOBAL coordinates, from cache while the cache is
+   * young enough to still describe this desktop.
+   *
+   * An action refreshes the cache on its own (it enumerates windows), so the
+   * TTL only ever costs the streaming path — which is the one path that would
+   * otherwise hold a rectangle from before the user unplugged a display and ask
+   * the helper for it twice a second for as long as the pane stayed open.
+   */
   private async workspaceRect(): Promise<ComputerRect> {
-    if (
-      this.lastWorkspaceGlobal &&
-      this.lastWorkspaceGlobal.width > 0 &&
-      this.lastWorkspaceGlobal.height > 0
-    ) {
-      return this.lastWorkspaceGlobal;
+    const cached = this.lastWorkspaceGlobal;
+    if (cached && cached.width > 0 && cached.height > 0) {
+      if (this.now() - this.workspaceReadAt < WORKSPACE_GEOMETRY_TTL_MS) return cached;
+      // `screen-size` is the helper's display-derived answer, so it is the read
+      // that notices a display change. A failed refresh is not worth failing a
+      // capture over: the remembered rectangle is still the best guess there is.
+      await this.getScreenSize().catch(() => undefined);
+      const refreshed = this.lastWorkspaceGlobal;
+      return refreshed && refreshed.width > 0 && refreshed.height > 0 ? refreshed : cached;
     }
     const [windows, origin] = await this.readWindows();
+    // That read reports the desktop's own workspace, which is the answer; the
+    // bounding box of the windows on it is only the fallback for a reply that
+    // carried none. Preferring the box regardless meant the first still after a
+    // cold start photographed the rectangle the windows happened to occupy
+    // instead of the screen.
+    const read = this.lastWorkspaceGlobal;
+    if (read && read.width > 0 && read.height > 0) return read;
     return shiftRect(workspaceRectFromWindows(windows), origin.x, origin.y);
   }
 
@@ -1335,6 +1519,15 @@ export class MacComputerBackend implements ComputerBackend {
   private async resetStaleAdhocGrants(missing: readonly ComputerPermission[]): Promise<void> {
     const cached = this.capabilityCache?.value;
     if (cached?.signature !== "adhoc") return;
+    // Which app macOS holds responsible for this helper's grants, as the
+    // desktop shell that spawned this server reported it. Never assumed: the
+    // `.dev` and `.canary` flavors are separate bundle identifiers with their
+    // own TCC rows, so guessing the production one both fails to repair the row
+    // that is actually stale and throws away a separately installed release
+    // build's real permissions. A server with no desktop behind it — a CLI run,
+    // a test — has no responsible app at all, and leaves TCC alone.
+    const bundleId = this.env[SYNARA_DESKTOP_BUNDLE_ID_ENV]?.trim();
+    if (!bundleId) return;
     // Narrowed to what the probe actually reports missing, which is wider than
     // it looks: a live refusal offers *both* grants when it cannot say which
     // one it wanted, and resetting a row the helper can see is granted would
@@ -1343,7 +1536,7 @@ export class MacComputerBackend implements ComputerBackend {
     for (const permission of missing.filter((candidate) => stale.includes(candidate))) {
       const service = TCC_SERVICE_NAMES[permission];
       try {
-        const result = await this.run("tccutil", ["reset", service, SYNARA_PRODUCTION_BUNDLE_ID], {
+        const result = await this.run("tccutil", ["reset", service, bundleId], {
           timeoutMs: TCC_RESET_TIMEOUT_MS,
         });
         if (result.code !== 0) {
@@ -1390,7 +1583,7 @@ export class MacComputerBackend implements ComputerBackend {
     readonly windowId?: string;
     readonly region?: ComputerRect;
     readonly maxDimension: number;
-  }): Promise<{ readonly bytes: Uint8Array; readonly region: ComputerRect | undefined }> {
+  }): Promise<MacCapturedImage> {
     const params: Record<string, unknown> = {
       kind: request.kind,
       maxDimension: request.maxDimension,
@@ -1410,7 +1603,7 @@ export class MacComputerBackend implements ComputerBackend {
       throw new ComputerBackendError("The macOS capture returned no image data.");
     }
     const bytes = new Uint8Array(Buffer.from(base64, "base64"));
-    return { bytes, region: this.parseWorkspace(payload.region) };
+    return { bytes, base64, region: this.parseWorkspace(payload.region) };
   }
 
   /**
@@ -1425,9 +1618,25 @@ export class MacComputerBackend implements ComputerBackend {
     } catch (error) {
       if (helperErrorCode(error) === HELPER_PERMISSION_DENIED_CODE) {
         // The refusal is a live contradiction of whatever the probe last said,
-        // so the cached probe has to go with it — otherwise a grant the user
-        // restores in System Settings stays invisible for the whole TTL.
-        this.capabilityCache = undefined;
+        // and it is itself a report: Screen Recording is not granted, proven by
+        // a call that just tried to use it. Recorded as such rather than by
+        // dropping the cache — an empty cache reads as "nobody has looked",
+        // which is exactly the answer `missingPermissions()` gives, so throwing
+        // it away meant the tool surface learned a grant was gone and
+        // immediately reported that nothing was missing. The report is stamped
+        // now, so the ordinary TTL still lets a grant the user restores in
+        // System Settings be noticed on the next read.
+        //
+        // Stamped already-expired rather than fresh, so the next reader still
+        // re-probes: the refusal is the truth about this instant, not a licence
+        // to keep answering from it once the user has been to System Settings.
+        const known = this.capabilityCache?.value;
+        if (known) {
+          this.capabilityCache = {
+            value: { ...known, screenRecording: false },
+            at: this.now() - CAPABILITY_CACHE_TTL_MS,
+          };
+        }
         this.setCaptureGranted(false);
       }
       throw error;
@@ -1456,11 +1665,7 @@ export class MacComputerBackend implements ComputerBackend {
     } catch (error) {
       const record = asRecord(error);
       const code = typeof record.code === "string" ? record.code : "";
-      if (
-        code === "helper_exited" ||
-        code === "helper_unavailable" ||
-        code === "helper_spawn_failed"
-      ) {
+      if (HELPER_CONNECTION_FAILURE_CODES.has(code)) {
         this.invalidateHelper();
         this.recordHealthFailure(error);
         this.publishHealth();
@@ -1538,11 +1743,26 @@ export class MacComputerBackend implements ComputerBackend {
   }
 
   private async startHelper(): Promise<MacHelperTransport> {
+    // The remembered failure is honoured here, not only by the passive probe.
+    // Without this an action path went straight back into `resolveBinary`, and a
+    // Mac whose helper cannot compile re-ran a five-minute Swift build for every
+    // publish — which is every action — while answering each one with the same
+    // error it already knew. `provision()` clears the memory explicitly, which
+    // is how the user asks for another attempt, and it ages out on its own.
+    const remembered = this.currentBuildFailure();
+    if (remembered) {
+      // Not recorded as a fresh health failure: nothing new went wrong, and
+      // counting one per call would turn `consecutiveFailures` into a call
+      // counter for as long as the memory stands.
+      throw new ComputerBackendError(remembered);
+    }
     let binaryPath: string;
     try {
-      binaryPath = await (this.binaryPromise ??= this.resolveBinary().finally(() => {
-        this.binaryPromise = undefined;
-      }));
+      binaryPath = await (this.binaryPromise ??= this.resolveBinary(this.shutdown.signal).finally(
+        () => {
+          this.binaryPromise = undefined;
+        },
+      ));
     } catch (error) {
       if (error instanceof MacHelperBuildError) {
         this.buildFailure = { message: error.message, at: this.now() };
@@ -1573,12 +1793,51 @@ export class MacComputerBackend implements ComputerBackend {
       this.helper = undefined;
       throw new ComputerBackendError("macOS computer backend is disposed.");
     }
-    this.healthState.recordConnected();
     // Establish the TCC grants here, where the helper comes up, so every path
     // that starts it knows whether capture is allowed. Learning this only from
     // `availability()` meant a stream attached through another path published
     // no frames at all, because `captureGranted` was still false.
-    const capabilities = await this.readCapabilities({ force: true }).catch(() => undefined);
+    let capabilities: MacHelperCapabilities | undefined;
+    let probeFailure: unknown;
+    try {
+      capabilities = await this.readCapabilities({ force: true });
+    } catch (error) {
+      // A probe that merely could not be answered — an unknown method on an odd
+      // build — is not a reason to refuse the helper, so the error is held
+      // rather than thrown, and only the check below decides.
+      probeFailure = error;
+    }
+    // The probe runs through `call()`, whose transport-failure branch disposes
+    // the helper and clears `this.helper`. Returning it anyway handed every
+    // later call a dead client that answered `helper_disposed` — classified
+    // non-retryable, and carrying none of the real cause: a `spawn ENOENT`
+    // arrived at the user as "Computer helper was shut down". If the probe took
+    // the connection down with it, the start failed, and it failed for the
+    // reason the probe reported.
+    if (this.helper !== helper || !helper.running) {
+      if (this.helper === helper) this.helper = undefined;
+      await helper.dispose().catch(() => undefined);
+      const failure =
+        probeFailure instanceof ComputerBackendError
+          ? probeFailure
+          : new ComputerBackendError(
+              probeFailure instanceof Error
+                ? probeFailure.message
+                : "The macOS computer-use helper stopped while it was starting.",
+              { retryable: true, ...(probeFailure === undefined ? {} : { cause: probeFailure }) },
+            );
+      // The cause where there is one: `call()` already counted the raw
+      // transport error, and the health counters de-duplicate an outage by
+      // object identity, so recording the wrapper instead would count this one
+      // failure twice.
+      this.recordHealthFailure(failure.cause ?? failure);
+      this.publishHealth();
+      throw failure;
+    }
+    // Recorded here, not before the probe: a helper that never answered one is
+    // not a connection, and counting it as one made the next real start look
+    // like a reconnect from an outage that never happened.
+    this.healthState.recordConnected();
     // The helper and this server ship together, so a protocol mismatch is never
     // a version to negotiate — it is a stale binary (a cached development build
     // from before a wire change, most often) answering today's calls with

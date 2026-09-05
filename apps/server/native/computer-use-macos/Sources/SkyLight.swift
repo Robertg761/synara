@@ -293,9 +293,17 @@ enum SkyLight {
   static func restoreActivation(to previousPID: pid_t, windowID: CGWindowID, from targetPID: pid_t)
     -> Bool
   {
-    guard let previous = process(owning: windowID, pid: previousPID),
-      let target = process(owning: 0, pid: targetPID), previous != target
-    else { return false }
+    guard let previous = process(owning: windowID, pid: previousPID) else { return false }
+    // The target may be gone by now — a click that quit it, a crash, an app the
+    // agent closed — and that is exactly when the restore matters most: the
+    // human's application is sitting there holding an unmatched deactivate, with
+    // no caret and no key routing, and it will keep holding it until something
+    // activates it. Requiring the *target's* process serial to resolve before
+    // posting anything meant a dead target took the human's focus with it. There
+    // is nothing to deactivate in that case, so only the activate half is posted.
+    guard let target = process(owning: 0, pid: targetPID), previous != target else {
+      return post(record(kind: .activate, windowID: windowID), to: previous)
+    }
     // The same pair, with the same settle. Posting the two back to back — which
     // this used to do — let the activate overtake the resign-active the
     // deactivate started, which is exactly the race the prelude sleeps to avoid;

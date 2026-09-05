@@ -120,12 +120,67 @@ enum Capture {
           source: .screenCaptureKit)
       }
     }
+    // `screencapture -l` composites the window's whole *surface*, which is not
+    // the rect `CGWindowList` reports: measured against a Terminal window the
+    // image started 32 pt above the enumerated origin, so every coordinate an
+    // agent read off it mapped 32 pt low on the desktop. The image is fine; the
+    // origin has to come from the same place ScreenCaptureKit takes it,
+    // `SCWindow.frame`. `SCShareableContent` is macOS 12.3, so this is available
+    // on every OS the helper supports, including the ones with no
+    // `SCScreenshotManager`.
+    //
+    // When the window cannot be found there — the content list is unavailable or
+    // hung, or the window is not shareable — this refuses instead of guessing.
+    // A capture whose reported region is wrong is worse than no capture: the
+    // agent cannot tell, and every click it derives lands somewhere else.
+    guard let surface = shareableWindowFrame(number) else {
+      throw RPCError(
+        .targetMissing,
+        "window \(number) could not be measured for the screencapture fallback; "
+          + "capture its bounds as a region instead")
+    }
     let args = ["-x", "-o", "-t", "png", "-l", String(number)]
     let png = try runScreencapture(extraArgs: args)
+    let covered = coveredRect(requested: surface, png: png)
+    // …and then check that the surface really is what came back. An origin taken
+    // from `SCWindow.frame` is only right if the CLI composited that same rect,
+    // and the audit's 32 pt case is exactly a disagreement about extent: the
+    // image is taller than the measured surface, so the pixels start somewhere
+    // above the reported origin and every coordinate read off them lands low.
+    // Measured on this machine the two agree exactly for every open window, but
+    // a disagreement is unknowable rather than correctable — nothing says
+    // whether the extra pixels are above or below — so it is refused instead of
+    // described. Whole points of tolerance, since the extent is recovered by
+    // dividing pixels by the backing scale.
+    guard abs(covered.width - surface.width) <= 1, abs(covered.height - surface.height) <= 1 else {
+      throw RPCError(
+        .internalError,
+        "screencapture returned \(Int(covered.width))×\(Int(covered.height)) pt for window "
+          + "\(number), whose surface measures \(Int(surface.width))×\(Int(surface.height)) pt; "
+          + "refusing to report a region these pixels do not cover")
+    }
     return Result(
       pngBase64: try downscaleAndEncode(png, maxDimension: maxDimension),
-      region: coveredRect(requested: target.bounds, png: png),
+      region: covered,
       source: .screencapture)
+  }
+
+  /// The `SCWindow` for a `CGWindowID`, or nil. A window opened inside the cache
+  /// TTL is not in the warm copy, so one forced refresh covers it; anything still
+  /// missing is not shareable.
+  private static func shareableWindow(_ number: CGWindowID) -> SCWindow? {
+    if let window = shareableContent()?.windows.first(where: { $0.windowID == number }) {
+      return window
+    }
+    invalidateShareableContent()
+    return shareableContent()?.windows.first { $0.windowID == number }
+  }
+
+  /// The window's surface frame according to ScreenCaptureKit, in global
+  /// top-left points — the rect the composited pixels actually cover, whichever
+  /// link of the chain produced them.
+  private static func shareableWindowFrame(_ number: CGWindowID) -> CGRect? {
+    shareableWindow(number)?.frame
   }
 
   /// The rect a fallback capture's pixels actually cover, in global top-left
@@ -176,7 +231,19 @@ enum Capture {
     guard overlappedDisplays == 1, let chosen = best else { return nil }
     let clipped = chosen.bounds.intersection(rect).integral
 
-    let filter = SCContentFilter(display: chosen.display, excludingWindows: [])
+    // Synara's own windows are cut out of every display capture.
+    //
+    // The whole-desktop still that feeds the Computer pane goes through here, so
+    // with an empty exclusion list the pane photographed itself: every still
+    // contained the pane showing the previous still, which is both an infinite
+    // mirror and — because the pane redraws on every frame — a guarantee that no
+    // two stills are ever byte-identical. The Node side's dedupe
+    // (`stillFrameDedupe.ts`) therefore never fired, and an open pane cost an SCK
+    // capture, a PNG encode and a ~1 MB JSON line twice a second for as long as
+    // it was open. The agent loses nothing: it cannot drive Synara either (see
+    // `Windows.enumerate`), so those pixels were never actionable.
+    let filter = SCContentFilter(
+      display: chosen.display, excludingWindows: hostWindows(in: content))
     let configuration = SCStreamConfiguration()
     // `sourceRect` is display-local points; everything else on the wire is global.
     configuration.sourceRect = CGRect(
@@ -204,17 +271,7 @@ enum Capture {
   private static func captureWindowWithSCK(_ number: CGWindowID, maxDimension: Int)
     -> (png: Data, frame: CGRect)?
   {
-    guard var content = shareableContent() else { return nil }
-    var match = content.windows.first { $0.windowID == number }
-    if match == nil {
-      // A window opened inside the cache TTL is not in the warm copy; one forced
-      // refresh covers it, and anything still missing takes the fallback.
-      invalidateShareableContent()
-      guard let refreshed = shareableContent() else { return nil }
-      content = refreshed
-      match = content.windows.first { $0.windowID == number }
-    }
-    guard let scWindow = match else { return nil }
+    guard let scWindow = shareableWindow(number) else { return nil }
 
     let filter = SCContentFilter(desktopIndependentWindow: scWindow)
     let configuration = SCStreamConfiguration()
@@ -243,6 +300,21 @@ enum Capture {
     // there sends every coordinate the agent reads off this image to the wrong
     // place on the desktop.
     return (png, scWindow.frame)
+  }
+
+  /// The shareable windows belonging to the application this helper runs for —
+  /// Synara, and the processes it was spawned through.
+  ///
+  /// Exactly the predicate `Windows.enumerate` uses to keep Synara out of the
+  /// agent's reach, so "what the agent can act on" and "what the agent is shown"
+  /// stay the same set. The helper's *own* overlay is deliberately **not**
+  /// excluded: the agent cursor is the one thing the still exists to show, and
+  /// its window is `.readOnly` precisely so it composites into captures.
+  private static func hostWindows(in content: SCShareableContent) -> [SCWindow] {
+    content.windows.filter { window in
+      guard let pid = window.owningApplication?.processID else { return false }
+      return Windows.isHostOwned(pid)
+    }
   }
 
   @available(macOS 14.0, *)
@@ -308,11 +380,30 @@ enum Capture {
   private static let contentLock = NSLock()
   private static var cachedContent: SCShareableContent?
   private static var cachedContentAt: UInt64 = 0
-  /// At most one outstanding `SCShareableContent` request, ever. The permit is
-  /// released by the completion handler, so a request that hangs (FB12114396)
-  /// holds it until it returns and every other caller fails fast to the CLI
-  /// fallback instead of adding another blocked thread.
-  private static let contentGate = DispatchSemaphore(value: 1)
+  /// At most one outstanding `SCShareableContent` request, ever — but everyone
+  /// else **waits on it** rather than giving up.
+  ///
+  /// The gate used to be a semaphore taken with a zero timeout, so every loser
+  /// was handed the (possibly nil) warm copy immediately and fell through to the
+  /// CLI. The perception lane is concurrent and the pane opens with a burst of
+  /// captures, so a cold helper served one image through ScreenCaptureKit and
+  /// every other one through `screencapture` — the slow path, and the path whose
+  /// geometry has to be reconstructed. Waiting costs a loser nothing it would
+  /// not have spent anyway: the winner is already under the same 3 s deadline,
+  /// and the waiters share it rather than each starting a fresh one, so the
+  /// whole burst is bounded by the one request's budget.
+  ///
+  /// A request that never returns (FB12114396) still leaks nothing: the flag is
+  /// cleared only by the completion handler, waiters past the shared deadline
+  /// fall through to the warm copy at once, and no second request is ever
+  /// started behind it.
+  private static let contentCondition = NSCondition()
+  private static var contentRequestInFlight = false
+  /// The in-flight request's own deadline, shared by everyone waiting on it.
+  private static var contentRequestDeadline = Date.distantPast
+  /// Bumped every time a request finishes, so a waiter can tell "the request I
+  /// was waiting for is done" from a spurious wakeup.
+  private static var contentGeneration: UInt64 = 0
 
   private static func invalidateShareableContent() {
     contentLock.lock()
@@ -320,20 +411,33 @@ enum Capture {
     contentLock.unlock()
   }
 
-  private static func shareableContent() -> SCShareableContent? {
+  /// The cached content, and whether it is inside its TTL.
+  private static func cachedShareableContent() -> (content: SCShareableContent?, fresh: Bool) {
     let now = DispatchTime.now().uptimeNanoseconds
     contentLock.lock()
-    let warm = cachedContent
-    let fresh = warm != nil && now &- cachedContentAt <= contentTTLNanoseconds
-    contentLock.unlock()
-    if fresh { return warm }
+    defer { contentLock.unlock() }
+    return (cachedContent, cachedContent != nil && now &- cachedContentAt <= contentTTLNanoseconds)
+  }
 
-    guard contentGate.wait(timeout: .now()) == .success else {
-      // Another request is still outstanding. A slightly stale display/window
-      // list is a far better answer than a second blocked thread; with no cache
-      // at all the caller takes the fallback.
-      return warm
+  private static func shareableContent() -> SCShareableContent? {
+    let warmed = cachedShareableContent()
+    if warmed.fresh { return warmed.content }
+
+    contentCondition.lock()
+    if contentRequestInFlight {
+      let generation = contentGeneration
+      let deadline = contentRequestDeadline
+      while contentRequestInFlight, contentGeneration == generation, Date() < deadline {
+        _ = contentCondition.wait(until: deadline)
+      }
+      contentCondition.unlock()
+      // Whatever the winner managed to store, or the warm copy if it stored
+      // nothing (failed, or still hung past the shared deadline).
+      return cachedShareableContent().content ?? warmed.content
     }
+    contentRequestInFlight = true
+    contentRequestDeadline = Date().addingTimeInterval(captureDeadlineSeconds)
+    contentCondition.unlock()
 
     let done = DispatchSemaphore(value: 0)
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) {
@@ -346,17 +450,26 @@ enum Capture {
       } else if let error {
         logDiagnostic("SCShareableContent failed: \(error.localizedDescription)")
       }
-      contentGate.signal()
+      finishShareableContentRequest()
       done.signal()
     }
-    guard done.wait(timeout: .now() + captureDeadlineSeconds) == .success else {
+    if done.wait(timeout: .now() + captureDeadlineSeconds) != .success {
+      // The flag is deliberately *not* cleared here: the call is still out there
+      // and clearing it would let a second one start behind it. Waiters are
+      // released by the shared deadline instead.
       logDiagnostic("SCShareableContent exceeded its \(captureDeadlineSeconds)s deadline")
-      return warm
     }
-    contentLock.lock()
-    let result = cachedContent
-    contentLock.unlock()
-    return result ?? warm
+    return cachedShareableContent().content ?? warmed.content
+  }
+
+  /// Wake everyone waiting on the in-flight request. Called from the completion
+  /// handler and nowhere else.
+  private static func finishShareableContentRequest() {
+    contentCondition.lock()
+    contentRequestInFlight = false
+    contentGeneration &+= 1
+    contentCondition.broadcast()
+    contentCondition.unlock()
   }
 
   /// A mutable cell a completion handler can write into from another thread; the

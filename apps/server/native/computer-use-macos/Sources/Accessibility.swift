@@ -73,9 +73,10 @@ enum Accessibility {
       throw RPCError(.permissionDenied, "Accessibility is not granted to this app")
     }
     let windows = Windows.list().filter { window in
-      // A minimized or off-screen window has no useful geometry for the agent to
-      // act on, and walking it costs the same as a visible one.
-      guard window.onScreen, !window.minimized else { return false }
+      // A window WindowServer is not compositing — minimized, or on another
+      // Space — has no useful geometry for the agent to act on, and walking it
+      // costs the same as a visible one.
+      guard window.onScreen else { return false }
       guard let windowIds else { return true }
       return windowIds.contains(window.windowNumber)
     }
@@ -326,7 +327,14 @@ enum Accessibility {
     /// mismatch was scored as a click that never arrived — which then condemned
     /// the whole browser to the visible rung for the rest of the session.
     /// Settability is the question that was meant, and it is one call not two.
-    func expectation(at point: CGPoint) -> (element: String, alreadyFocused: Bool)? {
+    ///
+    /// `focused` is the signature of whatever the application considered focused
+    /// *before* the gesture. The watch needs both: a click that moves focus to
+    /// the expected element landed, a click that leaves focus exactly where it
+    /// was did not, and a click that moved focus somewhere neither predicted nor
+    /// previous plainly did *something* and must not be replayed.
+    func expectation(at point: CGPoint) -> (element: String, focused: String, alreadyFocused: Bool)?
+    {
       guard !expired else { return nil }
       var raw: AXUIElement?
       guard
@@ -343,7 +351,7 @@ enum Accessibility {
       guard let hitSignature = signature(of: hit, isExpired: { self.expired }),
         let focused = focusedSignature()
       else { return nil }
-      return (hitSignature, hitSignature == focused)
+      return (hitSignature, focused, hitSignature == focused)
     }
 
     /// Whatever the application currently considers focused, or nil when it
@@ -428,24 +436,17 @@ enum Accessibility {
   /// is main/focused, and a background window that is neither routinely drops
   /// keystrokes. Best effort: every error is ignored, since the post itself is
   /// what actually delivers.
-  static func focusWindow(_ window: DesktopWindow) {
-    guard isTrusted() else { return }
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false)
-    defer { application.restore() }
-    guard let axWindow = application.match(window) else { return }
-    AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
-    AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-  }
-
-  /// The narrow version of the above, for the keyboard path.
   ///
-  /// `focusWindow` sets `AXMain` as well, and a great many apps implement
-  /// `-setAccessibilityMain:` as `makeKeyAndOrderFront:` — a raise. Doing that
-  /// before *every* keystroke into a background app meant the helper reordered
-  /// the human's windows as a side effect of typing, which is the one thing the
-  /// background rung exists to avoid. Setting only `AXFocused`, and only when
-  /// the app does not already consider this its focused window, is enough to
-  /// route keys and moves nothing.
+  /// There used to be a wider sibling of this that set `AXMain` as well, and the
+  /// `focus-window` RPC called it. A great many apps implement
+  /// `-setAccessibilityMain:` as `makeKeyAndOrderFront:` — a raise — and
+  /// `ComputerManager.prepareResolvedTarget` calls `focus-window` before *every*
+  /// window-targeted action, so every scoped click reordered the human's
+  /// windows. Nothing in the helper writes `AXMain` any more: the one path that
+  /// is allowed to move a window forward is `raise-window`, which says so in its
+  /// name and uses `AXRaise`. Setting only `AXFocused`, and only when the app
+  /// does not already consider this its focused window, is enough to route keys
+  /// and moves nothing.
   static func focusWindowForKeyboard(_ window: DesktopWindow) {
     guard isTrusted() else { return }
     let application = Application(
@@ -461,6 +462,50 @@ enum Accessibility {
       return
     }
     AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+  }
+
+  /// Which of `candidates` the owning application says are actually minimized.
+  ///
+  /// `list-windows` used to answer this with `!onScreen`, which is a different
+  /// question: WindowServer stops compositing a window when it is minimized
+  /// **and** when it is on another Space, so on an ordinary multi-Space desktop
+  /// most windows were reported minimized — and an agent told a window is
+  /// minimized stops trying to use it. `kAXMinimizedAttribute` is the app's own
+  /// answer and the only honest one.
+  ///
+  /// Only ever asked about windows that are already off screen: an on-screen
+  /// window is by construction not minimized, so the common desktop costs
+  /// nothing. One `Application` handle per owning pid, the per-window messaging
+  /// timeout, and a wall-clock budget, because this runs inside a `list-windows`
+  /// that the pane polls.
+  ///
+  /// A window whose app cannot be asked — accessibility not granted, no matching
+  /// AX window, the budget spent — is reported **not** minimized. That is the
+  /// safe direction: a real minimized window described as ordinary costs one
+  /// failed capture that says so, while an ordinary window described as
+  /// minimized is one the agent will not touch at all.
+  static func minimizedWindowIDs(among candidates: [DesktopWindow], budgetSeconds: Double = 0.75)
+    -> Set<CGWindowID>
+  {
+    guard isTrusted(), !candidates.isEmpty else { return [] }
+    let deadline = DispatchTime.now() + budgetSeconds
+    var applications: [pid_t: Application] = [:]
+    defer { for application in applications.values { application.restore() } }
+    var minimized: Set<CGWindowID> = []
+    for window in candidates {
+      guard DispatchTime.now() < deadline else { break }
+      let application =
+        applications[window.ownerPID]
+        ?? Application(
+          pid: window.ownerPID, enhanceUserInterface: false,
+          messagingTimeout: windowMessagingTimeout)
+      applications[window.ownerPID] = application
+      guard let axWindow = application.match(window) else { continue }
+      if boolAttribute(axWindow, kAXMinimizedAttribute) == true {
+        minimized.insert(window.windowNumber)
+      }
+    }
+    return minimized
   }
 
   // MARK: - Application handle
@@ -696,12 +741,20 @@ enum Accessibility {
       // wrong, so those fall through to the frame overlap below.
       if titled.count == 1 { return titled[0] }
     }
+    // Frame overlap, and only a *real* overlap counts. This used to start at
+    // `bestArea = -1`, so the first candidate with a readable frame won even
+    // when it shared no pixel with the window being matched — an app whose AX
+    // window list and CGWindowList disagree then had one AX window answer for
+    // two CGWindows, `describe-ui` emitted the same tree twice under two ids,
+    // and a `set-value` at the phantom id wrote into the other window
+    // (reproduced live). No overlap is no answer.
     var best: AXUIElement?
-    var bestArea: CGFloat = -1
+    var bestArea: CGFloat = 0
     for candidate in candidates {
       guard let frame = frame(of: candidate) else { continue }
       let overlap = frame.intersection(window.bounds)
-      let area = overlap.isNull ? 0 : overlap.width * overlap.height
+      guard !overlap.isNull else { continue }
+      let area = overlap.width * overlap.height
       if area > bestArea {
         bestArea = area
         best = candidate

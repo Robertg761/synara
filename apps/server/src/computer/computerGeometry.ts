@@ -494,6 +494,14 @@ export function screenshotFromPng(input: {
   readonly region: ComputerRect;
   readonly capturedAt: string;
   readonly source?: string;
+  /**
+   * The same image already encoded, when the caller was handed base64 to begin
+   * with. A backend whose transport speaks base64 decoded it only to read the
+   * PNG header, and re-encoding it here made every screenshot a base64 → bytes
+   * → base64 round trip over a multi-megabyte payload. Omitted by callers that
+   * genuinely hold only bytes.
+   */
+  readonly bytesBase64?: string;
 }): ComputerScreenshot {
   const dimensions = readPngDimensions(
     input.bytes,
@@ -504,7 +512,7 @@ export function screenshotFromPng(input: {
     width: dimensions.width,
     height: dimensions.height,
     sizeBytes: input.bytes.byteLength,
-    bytesBase64: Buffer.from(input.bytes).toString("base64"),
+    bytesBase64: input.bytesBase64 ?? Buffer.from(input.bytes).toString("base64"),
     region: input.region,
     scale: dimensions.width / input.region.width,
     capturedAt: input.capturedAt,

@@ -72,6 +72,19 @@ class FakeChild extends EventEmitter {
     this.exitCode = code;
     this.signalCode = signal;
     this.emit("exit", code, signal);
+    // Node always follows `exit` with `close` once the stdio streams are done;
+    // a fake that stops at `exit` cannot catch a client that reacts to both.
+    this.emit("close", code, signal);
+  }
+
+  /**
+   * A spawn that never produced a process: Node emits `error` and then `close`,
+   * and no `exit` at all. This is the shape of a missing or quarantined helper
+   * binary.
+   */
+  failToSpawn(message: string): void {
+    this.emit("error", new Error(message));
+    this.emit("close", null, null);
   }
 }
 
@@ -157,6 +170,47 @@ describe("MacComputerHelperClient", () => {
     const error = await pending.catch((value: unknown) => value);
     expect(error).toBeInstanceOf(MacComputerHelperError);
     expect((error as MacComputerHelperError).code).toBe("helper_exited");
+  });
+
+  it("stops running when the spawn failed, and keeps reporting why", async () => {
+    const { client, child } = clientWith(() => undefined);
+    const pending = client.request("capabilities");
+    const settled = pending.catch((value: unknown) => value);
+    child.failToSpawn("spawn /fake/computer-helper ENOENT");
+
+    // The in-flight request gets the cause.
+    const inFlight = (await settled) as MacComputerHelperError;
+    expect(inFlight.code).toBe("helper_spawn_failed");
+    expect(inFlight.message).toContain("ENOENT");
+
+    // And the client knows it has no process. Listening only for `exit` — which
+    // a failed spawn never emits — left `running` true over a child that does
+    // not exist, so the backend went on believing it had a helper and the next
+    // request failed as `helper_write_failed`: a fault code that says nothing
+    // about the missing binary.
+    expect(client.running).toBe(false);
+    const later = (await client.request("ping").catch((value: unknown) => value)) as Error;
+    expect(later).toBeInstanceOf(MacComputerHelperError);
+    expect((later as MacComputerHelperError).code).toBe("helper_spawn_failed");
+    expect(later.message).toContain("ENOENT");
+    await client.dispose();
+  });
+
+  it("reports one termination even though exit and close both fire", async () => {
+    const exits: string[] = [];
+    const child = new FakeChild(() => undefined);
+    const client = new MacComputerHelperClient({
+      binaryPath: "/fake/computer-helper",
+      spawn: () => child as unknown as ChildProcessWithoutNullStreams,
+      onExit: (reason) => exits.push(reason),
+    });
+    client.start();
+    child.exit(3, null);
+    // A second `onExit` would run the backend's invalidation against a helper it
+    // has already replaced.
+    expect(exits).toHaveLength(1);
+    expect(exits[0]).toContain("code=3");
+    await client.dispose();
   });
 
   it("kills the child when dispose races the start that spawned it", async () => {

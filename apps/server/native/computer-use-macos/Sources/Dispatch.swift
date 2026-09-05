@@ -56,6 +56,13 @@ enum Lanes {
   /// user answers. On the serial input lane that wait would hold every click and
   /// keystroke behind a dialog; on the concurrent perception lane it holds
   /// nothing at all.
+  /// Whether this method is an *action* — something the agent does to the
+  /// desktop — rather than a read. Exactly the set that runs on the input lane,
+  /// asked as one question so the two answers cannot drift.
+  static func isAction(_ method: String) -> Bool {
+    queue(for: method) === input
+  }
+
   static func queue(for method: String) -> DispatchQueue {
     switch method {
     case "move", "click", "double-click", "right-click", "drag", "scroll", "type", "press-key",

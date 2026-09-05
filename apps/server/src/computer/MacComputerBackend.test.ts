@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { COMPUTER_DELIVERY_PATH_MAX_LENGTH, type ComputerUiNode } from "@synara/contracts";
+import {
+  SYNARA_DESKTOP_BUNDLE_ID_ENV,
+  SYNARA_DEVELOPMENT_BUNDLE_ID,
+} from "@synara/shared/desktopIdentity";
 
-import { MacComputerBackend } from "./MacComputerBackend.ts";
+import { MAC_HELPER_DISPOSE_GRACE_MS, MacComputerBackend } from "./MacComputerBackend.ts";
 import {
   computerBackendActionResult,
   ComputerBackendError,
@@ -104,16 +108,28 @@ function makeBackend(
     readonly stillIntervalMs?: number;
     /** A moving clock, for the capability cache's TTL. Frozen at 0 by default. */
     readonly now?: () => number;
+    /**
+     * The backend's environment. Empty by default, which is also the shape of a
+     * server with no desktop shell behind it: nothing tells it which app macOS
+     * holds responsible for the helper's grants, so it must not touch TCC.
+     */
+    readonly env?: NodeJS.ProcessEnv;
   } = {},
 ): MacComputerBackend {
   return new MacComputerBackend({
     platform: "darwin",
     now: options.now ?? (() => 0),
+    env: options.env ?? {},
     resolveBinary: async () => "/fake/computer-helper",
     makeHelperClient: () => helper,
     run: options.run ?? (async () => XCODE_PRESENT),
     ...(options.stillIntervalMs === undefined ? {} : { stillIntervalMs: options.stillIntervalMs }),
   });
+}
+
+/** The environment a desktop shell hands the backend, naming the responsible app. */
+function desktopEnv(bundleId: string = SYNARA_DEVELOPMENT_BUNDLE_ID): NodeJS.ProcessEnv {
+  return { [SYNARA_DESKTOP_BUNDLE_ID_ENV]: bundleId };
 }
 
 /** Lets a `void`-fired request (and the reset it runs first) finish. */
@@ -496,6 +512,8 @@ describe("MacComputerBackend", () => {
       readonly missing?: { accessibility?: boolean; screenRecording?: boolean };
       readonly signature?: "adhoc" | "signed";
       readonly resetExit?: number;
+      /** Omitted to model a backend nobody told which app is responsible. */
+      readonly bundleId?: string | null;
     } = {},
   ) {
     const report = capabilitiesResponse({
@@ -516,6 +534,7 @@ describe("MacComputerBackend", () => {
         timeline.push([command, ...args].join(" "));
         return { code: options.resetExit ?? 0, stdout: "", stderr: "" };
       },
+      ...(options.bundleId === null ? {} : { env: desktopEnv(options.bundleId) }),
     });
     return { backend, helper, timeline };
   }
@@ -530,7 +549,7 @@ describe("MacComputerBackend", () => {
     // that dead decision without ever showing a dialog. Removing Synara's own
     // row is the only thing that makes it prompt again.
     expect(timeline).toEqual([
-      "tccutil reset ScreenCapture com.emanueledipietro.synara",
+      `tccutil reset ScreenCapture ${SYNARA_DEVELOPMENT_BUNDLE_ID}`,
       "request-permissions",
     ]);
   });
@@ -543,7 +562,7 @@ describe("MacComputerBackend", () => {
     // `ScreenCapture` is granted here; throwing that row away would take a
     // working permission off the user to re-ask for something else.
     expect(timeline).toEqual([
-      "tccutil reset Accessibility com.emanueledipietro.synara",
+      `tccutil reset Accessibility ${SYNARA_DEVELOPMENT_BUNDLE_ID}`,
       "request-permissions",
     ]);
   });
@@ -575,7 +594,7 @@ describe("MacComputerBackend", () => {
     // never have been given, in which case there is no row and the dialog is
     // still worth raising.
     expect(timeline).toEqual([
-      "tccutil reset Accessibility com.emanueledipietro.synara",
+      `tccutil reset Accessibility ${SYNARA_DEVELOPMENT_BUNDLE_ID}`,
       "request-permissions",
     ]);
     debug.mockRestore();
@@ -590,7 +609,7 @@ describe("MacComputerBackend", () => {
     await settle();
 
     expect(timeline).toEqual([
-      "tccutil reset Accessibility com.emanueledipietro.synara",
+      `tccutil reset Accessibility ${SYNARA_DEVELOPMENT_BUNDLE_ID}`,
       "request-permissions",
     ]);
   });
@@ -1246,5 +1265,326 @@ describe("MacComputerBackend", () => {
     await expect(backend.listWindows()).rejects.toBeInstanceOf(ComputerBackendError);
     expect(helper.running).toBe(false);
     expect(backend.health().status).toBe("unavailable");
+  });
+
+  it("does not turn a publish into a reconnect, or a health event", async () => {
+    const helper = new FakeMacHelper({ capabilities: GRANTED });
+    const backend = makeBackend(helper);
+    const events: number[] = [];
+    backend.onEvent((event) => {
+      if (event.type === "health-changed") events.push(event.health.reconnects);
+    });
+
+    for (let publish = 0; publish < 6; publish += 1) {
+      expect(await backend.availability()).toEqual({ kind: "available", backend: "mac" });
+    }
+
+    // The manager asks `availability()` on every publish and a publish follows
+    // every action. Recording a connection here made `reconnects` a publish
+    // counter and put a `health-changed` — and so a thread-state broadcast per
+    // thread — on the wire for every single click. One connection was made, and
+    // it was made once.
+    expect(events).toEqual([0]);
+    expect(backend.health().reconnects).toBe(0);
+    expect(helper.startCount).toBe(1);
+  });
+
+  it("answers the action path from a remembered build failure instead of rebuilding", async () => {
+    let builds = 0;
+    const helper = new FakeMacHelper({ capabilities: GRANTED });
+    const backend = new MacComputerBackend({
+      platform: "darwin",
+      now: () => 0,
+      env: {},
+      makeHelperClient: () => helper,
+      run: async () => XCODE_PRESENT,
+      resolveBinary: async () => {
+        builds += 1;
+        throw new MacHelperBuildError("Computer helper build failed: disk full");
+      },
+    });
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "backend-unavailable" });
+    expect(builds).toBe(1);
+
+    // The passive probe honoured the memory and the action path did not, so a
+    // Mac whose helper cannot compile re-ran a five-minute Swift build for every
+    // publish — and answered each one with the error it already had.
+    await expect(backend.listWindows()).rejects.toThrow(/disk full/);
+    expect(builds).toBe(1);
+    await backend.dispose();
+  });
+
+  it("surfaces the real spawn failure instead of returning a helper it already disposed", async () => {
+    let running = false;
+    let disposed = false;
+    let startCount = 0;
+    // The real client after a failed spawn: `error` rejects the in-flight
+    // request with the cause, `close` takes the client out of service, and a
+    // later request answers with the disposal, not the cause.
+    const helper: MacHelperTransport = {
+      get running() {
+        return running;
+      },
+      start() {
+        startCount += 1;
+        running = true;
+      },
+      async request() {
+        if (disposed) {
+          throw new MacComputerHelperError("helper_disposed", "Computer helper was shut down");
+        }
+        running = false;
+        throw new MacComputerHelperError(
+          "helper_spawn_failed",
+          "spawn /fake/computer-helper ENOENT",
+        );
+      },
+      async dispose() {
+        disposed = true;
+        running = false;
+      },
+    };
+    const backend = new MacComputerBackend({
+      platform: "darwin",
+      now: () => 0,
+      env: {},
+      resolveBinary: async () => "/fake/computer-helper",
+      makeHelperClient: () => helper,
+      run: async () => XCODE_PRESENT,
+    });
+
+    const availability = await backend.availability();
+
+    expect(availability.kind).toBe("backend-unavailable");
+    const message = availability.kind === "backend-unavailable" ? availability.message : "";
+    // The start's own capability probe took the connection down; handing the
+    // dead client back anyway reported the disposal — non-retryable, and with
+    // the one line that says what to fix thrown away.
+    expect(message).toContain("ENOENT");
+    expect(message).not.toContain("shut down");
+    expect(startCount).toBe(1);
+    await backend.dispose();
+  });
+
+  it("restarts a wedged helper after a timeout instead of asking it forever", async () => {
+    const helpers: FakeMacHelper[] = [];
+    let wedged = true;
+    const backend = new MacComputerBackend({
+      platform: "darwin",
+      now: () => 0,
+      env: {},
+      resolveBinary: async () => "/fake/computer-helper",
+      run: async () => XCODE_PRESENT,
+      makeHelperClient: () => {
+        const helper = new FakeMacHelper({
+          capabilities: GRANTED,
+          "list-windows": () => {
+            if (wedged) {
+              throw new MacComputerHelperError(
+                "helper_timeout",
+                "Computer helper list-windows timed out.",
+              );
+            }
+            return windowsResponse({ x: 0, y: 0, width: 1440, height: 900 });
+          },
+        });
+        helpers.push(helper);
+        return helper;
+      },
+    });
+
+    const failure = await backend.listWindows().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ComputerBackendError);
+    expect((failure as ComputerBackendError).retryable).toBe(true);
+    // A timeout had no recovery path at all: the wedged process stayed the
+    // backend's helper and answered every later call the same way, fifteen
+    // seconds at a time, for the life of the server.
+    expect(helpers[0]?.running).toBe(false);
+
+    wedged = false;
+    await expect(backend.listWindows()).resolves.toHaveLength(1);
+    expect(helpers).toHaveLength(2);
+    // And this is what `reconnects` is for: one outage, one recovery — the
+    // counter still moves for a real reconnection now that a publish cannot
+    // move it.
+    expect(backend.health().reconnects).toBe(1);
+    await backend.dispose();
+  });
+
+  it("leaves TCC alone when nothing has told it which app is responsible", async () => {
+    const { backend, timeline } = makeAdhocBackend({
+      missing: { accessibility: true },
+      bundleId: null,
+    });
+
+    await backend.provision();
+
+    // A reset aimed at a guess is worse than no reset: the production id names
+    // a separately installed release build whose grants are real, and the row
+    // that is actually stale belongs to whatever flavor is running.
+    expect(timeline).toEqual(["request-permissions"]);
+  });
+
+  it("keeps reporting the grant a capture refusal proved missing", async () => {
+    let granted = true;
+    const helper = new FakeMacHelper({
+      capabilities: () => capabilitiesResponse({ screenRecording: granted }),
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      capture: () => {
+        if (!granted) {
+          throw new MacComputerHelperError(
+            "helper_-32000",
+            "screencapture produced no image; is Screen Recording granted?",
+          );
+        }
+        return { base64: PNG_1X1 };
+      },
+    });
+    const backend = makeBackend(helper);
+    await backend.availability();
+
+    granted = false;
+    await expect(
+      backend.captureScreenshot({ kind: "region", region: { x: 0, y: 0, width: 10, height: 10 } }),
+    ).rejects.toBeInstanceOf(ComputerBackendError);
+
+    // Dropping the whole capability report on a refusal left the backend
+    // looking like one that had never probed at all — whose honest answer is
+    // "nothing is missing" — so the tool surface learned a grant was gone and
+    // in the same breath stopped asking the user for it.
+    expect(await backend.missingPermissions()).toEqual(["screenRecording"]);
+    expect(backend.buildSignature()).toBe("signed");
+  });
+
+  it("hands the helper's own encoding to the screenshot payload", async () => {
+    const helper = new FakeMacHelper({
+      capabilities: GRANTED,
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      capture: () => ({ base64: PNG_1X1 }),
+    });
+    const backend = makeBackend(helper);
+    await backend.availability();
+
+    const screenshot = await backend.captureScreenshot({
+      kind: "region",
+      region: { x: 0, y: 0, width: 10, height: 10 },
+    });
+
+    // Byte-identical to what the helper sent, because it is what the helper
+    // sent: decoding a multi-megabyte capture only to re-encode it spent two
+    // copies of the image to arrive back at the same string.
+    expect(screenshot.bytesBase64).toBe(PNG_1X1);
+  });
+
+  it("does not re-run the toolchain probe for every passive availability check", async () => {
+    let clock = 0;
+    let spawns = 0;
+    const backend = new MacComputerBackend({
+      platform: "darwin",
+      now: () => clock,
+      env: {},
+      helperCacheRoot: "/nonexistent/synara-computer-helper-cache",
+      resolveBinary: async () => "/fake/computer-helper",
+      makeHelperClient: () => new FakeMacHelper({ capabilities: GRANTED }),
+      run: async () => {
+        spawns += 1;
+        return { code: 127, stdout: "", stderr: "xcodebuild: not found" };
+      },
+    });
+
+    expect((await backend.probeAvailability()).kind).toBe("backend-unavailable");
+    const afterFirst = spawns;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    // This runs on every publish, on every host, at boot. On a source-build Mac
+    // it costs an `xcodebuild -version` spawn and a digest of every Swift source
+    // in the helper, to re-derive machine state that changes when somebody
+    // installs Xcode.
+    for (let publish = 0; publish < 5; publish += 1) {
+      expect((await backend.probeAvailability()).kind).toBe("backend-unavailable");
+    }
+    expect(spawns).toBe(afterFirst);
+
+    // Cached, not frozen: a toolchain installed while the server runs is found.
+    clock = 60_000;
+    expect((await backend.probeAvailability()).kind).toBe("backend-unavailable");
+    expect(spawns).toBeGreaterThan(afterFirst);
+    await backend.dispose();
+  });
+
+  it("re-reads the workspace when a display change outlives the cached rectangle", async () => {
+    vi.useFakeTimers();
+    try {
+      let clock = 0;
+      let width = 2560;
+      const regions: unknown[] = [];
+      const helper = new FakeMacHelper({
+        capabilities: GRANTED,
+        "list-windows": () => windowsResponse({ x: 0, y: 0, width, height: 900 }),
+        "screen-size": () => ({ x: 0, y: 0, width, height: 900, scale: 2 }),
+        capture: (params: Record<string, unknown>) => {
+          regions.push(params.region);
+          return { base64: PNG_1X1 };
+        },
+      });
+      const backend = makeBackend(helper, { stillIntervalMs: 100, now: () => clock });
+      await backend.availability();
+      await backend.attachStream(() => undefined);
+      expect(regions[0]).toMatchObject({ width: 2560, height: 900 });
+
+      // The user unplugs the external display. Nothing on the streaming path
+      // enumerates windows or reads the screen size, so the cached rectangle
+      // used to stand for as long as the pane was open — and every tick asked
+      // the helper for a region that no longer exists, which it refuses.
+      width = 1440;
+      clock = 5_000;
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(helper.callsFor("screen-size").length).toBeGreaterThan(0);
+      expect(regions.at(-1)).toMatchObject({ width: 1440, height: 900 });
+      await backend.detachStream();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not wait out an in-flight helper build when the backend is disposed", async () => {
+    vi.useFakeTimers();
+    try {
+      let aborted = false;
+      let buildStarted!: () => void;
+      const building = new Promise<void>((resolve) => {
+        buildStarted = resolve;
+      });
+      const backend = new MacComputerBackend({
+        platform: "darwin",
+        now: () => 0,
+        env: {},
+        makeHelperClient: () => new FakeMacHelper({ capabilities: GRANTED }),
+        run: async () => XCODE_PRESENT,
+        resolveBinary: (signal) =>
+          new Promise<string>((_resolve, reject) => {
+            buildStarted();
+            signal.addEventListener("abort", () => {
+              aborted = true;
+              reject(new MacHelperBuildError("Computer helper build was cancelled."));
+            });
+          }),
+      });
+
+      const availability = backend.availability();
+      await building;
+      const disposal = backend.dispose();
+      await vi.advanceTimersByTimeAsync(MAC_HELPER_DISPOSE_GRACE_MS);
+      await disposal;
+
+      // A cold Swift build is minutes. Waiting it out held the whole server's
+      // shutdown open to finish compiling a binary nothing would ever run.
+      expect(aborted).toBe(true);
+      await expect(availability).resolves.toMatchObject({ kind: "backend-unavailable" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

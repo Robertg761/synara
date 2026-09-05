@@ -38,8 +38,14 @@ struct DesktopWindow {
   let appName: String
   let bounds: CGRect
   let stackingIndex: Int
+  /// Whether WindowServer is compositing this window right now. **Not** the same
+  /// question as "is it minimized": a window on another Space is off screen and
+  /// perfectly un-minimized. There used to be a second stored `minimized` field
+  /// here holding exactly `!onScreen`, which is how `list-windows` came to report
+  /// eight of ten windows as minimized on an ordinary two-Space desktop. The
+  /// honest answer needs accessibility and is computed only where it is
+  /// reported — see `Accessibility.minimizedWindowIDs`.
   let onScreen: Bool
-  let minimized: Bool
 }
 
 enum Windows {
@@ -102,11 +108,42 @@ enum Windows {
   /// `NSRunningApplication` is documented as returning its properties
   /// atomically, so this is safe from the enumeration whichever lane runs it;
   /// it is the one piece of AppKit this file touches off the main thread.
+  ///
+  /// Memoised on the same terms as `helperProcessCache`: this is asked once per
+  /// window per enumeration *and* once per shareable window on every capture
+  /// (see `Capture.hostWindows`), which with the pane open is a few hundred
+  /// `NSRunningApplication` lookups a second for an answer that does not change.
   private static func isHostApplication(_ pid: pid_t) -> Bool {
-    guard let bundle = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else {
-      return false
+    cacheLock.lock()
+    if let cached = hostApplicationCache[pid] {
+      cacheLock.unlock()
+      return cached
     }
-    return bundle == hostBundlePrefix || bundle.hasPrefix("\(hostBundlePrefix).")
+    cacheLock.unlock()
+
+    let bundle = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+    let isHost =
+      bundle == hostBundlePrefix || bundle?.hasPrefix("\(hostBundlePrefix).") == true
+
+    cacheLock.lock()
+    if hostApplicationCache.count >= helperProcessCacheLimit { hostApplicationCache.removeAll() }
+    hostApplicationCache[pid] = isHost
+    cacheLock.unlock()
+    return isHost
+  }
+
+  /// Whether `pid` belongs to the application this helper is running on behalf
+  /// of — Synara itself, or one of the processes it was spawned through.
+  ///
+  /// Exposed because two subsystems need the same answer for the same reason.
+  /// `enumerate()` uses it to keep Synara out of every hit test, and
+  /// `Capture` uses it to keep Synara's own windows out of the whole-desktop
+  /// still: the Computer pane is drawn from those stills, so leaving it in the
+  /// frame made every still differ from the last (the pane had just redrawn the
+  /// previous one), which defeated the byte-identity dedupe on the Node side and
+  /// mirrored the pane inside itself.
+  static func isHostOwned(_ pid: pid_t) -> Bool {
+    ancestorProcessIDs.contains(pid) || isHostApplication(pid)
   }
 
   private static let cacheLock = NSLock()
@@ -118,6 +155,8 @@ enum Windows {
   /// enough that a stale entry is a non-issue, and the map is dropped wholesale
   /// once it grows past a desktop's worth of processes.
   private static var helperProcessCache: [pid_t: Bool] = [:]
+  /// The same memo for "is this pid Synara" — see `isHostApplication`.
+  private static var hostApplicationCache: [pid_t: Bool] = [:]
   private static let helperProcessCacheLimit = 256
   /// `PROC_PIDPATHINFO_MAXSIZE` (`4 * MAXPATHLEN`) from `<sys/proc_info.h>`. The
   /// macro itself does not survive the Swift importer, so it is restated here.
@@ -196,8 +235,13 @@ enum Windows {
   /// `focusedWindowID` is passed in rather than derived per window: it costs one
   /// WindowServer round trip, and every window in a `list-windows` reply is
   /// describing the same instant.
+  ///
+  /// `minimized` is passed in for a different reason: it is an accessibility
+  /// read, not a CGWindowList one (see `Accessibility.minimizedWindowIDs`), and
+  /// only the `list-windows` handler is entitled to pay for it. An on-screen
+  /// window is never minimized, so only the off-screen ones cost anything.
   static func dictionary(
-    _ window: DesktopWindow, occluders: [String], focusedWindowID: CGWindowID?
+    _ window: DesktopWindow, occluders: [String], focusedWindowID: CGWindowID?, minimized: Bool
   ) -> [String: Any] {
     var payload: [String: Any] = [
       "id": String(window.windowNumber),
@@ -208,7 +252,7 @@ enum Windows {
       // Truthful now. This was hard-coded false, so `list-windows` reported a
       // desktop in which nothing at all was focused.
       "focused": window.windowNumber == focusedWindowID,
-      "minimized": window.minimized,
+      "minimized": minimized,
       "visible": window.onScreen,
       "stackingIndex": window.stackingIndex,
     ]
@@ -300,8 +344,7 @@ enum Windows {
       // Synara itself, and the backend that spawned this helper. See
       // `ancestorProcessIDs`: the agent must not be able to drive the app that
       // is driving it.
-      if ancestorProcessIDs.contains(pid) { continue }
-      if isHostApplication(pid) { continue }
+      if isHostOwned(pid) { continue }
       // Two helpers can be alive at once — the installed Synara.app keeps its
       // own helper running while a dev server spawns a second one — and the
       // other instance's overlay is exactly as bad a click target as ours. It
@@ -334,8 +377,7 @@ enum Windows {
           appName: appName,
           bounds: bounds,
           stackingIndex: 0,
-          onScreen: onScreen,
-          minimized: !onScreen))
+          onScreen: onScreen))
     }
 
     // On-screen windows first, in the front-to-back order CGWindowList gave
@@ -353,8 +395,7 @@ enum Windows {
         appName: window.appName,
         bounds: window.bounds,
         stackingIndex: position,
-        onScreen: window.onScreen,
-        minimized: window.minimized)
+        onScreen: window.onScreen)
     }
     return ordered
   }

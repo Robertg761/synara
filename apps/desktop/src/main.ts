@@ -65,6 +65,7 @@ import {
   COMPUTER_HELPER_SOURCE_DIR_NAME,
 } from "@synara/shared/computerHelperPaths";
 import {
+  SYNARA_DESKTOP_BUNDLE_ID_ENV,
   SYNARA_DESKTOP_UPDATE_CHANNEL,
   resolveSynaraDesktopFlavor,
   synaraDesktopIdentity,
@@ -3544,6 +3545,16 @@ function backendEnv(): NodeJS.ProcessEnv {
             COMPUTER_HELPER_SOURCE_DIR_NAME,
           ),
         }
+      : {}),
+    // Which app macOS holds responsible for the computer-use helper's TCC
+    // grants. Both the packaged build and the dev launcher stamp this exact
+    // identifier into the running bundle's Info.plist (see
+    // `scripts/electron-launcher.mjs`), so it is the app whose privacy rows the
+    // backend may repair — and on a `.dev` or `.canary` build it is emphatically
+    // not the production one the server used to assume. A backend started
+    // without a desktop shell never sees this and leaves TCC alone.
+    ...(process.platform === "darwin"
+      ? { [SYNARA_DESKTOP_BUNDLE_ID_ENV]: desktopIdentity.bundleId }
       : {}),
     SYNARA_MODE: "desktop",
     SYNARA_NO_BROWSER: "1",
