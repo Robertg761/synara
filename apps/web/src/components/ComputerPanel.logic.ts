@@ -1,4 +1,7 @@
 import {
+  COMPUTER_INPUT_SCROLL_LIMIT,
+  COMPUTER_MAC_BACKEND,
+  COMPUTER_NESTED_KWIN_BACKEND,
   COMPUTER_RELEASE_CONTROL_HOTKEY,
   COMPUTER_RELEASE_HOTKEY_BACKENDS,
   type ComputerActionEvent,
@@ -13,6 +16,7 @@ import {
   type ComputerStatusResult,
   type ThreadComputerState,
 } from "@synara/contracts";
+import { isComputerNamedKey } from "@synara/shared/computerKeyNames";
 import { listComputerPermissions } from "@synara/shared/computerPermissions";
 
 export interface ComputerFrameGateState {
@@ -78,9 +82,7 @@ export function resolveComputerAvailabilityView(
     return {
       kind: "checking",
       title: "Reconnecting to the desktop",
-      description: health.lastFailure
-        ? health.lastFailure.message
-        : "The desktop backend dropped out and is being reconnected.",
+      description: health.lastFailure ? health.lastFailure.message : COMPUTER_RECONNECTING_NOTE,
     };
   }
   if (!availability) {
@@ -231,18 +233,41 @@ export function resolveComputerHealthBadge(
   };
 }
 
+/**
+ * How a non-connected backend is described, in one place.
+ *
+ * Three surfaces said this — the pane's blocked view, the header badge's
+ * tooltip, and the settings panel's health notes — and three copies is three
+ * chances to describe the same supervision state differently.
+ */
+export const COMPUTER_RECONNECTING_NOTE =
+  "The desktop backend dropped out and is being reconnected.";
+const COMPUTER_DISCONNECTED_NOTE = "The desktop backend is not connected.";
+
+/** The note naming what the supervisor last saw fail, or null when nothing has. */
+export function computerLastFailureNote(health: ComputerHealth | undefined): string | null {
+  return health?.lastFailure ? `Last failure: ${health.lastFailure.message}` : null;
+}
+
+/** The note counting reconnects since startup, or null when there were none. */
+export function computerReconnectsNote(health: ComputerHealth | undefined): string | null {
+  const reconnects = health?.reconnects ?? 0;
+  if (reconnects <= 0) return null;
+  return `Reconnected ${reconnects === 1 ? "once" : `${reconnects} times`} since startup.`;
+}
+
 /** Counters belong in the badge's tooltip, not in chrome of their own. */
 function computerHealthDetail(health: ComputerHealth): string {
   const parts = [
-    health.status === "reconnecting"
-      ? "The desktop backend dropped out and is being reconnected."
-      : "The desktop backend is not connected.",
+    health.status === "reconnecting" ? COMPUTER_RECONNECTING_NOTE : COMPUTER_DISCONNECTED_NOTE,
   ];
-  if (health.lastFailure) parts.push(`Last failure: ${health.lastFailure.message}`);
+  const lastFailure = computerLastFailureNote(health);
+  if (lastFailure) parts.push(lastFailure);
   if (health.consecutiveFailures > 0) {
     parts.push(`Failed attempts since the last connection: ${health.consecutiveFailures}.`);
   }
-  if (health.reconnects > 0) parts.push(`Reconnects since startup: ${health.reconnects}.`);
+  const reconnects = computerReconnectsNote(health);
+  if (reconnects) parts.push(reconnects);
   return parts.join(" ");
 }
 
@@ -293,8 +318,8 @@ export function computerCanvasLabel(input: {
   readonly visibleDesktop: boolean;
 }): string {
   const backend = input.availability?.kind === "available" ? input.availability.backend : undefined;
-  if (backend === "mac") return "This Mac's desktop";
-  if (backend === "nested-kwin") return "The agent's own desktop";
+  if (backend === COMPUTER_MAC_BACKEND) return "This Mac's desktop";
+  if (backend === COMPUTER_NESTED_KWIN_BACKEND) return "The agent's own desktop";
   if (input.visibleDesktop) return "This computer's desktop";
   return "The agent's desktop";
 }
@@ -512,8 +537,6 @@ function clampToRange(value: number, minimum: number, maximum: number): number {
   return Math.min(Math.max(value, minimum), maximum);
 }
 
-/** Matches the contract's per-event scroll ceiling. */
-export const COMPUTER_SCROLL_DELTA_LIMIT = 4_096;
 /** Typical line box, used to turn a line-mode wheel event into pixels. */
 const COMPUTER_WHEEL_LINE_PX = 16;
 /** A page-mode notch is a viewport jump; the desktop expects pixels. */
@@ -549,7 +572,7 @@ export function computerWheelScrollDelta(event: ComputerWheelEventLike): {
 /** Whole pixels inside the contract's range, used per event and per coalesced burst. */
 export function clampComputerScrollDelta(value: number): number {
   if (!Number.isFinite(value)) return 0;
-  return clampToRange(Math.round(value), -COMPUTER_SCROLL_DELTA_LIMIT, COMPUTER_SCROLL_DELTA_LIMIT);
+  return clampToRange(Math.round(value), -COMPUTER_INPUT_SCROLL_LIMIT, COMPUTER_INPUT_SCROLL_LIMIT);
 }
 
 export interface ComputerKeyEventLike {
@@ -564,41 +587,6 @@ export interface ComputerKeyCommand {
   readonly key: string;
   readonly modifiers: readonly ComputerInputModifier[];
 }
-
-/**
- * DOM key names the seat can synthesize, lowercased. This mirrors the server's
- * evdev name table rather than replacing it: the server stays the authority and
- * rejects anything else, but the pane must know what it may swallow, since a
- * key it forwards is a key the browser never sees.
- */
-const FORWARDED_NAMED_KEYS: ReadonlySet<string> = new Set([
-  "enter",
-  "escape",
-  "tab",
-  "backspace",
-  "delete",
-  "insert",
-  "home",
-  "end",
-  "pageup",
-  "pagedown",
-  "arrowup",
-  "arrowdown",
-  "arrowleft",
-  "arrowright",
-  "f1",
-  "f2",
-  "f3",
-  "f4",
-  "f5",
-  "f6",
-  "f7",
-  "f8",
-  "f9",
-  "f10",
-  "f11",
-  "f12",
-]);
 
 const PRINTABLE_ASCII_MIN = 0x21;
 const PRINTABLE_ASCII_MAX = 0x7e;
@@ -629,8 +617,13 @@ function resolveComputerKeyName(key: string): string | null {
     const codePoint = key.codePointAt(0) ?? 0;
     return codePoint >= PRINTABLE_ASCII_MIN && codePoint <= PRINTABLE_ASCII_MAX ? key : null;
   }
+  // The shared named-key vocabulary, which the server's evdev table is built
+  // from too: the pane must swallow exactly the keys the seat can synthesize,
+  // since a key it forwards is a key the browser never sees. Modifiers are
+  // deliberately not in that list — the browser needs to see a bare modifier
+  // press to keep its own state straight.
   const normalized = key.toLowerCase();
-  return FORWARDED_NAMED_KEYS.has(normalized) ? normalized : null;
+  return isComputerNamedKey(normalized) ? normalized : null;
 }
 
 export function computerCursorPosition(input: {

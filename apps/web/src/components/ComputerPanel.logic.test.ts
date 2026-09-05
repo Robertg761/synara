@@ -1,14 +1,14 @@
-import type {
-  ComputerFrameHeader,
-  ComputerHealth,
-  ThreadComputerState,
-  ThreadId,
+import {
+  COMPUTER_INPUT_SCROLL_LIMIT,
+  type ComputerFrameHeader,
+  type ComputerHealth,
+  type ThreadComputerState,
+  type ThreadId,
 } from "@synara/contracts";
 import { describe, expect, it } from "vitest";
 
 import {
   COMPUTER_AGENT_ACTIVE_LINGER_MS,
-  COMPUTER_SCROLL_DELTA_LIMIT,
   computerActionLabel,
   computerBackendIsVisibleDesktop,
   computerCanvasLabel,
@@ -56,7 +56,8 @@ function state(overrides: Partial<ThreadComputerState> = {}): ThreadComputerStat
       capture: true,
       input: true,
       clipboard: true,
-      activation: true,
+      focus: true,
+      raise: true,
       ghostCursor: true,
       visibleDesktop: true,
     },
@@ -191,7 +192,7 @@ describe("computer panel state helpers", () => {
     });
     expect(reconnecting?.title).toContain("KWin vanished");
     expect(reconnecting?.title).toContain("3");
-    expect(reconnecting?.title).toContain("Reconnects since startup: 1.");
+    expect(reconnecting?.title).toContain("Reconnected once since startup.");
 
     // Non-connected with a clean record is the lazy backend that has simply
     // never been engaged — the server no longer connects at boot — and must
@@ -384,8 +385,8 @@ describe("computer pane wheel and key mapping", () => {
       deltaY: -800,
     });
     expect(computerWheelScrollDelta({ deltaX: 1e9, deltaY: -1e9, deltaMode: 0 })).toEqual({
-      deltaX: COMPUTER_SCROLL_DELTA_LIMIT,
-      deltaY: -COMPUTER_SCROLL_DELTA_LIMIT,
+      deltaX: COMPUTER_INPUT_SCROLL_LIMIT,
+      deltaY: -COMPUTER_INPUT_SCROLL_LIMIT,
     });
     expect(computerWheelScrollDelta({ deltaX: Number.NaN, deltaY: 0, deltaMode: 0 })).toEqual({
       deltaX: 0,
@@ -434,6 +435,69 @@ function keyEvent(
     metaKey: modifiers.metaKey ?? false,
   });
 }
+
+describe("computerStatusNeedsSetup", () => {
+  it("says no when there is no state yet, so no surface offers Set up on a guess", () => {
+    expect(computerStatusNeedsSetup(undefined)).toBe(false);
+  });
+
+  it("says no on a host that could never have a desktop backend", () => {
+    // "Set up" on Windows would install nothing and explain nothing; the
+    // unsupported-platform message is the whole answer.
+    expect(
+      computerStatusNeedsSetup(
+        state({ availability: { kind: "unsupported-platform", platform: "win32" } }),
+      ),
+    ).toBe(false);
+  });
+
+  it("says no on a ready desktop", () => {
+    expect(computerStatusNeedsSetup(state())).toBe(false);
+  });
+
+  it("says yes on a withheld grant and on a backend that is not there", () => {
+    expect(
+      computerStatusNeedsSetup(
+        state({
+          availability: {
+            kind: "permission-required",
+            missing: ["screenRecording"],
+            message: "needs Screen Recording",
+            buildSignature: "adhoc",
+          },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      computerStatusNeedsSetup(
+        state({ availability: { kind: "backend-unavailable", message: "no helper" } }),
+      ),
+    ).toBe(true);
+  });
+
+  it("says yes when the desktop is driveable but blind", () => {
+    // captureAvailable is live health, not a capability: a Mac with
+    // Accessibility but no Screen Recording answers "available" and still
+    // cannot take a frame, and Set up is exactly what fixes it.
+    expect(
+      computerStatusNeedsSetup(
+        state({ health: { ...connectedHealth(), captureAvailable: false } }),
+      ),
+    ).toBe(true);
+  });
+
+  it("says yes when the backend has not been provisioned into existence yet", () => {
+    // The nested backend reports the empty capability set until its compositor
+    // and plugin exist, which is what routes a first-time user to Set up.
+    expect(
+      computerStatusNeedsSetup(
+        state({
+          capabilities: { ...state().capabilities, input: false, capture: false },
+        }),
+      ),
+    ).toBe(true);
+  });
+});
 
 describe("computerControlReadiness", () => {
   it("is unknown until live state arrives, so the card offers Set up rather than claiming ready", () => {

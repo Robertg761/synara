@@ -27,12 +27,11 @@ import {
   type ComputerWindow,
 } from "@synara/contracts";
 
+import { pngDimensions } from "../pngHeader.ts";
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { unwrapDbusValue } from "./dbusPlumbing.ts";
 import { clampTextToLength } from "./utf8Truncation.ts";
 
-const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
-const PNG_IHDR = Uint8Array.of(0x49, 0x48, 0x44, 0x52);
 /** Prefix of the message a capture failure carries when no backend names itself. */
 const DEFAULT_CAPTURE_SOURCE = "The desktop capture";
 
@@ -467,21 +466,13 @@ export function readPngDimensions(
   bytes: Uint8Array,
   options: { readonly source?: string } = {},
 ): { readonly width: number; readonly height: number } {
-  const source = options.source ?? DEFAULT_CAPTURE_SOURCE;
-  if (
-    bytes.byteLength < 24 ||
-    !PNG_SIGNATURE.every((byte, index) => bytes[index] === byte) ||
-    !PNG_IHDR.every((byte, index) => bytes[12 + index] === byte)
-  ) {
-    throw new ComputerBackendError(`${source} did not return a PNG image.`);
+  const dimensions = pngDimensions(bytes);
+  if (!dimensions) {
+    throw new ComputerBackendError(
+      `${options.source ?? DEFAULT_CAPTURE_SOURCE} did not return a usable PNG image.`,
+    );
   }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const width = view.getUint32(16);
-  const height = view.getUint32(20);
-  if (width < 1 || height < 1) {
-    throw new ComputerBackendError(`${source} has invalid dimensions.`);
-  }
-  return { width, height };
+  return dimensions;
 }
 
 /**

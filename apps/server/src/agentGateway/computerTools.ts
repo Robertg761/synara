@@ -2,7 +2,11 @@
 import { Effect } from "effect";
 
 import {
+  COMPUTER_DRAG_MAX_DURATION_MS,
+  COMPUTER_HOTKEY_MAX_KEYS,
+  COMPUTER_KEY_NAME_MAX_LENGTH,
   COMPUTER_MODIFIERS_MAX_ITEMS,
+  COMPUTER_SEMANTIC_ACTION_MAX_LENGTH,
   COMPUTER_TEXT_MAX_LENGTH,
   COMPUTER_WAIT_MAX_MS,
   type ComputerActionResult,
@@ -40,6 +44,7 @@ import {
   screenshotRectToDesktop,
 } from "../computer/screenshotFrames.ts";
 import { PROVIDERS_WITHOUT_APPROVAL_GATE } from "./approvalGate.ts";
+import { DELIVERY_VERDICT_GUIDANCE } from "./computerGuidance.ts";
 import { mcpToolResultError, mcpToolResultJson, type McpToolCallResult } from "./protocol.ts";
 import {
   ToolInputError,
@@ -280,19 +285,10 @@ const KEYBOARD_TARGET_HINT =
   'Keys go where the agent seat is aimed: click into the window first, or pass window_id. A hover does not aim it. See "Aiming the keyboard" in this server\'s instructions.';
 
 /**
- * The result already carries the verdict; this is what makes the model read it.
- * Without it an unconfirmed delivery reads as plain success, and the model
- * re-sends the same keys — a real session retyped an email address in
- * six-character chunks and looped select-all/paste six times because every call
- * said `ok` while nothing had landed.
- *
- * The three verdicts are spelled out because collapsing them is the opposite
- * failure: most native controls expose no value to read back, so treating
- * anything short of `confirmed` as suspect buys a screenshot after every
- * keystroke and slows every desktop turn for nothing.
+ * The shared verdict account plus the one escalation only this surface can
+ * name: the tool that exists to fix a repeatedly unconfirmed delivery.
  */
-const DELIVERY_NOTE =
-  'The result may carry delivery.verified: "confirmed" means the effect was read back, "unverifiable" means the control exposes no readable value and is the normal answer for most native controls, and "unconfirmed" means the backend looked and did not see the input land. Only on "unconfirmed" check with computer_get_state or computer_screenshot before continuing. Never retry the same input blindly on any verdict. If a retry still comes back unconfirmed and the target window is not the active one, computer_activate_window is the escalation — some applications drop shortcuts sent to an inactive window.';
+const DELIVERY_NOTE = `${DELIVERY_VERDICT_GUIDANCE} If a retry still comes back unconfirmed and the target window is not the active one, computer_activate_window is the escalation — some applications drop shortcuts sent to an inactive window.`;
 
 /**
  * The refusals a model has to tell apart, because the right response to each is
@@ -498,19 +494,18 @@ function readDelta(args: Record<string, unknown>, name: string): number {
 
 const DEFAULT_DRAG_DURATION_MS = 250;
 /**
- * Longest glide a drag may hold the pointer button for. The bound is repeated in
- * the JSON Schema for the model's benefit, but it is enforced here because
- * nothing validates MCP tool arguments against that schema before dispatch: an
- * unclamped `duration_ms` of 1e9 is a drag that holds the button — and the
- * exclusive desktop lease — for eleven days.
+ * Clamped rather than refused: the caller's intent is clear, only the scale is
+ * wrong.
+ *
+ * The contract's bound is enforced here as well as declared in the JSON Schema
+ * because nothing validates MCP tool arguments against that schema before
+ * dispatch: an unclamped `duration_ms` of 1e9 is a drag that holds the button —
+ * and the exclusive desktop lease — for eleven days.
  */
-const MAX_DRAG_DURATION_MS = 30_000;
-
-/** Clamped rather than refused: the caller's intent is clear, only the scale is wrong. */
 function readDragDurationMs(args: Record<string, unknown>): number {
   const value = readNumberArg(args, "duration_ms");
   if (value === undefined) return DEFAULT_DRAG_DURATION_MS;
-  return Math.min(MAX_DRAG_DURATION_MS, Math.max(0, value));
+  return Math.min(COMPUTER_DRAG_MAX_DURATION_MS, Math.max(0, value));
 }
 
 function readRawRequiredString(args: Record<string, unknown>, name: string): string {
@@ -539,10 +534,6 @@ function readSetValueValue(args: Record<string, unknown>): string {
   return value;
 }
 
-/** Mirrors `ComputerHotkeyInput`: at most 16 keys, each a name of 128 characters. */
-const HOTKEY_KEYS_MAX_ITEMS = 16;
-const HOTKEY_KEY_MAX_LENGTH = 128;
-
 /**
  * The hotkey chord. Every key becomes a press/release pair holding the seat,
  * so thousands of keys would hold it indefinitely; the bound is enforced here
@@ -554,26 +545,23 @@ function readHotkeyKeys(args: Record<string, unknown>): readonly string[] {
     (() => {
       throw new ToolInputError('Missing required argument "keys".');
     })();
-  if (keys.length > HOTKEY_KEYS_MAX_ITEMS) {
-    throw new ToolInputError(`Argument "keys" accepts at most ${HOTKEY_KEYS_MAX_ITEMS} keys.`);
+  if (keys.length > COMPUTER_HOTKEY_MAX_KEYS) {
+    throw new ToolInputError(`Argument "keys" accepts at most ${COMPUTER_HOTKEY_MAX_KEYS} keys.`);
   }
-  const oversized = keys.find((key) => key.length > HOTKEY_KEY_MAX_LENGTH);
+  const oversized = keys.find((key) => key.length > COMPUTER_KEY_NAME_MAX_LENGTH);
   if (oversized !== undefined) {
     throw new ToolInputError(
-      `Each key in "keys" is at most ${HOTKEY_KEY_MAX_LENGTH} characters; got one of ${oversized.length}.`,
+      `Each key in "keys" is at most ${COMPUTER_KEY_NAME_MAX_LENGTH} characters; got one of ${oversized.length}.`,
     );
   }
   return keys;
 }
 
-/** Mirrors the contract's action-name bound on semantic actions. */
-const ACTION_NAME_MAX_LENGTH = 256;
-
 function readActionName(args: Record<string, unknown>): string {
   const value = readStringArg(args, "action", { required: true })!;
-  if (value.length > ACTION_NAME_MAX_LENGTH) {
+  if (value.length > COMPUTER_SEMANTIC_ACTION_MAX_LENGTH) {
     throw new ToolInputError(
-      `Argument "action" is longer than ${ACTION_NAME_MAX_LENGTH} characters.`,
+      `Argument "action" is longer than ${COMPUTER_SEMANTIC_ACTION_MAX_LENGTH} characters.`,
     );
   }
   return value;
@@ -1345,7 +1333,7 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_read_clipboard",
-        description: `Read the desktop clipboard as text, returned as "value". ${SHARED_CLIPBOARD_NOTE} It returns whatever was copied last by anyone, so it may hold something the user copied for their own purposes. An empty clipboard returns an empty string; a clipboard holding an image, other non-text content, or more than 16384 characters of text is an error.`,
+        description: `Read the desktop clipboard as text, returned as "value". ${SHARED_CLIPBOARD_NOTE} It returns whatever was copied last by anyone, so it may hold something the user copied for their own purposes. An empty clipboard returns an empty string; a clipboard holding an image, other non-text content, or more than ${COMPUTER_TEXT_MAX_LENGTH} characters of text is an error.`,
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         // Not READ_ONLY_TOOL_ANNOTATIONS: providers auto-approve on
         // readOnlyHint, and this read must go through approval — the clipboard
@@ -1437,8 +1425,8 @@ export function makeAgentGatewayComputerTools(
           duration_ms: {
             type: "integer",
             minimum: 0,
-            maximum: MAX_DRAG_DURATION_MS,
-            description: `How long the pointer takes to travel, in milliseconds. Defaults to ${DEFAULT_DRAG_DURATION_MS}; clamped to ${MAX_DRAG_DURATION_MS}. A longer glide helps an application that needs to see the drag in progress, such as a drag-and-drop target that must highlight before the drop.`,
+            maximum: COMPUTER_DRAG_MAX_DURATION_MS,
+            description: `How long the pointer takes to travel, in milliseconds. Defaults to ${DEFAULT_DRAG_DURATION_MS}; clamped to ${COMPUTER_DRAG_MAX_DURATION_MS}. A longer glide helps an application that needs to see the drag in progress, such as a drag-and-drop target that must highlight before the drop.`,
           },
         },
         required: ["from", "to"],
@@ -1550,7 +1538,7 @@ export function makeAgentGatewayComputerTools(
             type: "array",
             items: { type: "string" },
             minItems: 1,
-            maxItems: HOTKEY_KEYS_MAX_ITEMS,
+            maxItems: COMPUTER_HOTKEY_MAX_KEYS,
             description: hotkeyKeysNote(dialect),
           },
           ...keyboardTargetProperties,

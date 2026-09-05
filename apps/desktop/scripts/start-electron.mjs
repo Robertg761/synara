@@ -12,7 +12,7 @@ if (process.platform === "darwin") {
   // what ships — the difference is small but real, and the fingerprint cache
   // makes it a one-time cost. Pass SYNARA_COMPUTER_HELPER_OPTIMIZE=debug to
   // build.sh directly when iterating on the Swift itself.
-  buildComputerHelper({ arch: process.arch, release: true });
+  buildComputerHelper({ arch: process.arch });
 }
 
 const childEnv = { ...process.env };

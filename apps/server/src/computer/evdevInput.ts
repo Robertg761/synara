@@ -7,6 +7,11 @@
  * rather than restating them.
  */
 import type { ComputerInputModifier } from "@synara/contracts";
+import {
+  COMPUTER_KEY_NAME_ALIASES,
+  type ComputerModifierKeyName,
+  type ComputerNamedKey,
+} from "@synara/shared/computerKeyNames";
 
 /** Linux input-event codes used by every evdev-shaped injection API. */
 export const EVDEV_KEY_CODES = {
@@ -195,39 +200,29 @@ const SHIFTED_CODES: Readonly<Record<string, number>> = {
   "?": EVDEV_KEY_CODES.Slash,
 };
 
-const NAMED_KEYS: Readonly<Record<string, number>> = {
-  esc: EVDEV_KEY_CODES.Escape,
+/**
+ * The canonical named keys, given evdev codes.
+ *
+ * Keyed by `ComputerNamedKey` rather than by a loose string so a name added to
+ * the shared vocabulary fails this file's typecheck until it has a code here,
+ * instead of silently becoming a key the pane forwards and the seat drops.
+ */
+const CANONICAL_NAMED_KEY_CODES: Readonly<Record<ComputerNamedKey, number>> = {
   escape: EVDEV_KEY_CODES.Escape,
   enter: EVDEV_KEY_CODES.Enter,
-  return: EVDEV_KEY_CODES.Enter,
   tab: EVDEV_KEY_CODES.Tab,
   space: EVDEV_KEY_CODES.Space,
-  spacebar: EVDEV_KEY_CODES.Space,
   backspace: EVDEV_KEY_CODES.Backspace,
   delete: EVDEV_KEY_CODES.Delete,
-  del: EVDEV_KEY_CODES.Delete,
   insert: EVDEV_KEY_CODES.Insert,
   home: EVDEV_KEY_CODES.Home,
   end: EVDEV_KEY_CODES.End,
   pageup: EVDEV_KEY_CODES.PageUp,
   pagedown: EVDEV_KEY_CODES.PageDown,
   arrowup: EVDEV_KEY_CODES.ArrowUp,
-  up: EVDEV_KEY_CODES.ArrowUp,
   arrowdown: EVDEV_KEY_CODES.ArrowDown,
-  down: EVDEV_KEY_CODES.ArrowDown,
   arrowleft: EVDEV_KEY_CODES.ArrowLeft,
-  left: EVDEV_KEY_CODES.ArrowLeft,
   arrowright: EVDEV_KEY_CODES.ArrowRight,
-  right: EVDEV_KEY_CODES.ArrowRight,
-  shift: EVDEV_KEY_CODES.LeftShift,
-  ctrl: EVDEV_KEY_CODES.LeftControl,
-  control: EVDEV_KEY_CODES.LeftControl,
-  alt: EVDEV_KEY_CODES.LeftAlt,
-  option: EVDEV_KEY_CODES.LeftAlt,
-  meta: EVDEV_KEY_CODES.LeftMeta,
-  super: EVDEV_KEY_CODES.LeftMeta,
-  command: EVDEV_KEY_CODES.LeftMeta,
-  capslock: EVDEV_KEY_CODES.CapsLock,
   f1: EVDEV_KEY_CODES.F1,
   f2: EVDEV_KEY_CODES.F2,
   f3: EVDEV_KEY_CODES.F3,
@@ -240,6 +235,35 @@ const NAMED_KEYS: Readonly<Record<string, number>> = {
   f10: EVDEV_KEY_CODES.F10,
   f11: EVDEV_KEY_CODES.F11,
   f12: EVDEV_KEY_CODES.F12,
+};
+
+/** The modifier names a chord may hold, each on its left-hand key. */
+const MODIFIER_KEY_CODES: Readonly<Record<ComputerModifierKeyName, number>> = {
+  shift: EVDEV_KEY_CODES.LeftShift,
+  ctrl: EVDEV_KEY_CODES.LeftControl,
+  control: EVDEV_KEY_CODES.LeftControl,
+  alt: EVDEV_KEY_CODES.LeftAlt,
+  option: EVDEV_KEY_CODES.LeftAlt,
+  meta: EVDEV_KEY_CODES.LeftMeta,
+  super: EVDEV_KEY_CODES.LeftMeta,
+  command: EVDEV_KEY_CODES.LeftMeta,
+  capslock: EVDEV_KEY_CODES.CapsLock,
+};
+
+/**
+ * Every spelling this synthesizer accepts: the canonical names, the shared
+ * aliases resolved onto them, and the modifiers. Built rather than written out
+ * so an alias can only ever point at a name that has a code.
+ */
+const NAMED_KEYS: Readonly<Record<string, number>> = {
+  ...CANONICAL_NAMED_KEY_CODES,
+  ...Object.fromEntries(
+    Object.entries(COMPUTER_KEY_NAME_ALIASES).map(([alias, canonical]) => [
+      alias,
+      CANONICAL_NAMED_KEY_CODES[canonical],
+    ]),
+  ),
+  ...MODIFIER_KEY_CODES,
 };
 
 /**

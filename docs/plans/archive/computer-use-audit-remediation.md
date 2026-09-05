@@ -2,7 +2,31 @@
 
 Branch: `computer-use-linux`
 Date: 2026-08-21
-Status: **Plan only — no code changes made yet.**
+Status: **Archived 2026-09-05. Historical record — do not plan from it.**
+
+> **Read this first.** The document below is the plan exactly as written on
+> 2026-08-21, kept verbatim because it records why each fix was made. It is no
+> longer an accurate description of the tree, in three specific ways:
+>
+> 1. **"Plan only — no code changes made yet." is stale.** The plan was executed.
+>    The batches landed on `computer-use-linux` and the fixes are in the code;
+>    treat every finding here as addressed unless a later audit says otherwise.
+> 2. **Roughly a third of it targets files that no longer exist.** Every `portal`
+>    finding (H3, H4, M13, and the `portal`/desktop-helper low items) describes
+>    the shared-seat portal backend, `native/computer-desktop-helper`, and the
+>    GNOME Shell extension, all deleted outright on 2026-08-29 — see
+>    "Shared-seat backend removed" in `docs/computer-use-design.md`. Those
+>    findings were closed by deletion, not by a fix.
+> 3. **The capability model it records was deliberately inverted.** The line
+>    under "Checked and found solid" describing `computer:control` as "opt-in
+>    only via `additionalCapabilities`" was true then and is false now: computer
+>    use is not a switch, and the capability is leased to every provider session
+>    (decided 2026-09-01; see "Current capabilities" in
+>    `docs/computer-use-design.md`). What guards the desktop is the approval gate
+>    on the action tools, which is unchanged.
+>
+> The current audit of this feature is
+> `docs/plans/computer-use-macos-audit-2026-09-04.md`.
 
 ## Scope and method
 

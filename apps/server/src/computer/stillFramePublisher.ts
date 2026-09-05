@@ -33,6 +33,25 @@ import { StillFrameDedupe } from "./stillFrameDedupe.ts";
  */
 const MAX_FORCE_RETRIES = 1;
 
+/**
+ * How often a Tier-1 backend pulls a still when nobody asked for a faster one.
+ * Twice a second: fast enough that the pane reads as live, slow enough that a
+ * whole-desktop PNG encode is not the machine's busiest job.
+ */
+export const DEFAULT_STILL_INTERVAL_MS = 500;
+
+/**
+ * The floor a caller-supplied interval is clamped to. Below this the capture
+ * for one tick has not finished before the next is due, so the loop only ever
+ * queues work it cannot do.
+ */
+export const MIN_STILL_INTERVAL_MS = 100;
+
+/** The one clamp both Tier-1 backends apply to their configured interval. */
+export function resolveStillIntervalMs(intervalMs: number | undefined): number {
+  return Math.max(MIN_STILL_INTERVAL_MS, intervalMs ?? DEFAULT_STILL_INTERVAL_MS);
+}
+
 export interface StillFramePublisherOptions {
   /**
    * Captures one whole-workspace still as raw PNG bytes.

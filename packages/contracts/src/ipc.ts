@@ -168,16 +168,12 @@ import type {
 import type {
   ComputerActionResult,
   ComputerEvent,
-  ComputerGetScreenSizeInput,
-  ComputerGetScreenSizeResult,
   ComputerGetStatusInput,
   ComputerInputClickInput,
   ComputerInputKeyInput,
   ComputerInputScrollInput,
-  ComputerListWindowsInput,
   ComputerProvisionInput,
   ComputerProvisionResult,
-  ComputerListWindowsResult,
   ComputerStatusResult,
   ComputerThreadInput,
   ThreadComputerState,
@@ -984,8 +980,6 @@ export interface NativeApi {
     /** Install or compile whatever this desktop is missing, on user request. */
     provision: (input: ComputerProvisionInput) => Promise<ComputerProvisionResult>;
     getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
-    listWindows: (input: ComputerListWindowsInput) => Promise<ComputerListWindowsResult>;
-    getScreenSize: (input: ComputerGetScreenSizeInput) => Promise<ComputerGetScreenSizeResult>;
     /** User input from the computer dock pane; needs no agent turn in flight. */
     inputClick: (input: ComputerInputClickInput) => Promise<ComputerActionResult>;
     inputScroll: (input: ComputerInputScrollInput) => Promise<ComputerActionResult>;

@@ -35,6 +35,7 @@ import {
   type ComputerCaptureRequest,
   type ComputerFrameListener,
   type ComputerResolvedTarget,
+  DEFAULT_COMPUTER_ID,
 } from "./ComputerBackend.ts";
 import { resolveAppLaunchOnHost, type AppLaunchResolver } from "./appLaunchResolution.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
@@ -66,7 +67,7 @@ import {
   windowInAgentSpace,
   workspaceRectFromWindows,
 } from "./computerGeometry.ts";
-import { StillFramePublisher } from "./stillFramePublisher.ts";
+import { resolveStillIntervalMs, StillFramePublisher } from "./stillFramePublisher.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
 import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./humanActivity.ts";
 import {
@@ -107,9 +108,7 @@ import {
   type ClipboardCommandRunner,
 } from "./wlClipboard.ts";
 
-const DEFAULT_COMPUTER_ID = "desktop";
 const DEFAULT_GLIDE_DURATION_MS = 180;
-const DEFAULT_STILL_INTERVAL_MS = 500;
 const DEFAULT_CAPTURE_MAX_DIMENSION = DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION;
 const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 const KWIN_RECONNECT_BASE_DELAY_MS = 250;
@@ -409,7 +408,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.resolveApp = options.resolveApp ?? resolveAppLaunchOnHost;
     this.runClipboardCommand = options.runClipboardCommand ?? spawnClipboardCommand;
     this.glideDurationMs = Math.max(0, options.glideDurationMs ?? DEFAULT_GLIDE_DURATION_MS);
-    this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
+    this.stillIntervalMs = resolveStillIntervalMs(options.stillIntervalMs);
     this.stills = new StillFramePublisher({
       capture: () => this.captureStillFrame(),
       // A plugin whose capture path is missing must never be asked twice a
@@ -522,7 +521,8 @@ export class KWinComputerBackend implements ComputerBackend {
       capture: true,
       input: true,
       clipboard: true,
-      activation: true,
+      focus: true,
+      raise: true,
       ghostCursor: true,
       visibleDesktop: this.visibleDesktop,
     };

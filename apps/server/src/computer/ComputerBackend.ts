@@ -61,6 +61,30 @@ export const MAX_COMPUTER_CAPTURE_MAX_DIMENSION = 16_384;
 export const MAX_COMPUTER_CLIPBOARD_BYTES = 1024 * 1024;
 
 /**
+ * The id every real desktop backend reports for the one computer it drives.
+ *
+ * Shared rather than repeated because it is the key the frame socket, the pane,
+ * and the thread state all address that desktop by: two backends spelling it
+ * differently would route a frame to a pane that is not listening.
+ */
+export const DEFAULT_COMPUTER_ID = "desktop";
+
+/**
+ * Refuses a clipboard write past `MAX_COMPUTER_CLIPBOARD_BYTES`.
+ *
+ * One check for every backend: the Linux path enforced it and the macOS one did
+ * not, so the same document that was refused on one desktop was piped through a
+ * line-framed helper on the other.
+ */
+export function assertComputerClipboardWriteFits(text: string): void {
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= MAX_COMPUTER_CLIPBOARD_BYTES) return;
+  throw new ComputerBackendError(
+    `Clipboard text is ${bytes} bytes, past the ${MAX_COMPUTER_CLIPBOARD_BYTES} byte limit this tool writes.`,
+  );
+}
+
+/**
  * A zoomed capture request: one window, or one rect of the global desktop
  * coordinate space that window bounds and pointer actions already use.
  */
@@ -184,7 +208,8 @@ export const NO_COMPUTER_CAPABILITIES: ComputerCapabilities = {
   capture: false,
   input: false,
   clipboard: false,
-  activation: false,
+  focus: false,
+  raise: false,
   ghostCursor: false,
   visibleDesktop: false,
 };
@@ -255,13 +280,20 @@ export interface ComputerBackend {
    */
   health(): ComputerHealth;
   /**
-   * What this backend can do, decided by which providers its probe resolved.
-   * Synchronous and cheap by contract: a capability is a property of the
-   * display server this process is talking to, not a live reading, so it is
-   * safe to publish with every state snapshot. It changes for exactly one
-   * reason — provisioning installed something the construction probe did not
-   * see — and that transition arrives through `onEvent` as
-   * `capabilities-changed`, so a caller may cache this until that event fires.
+   * What this backend can do once it is up. Synchronous and cheap by contract:
+   * a capability is a property of the display server this process talks to, not
+   * a live reading, so it is safe to publish with every state snapshot.
+   *
+   * Two things it deliberately is *not*. It is not a permission report: an OS
+   * grant the user has withheld leaves the capability true and shows up in
+   * `probeAvailability()` (`permission-required`) or, for screen capture, in
+   * `health().captureAvailable` — the macOS backend advertises the full set on
+   * a Mac that has granted it nothing. And it is not a live reading of the
+   * running session: only the nested backend varies it at all, reporting the
+   * empty set until its compositor and plugin exist so the settings panel can
+   * offer Set up, and the full KWin set afterwards. That one transition arrives
+   * through `onEvent` as `capabilities-changed`, so a caller may cache this
+   * until the event fires.
    */
   capabilities(): ComputerCapabilities;
   /**

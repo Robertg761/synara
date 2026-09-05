@@ -83,6 +83,26 @@ export const COMPUTER_WINDOW_LIST_MAX_LENGTH = 512;
  * needs hundreds of occluders. Exported for the same reason as above.
  */
 export const COMPUTER_OCCLUDERS_MAX_LENGTH = 32;
+/**
+ * Caps `ComputerProvisionResult.summary`. Exported because the sentence is
+ * composed from output the backend does not control — a compiler's stderr, a
+ * package manager's transcript — and an unbounded one would either fail the
+ * encode of a provision that actually succeeded or push a build log into the
+ * settings card. The producer clamps to this.
+ */
+export const COMPUTER_PROVISION_SUMMARY_MAX_LENGTH = 4_096;
+/**
+ * The longest gesture `computer_drag` may spread over. Exported because the
+ * tool layer advertises the same ceiling it validates against, and a second
+ * literal there drifted from this one.
+ */
+export const COMPUTER_DRAG_MAX_DURATION_MS = 30_000;
+/** Most keys one `computer_hotkey` chord may carry. Exported with the above. */
+export const COMPUTER_HOTKEY_MAX_KEYS = 16;
+/** Longest single key name in a chord. Exported with the above. */
+export const COMPUTER_KEY_NAME_MAX_LENGTH = 128;
+/** Longest semantic action name `computer_perform_action` accepts. */
+export const COMPUTER_SEMANTIC_ACTION_MAX_LENGTH = 256;
 
 /**
  * Thread-activity kind appended by the agent gateway when a computer tool call
@@ -175,9 +195,11 @@ export type ComputerWindowId = typeof ComputerWindowId.Type;
  * An OS privacy grant desktop control needs and the user alone can give.
  *
  * Named rather than described so every surface says the same words: the chat's
- * setup card, the settings panel, the desktop preflight and the tool result the
- * agent reads all key off these two identifiers, and their user-facing labels
- * live in one place (`@synara/shared/computerPermissions`).
+ * setup card, the settings panel, and the tool result the agent reads all key
+ * off these two identifiers, and their user-facing labels live in one place
+ * (`@synara/shared/computerPermissions`). There is no fourth surface — the
+ * Electron-side permission preflight that used to be one was deleted, because
+ * the prompt has to come from the process that actually needs the grant.
  *
  * macOS is the only platform with such a model today. The two are not
  * equivalent: without Accessibility nothing can be driven at all, while without
@@ -339,8 +361,21 @@ export const ComputerCapabilities = Schema.Struct({
   capture: Schema.Boolean,
   input: Schema.Boolean,
   clipboard: Schema.Boolean,
-  /** A window can be focused or raised, so window-targeted typing is possible. */
-  activation: Schema.Boolean,
+  /**
+   * A window can be given the agent's keyboard focus, so window-targeted typing
+   * is possible. Split from `raise` because the two are genuinely separate
+   * abilities and the macOS helper deliberately does one without the other:
+   * it aims the keyboard at a window's process while leaving the stacking order
+   * exactly as the human left it.
+   */
+  focus: Schema.Boolean,
+  /**
+   * A window can be brought in front of the ones covering it. This is the only
+   * ability in this set whose whole effect is on what the person sitting at the
+   * machine sees, which is why `computer_activate_window` — the one tool that
+   * uses it — is gated on this flag alone rather than on `focus`.
+   */
+  raise: Schema.Boolean,
   /** A second pointer the agent drives, drawn without moving the human's cursor. */
   ghostCursor: Schema.Boolean,
   /**
@@ -567,7 +602,7 @@ export type ComputerProvisionInput = typeof ComputerProvisionInput.Type;
  * card it was pressed from is now wrong.
  */
 export const ComputerProvisionResult = Schema.Struct({
-  summary: TrimmedNonEmptyString,
+  summary: TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_PROVISION_SUMMARY_MAX_LENGTH)),
   status: ComputerStatusResult,
 });
 export type ComputerProvisionResult = typeof ComputerProvisionResult.Type;
@@ -716,7 +751,9 @@ export type ComputerWaitInput = typeof ComputerWaitInput.Type;
 export const ComputerDragInput = Schema.Struct({
   from: ComputerTarget,
   to: ComputerTarget,
-  durationMs: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 30_000 }))),
+  durationMs: Schema.optional(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: COMPUTER_DRAG_MAX_DURATION_MS })),
+  ),
 });
 export type ComputerDragInput = typeof ComputerDragInput.Type;
 
@@ -738,10 +775,9 @@ export const ComputerPressKeyInput = Schema.Struct({
 export type ComputerPressKeyInput = typeof ComputerPressKeyInput.Type;
 
 export const ComputerHotkeyInput = Schema.Struct({
-  keys: Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(128))).check(
-    Schema.isMinLength(1),
-    Schema.isMaxLength(16),
-  ),
+  keys: Schema.Array(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_KEY_NAME_MAX_LENGTH)),
+  ).check(Schema.isMinLength(1), Schema.isMaxLength(COMPUTER_HOTKEY_MAX_KEYS)),
 });
 export type ComputerHotkeyInput = typeof ComputerHotkeyInput.Type;
 
@@ -753,7 +789,7 @@ export type ComputerSetValueInput = typeof ComputerSetValueInput.Type;
 
 export const ComputerPerformActionInput = Schema.Struct({
   ...ComputerTargetFields,
-  action: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  action: TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_SEMANTIC_ACTION_MAX_LENGTH)),
 });
 export type ComputerPerformActionInput = typeof ComputerPerformActionInput.Type;
 
@@ -766,7 +802,7 @@ const COMPUTER_INPUT_COORDINATE_MAX = 32_767;
  * is a runaway accumulator rather than a gesture, and forwarding it would spin
  * the desktop through thousands of lines.
  */
-const COMPUTER_INPUT_SCROLL_LIMIT = 4_096;
+export const COMPUTER_INPUT_SCROLL_LIMIT = 4_096;
 
 /**
  * Desktop logical pixels, the same space as window bounds. Integers only: the
@@ -848,10 +884,10 @@ export const ComputerActionResult = Schema.Struct({
    */
   scroll: Schema.optional(
     Schema.Struct({
-      requested: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
-      injected: Schema.Struct({ deltaX: Schema.Number, deltaY: Schema.Number }),
-      traveledY: Schema.optional(Schema.Number),
-      gearing: Schema.optional(Schema.Number),
+      requested: Schema.Struct({ deltaX: Schema.Finite, deltaY: Schema.Finite }),
+      injected: Schema.Struct({ deltaX: Schema.Finite, deltaY: Schema.Finite }),
+      traveledY: Schema.optional(Schema.Finite),
+      gearing: Schema.optional(Schema.Finite),
     }),
   ),
   /**
@@ -942,9 +978,6 @@ export type ComputerEvent = typeof ComputerEvent.Type;
 
 export const COMPUTER_FRAME_MAGIC = 0x5343;
 export const COMPUTER_FRAME_VERSION = 1;
-export const COMPUTER_FRAME_FLAG_KEYFRAME = 0b0000_0001;
-export const COMPUTER_FRAME_FLAG_CODEC_CONFIG = 0b0000_0010;
-export const COMPUTER_FRAME_HEADER_FIXED_BYTES = 17;
 export const COMPUTER_FRAME_MAX_COMPUTER_ID_BYTES = 255;
 
 export const ComputerFrameHeader = Schema.Struct({

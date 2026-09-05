@@ -64,7 +64,7 @@ if (process.platform === "darwin") {
   // build.sh directly when iterating on the Swift itself.
   buildOptionalMacHelper(
     "computer-use",
-    () => buildComputerHelper({ arch: process.arch, release: true }),
+    () => buildComputerHelper({ arch: process.arch }),
     "Computer control will be unavailable in this dev session; everything else runs normally.",
   );
 }

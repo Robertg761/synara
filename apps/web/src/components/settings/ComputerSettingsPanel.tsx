@@ -4,6 +4,10 @@
 // Exports: ComputerSettingsPanel
 
 import {
+  COMPUTER_HYPRLAND_BACKEND,
+  COMPUTER_KWIN_BACKEND,
+  COMPUTER_MAC_BACKEND,
+  COMPUTER_NESTED_KWIN_BACKEND,
   COMPUTER_RELEASE_CONTROL_HOTKEY,
   COMPUTER_RELEASE_HOTKEY_BACKENDS,
   type ComputerCapabilities,
@@ -18,6 +22,8 @@ import { useQuery } from "@tanstack/react-query";
 import type { AppSettingsBinding } from "~/appSettings";
 import {
   computerBackendIsVisibleDesktop,
+  computerLastFailureNote,
+  computerReconnectsNote,
   computerStatusNeedsSetup,
   resolveComputerAvailabilityView,
 } from "~/components/ComputerPanel.logic";
@@ -41,10 +47,10 @@ import {
 const EMPTY_PERMISSIONS: readonly ComputerPermission[] = [];
 
 const BACKEND_DISPLAY_NAMES: Record<string, string> = {
-  kwin: "KWin plugin (KDE)",
-  hyprland: "Hyprland plugin",
-  "nested-kwin": "Isolated agent desktop (nested KWin)",
-  mac: "macOS desktop",
+  [COMPUTER_KWIN_BACKEND]: "KWin plugin (KDE)",
+  [COMPUTER_HYPRLAND_BACKEND]: "Hyprland plugin",
+  [COMPUTER_NESTED_KWIN_BACKEND]: "Isolated agent desktop (nested KWin)",
+  [COMPUTER_MAC_BACKEND]: "macOS desktop",
   fake: "Test backend",
 };
 
@@ -58,7 +64,8 @@ const CAPABILITY_LABELS: ReadonlyArray<{
   { key: "windows", label: "window listing" },
   { key: "windowBounds", label: "window geometry" },
   { key: "stacking", label: "stacking order" },
-  { key: "activation", label: "window activation" },
+  { key: "focus", label: "keyboard focus" },
+  { key: "raise", label: "window raising" },
   { key: "clipboard", label: "clipboard" },
   { key: "ghostCursor", label: "ghost cursor" },
 ];
@@ -127,7 +134,7 @@ export function ComputerSettingsPanel({
   // it, and a nested offscreen session never hears the human's keys, so only a
   // visible plugin-backed desktop may promise it.
   const capabilitiesDescription =
-    backend === "mac"
+    backend === COMPUTER_MAC_BACKEND
       ? "The agent shares your desktop. It drives a cursor Synara draws, so your own pointer never moves, and it clicks and types into background windows without raising them. When an app refuses input in the background, Synara brings it forward for a moment and puts your app back."
       : backend !== null &&
           COMPUTER_RELEASE_HOTKEY_BACKENDS.includes(backend) &&
@@ -160,16 +167,12 @@ export function ComputerSettingsPanel({
   // Shared with the chat's setup card, which asks the same question of the same
   // status after pressing the same server-side Set up.
   const needsSetup = computerStatusNeedsSetup(status);
+  // The same two sentences the pane's health badge composes, from the same
+  // helpers: one account of a supervision state, however it is surfaced.
   const healthNotes = [
-    ...(health && health.reconnects > 0
-      ? [
-          `Reconnected ${health.reconnects === 1 ? "once" : `${health.reconnects} times`} since startup.`,
-        ]
-      : []),
-    ...(health?.lastFailure && availabilityView.kind === "ready"
-      ? [`Last failure: ${health.lastFailure.message}`]
-      : []),
-  ];
+    computerReconnectsNote(health),
+    availabilityView.kind === "ready" ? computerLastFailureNote(health) : null,
+  ].filter((note): note is string => note !== null);
 
   return (
     <div className="space-y-6">
@@ -259,7 +262,7 @@ export function ComputerSettingsPanel({
                 </span>
               }
               description={
-                backend === "mac"
+                backend === COMPUTER_MAC_BACKEND
                   ? "The agent can act on the desktop but cannot see it, so screenshots fail. Turn Synara on in System Settings › Privacy & Security › Screen Recording, then press Set up to reconnect."
                   : "The agent can act on the desktop but cannot see it, so screenshots fail. Press Set up to reconnect."
               }

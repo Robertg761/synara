@@ -53,8 +53,9 @@ describe("Synara harness policy", () => {
     // failure: an agent told that anything short of "confirmed" is suspect
     // screenshots after every keystroke on the many native controls that expose
     // no value to read back.
-    assert.include(policy, '"unverifiable" means the control exposes no value to read');
-    assert.include(policy, 'only "unconfirmed" means the backend looked and did not see');
+    assert.include(policy, '"unverifiable" means the control exposes no readable value');
+    assert.include(policy, '"unconfirmed" means the backend looked and did not see');
+    assert.include(policy, 'Only on "unconfirmed" look at the screen');
     assert.include(policy, "Never resend the same input blindly on any verdict");
     // The policy goes to Linux hosts too, so it must not assert that a desktop
     // permission failure is a macOS one.

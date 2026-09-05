@@ -78,7 +78,6 @@ const program = Effect.gen(function* () {
       attachments: [],
     },
     modelSelection,
-    enableComputerControl: true,
     runtimeMode: "full-access",
     interactionMode: "default",
     createdAt: now(),

@@ -40,6 +40,8 @@ import {
   type ComputerCaptureRequest,
   type ComputerFrameListener,
   type ComputerResolvedTarget,
+  DEFAULT_COMPUTER_ID,
+  assertComputerClipboardWriteFits,
 } from "./ComputerBackend.ts";
 import {
   alignRect,
@@ -47,6 +49,7 @@ import {
   asRecord,
   asString,
   formatRect,
+  parseComputerRect,
   pointerClampResult,
   readPngDimensions,
   requireWindowBounds,
@@ -61,7 +64,7 @@ import {
 } from "./computerGeometry.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
 import { responsibleDesktopBundleId } from "./computerSetupSignal.ts";
-import { StillFramePublisher } from "./stillFramePublisher.ts";
+import { resolveStillIntervalMs, StillFramePublisher } from "./stillFramePublisher.ts";
 import {
   MacComputerHelperClient,
   MAC_HELPER_METHODS,
@@ -77,8 +80,6 @@ import {
 } from "./macComputerHelperProvisioning.ts";
 import { parseMacUiForest } from "./macUiTree.ts";
 
-const DEFAULT_COMPUTER_ID = "desktop";
-const DEFAULT_STILL_INTERVAL_MS = 500;
 const DEFAULT_DRAG_DURATION_MS = 220;
 const UNSUPPORTED_MACOS_MESSAGE =
   "This Synara build does not include its macOS computer-control helper, and no Swift " +
@@ -501,7 +502,7 @@ export class MacComputerBackend implements ComputerBackend {
     this.computerId = (options.computerId ?? DEFAULT_COMPUTER_ID) as ComputerId;
     this.platform = options.platform ?? process.platform;
     this.now = options.now ?? Date.now;
-    this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
+    this.stillIntervalMs = resolveStillIntervalMs(options.stillIntervalMs);
     this.captureMaxDimension = Math.max(
       1,
       Math.min(
@@ -558,10 +559,17 @@ export class MacComputerBackend implements ComputerBackend {
   /**
    * The macOS Tier-1 capability set. The native helper enumerates windows with
    * `CGWindowList` geometry and stacking, captures with ScreenCaptureKit, posts
-   * input to target processes, reads and writes `NSPasteboard`, raises windows
-   * through AX, and draws the Software Cursor overlay — so every capability is
-   * true. `capture` being true is the capability's existence; whether the live
-   * Screen Recording grant is present rides on `health.captureAvailable`.
+   * input to target processes, reads and writes `NSPasteboard`, and draws the
+   * Software Cursor overlay — so every capability is true. `capture` being true
+   * is the capability's existence; whether the live Screen Recording grant is
+   * present rides on `health.captureAvailable`.
+   *
+   * `focus` and `raise` are both true but mean different things here, which is
+   * why they are two flags. `focus` is the ordinary path: the helper aims the
+   * keyboard at a window's process and the stacking order is left exactly as the
+   * human left it. `raise` is `computer_activate_window` alone, and the helper
+   * raises only *within* the window's owning application — it refuses rather
+   * than pulling a different app in front of the person sitting there.
    */
   capabilities(): ComputerCapabilities {
     return {
@@ -571,7 +579,8 @@ export class MacComputerBackend implements ComputerBackend {
       capture: true,
       input: true,
       clipboard: true,
-      activation: true,
+      focus: true,
+      raise: true,
       ghostCursor: true,
       visibleDesktop: true,
     };
@@ -1154,6 +1163,9 @@ export class MacComputerBackend implements ComputerBackend {
   }
 
   async writeClipboard(text: string): Promise<void> {
+    // The same ceiling the Linux path enforces, through the same check: without
+    // it a whole document went down the helper's line framer.
+    assertComputerClipboardWriteFits(text);
     await this.call(MAC_HELPER_METHODS.writeClipboard, { text });
   }
 
@@ -1451,17 +1463,19 @@ export class MacComputerBackend implements ComputerBackend {
     return this.lastOrigin;
   }
 
+  /**
+   * A rect off the helper, rejected unless it has area.
+   *
+   * The parse itself is `parseComputerRect`, shared with every other backend;
+   * the only thing added here is the stricter emptiness rule. A zero-sized
+   * workspace or capture region is not a degenerate rect to carry forward, it
+   * is a helper that answered without knowing, and the callers have a real
+   * fallback for that (`workspaceRectFromWindows`).
+   */
   private parseWorkspace(value: unknown): ComputerRect | undefined {
-    const record = asRecord(value);
-    const x = asFiniteNumber(record.x);
-    const y = asFiniteNumber(record.y);
-    const width = asFiniteNumber(record.width);
-    const height = asFiniteNumber(record.height);
-    if (x === undefined || y === undefined || width === undefined || height === undefined) {
-      return undefined;
-    }
-    if (width <= 0 || height <= 0) return undefined;
-    return { x, y, width, height };
+    const rect = parseComputerRect(value);
+    if (!rect || rect.width <= 0 || rect.height <= 0) return undefined;
+    return rect;
   }
 
   /**

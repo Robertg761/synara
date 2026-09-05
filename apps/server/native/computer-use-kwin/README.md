@@ -314,10 +314,15 @@ apps/server/native/computer-use-kwin/scripts/install-and-load.sh
 ```
 
 The installer keeps its build cache under `~/.cache/synara/` and its signature
-under `~/.local/state/synara/`. It uses `sudo install` for the root-owned KWin
-plugin directory. Use `--force` when you deliberately want another versioned
-load of the same source and KWin build. `--noninteractive` is for the systemd
-unit and uses `sudo -n`.
+under `~/.local/state/synara/`, and installs the plugin into the user's home —
+`~/.local/lib*/qt6/plugins`, reachable through `QT_PLUGIN_PATH` — so an ordinary
+install needs **no root at all**, and Synara's own provisioning path
+(`kwinPluginProvisioning.ts`) never leaves the home directory. `sudo install` is
+used only by a caller who deliberately points `--plugin-dir` at a
+root-owned directory; the script asks for it at that point and not before. Use
+`--force` when you deliberately want another versioned load of the same source
+and KWin build. `--noninteractive` is for the systemd unit and passes `-n` to
+sudo so such a call fails rather than blocking on a prompt.
 
 For a compile-only build that does not install or load anything:
 
@@ -433,8 +438,9 @@ apps/server/native/computer-use-kwin/systemd/enable.sh
 ```
 
 The helper enables the path and timer without starting either one. The service
-passes `--noninteractive`, so unattended installation needs a narrow sudo rule
-for the plugin copy or another policy that permits `sudo -n install`.
+passes `--noninteractive`, which is only a constraint if the unit was pointed at
+a system plugin directory: a home-directory install, the default, needs no
+sudo rule at all.
 
 ## Provenance
 

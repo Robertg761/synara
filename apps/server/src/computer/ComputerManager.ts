@@ -4,6 +4,7 @@ import {
   ComputerId,
   ComputerPoint,
   ComputerScreenSize,
+  COMPUTER_PROVISION_SUMMARY_MAX_LENGTH,
   COMPUTER_TEXT_MAX_LENGTH,
   ThreadId,
   type ComputerActionResult,
@@ -54,6 +55,7 @@ import {
   resolveComputerWindowTarget,
 } from "./uiTreeTargeting.ts";
 import { describeComputerUiTree } from "./uiTreeText.ts";
+import { clampTextToLength } from "./utf8Truncation.ts";
 
 export const COMPUTER_FRAME_QUEUE_LIMIT = 8;
 export const COMPUTER_FRAME_SOCKET_BUDGET_BYTES = 2 * 1024 * 1024;
@@ -486,7 +488,14 @@ export class ComputerManager {
     if (!this.backend.provision) {
       throw new Error("This desktop backend has nothing to install.");
     }
-    const summary = await this.backend.provision();
+    // Composed from output nothing here controls — a compiler's diagnostics, a
+    // package manager's transcript — so it is clamped before it can either fail
+    // the encode of a provision that actually succeeded or push a build log
+    // into the settings card.
+    const summary = clampTextToLength(
+      await this.backend.provision(),
+      COMPUTER_PROVISION_SUMMARY_MAX_LENGTH,
+    );
     return { summary, status: await this.getStatus() };
   }
 
@@ -1003,7 +1012,7 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const raise = this.backend.raiseWindow?.bind(this.backend);
-    if (!raise || !this.backendCapabilities.activation) {
+    if (!raise || !this.backendCapabilities.raise) {
       throw activationUnsupportedError();
     }
     const windows = await this.readWindows();

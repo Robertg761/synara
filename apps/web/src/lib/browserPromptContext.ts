@@ -8,7 +8,6 @@ const EXPLICIT_COMPUTER_USE_PATTERNS = [
   "computer-use",
   "@computer-use",
   "@computer use",
-  "mcp__computer_use__",
 ];
 
 const INTERNAL_BROWSER_SCOPE_PATTERNS = [

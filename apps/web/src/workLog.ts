@@ -116,7 +116,6 @@ export interface WorkLogAutomation {
 }
 
 export interface WorkLogComputerSetupRequired {
-  toolName: string | null;
   /**
    * The grants the OS is withholding, so the card can name them. Empty when the
    * backend refused without naming one — the card then says what it can.
@@ -655,7 +654,6 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
     const buildSignature = asComputerBuildSignature(payload?.buildSignature);
     const bundleId = asTrimmedString(payload?.bundleId);
     entry.computerSetupRequired = {
-      toolName: asTrimmedString(payload?.toolName),
       missing: asComputerPermissions(payload?.missing),
       ...(buildSignature ? { buildSignature } : {}),
       ...(bundleId ? { bundleId } : {}),

@@ -65,6 +65,7 @@ import {
   type HelperProbeResult,
 } from "./helperCapabilities.ts";
 import { HELPER_METHODS, HelperClient, type DeviceHelperError } from "./helperClient.ts";
+import { pngDimensions, type PngDimensions } from "../pngHeader.ts";
 import {
   SANDBOX_OPT_OUT_ENV,
   sandboxedHelperCommand,
@@ -1407,14 +1408,13 @@ export function normalizeUiNode(raw: unknown): DeviceUiNode {
   };
 }
 
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-/** Width/height live in the IHDR chunk at a fixed offset; no decoder needed. */
-export function readPngDimensions(
-  bytes: Buffer,
-): { readonly width: number; readonly height: number } | null {
-  if (bytes.byteLength < 24 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
-  const width = bytes.readUInt32BE(16);
-  const height = bytes.readUInt32BE(20);
-  return width > 0 && height > 0 ? { width, height } : null;
+/**
+ * Width/height from the PNG header, or null when the bytes are not one.
+ *
+ * A thin alias over the shared reader, kept as a named export because this
+ * module's own callers and tests know it by this name; the parse itself is
+ * `pngHeader.ts`, shared with the computer backends.
+ */
+export function readPngDimensions(bytes: Buffer): PngDimensions | null {
+  return pngDimensions(bytes);
 }

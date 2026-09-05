@@ -56,7 +56,8 @@ const DEFAULT_FAKE_CAPABILITIES: ComputerCapabilities = {
   capture: true,
   input: true,
   clipboard: true,
-  activation: true,
+  focus: true,
+  raise: true,
   ghostCursor: true,
   visibleDesktop: false,
 };

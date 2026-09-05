@@ -15,7 +15,11 @@
  */
 import { spawn } from "node:child_process";
 
-import { ComputerBackendError, MAX_COMPUTER_CLIPBOARD_BYTES } from "./ComputerBackend.ts";
+import {
+  assertComputerClipboardWriteFits,
+  ComputerBackendError,
+  MAX_COMPUTER_CLIPBOARD_BYTES,
+} from "./ComputerBackend.ts";
 
 /** Enough stderr to quote a wl-clipboard diagnostic, never enough to hold a payload. */
 const MAX_CLIPBOARD_STDERR_BYTES = 8 * 1024;
@@ -107,12 +111,7 @@ export async function readWlClipboard(run: ClipboardCommandRunner): Promise<stri
 
 /** Replaces the seat0 clipboard, which discards whatever the human last copied. */
 export async function writeWlClipboard(run: ClipboardCommandRunner, text: string): Promise<void> {
-  const bytes = Buffer.byteLength(text, "utf8");
-  if (bytes > MAX_COMPUTER_CLIPBOARD_BYTES) {
-    throw new ComputerBackendError(
-      `Clipboard text is ${bytes} bytes, past the ${MAX_COMPUTER_CLIPBOARD_BYTES} byte limit this tool writes.`,
-    );
-  }
+  assertComputerClipboardWriteFits(text);
   const result = await runClipboardCommand(run, {
     command: WL_COPY,
     args: ["--type", CLIPBOARD_WRITE_TYPE],

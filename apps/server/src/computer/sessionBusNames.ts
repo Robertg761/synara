@@ -40,23 +40,6 @@ export async function sessionBusNameHasOwner(name: string): Promise<boolean> {
   });
 }
 
-/** One `org.freedesktop.DBus.Properties.Get`, on a connection that does not outlive it. */
-export async function readSessionBusProperty(spec: {
-  readonly busName: string;
-  readonly objectPath: string;
-  readonly interfaceName: string;
-  readonly propertyName: string;
-}): Promise<unknown> {
-  return await withSessionBus(async (bus) => {
-    const object = await withBusTimeout(
-      Promise.resolve(bus.getProxyObject(spec.busName, spec.objectPath)),
-      "getProxyObject",
-    );
-    const properties = object.getInterface("org.freedesktop.DBus.Properties");
-    return await invokeKWinDbusMethod(properties, "Get", spec.interfaceName, spec.propertyName);
-  });
-}
-
 /**
  * Runs one operation on a throwaway session-bus connection.
  *

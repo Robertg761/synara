@@ -304,6 +304,10 @@
       "types": "./src/computerHelperPaths.ts",
       "import": "./src/computerHelperPaths.ts"
     },
+    "./computerKeyNames": {
+      "types": "./src/computerKeyNames.ts",
+      "import": "./src/computerKeyNames.ts"
+    },
     "./computerPermissions": {
       "types": "./src/computerPermissions.ts",
       "import": "./src/computerPermissions.ts"
