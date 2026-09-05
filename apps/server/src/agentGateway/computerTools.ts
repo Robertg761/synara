@@ -508,8 +508,24 @@ export function makeAgentGatewayComputerTools(
     payload: Record<string, unknown>,
     screenshot: ComputerScreenshot,
     windowId?: string,
+    reuseUnchanged = false,
   ): McpToolCallResult => {
     const { bytesBase64, ...metadata } = screenshot;
+    const previous = reuseUnchanged
+      ? frames.matchLatest(threadId, screenshot, windowId)
+      : undefined;
+    if (previous) {
+      return mcpToolResultJson({
+        ...payload,
+        screenshotUnchanged: true,
+        screenshot: {
+          ...metadata,
+          screenshotId: previous.id,
+          ...(windowId !== undefined ? { windowId } : {}),
+        },
+        note: "The image and coordinate frame are unchanged. Keep using this screenshotId and the previous image.",
+      });
+    }
     const frame = frames.record(threadId, screenshot, windowId);
     return {
       content: [
@@ -575,7 +591,7 @@ export function makeAgentGatewayComputerTools(
     ) =>
     (args: Record<string, unknown>, context: ToolContext) =>
       Effect.tryPromise({
-        try: async () => {
+        try: async (signal) => {
           if (
             computerToolRequiresApproval(name) &&
             PROVIDERS_WITHOUT_APPROVAL_GATE.has(context.callerProvider)
@@ -586,8 +602,14 @@ export function makeAgentGatewayComputerTools(
           // desktop, and the badge has to name this thread from the first
           // action rather than from the second.
           manager.setThreadLabel(context.callerThreadId, context.callerThreadLabel);
-          const value = await manager.withAgentActivity(context.callerThreadId, () =>
-            run(args, context),
+          const value = await manager.withAgentActivity(
+            context.callerThreadId,
+            async () => {
+              await Effect.runPromise(context.assertCallerTurnActive(), { signal });
+              signal.throwIfAborted();
+              return run(args, context);
+            },
+            signal,
           );
           return isToolResult(value) ? value : mcpToolResultJson(value);
         },
@@ -643,14 +665,13 @@ export function makeAgentGatewayComputerTools(
         note: "The window this action targeted no longer exists — the action likely closed it, so no post-action screenshot was taken. Use computer_list_windows or computer_get_state to see the desktop now.",
       };
     }
-    if ("screenshotUnchanged" in capture) {
-      return {
-        ...result,
-        screenshotUnchanged: true,
-        note: "The screen has not changed since your previous screenshot, pixel for pixel, so the identical image was not sent again. Keep reading the previous one. If you expected this action to change something, it did not land — check the window is focused and not covered, or that the control is where you aimed.",
-      };
-    }
-    return deliverScreenshot(context.callerThreadId, result, capture.screenshot, capture.windowId);
+    return deliverScreenshot(
+      context.callerThreadId,
+      result,
+      capture.screenshot,
+      capture.windowId,
+      true,
+    );
   };
 
   /**
@@ -669,11 +690,7 @@ export function makeAgentGatewayComputerTools(
     return withObservation(
       context,
       result,
-      await manager.captureActionScreenshot(
-        result.windowId,
-        result.clampedTo ?? result.point,
-        context.callerThreadId,
-      ),
+      await manager.captureActionScreenshot(result.windowId, result.clampedTo ?? result.point),
     );
   };
 

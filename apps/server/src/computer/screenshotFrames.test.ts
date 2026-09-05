@@ -125,3 +125,47 @@ describe("ScreenshotFrameRegistry", () => {
     expect(() => frames.resolve("t")).toThrow(ComputerTargetError);
   });
 });
+
+describe("screenshot reuse", () => {
+  const image = {
+    ...shot(200, 400, { x: 1050, y: 120, width: 400, height: 800 }),
+    mimeType: "image/png" as const,
+    sizeBytes: 3,
+    bytesBase64: "YWJj",
+    capturedAt: "2026-09-05T00:00:00.000Z",
+  };
+
+  it("requires identical pixels, window, geometry, and scale in the latest delivered frame", () => {
+    const frames = new ScreenshotFrameRegistry();
+    const frame = frames.record("thread-a", image, "window-a");
+    expect(
+      frames.matchLatest(
+        "thread-a",
+        { ...image, capturedAt: "2026-09-05T00:01:00.000Z" },
+        "window-a",
+      ),
+    ).toBe(frame);
+    expect(frames.matchLatest("thread-a", image, "window-b")).toBeUndefined();
+    expect(frames.matchLatest("thread-b", image, "window-a")).toBeUndefined();
+    for (const changed of [
+      { ...image, scale: 1 },
+      { ...image, width: 201 },
+      { ...image, bytesBase64: "ZGVm" },
+      { ...image, region: { ...image.region, x: 600 } },
+    ]) {
+      expect(frames.matchLatest("thread-a", changed, "window-a")).toBeUndefined();
+    }
+    frames.record("thread-b", image, "window-a");
+    expect(frames.matchLatest("thread-a", image, "window-a")).toBe(frame);
+    frames.record("thread-a", image, "window-b");
+    expect(frames.matchLatest("thread-a", image, "window-a")).toBeUndefined();
+  });
+
+  it("invalidates the active frame after delivering an image without geometry", () => {
+    const frames = new ScreenshotFrameRegistry();
+    frames.record("thread-a", image, "window-a");
+    frames.record("thread-a", { width: 1, height: 1, bytesBase64: "YWJj" });
+    expect(frames.matchLatest("thread-a", image, "window-a")).toBeUndefined();
+    expect(() => frames.resolve("thread-a")).toThrow("No screenshot");
+  });
+});

@@ -37,3 +37,7 @@ absolute path with no relogin ever.
 Development testing runs in a disposable nested Hyprland (nested inside a
 headless `kwin_wayland --virtual` parent — Hyprland cannot boot headless on a
 busy seat), never against the live desktop.
+
+Run `make test` for the compositor-free input regression fixture. It compiles
+the production input functions against stub protocol resources and checks
+clicks, dragging, scrolling, focus restoration, and refusal cleanup.

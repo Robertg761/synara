@@ -16,7 +16,7 @@ import {
   PROVIDERS_WITHOUT_APPROVAL_GATE,
 } from "./computerTools.ts";
 import type { McpToolCallResult } from "./protocol.ts";
-import type { ToolContext } from "./toolRuntime.ts";
+import { GatewayToolError, type ToolContext } from "./toolRuntime.ts";
 
 const THREAD = "thread-computer";
 
@@ -747,7 +747,11 @@ describe("agent gateway computer tools", () => {
     expect(resultJson(repeat)).toMatchObject({
       action: "computer_press_key",
       screenshotUnchanged: true,
-      note: expect.stringContaining("has not changed since your previous screenshot"),
+      screenshot: {
+        screenshotId: (resultJson(first) as { screenshot: { screenshotId: string } }).screenshot
+          .screenshotId,
+      },
+      note: expect.stringContaining("image and coordinate frame are unchanged"),
     });
     expect(backend.callsFor("captureScreenshot")).toHaveLength(2);
 
@@ -1165,5 +1169,100 @@ describe("agent gateway computer tools", () => {
     };
     // The clamp is the schema's own bound, not a second opinion about it.
     expect(schema.properties.duration_ms).toMatchObject({ maximum: 30_000, minimum: 0 });
+  });
+});
+
+describe("screenshot delivery consistency", () => {
+  it("refreshes screenshot coordinates when an unchanged window moves", async () => {
+    const { backend, manager, call } = await setup();
+    try {
+      await call("computer_press_key", { key: "enter", window_id: "fake-calculator" });
+      const windows = await backend.listWindows();
+      backend.emitWindowsChanged(
+        windows.map((w) =>
+          w.id === "fake-calculator" ? { ...w, bounds: { ...w.bounds!, x: 600 } } : w,
+        ),
+      );
+      await call("computer_press_key", { key: "enter", window_id: "fake-calculator" });
+      await call("computer_click", { x: 5, y: 5, include_screenshot: false });
+      expect(backend.callsFor("click").at(-1)?.args[0]).toEqual({ x: 605, y: 125 });
+    } finally {
+      await manager.dispose();
+    }
+  });
+  it("returns the action window after an intervening workspace screenshot", async () => {
+    const { manager, call, see } = await setup();
+    try {
+      await call("computer_press_key", { key: "enter", window_id: "fake-calculator" });
+      await see();
+      const repeat = await call("computer_press_key", {
+        key: "enter",
+        window_id: "fake-calculator",
+      });
+      expect(repeat.content.some((c) => c.type === "image")).toBe(true);
+    } finally {
+      await manager.dispose();
+    }
+  });
+});
+
+describe("computer operation ordering", () => {
+  it("keeps pane input after the action observation and refuses a queued call from an ended turn", async () => {
+    const { backend, manager, byName, call } = await setup();
+    let finish = () => {};
+    let entered = () => {};
+    const held = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const pressKey = backend.pressKey.bind(backend);
+    backend.pressKey = async (key) => {
+      const result = await pressKey(key);
+      entered();
+      await held;
+      return result;
+    };
+    const events: string[] = [];
+    const capture = backend.captureScreenshot.bind(backend);
+    backend.captureScreenshot = async (request) => {
+      events.push("capture");
+      return capture(request);
+    };
+    const type = backend.typeText.bind(backend);
+    backend.typeText = async (text) => {
+      events.push("pane input");
+      return type(text);
+    };
+    let active = true;
+    try {
+      const first = call("computer_press_key", { key: "enter" });
+      await started;
+      const paneInput = manager.typeText(undefined, "human");
+      const context = {
+        ...makeContext(),
+        assertCallerTurnActive: () =>
+          active
+            ? Effect.void
+            : Effect.fail(
+                new GatewayToolError("caller_turn_inactive", "The requesting turn ended."),
+              ),
+      };
+      const next = Effect.runPromise(
+        byName.get("computer_press_key")!.handler({ key: "escape" }, context),
+      );
+      active = false;
+      expect(events).toEqual([]);
+      finish();
+      await first;
+      await paneInput;
+      expect((await next).isError).toBe(true);
+      expect(events).toEqual(["capture", "pane input"]);
+      expect(backend.callsFor("pressKey")).toHaveLength(1);
+    } finally {
+      finish();
+      await manager.dispose();
+    }
   });
 });

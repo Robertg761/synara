@@ -745,6 +745,79 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  /**
+   * The release the lease reactor sends on session.exited can land while the
+   * dead session's last call is still executing — a gateway call cannot be
+   * aborted. Handing the desktop over at that moment would put two threads on
+   * the same pointer, so the release waits for the call to drain.
+   */
+  it("defers a release until the owner's in-flight call drains", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    await manager.getThreadState("thread-a");
+    await manager.getThreadState("thread-b");
+
+    const started = deferred();
+    const finish = deferred();
+    const inFlight = manager.withAgentActivity("thread-a", async () => {
+      await manager.click("thread-a", { x: 10, y: 10 });
+      started.resolve();
+      await finish.promise;
+    });
+    await started.promise;
+
+    await manager.releaseDesktopControl("thread-a");
+    // Still A's desktop: the release is recorded, not applied.
+    await expect(manager.typeText("thread-b", "hi")).rejects.toThrow(/another conversation/);
+    await expect(manager.getThreadState("thread-b")).resolves.toMatchObject({
+      controlledByOtherThread: true,
+    });
+
+    finish.resolve();
+    await inFlight;
+    // The drain completed the release, and told every thread so.
+    await expect(manager.getThreadState("thread-b")).resolves.toMatchObject({
+      controlledByOtherThread: false,
+    });
+    await expect(manager.typeText("thread-b", "hi")).resolves.toMatchObject({
+      action: "computer_type_text",
+    });
+    await expect(manager.click("thread-a", { x: 10, y: 10 })).rejects.toThrow(
+      /another conversation/,
+    );
+
+    await manager.dispose();
+  });
+
+  it("reacquires the lease for a new turn after the previous operation drains", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    await manager.getThreadState("thread-a");
+
+    const started = deferred();
+    const finish = deferred();
+    const inFlight = manager.withAgentActivity("thread-a", async () => {
+      await manager.click("thread-a", { x: 10, y: 10 });
+      started.resolve();
+      await finish.promise;
+    });
+    await started.promise;
+    await manager.releaseDesktopControl("thread-a");
+    // The next turn waits for the old operation, then takes a fresh lease.
+    const nextTurn = manager.click("thread-a", { x: 20, y: 20 });
+    expect(backend.callsFor("click")).toHaveLength(1);
+    finish.resolve();
+    await inFlight;
+    await nextTurn;
+
+    await expect(manager.typeText("thread-b", "hi")).rejects.toThrow(/another conversation/);
+    await expect(manager.getThreadState("thread-b")).resolves.toMatchObject({
+      controlledByOtherThread: true,
+    });
+
+    await manager.dispose();
+  });
+
   it("expires an idle lease as a backstop, but never one whose owner is still acting", async () => {
     const backend = new FakeComputerBackend();
     let nowMs = 0;
@@ -1357,71 +1430,18 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
-  it("reports an unchanged screen instead of resending identical pixels", async () => {
+  it("returns every capture for the gateway to compare with delivered screenshots", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend, actionSettleMs: 0 });
-
-    const first = await manager.captureActionScreenshot("fake-terminal");
-    expect(first !== undefined && "screenshot" in first).toBe(true);
-
-    // The fake returns the same PNG every time, which is exactly the live case
-    // this exists for: an action the desktop did not visibly react to.
-    expect(await manager.captureActionScreenshot("fake-terminal")).toEqual({
-      screenshotUnchanged: true,
-      windowId: "fake-terminal",
-    });
-    // The capture still happens — the only thing skipped is sending the bytes.
-    expect(backend.callsFor("captureScreenshot")).toHaveLength(2);
-
-    // Another window's identical pixels are not a repeat: this is the caller's
-    // first sight of that window.
-    const other = await manager.captureActionScreenshot("fake-calculator");
-    expect(other !== undefined && "screenshot" in other).toBe(true);
-    // And the memory follows the last image handed over, so the terminal is
-    // sent again rather than reported as unchanged against the calculator.
-    const back = await manager.captureActionScreenshot("fake-terminal");
-    expect(back !== undefined && "screenshot" in back).toBe(true);
-
-    await manager.dispose();
-  });
-
-  it("never reports an unchanged screen to a thread that has not seen it", async () => {
-    const backend = new FakeComputerBackend();
-    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
-
-    const seenByA = await manager.captureActionScreenshot("fake-terminal", undefined, "thread-a");
-    expect(seenByA !== undefined && "screenshot" in seenByA).toBe(true);
-
-    // Identical pixels, different thread: thread B has no previous screenshot
-    // to keep reading, so the bytes must be sent, not suppressed.
-    const firstForB = await manager.captureActionScreenshot("fake-terminal", undefined, "thread-b");
-    expect(firstForB !== undefined && "screenshot" in firstForB).toBe(true);
-
-    // The same thread repeating its own view is still a repeat.
-    expect(await manager.captureActionScreenshot("fake-terminal", undefined, "thread-b")).toEqual({
-      screenshotUnchanged: true,
-      windowId: "fake-terminal",
-    });
-
-    await manager.dispose();
-  });
-
-  it("never reports an unchanged screen across different regions", async () => {
-    const backend = new FakeComputerBackend();
-    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
-    // Nothing holds the agent's focus, so observation falls back to the whole
-    // workspace, and the region is what identifies it.
-    backend.emitWindowsChanged([]);
-
-    const first = await manager.captureActionScreenshot();
-    expect(first !== undefined && "screenshot" in first).toBe(true);
-    expect(await manager.captureActionScreenshot()).toEqual({ screenshotUnchanged: true });
-
-    backend.setScreenSize({ width: 1_280, height: 720, scale: 1 });
-    const resized = await manager.captureActionScreenshot();
-    expect(resized !== undefined && "screenshot" in resized).toBe(true);
-
-    await manager.dispose();
+    try {
+      const first = await manager.captureActionScreenshot("fake-terminal");
+      const second = await manager.captureActionScreenshot("fake-terminal");
+      expect(first).toHaveProperty("screenshot");
+      expect(second).toEqual(first);
+      expect(backend.callsFor("captureScreenshot")).toHaveLength(2);
+    } finally {
+      await manager.dispose();
+    }
   });
 
   /**
@@ -1591,9 +1611,9 @@ describe("ComputerManager and FakeComputerBackend", () => {
     });
     expect(second.result.scroll?.injected).toEqual({ deltaX: 0, deltaY: 400 });
     expect(second.result.scroll?.traveledY).toBe(0);
-    // The after-capture is still the caller's observation, so a screen that did
-    // not change comes back as the repeat it is rather than the same image.
-    expect(second.observation).toEqual({ screenshotUnchanged: true, windowId: "fake-calculator" });
+    // Delivery decides whether the caller can reuse its previous image.
+    expect(second.observation).toHaveProperty("screenshot");
+    expect(second.observation).toHaveProperty("windowId", "fake-calculator");
     expect(measurements).toEqual([]);
 
     await manager.dispose();

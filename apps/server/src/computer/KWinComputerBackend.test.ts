@@ -1979,31 +1979,35 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
-  it("falls back to typing when the AT-SPI helper fails", async () => {
-    const dbus = new FakeDbus();
-    const backend = makeBackend(dbus, {
-      glideDurationMs: 0,
-      atspi: {
-        readTrees: async () => [],
-        setText: async () => {
-          throw new Error("AT-SPI helper exited (code=1, signal=null).");
+  it.each(["refused", "failed", "partial"] as const)(
+    "refuses a %s semantic write without inserting fallback text",
+    async (failure) => {
+      const dbus = new FakeDbus();
+      let contents = "old";
+      const backend = makeBackend(dbus, {
+        glideDurationMs: 0,
+        atspi: {
+          readTrees: async () => [],
+          setText: async () => {
+            if (failure === "refused") return false;
+            if (failure === "partial") contents = "a";
+            throw new Error("AT-SPI helper exited (code=1, signal=null).");
+          },
+          dispose: async () => undefined,
         },
-        dispose: async () => undefined,
-      },
-    });
-    await backend.availability();
+      });
+      await backend.availability();
 
-    await expect(backend.setValue(resolvedTarget({ editable: true }), "ab")).resolves.toEqual({
-      point: { x: 1_000, y: 1_600 },
-      windowId: "window-1",
-      value: "ab",
-    });
+      await expect(backend.setValue(resolvedTarget({ editable: true }), "ab")).rejects.toThrow(
+        "Could not confirm that AT-SPI replaced",
+      );
+      expect(dbus.plugin.calls.filter((call) => call.method === "key")).toHaveLength(0);
+      expect(contents).toBe(failure === "partial" ? "a" : "old");
+      await backend.dispose();
+    },
+  );
 
-    expect(dbus.plugin.calls.filter((call) => call.method === "key")).toHaveLength(4);
-    await backend.dispose();
-  });
-
-  it("types into a control that exposes no editable-text interface", async () => {
+  it("refuses a noneditable control before clicking or typing", async () => {
     const dbus = new FakeDbus();
     let writes = 0;
     const backend = makeBackend(dbus, {
@@ -2019,10 +2023,13 @@ describe("KWinComputerBackend", () => {
     });
     await backend.availability();
 
-    await backend.setValue(resolvedTarget({ editable: false }), "ab");
-
+    await expect(backend.setValue(resolvedTarget({ editable: false }), "ab")).rejects.toThrow(
+      "does not support replacing",
+    );
     expect(writes).toBe(0);
-    expect(dbus.plugin.calls.filter((call) => call.method === "key")).toHaveLength(4);
+    expect(
+      dbus.plugin.calls.filter((call) => call.method === "key" || call.method === "button"),
+    ).toHaveLength(0);
     await backend.dispose();
   });
 
@@ -2855,5 +2862,41 @@ describe("plugin source and prebuilt lookup", () => {
     // A path that was pointed at but holds nothing is not a prebuilt root: this
     // is the difference between installing a shipped binary and building one.
     expect(prebuiltPluginRoot("/app", configured, () => false)).toBeUndefined();
+  });
+});
+
+describe("serialized desktop input", () => {
+  it("keeps concurrent clicks at their requested points", async () => {
+    const plugin = new FakePlugin();
+    const backend = makeBackend(new FakeDbus(plugin), { glideDurationMs: 0 });
+    const manager = new (await import("./ComputerManager.ts")).ComputerManager({
+      backend,
+      actionSettleMs: 0,
+    });
+    const pressedAt: Array<{ x: number; y: number }> = [];
+    const button = plugin.button;
+    plugin.button = async (code, pressed) => {
+      if (pressed) pressedAt.push({ ...plugin.position });
+      return button(code, pressed);
+    };
+    try {
+      await backend.availability();
+      await Promise.all([
+        manager.withAgentActivity("audit-thread", () =>
+          manager.click("audit-thread", { x: 100, y: 100 }),
+        ),
+        manager.withAgentActivity("audit-thread", () =>
+          manager.click("audit-thread", { x: 300, y: 300 }),
+        ),
+      ]);
+      expect(pressedAt).toEqual(
+        expect.arrayContaining([
+          { x: 100, y: 100 },
+          { x: 300, y: 300 },
+        ]),
+      );
+    } finally {
+      await manager.dispose();
+    }
   });
 });

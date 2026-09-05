@@ -901,25 +901,25 @@ export class KWinComputerBackend implements ComputerBackend {
     await writeWlClipboard(this.runClipboardCommand, text);
   }
 
-  /**
-   * Writes through AT-SPI when the resolved control exposes `EditableText`, and
-   * types the value otherwise.
-   *
-   * The semantic write is atomic, replaces the whole contents rather than
-   * appending to them, and carries text no QWERTY key map can express. The
-   * click still runs first in both paths: it raises and focuses the control,
-   * which the toolkit needs for anything the user or the agent does next, and a
-   * semantic write on its own leaves keyboard focus wherever it was.
-   */
+  /** Replace the complete value through EditableText; insertion is a separate operation. */
   async setValue(
     target: ComputerResolvedTarget,
     value: string,
   ): Promise<ComputerBackendActionResult> {
     // Ahead of the click, so a refusal costs the human nothing at all: the click
     // that focuses the control is itself a mutation of their window.
+    if (!atspiTextWriteAddress(target.node)) {
+      throw new ComputerBackendError(
+        "This control does not support replacing its value through AT-SPI.",
+      );
+    }
     await this.guardHumanActiveWindow(await this.ensurePlugin(), target.node.windowId);
     const clicked = await this.click(target.point);
-    if (!(await this.writeValueThroughAtspi(target, value))) await this.typeText(value);
+    if (!(await this.writeValueThroughAtspi(target, value))) {
+      throw new ComputerBackendError(
+        "Could not confirm that AT-SPI replaced the control's value. Read the control again before retrying; it may have changed.",
+      );
+    }
     return {
       ...clicked,
       point: target.point,
@@ -928,11 +928,7 @@ export class KWinComputerBackend implements ComputerBackend {
     };
   }
 
-  /**
-   * Never throws: AT-SPI is an optional actuation path, so a stopped helper, a
-   * moved node, or a toolkit that refuses the write all fall back to typing,
-   * which is the only path older sessions ever had.
-   */
+  /** A failed or partial semantic write must never be retried as key insertion. */
   private async writeValueThroughAtspi(
     target: ComputerResolvedTarget,
     value: string,

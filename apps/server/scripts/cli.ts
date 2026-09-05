@@ -152,6 +152,12 @@ const buildCmd = Command.make(
       yield* fs.chmod(path.join(deviceHelperTarget, "build.sh"), 0o755);
       yield* Effect.log("[cli] Bundled iOS Simulator helper sources into dist/device-helper");
 
+      // The bundled AT-SPI client resolves this beside index.mjs/index.cjs.
+      yield* fs.copyFile(
+        path.join(serverDir, "src/computer/atspi_helper.py"),
+        path.join(serverDir, "dist/atspi_helper.py"),
+      );
+
       // Same reasoning for the Linux computer-use plugins: the KWin plugin
       // needs its sources and installer for the source-build fallback plus any
       // CI prebuilts, resolved relative to the packaged module directory at
@@ -201,6 +207,7 @@ const stageDistributionPackage = Effect.fn("stageDistributionPackage")(function*
   for (const relPath of [
     "dist/index.mjs",
     "dist/restoreMigrationBackup.mjs",
+    "dist/atspi_helper.py",
     "dist/client/index.html",
   ]) {
     const abs = path.join(serverDir, relPath);

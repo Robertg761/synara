@@ -18,6 +18,8 @@
  * different windows must not read each other's pictures, and bounded, because
  * a model only ever refers back a few screenshots.
  */
+import { createHash } from "node:crypto";
+
 import type { ComputerPoint, ComputerRect, ComputerScreenshot } from "@synara/contracts";
 
 import { ComputerTargetError } from "./uiTreeTargeting.ts";
@@ -39,7 +41,7 @@ export interface ScreenshotFrame {
 export type ScreenshotFrameSource = Pick<
   ComputerScreenshot,
   "width" | "height" | "region" | "scale"
->;
+> & { readonly bytesBase64?: string };
 
 /**
  * How far back a thread can point. A model names an earlier screenshot only to
@@ -55,6 +57,7 @@ const SCREENSHOT_FRAME_THREADS = 256;
 export class ScreenshotFrameRegistry {
   /** Insertion order doubles as recency: a thread is re-inserted on every record. */
   private readonly threads = new Map<string, ScreenshotFrame[]>();
+  private readonly hashes = new WeakMap<ScreenshotFrame, string>();
   private sequence = 0;
 
   /**
@@ -68,18 +71,27 @@ export class ScreenshotFrameRegistry {
     windowId?: string,
   ): ScreenshotFrame | undefined {
     const region = screenshot.region;
-    if (!region || region.width <= 0 || region.height <= 0) return undefined;
+    if (!region || region.width <= 0 || region.height <= 0) {
+      this.threads.delete(threadId);
+      return undefined;
+    }
     const scale = screenshot.scale ?? screenshot.width / region.width;
-    if (!Number.isFinite(scale) || scale <= 0) return undefined;
+    if (!Number.isFinite(scale) || scale <= 0) {
+      this.threads.delete(threadId);
+      return undefined;
+    }
     this.sequence += 1;
     const frame: ScreenshotFrame = {
       id: `shot-${this.sequence}`,
       width: screenshot.width,
       height: screenshot.height,
-      region,
+      region: { ...region },
       scale,
       ...(windowId !== undefined ? { windowId } : {}),
     };
+    if (screenshot.bytesBase64 !== undefined) {
+      this.hashes.set(frame, createHash("sha256").update(screenshot.bytesBase64).digest("hex"));
+    }
     const frames = this.threads.get(threadId) ?? [];
     this.threads.delete(threadId);
     frames.push(frame);
@@ -97,6 +109,32 @@ export class ScreenshotFrameRegistry {
 
   latest(threadId: string): ScreenshotFrame | undefined {
     return this.threads.get(threadId)?.at(-1);
+  }
+
+  /** Reuse only the latest delivered image, with exactly the same coordinate frame. */
+  matchLatest(
+    threadId: string,
+    screenshot: ComputerScreenshot,
+    windowId?: string,
+  ): ScreenshotFrame | undefined {
+    const frame = this.latest(threadId);
+    const region = screenshot.region;
+    if (
+      !frame ||
+      !region ||
+      frame.windowId !== windowId ||
+      frame.width !== screenshot.width ||
+      frame.height !== screenshot.height ||
+      frame.scale !== (screenshot.scale ?? screenshot.width / region.width) ||
+      frame.region.x !== region.x ||
+      frame.region.y !== region.y ||
+      frame.region.width !== region.width ||
+      frame.region.height !== region.height ||
+      this.hashes.get(frame) !== createHash("sha256").update(screenshot.bytesBase64).digest("hex")
+    ) {
+      return undefined;
+    }
+    return frame;
   }
 
   /**

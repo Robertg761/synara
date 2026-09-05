@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import {
   ComputerId,
   ComputerPoint,
@@ -36,6 +34,7 @@ import {
   type ComputerStreamFrame,
   type ComputerResolvedTarget,
 } from "./ComputerBackend.ts";
+import { DesktopOperationQueue } from "./DesktopOperationQueue.ts";
 import {
   rectContainsPoint,
   topmostWindowAtPoint,
@@ -139,6 +138,12 @@ interface ThreadComputerRuntimeState {
 interface DesktopLease {
   readonly threadId: string;
   lastActivityMs: number;
+  /**
+   * The owner's turn ended (or its session exited) while one of its calls was
+   * still running. Ownership is handed over when that call drains, not now:
+   * see `releaseDesktopControl`.
+   */
+  releaseRequested: boolean;
 }
 
 export interface ComputerManagerOptions {
@@ -182,26 +187,10 @@ export interface ComputerCapturedWindow {
   readonly windowId?: string;
 }
 
-/**
- * Post-action perception: the capture, the discovery that the acted-on window
- * no longer exists, or the discovery that its pixels are byte-for-byte what the
- * caller was shown last time. The disappearance is a result in its own right —
- * usually meaning the action closed the window — never a cue to photograph
- * whatever window happens to hold focus instead, which on a live desktop is
- * the human's. An unchanged screen is a result too, and a far cheaper one to
- * report than an identical image the caller already has in front of it.
- */
+/** Post-action capture, or confirmation that the targeted window has closed. */
 export type ComputerActionObservation =
   | ComputerCapturedWindow
-  | { readonly targetWindowClosed: true }
-  | { readonly screenshotUnchanged: true; readonly windowId?: string };
-
-/** The last observation handed out, identified so nothing else is compared to it. */
-interface ActionObservationMemory {
-  /** The window or region the pixels covered; a different one is never a repeat. */
-  readonly key: string;
-  readonly hash: string;
-}
+  | { readonly targetWindowClosed: true };
 
 /**
  * Refusal raised when another thread owns the desktop. It extends
@@ -289,7 +278,7 @@ export class ComputerManager {
   private get backendCapabilities(): ComputerCapabilities {
     return this.backend.capabilities();
   }
-  private lastActionObservation: ActionObservationMemory | undefined;
+  private readonly operations = new DesktopOperationQueue();
   private streamAttached = false;
   private streamDesired = false;
   private streamEpoch = 0;
@@ -502,7 +491,6 @@ export class ComputerManager {
   async captureActionScreenshot(
     windowIdHint?: string,
     actionPoint?: ComputerPoint,
-    threadId?: string,
   ): Promise<ComputerActionObservation | undefined> {
     if (!this.backendCapabilities.capture) return undefined;
     this.engageBackend();
@@ -511,17 +499,14 @@ export class ComputerManager {
     }
     if (windowIdHint !== undefined) {
       try {
-        return this.observeCapture(
-          {
-            screenshot: await this.backend.captureScreenshot({
-              kind: "window",
-              windowId: windowIdHint,
-              maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
-            }),
+        return {
+          screenshot: await this.backend.captureScreenshot({
+            kind: "window",
             windowId: windowIdHint,
-          },
-          threadId,
-        );
+            maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+          }),
+          windowId: windowIdHint,
+        };
       } catch {
         try {
           const stillListed = (await this.backend.listWindows()).some(
@@ -538,17 +523,14 @@ export class ComputerManager {
       const pointWindowId = await this.windowIdAtActionPoint(actionPoint);
       if (pointWindowId !== undefined) {
         try {
-          return this.observeCapture(
-            {
-              screenshot: await this.backend.captureScreenshot({
-                kind: "window",
-                windowId: pointWindowId,
-                maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
-              }),
+          return {
+            screenshot: await this.backend.captureScreenshot({
+              kind: "window",
               windowId: pointWindowId,
-            },
-            threadId,
-          );
+              maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+            }),
+            windowId: pointWindowId,
+          };
         } catch {
           // The window vanished between the listing and the capture. It was
           // never named by the caller, so fall through to the focus path
@@ -557,64 +539,12 @@ export class ComputerManager {
       }
     }
     try {
-      return this.observeCapture(
-        await this.captureFocusedWindow(COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION, {
-          agentFocusOnly: true,
-        }),
-        threadId,
-      );
+      return await this.captureFocusedWindow(COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION, {
+        agentFocusOnly: true,
+      });
     } catch {
       return undefined;
     }
-  }
-
-  /**
-   * The capture, or the news that it is the same picture as last time.
-   *
-   * A desktop that did not visibly react to an action produces a PNG identical
-   * to the one the caller is already looking at, and sending it again costs a
-   * second copy of the same image tokens to convey nothing. Byte equality is
-   * the whole test: it cannot be wrong about "nothing changed", where a
-   * threshold on similarity could be.
-   *
-   * Scoped to what the pixels cover, so a different window or a different
-   * region is never compared against them — two windows can be equally blank,
-   * and reporting the second as unchanged would hide the first sight of it.
-   */
-  private observeCapture(
-    capture: ComputerCapturedWindow,
-    threadId?: string,
-  ): ComputerActionObservation {
-    const region = capture.screenshot.region;
-    // Scoped to the observing thread as well: "unchanged" tells the caller to
-    // keep reading its previous screenshot, which only makes sense against an
-    // image that same thread actually received. Without the scope, thread A's
-    // delivered capture suppressed thread B's first sight of the same window.
-    const scope = threadId ?? "";
-    const key =
-      capture.windowId !== undefined
-        ? `${scope}|window:${capture.windowId}`
-        : region
-          ? `${scope}|region:${region.x},${region.y},${region.width}x${region.height}`
-          : undefined;
-    if (key === undefined) {
-      // Pixels that say nothing about what they cover cannot be compared: two
-      // unrelated captures would look like a repeat of each other.
-      this.lastActionObservation = undefined;
-      return capture;
-    }
-    const hash = createHash("sha256").update(capture.screenshot.bytesBase64).digest("hex");
-    const previous = this.lastActionObservation;
-    if (previous?.key === key && previous.hash === hash) {
-      return {
-        screenshotUnchanged: true,
-        ...(capture.windowId !== undefined ? { windowId: capture.windowId } : {}),
-      };
-    }
-    // Reset to what is being handed over: the memory tracks the last image the
-    // caller actually received, which is the only thing a repeat can repeat.
-    this.lastActionObservation = { key, hash };
-    return capture;
   }
 
   /**
@@ -674,10 +604,11 @@ export class ComputerManager {
     app: string,
     args: readonly string[] = [],
   ): Promise<ComputerLaunchAppResult> {
-    await this.claimDesktopControl(threadId);
-    const result = await this.backend.launchApp(app, args);
-    this.emitAction(threadId, "computer_launch_app");
-    return result;
+    return this.withDesktopControl(threadId, async () => {
+      const result = await this.backend.launchApp(app, args);
+      this.emitAction(threadId, "computer_launch_app");
+      return result;
+    });
   }
 
   async getThreadState(threadId: string): Promise<ThreadComputerState> {
@@ -686,70 +617,80 @@ export class ComputerManager {
   }
 
   async click(threadId: string | undefined, target: ComputerTarget): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved);
-    const result = await this.injectScoped("computer_click", resolved, () =>
-      this.backend.click(resolved.point),
-    );
-    return this.actionResult(threadId, "computer_click", resolved.point, result, resolved.windowId);
+    return this.withDesktopControl(threadId, async () => {
+      const resolved = await this.resolvePointTarget(target);
+      await this.prepareResolvedTarget(resolved);
+      const result = await this.injectScoped("computer_click", resolved, () =>
+        this.backend.click(resolved.point),
+      );
+      return this.actionResult(
+        threadId,
+        "computer_click",
+        resolved.point,
+        result,
+        resolved.windowId,
+      );
+    });
   }
 
   async doubleClick(
     threadId: string | undefined,
     target: ComputerTarget,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved);
-    const result = await this.injectScoped("computer_double_click", resolved, () =>
-      this.backend.doubleClick(resolved.point),
-    );
-    return this.actionResult(
-      threadId,
-      "computer_double_click",
-      resolved.point,
-      result,
-      resolved.windowId,
-    );
+    return this.withDesktopControl(threadId, async () => {
+      const resolved = await this.resolvePointTarget(target);
+      await this.prepareResolvedTarget(resolved);
+      const result = await this.injectScoped("computer_double_click", resolved, () =>
+        this.backend.doubleClick(resolved.point),
+      );
+      return this.actionResult(
+        threadId,
+        "computer_double_click",
+        resolved.point,
+        result,
+        resolved.windowId,
+      );
+    });
   }
 
   async rightClick(
     threadId: string | undefined,
     target: ComputerTarget,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved);
-    const result = await this.injectScoped("computer_right_click", resolved, () =>
-      this.backend.rightClick(resolved.point),
-    );
-    return this.actionResult(
-      threadId,
-      "computer_right_click",
-      resolved.point,
-      result,
-      resolved.windowId,
-    );
+    return this.withDesktopControl(threadId, async () => {
+      const resolved = await this.resolvePointTarget(target);
+      await this.prepareResolvedTarget(resolved);
+      const result = await this.injectScoped("computer_right_click", resolved, () =>
+        this.backend.rightClick(resolved.point),
+      );
+      return this.actionResult(
+        threadId,
+        "computer_right_click",
+        resolved.point,
+        result,
+        resolved.windowId,
+      );
+    });
   }
 
   async moveCursor(
     threadId: string | undefined,
     target: ComputerTarget,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved);
-    const result = await this.injectScoped("computer_move_cursor", resolved, () =>
-      this.backend.moveCursor(resolved.point),
-    );
-    return this.actionResult(
-      threadId,
-      "computer_move_cursor",
-      resolved.point,
-      result,
-      resolved.windowId,
-    );
+    return this.withDesktopControl(threadId, async () => {
+      const resolved = await this.resolvePointTarget(target);
+      await this.prepareResolvedTarget(resolved);
+      const result = await this.injectScoped("computer_move_cursor", resolved, () =>
+        this.backend.moveCursor(resolved.point),
+      );
+      return this.actionResult(
+        threadId,
+        "computer_move_cursor",
+        resolved.point,
+        result,
+        resolved.windowId,
+      );
+    });
   }
 
   async drag(
@@ -758,26 +699,27 @@ export class ComputerManager {
     to: ComputerTarget,
     durationMs = 250,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const [resolvedFrom, resolvedTo] = await Promise.all([
-      this.resolvePointTarget(from),
-      this.resolvePointTarget(to),
-    ]);
-    // The drag is grabbed by the window it starts in, so that window is the one
-    // raised and focused; the destination only scopes it when the origin names
-    // no window at all.
-    const grabbed = resolvedFrom.windowId ? resolvedFrom : resolvedTo;
-    await this.prepareResolvedTarget(grabbed);
-    const result = await this.injectScoped("computer_drag", grabbed, () =>
-      this.backend.drag(resolvedFrom.point, resolvedTo.point, durationMs),
-    );
-    return this.actionResult(
-      threadId,
-      "computer_drag",
-      resolvedTo.point,
-      result,
-      resolvedTo.windowId ?? resolvedFrom.windowId,
-    );
+    return this.withDesktopControl(threadId, async () => {
+      const [resolvedFrom, resolvedTo] = await Promise.all([
+        this.resolvePointTarget(from),
+        this.resolvePointTarget(to),
+      ]);
+      // The drag is grabbed by the window it starts in, so that window is the one
+      // raised and focused; the destination only scopes it when the origin names
+      // no window at all.
+      const grabbed = resolvedFrom.windowId ? resolvedFrom : resolvedTo;
+      await this.prepareResolvedTarget(grabbed);
+      const result = await this.injectScoped("computer_drag", grabbed, () =>
+        this.backend.drag(resolvedFrom.point, resolvedTo.point, durationMs),
+      );
+      return this.actionResult(
+        threadId,
+        "computer_drag",
+        resolvedTo.point,
+        result,
+        resolvedTo.windowId ?? resolvedFrom.windowId,
+      );
+    });
   }
 
   /**
@@ -794,16 +736,17 @@ export class ComputerManager {
     deltaX: number,
     deltaY: number,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.prepareScrollTarget(target);
-    const result = await this.injectScroll(resolved, deltaX, deltaY);
-    return this.actionResult(
-      threadId,
-      "computer_scroll",
-      resolved?.point,
-      result,
-      resolved?.windowId,
-    );
+    return this.withDesktopControl(threadId, async () => {
+      const resolved = await this.prepareScrollTarget(target);
+      const result = await this.injectScroll(resolved, deltaX, deltaY);
+      return this.actionResult(
+        threadId,
+        "computer_scroll",
+        resolved?.point,
+        result,
+        resolved?.windowId,
+      );
+    });
   }
 
   /**
@@ -843,107 +786,110 @@ export class ComputerManager {
     readonly result: ComputerActionResult;
     readonly observation?: ComputerActionObservation;
   }> {
-    await this.claimDesktopControl(threadId);
-    // An untargeted scroll routes to whatever sits under the agent's cursor
-    // once the pinned focus is cleared — but preparing the target clears that
-    // focus, and it was the only fallback naming the observed window. Read the
-    // candidates that will not survive the clear first: the cursor position
-    // this thread last drove to, and the focus about to be dropped.
-    const attributed = agentThreadId(threadId);
-    const cursorPoint =
-      target !== null ? undefined : attributed ? this.threads.get(attributed)?.cursor : undefined;
-    const preClearFocusId = target !== null ? undefined : await this.agentFocusWindowId();
-    const resolved = await this.prepareScrollTarget(target);
-    // The window the gesture lands in, by the ladder `captureActionScreenshot`
-    // already climbs: the one targeting named, else the one the compositor
-    // routes an unscoped pointer action to, else the agent's own focus target.
-    // A scroll that lands somewhere else measures no travel and so teaches this
-    // window nothing, which is the right outcome for a guess.
-    const observedWindowId =
-      resolved?.windowId ??
-      (resolved?.point ? await this.windowIdAtActionPoint(resolved.point) : undefined) ??
-      (cursorPoint ? await this.windowIdAtActionPoint(cursorPoint) : undefined) ??
-      preClearFocusId ??
-      (await this.agentFocusWindowId());
-    const before = options.observe ? await this.captureForMeasurement(observedWindowId) : undefined;
+    return this.withDesktopControl(threadId, async () => {
+      // An untargeted scroll routes to whatever sits under the agent's cursor
+      // once the pinned focus is cleared — but preparing the target clears that
+      // focus, and it was the only fallback naming the observed window. Read the
+      // candidates that will not survive the clear first: the cursor position
+      // this thread last drove to, and the focus about to be dropped.
+      const attributed = agentThreadId(threadId);
+      const cursorPoint =
+        target !== null ? undefined : attributed ? this.threads.get(attributed)?.cursor : undefined;
+      const preClearFocusId = target !== null ? undefined : await this.agentFocusWindowId();
+      const resolved = await this.prepareScrollTarget(target);
+      // The window the gesture lands in, by the ladder `captureActionScreenshot`
+      // already climbs: the one targeting named, else the one the compositor
+      // routes an unscoped pointer action to, else the agent's own focus target.
+      // A scroll that lands somewhere else measures no travel and so teaches this
+      // window nothing, which is the right outcome for a guess.
+      const observedWindowId =
+        resolved?.windowId ??
+        (resolved?.point ? await this.windowIdAtActionPoint(resolved.point) : undefined) ??
+        (cursorPoint ? await this.windowIdAtActionPoint(cursorPoint) : undefined) ??
+        preClearFocusId ??
+        (await this.agentFocusWindowId());
+      const before = options.observe
+        ? await this.captureForMeasurement(observedWindowId)
+        : undefined;
 
-    let injectedX = 0;
-    let injectedY = 0;
-    let after: ComputerCapturedWindow | undefined;
-    let traveledY: number | undefined;
-    let result: ComputerBackendActionResult | void;
+      let injectedX = 0;
+      let injectedY = 0;
+      let after: ComputerCapturedWindow | undefined;
+      let traveledY: number | undefined;
+      let result: ComputerBackendActionResult | void;
 
-    if (
-      before !== undefined &&
-      observedWindowId !== undefined &&
-      !this.scrollGearing.has(observedWindowId) &&
-      Math.abs(deltaY) > SCROLL_PROBE_TRIGGER_PX
-    ) {
-      const probe = Math.sign(deltaY) * SCROLL_PROBE_PX;
-      result = await this.injectScroll(resolved, 0, probe);
-      injectedY += probe;
-      const probeLeg = await this.settleAndMeasure(observedWindowId, before, probe);
-      after = probeLeg.capture;
-      // What the probe already delivered comes off the ask. An unmeasured or
-      // wrong-way measurement deducts only the probe's own request, which is
-      // the strongest claim it can still make.
-      const covered =
-        probeLeg.traveled !== undefined && Math.sign(probeLeg.traveled) === Math.sign(deltaY)
-          ? probeLeg.traveled
-          : probe;
-      const remainder = Math.abs(covered) >= Math.abs(deltaY) ? 0 : deltaY - covered;
-      // One gearing per window drives both axes: a toolkit's unit conversion is
-      // a property of how it reads scroll events, not of which axis they carry,
-      // and only the vertical travel is measurable from a row correlation.
-      const legX = this.scrollGearing.plan(observedWindowId, deltaX);
-      const legY = this.scrollGearing.plan(observedWindowId, remainder);
-      if (legX !== 0 || legY !== 0) {
-        result = await this.injectScroll(resolved, legX, legY);
-        injectedX += legX;
-        injectedY += legY;
-        if (after) {
-          const remainderLeg = await this.settleAndMeasure(observedWindowId, after, legY);
-          after = remainderLeg.capture ?? after;
-          traveledY =
-            probeLeg.traveled !== undefined && remainderLeg.traveled !== undefined
-              ? probeLeg.traveled + remainderLeg.traveled
-              : undefined;
+      if (
+        before !== undefined &&
+        observedWindowId !== undefined &&
+        !this.scrollGearing.has(observedWindowId) &&
+        Math.abs(deltaY) > SCROLL_PROBE_TRIGGER_PX
+      ) {
+        const probe = Math.sign(deltaY) * SCROLL_PROBE_PX;
+        result = await this.injectScroll(resolved, 0, probe);
+        injectedY += probe;
+        const probeLeg = await this.settleAndMeasure(observedWindowId, before, probe);
+        after = probeLeg.capture;
+        // What the probe already delivered comes off the ask. An unmeasured or
+        // wrong-way measurement deducts only the probe's own request, which is
+        // the strongest claim it can still make.
+        const covered =
+          probeLeg.traveled !== undefined && Math.sign(probeLeg.traveled) === Math.sign(deltaY)
+            ? probeLeg.traveled
+            : probe;
+        const remainder = Math.abs(covered) >= Math.abs(deltaY) ? 0 : deltaY - covered;
+        // One gearing per window drives both axes: a toolkit's unit conversion is
+        // a property of how it reads scroll events, not of which axis they carry,
+        // and only the vertical travel is measurable from a row correlation.
+        const legX = this.scrollGearing.plan(observedWindowId, deltaX);
+        const legY = this.scrollGearing.plan(observedWindowId, remainder);
+        if (legX !== 0 || legY !== 0) {
+          result = await this.injectScroll(resolved, legX, legY);
+          injectedX += legX;
+          injectedY += legY;
+          if (after) {
+            const remainderLeg = await this.settleAndMeasure(observedWindowId, after, legY);
+            after = remainderLeg.capture ?? after;
+            traveledY =
+              probeLeg.traveled !== undefined && remainderLeg.traveled !== undefined
+                ? probeLeg.traveled + remainderLeg.traveled
+                : undefined;
+          }
+        } else {
+          traveledY = probeLeg.traveled;
         }
       } else {
-        traveledY = probeLeg.traveled;
+        injectedX = this.scrollGearing.plan(observedWindowId, deltaX);
+        injectedY = this.scrollGearing.plan(observedWindowId, deltaY);
+        result = await this.injectScroll(resolved, injectedX, injectedY);
+        if (before) {
+          const leg = await this.settleAndMeasure(observedWindowId, before, injectedY);
+          after = leg.capture;
+          traveledY = leg.traveled;
+        }
       }
-    } else {
-      injectedX = this.scrollGearing.plan(observedWindowId, deltaX);
-      injectedY = this.scrollGearing.plan(observedWindowId, deltaY);
-      result = await this.injectScroll(resolved, injectedX, injectedY);
-      if (before) {
-        const leg = await this.settleAndMeasure(observedWindowId, before, injectedY);
-        after = leg.capture;
-        traveledY = leg.traveled;
-      }
-    }
 
-    const base = this.actionResult(
-      threadId,
-      "computer_scroll",
-      resolved?.point,
-      result,
-      resolved?.windowId,
-    );
-    return {
-      result: {
-        ...base,
-        scroll: {
-          requested: { deltaX, deltaY },
-          injected: { deltaX: round2(injectedX), deltaY: round2(injectedY) },
-          ...(traveledY === undefined ? {} : { traveledY: round2(traveledY) }),
-          ...(observedWindowId === undefined
-            ? {}
-            : { gearing: round2(this.scrollGearing.gearing(observedWindowId)) }),
+      const base = this.actionResult(
+        threadId,
+        "computer_scroll",
+        resolved?.point,
+        result,
+        resolved?.windowId,
+      );
+      return {
+        result: {
+          ...base,
+          scroll: {
+            requested: { deltaX, deltaY },
+            injected: { deltaX: round2(injectedX), deltaY: round2(injectedY) },
+            ...(traveledY === undefined ? {} : { traveledY: round2(traveledY) }),
+            ...(observedWindowId === undefined
+              ? {}
+              : { gearing: round2(this.scrollGearing.gearing(observedWindowId)) }),
+          },
         },
-      },
-      ...(after ? { observation: this.observeCapture(after, threadId) } : {}),
-    };
+        ...(after ? { observation: after } : {}),
+      };
+    });
   }
 
   private async prepareScrollTarget(
@@ -1047,7 +993,7 @@ export class ComputerManager {
   /**
    * A capture taken to be measured against another one, and then handed to the
    * caller as the action's observation. It deliberately bypasses
-   * `observeCapture`: the before-capture is never shown to anyone, so recording
+   * screenshot delivery: the before-capture is never shown to anyone, so recording
    * it as the last thing the caller saw would make the after-capture vanish as a
    * repeat of an image that was never sent.
    *
@@ -1107,10 +1053,11 @@ export class ComputerManager {
     text: string,
     windowId?: string,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    await this.prepareKeyboardTarget(windowId);
-    const result = await this.backend.typeText(text);
-    return this.actionResult(threadId, "computer_type_text", undefined, result, windowId);
+    return this.withDesktopControl(threadId, async () => {
+      await this.prepareKeyboardTarget(windowId);
+      const result = await this.backend.typeText(text);
+      return this.actionResult(threadId, "computer_type_text", undefined, result, windowId);
+    });
   }
 
   async pressKey(
@@ -1118,10 +1065,11 @@ export class ComputerManager {
     key: string,
     windowId?: string,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    await this.prepareKeyboardTarget(windowId);
-    const result = await this.backend.pressKey(key);
-    return this.actionResult(threadId, "computer_press_key", undefined, result, windowId);
+    return this.withDesktopControl(threadId, async () => {
+      await this.prepareKeyboardTarget(windowId);
+      const result = await this.backend.pressKey(key);
+      return this.actionResult(threadId, "computer_press_key", undefined, result, windowId);
+    });
   }
 
   async hotkey(
@@ -1129,10 +1077,11 @@ export class ComputerManager {
     keys: readonly string[],
     windowId?: string,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    await this.prepareKeyboardTarget(windowId);
-    const result = await this.backend.hotkey(keys);
-    return this.actionResult(threadId, "computer_hotkey", undefined, result, windowId);
+    return this.withDesktopControl(threadId, async () => {
+      await this.prepareKeyboardTarget(windowId);
+      const result = await this.backend.hotkey(keys);
+      return this.actionResult(threadId, "computer_hotkey", undefined, result, windowId);
+    });
   }
 
   /**
@@ -1147,29 +1096,31 @@ export class ComputerManager {
    * perception of the screen is free, everything clipboard is not.
    */
   async readClipboard(threadId: string | undefined): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const read = this.backend.readClipboard?.bind(this.backend);
-    if (!read) throw clipboardUnsupportedError();
-    const value = await read();
-    // `ComputerActionResult.value` is contract-bounded well below the backend's
-    // byte cap, and an oversized read must not slip out through the unvalidated
-    // MCP result path.
-    if (value.length > COMPUTER_TEXT_MAX_LENGTH) {
-      throw new ComputerBackendError(
-        `The desktop clipboard holds ${value.length} characters of text, more than the ${COMPUTER_TEXT_MAX_LENGTH} this tool returns.`,
-      );
-    }
-    return this.actionResult(threadId, "computer_read_clipboard", undefined, { value });
+    return this.withDesktopControl(threadId, async () => {
+      const read = this.backend.readClipboard?.bind(this.backend);
+      if (!read) throw clipboardUnsupportedError();
+      const value = await read();
+      // `ComputerActionResult.value` is contract-bounded well below the backend's
+      // byte cap, and an oversized read must not slip out through the unvalidated
+      // MCP result path.
+      if (value.length > COMPUTER_TEXT_MAX_LENGTH) {
+        throw new ComputerBackendError(
+          `The desktop clipboard holds ${value.length} characters of text, more than the ${COMPUTER_TEXT_MAX_LENGTH} this tool returns.`,
+        );
+      }
+      return this.actionResult(threadId, "computer_read_clipboard", undefined, { value });
+    });
   }
 
   async writeClipboard(threadId: string | undefined, text: string): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const write = this.backend.writeClipboard?.bind(this.backend);
-    if (!write) throw clipboardUnsupportedError();
-    await write(text);
-    // The text is not echoed back on `value`: the caller already has it, and it
-    // may be far larger than the contract bound on that field.
-    return this.actionResult(threadId, "computer_write_clipboard", undefined, undefined);
+    return this.withDesktopControl(threadId, async () => {
+      const write = this.backend.writeClipboard?.bind(this.backend);
+      if (!write) throw clipboardUnsupportedError();
+      await write(text);
+      // The text is not echoed back on `value`: the caller already has it, and it
+      // may be far larger than the contract bound on that field.
+      return this.actionResult(threadId, "computer_write_clipboard", undefined, undefined);
+    });
   }
 
   async setValue(
@@ -1177,17 +1128,18 @@ export class ComputerManager {
     target: ComputerTarget,
     value: string,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.resolveSemanticTarget(target);
-    await this.prepareResolvedTarget(semanticPointTarget(resolved));
-    const result = await this.backend.setValue(resolved, value);
-    return this.actionResult(
-      threadId,
-      "computer_set_value",
-      resolved.point,
-      result,
-      resolved.node.windowId ?? undefined,
-    );
+    return this.withDesktopControl(threadId, async () => {
+      const resolved = await this.resolveSemanticTarget(target);
+      await this.prepareResolvedTarget(semanticPointTarget(resolved));
+      const result = await this.backend.setValue(resolved, value);
+      return this.actionResult(
+        threadId,
+        "computer_set_value",
+        resolved.point,
+        result,
+        resolved.node.windowId ?? undefined,
+      );
+    });
   }
 
   async performAction(
@@ -1195,17 +1147,18 @@ export class ComputerManager {
     target: ComputerTarget,
     action: string,
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.resolveSemanticTarget(target);
-    await this.prepareResolvedTarget(semanticPointTarget(resolved));
-    const result = await this.backend.performAction(resolved, action);
-    return this.actionResult(
-      threadId,
-      "computer_perform_action",
-      resolved.point,
-      result,
-      resolved.node.windowId ?? undefined,
-    );
+    return this.withDesktopControl(threadId, async () => {
+      const resolved = await this.resolveSemanticTarget(target);
+      await this.prepareResolvedTarget(semanticPointTarget(resolved));
+      const result = await this.backend.performAction(resolved, action);
+      return this.actionResult(
+        threadId,
+        "computer_perform_action",
+        resolved.point,
+        result,
+        resolved.node.windowId ?? undefined,
+      );
+    });
   }
 
   /**
@@ -1218,23 +1171,55 @@ export class ComputerManager {
    * middle of a drag. Publishing the badge still requires a record, since a
    * thread nobody is watching has no panel to update.
    */
-  async withAgentActivity<A>(threadId: string, action: () => Promise<A>): Promise<A> {
-    const owner = agentThreadId(threadId);
-    if (owner === undefined) return await action();
-    const depth = (this.agentCallsInFlight.get(owner) ?? 0) + 1;
-    this.agentCallsInFlight.set(owner, depth);
-    if (depth === 1) await this.publish(owner, true).catch(() => undefined);
-    try {
-      return await action();
-    } finally {
-      const remaining = Math.max(0, (this.agentCallsInFlight.get(owner) ?? 1) - 1);
-      if (remaining === 0) {
-        this.agentCallsInFlight.delete(owner);
-        await this.publish(owner, true).catch(() => undefined);
-      } else {
-        this.agentCallsInFlight.set(owner, remaining);
+  async withAgentActivity<A>(
+    threadId: string,
+    action: () => Promise<A>,
+    signal?: AbortSignal,
+  ): Promise<A> {
+    return this.operations.run(async () => {
+      const owner = agentThreadId(threadId);
+      if (owner === undefined) return await action();
+      const depth = (this.agentCallsInFlight.get(owner) ?? 0) + 1;
+      this.agentCallsInFlight.set(owner, depth);
+      if (depth === 1) await this.publish(owner, true).catch(() => undefined);
+      try {
+        return await action();
+      } finally {
+        const remaining = Math.max(0, (this.agentCallsInFlight.get(owner) ?? 1) - 1);
+        if (remaining === 0) {
+          this.agentCallsInFlight.delete(owner);
+          // A release that arrived mid-call waited for this moment; it publishes
+          // every thread itself, so the single publish below would be redundant.
+          if (this.lease?.threadId === owner && this.lease.releaseRequested) {
+            await this.releaseDesktopControl(owner);
+          } else {
+            await this.publish(owner, true).catch(() => undefined);
+          }
+        } else {
+          this.agentCallsInFlight.set(owner, remaining);
+        }
       }
+    }, signal);
+  }
+
+  private assertDesktopAvailable(threadId: string | undefined): void {
+    const owner = agentThreadId(threadId);
+    const held = this.lease;
+    if (owner && held && held.threadId !== owner && !this.isLeaseStale(held, this.now())) {
+      throw new ComputerLeaseError();
     }
+  }
+
+  private withDesktopControl<A>(
+    threadId: string | undefined,
+    action: () => Promise<A>,
+  ): Promise<A> {
+    // Reject a competing owner promptly, then recheck when this job reaches the front.
+    this.assertDesktopAvailable(threadId);
+    return this.operations.run(async () => {
+      await this.claimDesktopControl(threadId);
+      return action();
+    });
   }
 
   /**
@@ -1265,7 +1250,7 @@ export class ComputerManager {
       throw new ComputerLeaseError();
     }
     const changed = held?.threadId !== owner;
-    this.lease = { threadId: owner, lastActivityMs: now };
+    this.lease = { threadId: owner, lastActivityMs: now, releaseRequested: false };
     if (changed) {
       await this.announceDrivingAgent(owner);
       // Both panels change: the new owner stops being blocked, and every other
@@ -1317,10 +1302,21 @@ export class ComputerManager {
    * ids, and it does not need them, because the gateway already refuses every
    * computer tool call outside an active turn. A thread whose turn ended cannot
    * act again regardless of what the lease says.
+   *
+   * Deferred, not skipped, while one of the owner's calls is still running: a
+   * session that exits mid-drag leaves that drag executing, because a gateway
+   * call cannot be aborted, and releasing now would let the next conversation
+   * take the pointer while the old one is still moving it. The record is
+   * marked instead, and `withAgentActivity` completes the release when the
+   * owner's activity count reaches zero.
    */
   async releaseDesktopControl(threadId: string): Promise<void> {
     const owner = agentThreadId(threadId);
     if (owner === undefined || this.lease?.threadId !== owner) return;
+    if ((this.agentCallsInFlight.get(owner) ?? 0) > 0) {
+      this.lease.releaseRequested = true;
+      return;
+    }
     this.lease = null;
     await this.announceDrivingAgent(null);
     await this.publishAllThreads();
@@ -1407,6 +1403,7 @@ export class ComputerManager {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    await this.operations.close();
     if (this.windowsPublishTimer !== undefined) clearTimeout(this.windowsPublishTimer);
     this.windowsPublishTimer = undefined;
     this.windowsPublishPending = false;

@@ -446,10 +446,29 @@ function verifyDesktopStageLockAuthority(): void {
   }
 }
 
+// Optional built/staged server directory: release checks also run before builds.
+function verifyServerAssets(): void {
+  const option = process.argv.indexOf("--server-dist");
+  if (option < 0) return;
+  const directory = process.argv[option + 1];
+  if (!directory) throw new Error("--server-dist requires a directory.");
+  const helper = readFileSync(resolve(directory, "atspi_helper.py"));
+  const source = readFileSync(resolve(repoRoot, "apps/server/src/computer/atspi_helper.py"));
+  if (!helper.equals(source)) throw new Error("Packaged AT-SPI helper differs from its source.");
+  for (const bundle of ["index.mjs", "index.cjs"]) {
+    assertContains(
+      readFileSync(resolve(directory, bundle), "utf8"),
+      "./atspi_helper.py",
+      `${bundle} must resolve the packaged accessibility helper.`,
+    );
+  }
+}
+
 const tempRoot = mkdtempSync(join(tmpdir(), "synara-release-smoke-"));
 
 try {
   verifyCanonicalIdentity();
+  verifyServerAssets();
   verifyReleaseWorkflowSafety();
   verifyDesktopStageLockAuthority();
   copyWorkspaceManifestFixture(tempRoot);
