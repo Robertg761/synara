@@ -704,6 +704,48 @@ describe("MacComputerBackend", () => {
     expect(state.screenshot).toBeUndefined();
   });
 
+  it("passes held modifiers and a triple click straight through to the helper", async () => {
+    const helper = new FakeMacHelper();
+    const backend = makeBackend(helper);
+    await backend.availability();
+
+    await backend.click({ x: 10, y: 20 }, "7", ["meta", "shift", "meta"]);
+    expect(helper.callsFor("click")).toEqual([
+      // Deduplicated, and omitted entirely when empty so an older helper sees
+      // exactly the request it always saw.
+      { x: 10, y: 20, windowId: "7", modifiers: ["meta", "shift"] },
+    ]);
+
+    await backend.scroll({ x: 10, y: 20 }, 0, -4, undefined, ["ctrl"]);
+    expect(helper.callsFor("scroll")).toEqual([
+      { deltaX: 0, deltaY: -4, x: 10, y: 20, modifiers: ["ctrl"] },
+    ]);
+
+    await backend.rightClick({ x: 1, y: 2 });
+    expect(helper.callsFor("right-click")).toEqual([{ x: 1, y: 2 }]);
+
+    await backend.tripleClick({ x: 3, y: 4 });
+    expect(helper.callsFor("triple-click")).toEqual([{ x: 3, y: 4 }]);
+    await backend.dispose();
+  });
+
+  it("raises a window only when asked to, never as part of an ordinary action", async () => {
+    // The raise is the one thing this backend does that the human sees, so it
+    // is reachable only through computer_activate_window; input stamped with a
+    // window id already reaches its window whatever is stacked above.
+    const helper = new FakeMacHelper();
+    const backend = makeBackend(helper);
+    await backend.availability();
+
+    await backend.click({ x: 10, y: 20 }, "7");
+    await backend.focusWindow("7");
+    expect(helper.callsFor("raise-window")).toEqual([]);
+
+    await backend.raiseWindow("7");
+    expect(helper.callsFor("raise-window")).toEqual([{ windowId: "7" }]);
+    await backend.dispose();
+  });
+
   it("translates window bounds out of a negative-origin workspace into agent space", async () => {
     const helper = new FakeMacHelper({
       "list-windows": windowsResponse({ x: -100, y: -50, width: 1440, height: 900 }),

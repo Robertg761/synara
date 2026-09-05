@@ -481,6 +481,17 @@ export const ComputerState = Schema.Struct({
   computerId: ComputerId,
   windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(COMPUTER_WINDOW_LIST_MAX_LENGTH)),
   screenSize: ComputerScreenSize,
+  /**
+   * What the desktop could establish about itself while answering.
+   *
+   * Optional because a backend with no permission model has nothing to add, but
+   * load-bearing where there is one: a perception read is the primary tool an
+   * agent reaches for, and without this field the one result that most needs to
+   * say "the OS is withholding a grant" was the one result that could not. The
+   * window list and screen-size results have carried it all along; the state
+   * read is the outlier this closes.
+   */
+  availability: Schema.optional(ComputerAvailability),
   root: Schema.optional(ComputerUiNode),
   text: Schema.optional(Schema.String.check(Schema.isMaxLength(4 * 1024 * 1024))),
   screenshot: Schema.optional(ComputerScreenshot),
@@ -565,6 +576,17 @@ export type ComputerListWindowsResult = typeof ComputerListWindowsResult.Type;
 export const ComputerGetStateInput = Schema.Struct({
   includeScreenshot: Schema.optional(Schema.Boolean),
   includeText: Schema.optional(Schema.Boolean),
+  /** Restrict the elements digest to controls owned by this window. */
+  windowId: Schema.optional(ComputerWindowId),
+  /**
+   * Restrict the elements digest to controls whose label contains this text,
+   * case-insensitively. The scoping lever for a busy desktop: without it the
+   * digest is capped at a fixed length and whatever the caller was looking for
+   * may simply not have fitted.
+   */
+  labelContains: Schema.optional(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_LABEL_MAX_LENGTH)),
+  ),
 });
 export type ComputerGetStateInput = typeof ComputerGetStateInput.Type;
 
@@ -603,6 +625,28 @@ export type ComputerLaunchAppResult = typeof ComputerLaunchAppResult.Type;
 
 // ── Action inputs ───────────────────────────────────────────────────
 
+/**
+ * The modifier vocabulary both input surfaces speak: the human's pane keys and
+ * the agent's modifier-held gestures. One list, because a chord the pane can
+ * express and the agent cannot (or the reverse) is a difference nothing in the
+ * product means.
+ */
+export const ComputerInputModifier = Schema.Literals(["ctrl", "alt", "shift", "meta"]);
+export type ComputerInputModifier = typeof ComputerInputModifier.Type;
+
+/** One of each at most, so the bound is the vocabulary's own size. */
+export const COMPUTER_MODIFIERS_MAX_ITEMS = 4;
+
+/**
+ * Modifiers held down for the duration of one pointer gesture and released
+ * after it, in the order given. This is what shift-click, cmd-click and
+ * ctrl-scroll are, and it is not expressible as a hotkey: `computer_hotkey`
+ * presses and releases, so nothing is still held when the click arrives.
+ */
+const ComputerHeldModifiers = Schema.optional(
+  Schema.Array(ComputerInputModifier).check(Schema.isMaxLength(COMPUTER_MODIFIERS_MAX_ITEMS)),
+);
+
 const ComputerTargetFields = {
   x: Schema.optional(Schema.Finite),
   y: Schema.optional(Schema.Finite),
@@ -616,14 +660,49 @@ const ComputerTargetFields = {
 export const ComputerTarget = Schema.Struct(ComputerTargetFields);
 export type ComputerTarget = typeof ComputerTarget.Type;
 
-export const ComputerClickInput = ComputerTarget;
+/** A pointer target that may also hold modifiers down across the gesture. */
+const ComputerModifiedTargetFields = {
+  ...ComputerTargetFields,
+  modifiers: ComputerHeldModifiers,
+} as const;
+
+export const ComputerClickInput = Schema.Struct(ComputerModifiedTargetFields);
 export type ComputerClickInput = typeof ComputerClickInput.Type;
-export const ComputerDoubleClickInput = ComputerTarget;
+export const ComputerDoubleClickInput = Schema.Struct(ComputerModifiedTargetFields);
 export type ComputerDoubleClickInput = typeof ComputerDoubleClickInput.Type;
-export const ComputerRightClickInput = ComputerTarget;
+export const ComputerTripleClickInput = Schema.Struct(ComputerModifiedTargetFields);
+export type ComputerTripleClickInput = typeof ComputerTripleClickInput.Type;
+export const ComputerRightClickInput = Schema.Struct(ComputerModifiedTargetFields);
 export type ComputerRightClickInput = typeof ComputerRightClickInput.Type;
+/**
+ * No modifiers: a hover holds nothing down, and it deliberately does not aim
+ * the keyboard either — only a real gesture or an explicit window does.
+ */
 export const ComputerMoveCursorInput = ComputerTarget;
 export type ComputerMoveCursorInput = typeof ComputerMoveCursorInput.Type;
+
+/**
+ * Bring one window forward. The only computer call whose whole purpose is to
+ * change what the human sees on their own screen, which is why it is a tool of
+ * its own rather than a flag on the pointer tools.
+ */
+export const ComputerActivateWindowInput = Schema.Struct({ windowId: ComputerWindowId });
+export type ComputerActivateWindowInput = typeof ComputerActivateWindowInput.Type;
+
+/**
+ * Longest pause an agent may ask the desktop for.
+ *
+ * Bounded because the wait holds the turn: a model that reads "wait for the
+ * installer" as a number of minutes would stall the conversation behind a sleep
+ * nothing can interrupt. Ten seconds covers a window appearing, a menu
+ * animating, and a page painting; anything slower is a poll loop, not a wait.
+ */
+export const COMPUTER_WAIT_MAX_MS = 10_000;
+
+export const ComputerWaitInput = Schema.Struct({
+  durationMs: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: COMPUTER_WAIT_MAX_MS })),
+});
+export type ComputerWaitInput = typeof ComputerWaitInput.Type;
 
 export const ComputerDragInput = Schema.Struct({
   from: ComputerTarget,
@@ -633,7 +712,7 @@ export const ComputerDragInput = Schema.Struct({
 export type ComputerDragInput = typeof ComputerDragInput.Type;
 
 export const ComputerScrollInput = Schema.Struct({
-  ...ComputerTargetFields,
+  ...ComputerModifiedTargetFields,
   deltaX: Schema.Finite,
   deltaY: Schema.Finite,
 });
@@ -696,9 +775,6 @@ const ComputerInputDelta = Schema.Finite.check(
 /** Only the buttons the seat can synthesize as a complete press/release pair. */
 export const ComputerInputButton = Schema.Literals(["left", "right"]);
 export type ComputerInputButton = typeof ComputerInputButton.Type;
-
-export const ComputerInputModifier = Schema.Literals(["ctrl", "alt", "shift", "meta"]);
-export type ComputerInputModifier = typeof ComputerInputModifier.Type;
 
 export const ComputerInputClickInput = Schema.Struct({
   x: ComputerInputCoordinate,

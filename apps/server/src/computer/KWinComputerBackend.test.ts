@@ -20,6 +20,7 @@ import {
 } from "./KWinComputerBackend.ts";
 import {
   ComputerBackendError,
+  DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   MAX_COMPUTER_CLIPBOARD_BYTES,
   type ComputerResolvedTarget,
 } from "./ComputerBackend.ts";
@@ -1661,7 +1662,7 @@ describe("KWinComputerBackend", () => {
     const state = await backend.getState({ includeScreenshot: true });
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureRegion",
-      args: [0, 0, 5_120, 2_520, 2_048],
+      args: [0, 0, 5_120, 2_520, DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION],
     });
     expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
     expect(state.screenshot).toMatchObject({
@@ -1683,7 +1684,7 @@ describe("KWinComputerBackend", () => {
     // The single fake window spans (956, 1519) to (1604, 2037).
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureRegion",
-      args: [0, 0, 1_604, 2_037, 2_048],
+      args: [0, 0, 1_604, 2_037, DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION],
     });
     expect(state.screenshot?.region).toEqual({ x: 0, y: 0, width: 1_604, height: 2_037 });
     await backend.dispose();
@@ -1709,7 +1710,7 @@ describe("KWinComputerBackend", () => {
     });
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureWindow",
-      args: ["window-1", 2_048],
+      args: ["window-1", DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION],
     });
     await backend.dispose();
   });
@@ -1785,7 +1786,7 @@ describe("KWinComputerBackend", () => {
     });
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureRegion",
-      args: [0, 0, 300, 250, 2_048],
+      args: [0, 0, 300, 250, DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION],
     });
     await backend.dispose();
   });
@@ -1836,7 +1837,7 @@ describe("KWinComputerBackend", () => {
 
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureRegion",
-      args: [0, 0, 5_120, 2_520, 2_048],
+      args: [0, 0, 5_120, 2_520, DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION],
     });
     expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
     await backend.dispose();
@@ -2515,6 +2516,30 @@ describe("KWinComputerBackend", () => {
     expect(dbus.plugin.calls).toContainEqual({ method: "key", args: [30, true] });
     expect(dbus.plugin.calls).toContainEqual({ method: "focusWindow", args: ["window-1"] });
     expect(dbus.plugin.calls).toContainEqual({ method: "clearFocusWindow", args: [] });
+    await backend.dispose();
+  });
+
+  it("holds modifiers around the gesture and pairs a triple click's presses", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus, { glideDurationMs: 0, sleep: async () => undefined });
+    await backend.availability();
+
+    await backend.click({ x: 100, y: 100 }, undefined, ["shift"]);
+    const after = dbus.plugin.calls.map((call) => `${call.method}:${call.args.join(",")}`);
+    const shiftDown = after.indexOf("key:42,true");
+    const shiftUp = after.indexOf("key:42,false");
+    const buttonDown = after.indexOf("button:272,true");
+    const buttonUp = after.lastIndexOf("button:272,false");
+    // The modifier goes down before the press and comes up after the release,
+    // which is the whole difference between a shift-click and a plain one
+    // preceded by a Shift tap.
+    expect(shiftDown).toBeGreaterThanOrEqual(0);
+    expect(shiftDown).toBeLessThan(buttonDown);
+    expect(buttonUp).toBeLessThan(shiftUp);
+
+    dbus.plugin.calls.length = 0;
+    await backend.tripleClick({ x: 100, y: 100 });
+    expect(dbus.plugin.calls.filter((call) => call.method === "button")).toHaveLength(6);
     await backend.dispose();
   });
 

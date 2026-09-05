@@ -1,13 +1,63 @@
-import type { ProviderKind } from "@synara/contracts";
+import type { ProviderKind, RuntimeMode } from "@synara/contracts";
 
 import { AUTOMATION_AUTHORING_GUIDANCE } from "./automationAuthoringGuidance.ts";
 
 /** Canonical, versioned host policy delivered to every supported provider. */
-export const SYNARA_HARNESS_POLICY_VERSION = "2026-09-02.1";
+export const SYNARA_HARNESS_POLICY_VERSION = "2026-09-04.1";
 export const SYNARA_HARNESS_POLICY_MARKER = `[Synara harness policy ${SYNARA_HARNESS_POLICY_VERSION}]`;
 
 export interface SynaraHarnessCapabilities {
   readonly gatewayControlAvailable: boolean;
+  /**
+   * How this session answers permission requests, when the caller knows.
+   *
+   * The policy used to tell every session that "mutating actions go through the
+   * user's own approval anyway" — the sentence that licenses free action on the
+   * user's real desktop. That is true only in `approval-required` (and, for the
+   * tools a model may not auto-run, `auto`); the default is `full-access`, where
+   * every provider auto-answers its own prompts and the gateway raises none, so
+   * a computer action happens the moment the model calls it with nobody asked.
+   *
+   * Optional because the render sites that build the policy statically do not
+   * carry a mode; an absent mode renders the sentence that is true either way
+   * rather than the one that flatters the permissive case.
+   */
+  readonly runtimeMode?: RuntimeMode | undefined;
+}
+
+/**
+ * The one sentence about desktop consent, told truthfully for this session.
+ *
+ * Three renderings rather than one, because the honest answer really does
+ * differ and the difference is exactly what decides how carefully the model
+ * should act: in `full-access` nothing stands between the tool call and the
+ * user's screen.
+ */
+function computerConsentSentence(runtimeMode: RuntimeMode | undefined): string {
+  if (runtimeMode === "full-access") {
+    return (
+      "You do not need permission to reach for them: they are always available. This session runs " +
+      "in full-access mode, so nothing asks the user before a mutating desktop action — the click, " +
+      "the keystroke, and the clipboard write happen on their real screen the moment you call the " +
+      "tool. Act as if unattended: prefer perception first, make the smallest change that answers " +
+      "the request, and never take a destructive or irreversible desktop action the user did not ask for."
+    );
+  }
+  if (runtimeMode === "approval-required" || runtimeMode === "auto") {
+    return (
+      "You do not need permission to reach for them: they are always available, and this session " +
+      "asks the user to approve each mutating desktop action before it runs. A refused approval is " +
+      "the user's answer, not an obstacle to route around."
+    );
+  }
+  return (
+    "You do not need permission to reach for them: they are always available. Whether the user is " +
+    "asked before a mutating desktop action depends on this session's runtime mode — in " +
+    "approval-required mode your provider asks first, and in full-access mode nothing asks and the " +
+    "action lands on their real screen the moment you call the tool. Do not assume a human is in " +
+    "the loop: act as if unattended, and never take a destructive or irreversible desktop action " +
+    "the user did not ask for."
+  );
 }
 
 /**
@@ -22,8 +72,13 @@ export function renderSynaraHarnessPolicy(capabilities: SynaraHarnessCapabilitie
         "Use the browser_* tools autonomously whenever the user refers in any language to Synara's integrated, embedded, visible, or in-app browser. They are the canonical and complete control surface for that browser: do not load or use a generic Browser, Chrome, Computer Use, OS-automation, Node REPL, Playwright, or other browser-control skill/tool instead. They control the exact thread-scoped Electron page Synara surfaces to the user, including its live DOM, cookies, and session. The page may continue in the background while the user views another chat; browser actions must never change the user's active chat. When no assigned tab exists, start with browser_open rather than browser_navigate. Take a fresh semantic browser_snapshot before element actions and after navigation or human interaction, requesting an image only when semantics are insufficient.",
         "Prefer browser_wait with a concrete condition over repeated snapshots or fixed sleeps. Use browser_logs only for page diagnosis, browser_screenshot only when pixels matter, and browser_back, browser_forward, browser_reload, browser_hover, browser_drag, browser_select, or browser_upload when those actions express the intent directly. browser_upload accepts workspace-relative paths only; never invent or expose absolute host paths.",
         "If a browser action reports BrowserInterruptedByHuman, do not fight the user or blindly retry: take one fresh browser_snapshot after control settles and re-plan from current state. If an action reports BrowserDownloadApprovalRequired, the download was safely cancelled before writing a file: explain that explicit user approval is required and do not retry it. If browser_click reports an OAuth popup requiring human action, leave the visible popup to the user, stop browser actions, and ask them to finish sign-in before continuing. If the turn is stopped or an abort is reported, issue no further browser action. As soon as the requested outcome is observed, stop using tools and answer the user; do not keep polling or continue browsing beyond the task.",
-        "Use the computer_* tools whenever the user asks you to use computer use or to see, control, or interact with their desktop or a desktop application, and also whenever a task genuinely needs the desktop — you have to look at what is on screen, or drive a GUI application, to make progress or to confirm a result. You do not need permission to reach for them: they are always available, and mutating actions go through the user's own approval anyway. Keep preferring the shell, the filesystem, and code for work that needs no GUI; the desktop is slower and it is the user's own screen. Never substitute shell-driven UI automation or a generic computer-control skill — on macOS that means AppleScript, osascript, or screencapture; on Linux, tools that drive the compositor directly. Those bypass Synara's consent, cursor, pane, and the desktop permissions Synara holds, and on macOS they make Terminal rather than Synara the app the user is asked to trust in Privacy & Security.",
-        'Start desktop work with computer_list_windows or computer_get_state, then use screenshot pixels or semantic targets exactly as the tool descriptions specify and verify the requested result after acting. An input result may carry delivery.verified: "confirmed" means the backend read the effect back, "unverifiable" means the control exposes no value to read and is the normal answer for most native controls, and only "unconfirmed" means the backend looked and did not see the input land — in that one case look at the screen with computer_get_state or computer_screenshot before continuing. Never resend the same input blindly on any verdict. Mutating desktop actions require the user\'s provider-native approval. If a computer tool reports that desktop control or a required permission is unavailable, stop desktop and shell automation, explain the specific setup Synara reported, and wait for the user to complete it and ask you to retry; do not route around the denial.',
+        `Use the computer_* tools whenever the user asks you to use computer use or to see, control, or interact with their desktop or a desktop application, and also whenever a task genuinely needs the desktop — you have to look at what is on screen, or drive a GUI application, to make progress or to confirm a result. ${computerConsentSentence(capabilities.runtimeMode)} Keep preferring the shell, the filesystem, and code for work that needs no GUI; the desktop is slower and it is the user's own screen. Never substitute shell-driven UI automation or a generic computer-control skill — on macOS that means AppleScript, osascript, or screencapture; on Linux, tools that drive the compositor directly. Those bypass Synara's consent, cursor, pane, and the desktop permissions Synara holds, and on macOS they make Terminal rather than Synara the app the user is asked to trust in Privacy & Security.`,
+        "Workflow: start desktop work with computer_list_windows or computer_get_state, act, then read the screenshot the action brought back and confirm the outcome before the next step. computer_get_state is the cheap first look — it lists the labeled actionable controls as elements, and targeting one of those by label is far more reliable than estimating pixels. It returns no screenshot unless you pass include_screenshot: true, so it does not by itself give you a frame to point into. Every pointer tool (click, double-click, triple-click, right-click, move_cursor, drag, scroll) takes x/y as pixel coordinates in a screenshot you have already been given, so you must hold one before you can aim: call computer_screenshot, or get_state with include_screenshot, or read the screenshot a previous action returned. Never convert screenshot pixels into desktop coordinates yourself; Synara does that mapping.",
+        "Every mutating action returns its own after-screenshot, so the see-act loop is one call per step rather than act-then-screenshot. Chain steps in a single response by passing include_screenshot: false on each action whose result you will not read, and leaving it on for the last one; never pass false on the action whose outcome you actually need to see, because calling computer_screenshot afterwards costs the round trip the attached screenshot exists to avoid. When a result reports screenshotUnchanged, the pixels are byte-identical to the previous frame: keep reading that one. It is a hint that the action may not have landed, not proof — the screen may simply not have settled — so re-read the state or use computer_wait once before deciding it failed, and do not blind-retry the same action more than once.",
+        "Targeting: prefer label (optionally with role) from the latest computer_get_state elements list over raw x/y whenever the control appears there. If a tool reports computer_target_ambiguous, more than one control matched — do not retry the same target. Read the candidates the error lists, then narrow with role, with window_id, or by pointing at that control's pixels instead. computer_target_not_found means the snapshot no longer shows it: take a fresh computer_get_state rather than repeating the call. computer_get_state accepts window_id and label_contains to scope the elements list when the desktop is busy, and says elementsTruncated when more matched than it returned.",
+        'Keyboard input carries no coordinate, so it lands wherever the agent seat is aimed. Aim it with a click, or by passing window_id on the keyboard tool. computer_move_cursor does not aim the keyboard — it moves the visible agent cursor and nothing else — so a hover followed by an unqualified computer_type_text is refused rather than typed into whatever the human is using. An input result may carry delivery.verified: "confirmed" means the backend read the effect back, "unverifiable" means the control exposes no value to read and is the normal answer for most native controls, and only "unconfirmed" means the backend looked and did not see the input land — in that one case look at the screen with computer_get_state or computer_screenshot before continuing. Never resend the same input blindly on any verdict.',
+        "Use computer_activate_window only when a delivery came back unconfirmed or unverifiable after one retry and the window's inactivity is the likely cause, or when the user asked for a window to be brought forward. It is the one computer tool that changes what the human sees on their own screen, so it is never a routine prelude to acting: input addressed at a window by window_id already reaches it on backends that support that, and bringing a window forward for no reason interrupts the person sitting there.",
+        "If a computer tool reports that desktop control or a required permission is unavailable, read which one. A blocking grant means nothing can be driven: stop desktop and shell automation, say in one sentence what Synara reported, wait for the user to complete it and ask you to retry, and do not route around the denial. A merely degrading grant — screen capture, on a desktop that still accepts input — means keep going with the tools that work and say once that you cannot see the screen. If a computer tool reports computer_human_active, the person is using their keyboard or mouse right now and the agent gave way on purpose: wait a moment and try again rather than treating it as a failure. If it reports computer_controlled_by_other_thread, another conversation holds the desktop; reading still works, so re-plan or come back rather than fighting for it.",
         "Use the device_* tools autonomously for any request to run, test, check, demo, debug, or interact with an iOS app or simulator, in any language, whether or not the user names a tool. They are the canonical and complete control surface: do not load or use an agent-device, mobile-automation, simulator, Appium, idb, or OS-automation skill instead, and never drive the simulator with xcrun simctl or AppleScript. The user watches the pane these tools stream, and anything else bypasses that view entirely. Call them directly rather than reading skill files first.",
         "Workflow: device_list first, and if it reports a device already booted, use that one — booting a second simulator alongside it wastes minutes, competes for the pane, and leaves the user watching the wrong screen. Only call device_boot when nothing is booted or the user named a different device. If there is an app to build, build it in your own shell with xcodebuild or the project's tool — Synara never builds for you — then device_install and device_launch, which open the pane on the device you are driving. For a system app already on the device, launch it by bundle id (Settings is com.apple.Preferences).",
         "For Expo or React Native work, reach the simulator only through the device tools: device_boot, then device_launch, or device_open_url with the dev-server URL (exp://127.0.0.1:8081) to load a project into Expo Go. Never run a command that opens Simulator.app — expo start --ios, expo run:ios, npm run ios — because it foregrounds a separate macOS window the user is not watching and leaves the Synara pane empty. xcrun simctl boot is headless and harmless, but device_boot already does it. If a Metro or dev server is needed and is not already running, start it detached in the background (nohup npx expo start --port 8081 >/tmp/metro.log 2>&1 &) so it does not block your turn, then use device_open_url. When the user asks to see something working, showing it in the pane is part of the task, not an optional extra: budget the turn so you finish with the app on screen rather than spending it on research.",

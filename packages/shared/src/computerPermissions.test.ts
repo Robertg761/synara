@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   computerPermissionSetupMessage,
+  computerPermissionsBlockControl,
   computerStaleGrantAdvice,
   listComputerPermissions,
   sortComputerPermissions,
@@ -47,5 +48,17 @@ describe("computer permission copy", () => {
     const message = computerPermissionSetupMessage(["accessibility"], "adhoc");
     expect(message).toContain("System Settings");
     expect(message).toContain("tccutil reset Accessibility");
+  });
+});
+
+describe("computerPermissionsBlockControl", () => {
+  it("separates the grant that stops everything from the one that only blinds", () => {
+    // The whole point of the split: a missing Screen Recording grant leaves the
+    // window list, the accessibility tree and every input working, and telling
+    // an agent to stop over it costs the user the task.
+    expect(computerPermissionsBlockControl(["accessibility"])).toBe(true);
+    expect(computerPermissionsBlockControl(["accessibility", "screenRecording"])).toBe(true);
+    expect(computerPermissionsBlockControl(["screenRecording"])).toBe(false);
+    expect(computerPermissionsBlockControl([])).toBe(false);
   });
 });

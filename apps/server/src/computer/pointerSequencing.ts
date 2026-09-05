@@ -214,6 +214,48 @@ export async function pressHotkeyStrokes(options: {
   }
 }
 
+/**
+ * A gesture performed with modifier keys held down for its whole duration.
+ *
+ * Shift-click, cmd-click and ctrl-scroll are not chords in the `hotkey` sense:
+ * `pressHotkeyStrokes` presses and releases, so by the time the pointer event
+ * arrives nothing is held and the application sees a plain click. The keys have
+ * to go down, stay down across the gesture, and come up after it.
+ *
+ * The release path mirrors `pressHotkeyStrokes`: everything that went down comes
+ * back up, in reverse, whatever the gesture did — a modifier stranded on the
+ * human's keyboard by a failed click is the failure this shape exists to
+ * prevent — and a release failure surfaces only when there is no earlier error
+ * worth reporting instead.
+ */
+export async function withHeldModifiers<T>(options: {
+  readonly sink: Pick<ComputerInputSink, "key">;
+  readonly modifierCodes: readonly number[];
+  readonly run: () => Promise<T>;
+}): Promise<T> {
+  const { sink, modifierCodes, run } = options;
+  if (modifierCodes.length === 0) return await run();
+  const held: number[] = [];
+  let failed = false;
+  try {
+    for (const code of modifierCodes) {
+      await sink.key(code, true, POINTER_SEQUENCE_OPERATIONS.keyPress);
+      held.push(code);
+    }
+    return await run();
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    const releaseError = await firstFailureOf(
+      held
+        .toReversed()
+        .map((code) => () => sink.key(code, false, POINTER_SEQUENCE_OPERATIONS.keyRelease)),
+    );
+    if (!failed && releaseError !== undefined) throw releaseError;
+  }
+}
+
 /** One button press held for long enough to register, released even on failure. */
 export async function pressButtonOnce(options: {
   readonly sink: Pick<ComputerInputSink, "button">;

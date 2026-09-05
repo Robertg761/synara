@@ -78,7 +78,7 @@ import { makeAgentGatewayAutomationTools } from "../automationTools.ts";
 import { makeAgentGatewayBrowserTools } from "../browserTools.ts";
 import { makeAgentGatewayDeviceTools } from "../deviceTools.ts";
 import { DeviceService } from "../../device/Services/DeviceService.ts";
-import { makeAgentGatewayComputerTools } from "../computerTools.ts";
+import { computerToolInstructions, makeAgentGatewayComputerTools } from "../computerTools.ts";
 import { ComputerService } from "../../computer/Services/ComputerService.ts";
 import { BrowserAutomationHost } from "../../browserAutomation/Services/BrowserAutomationHost.ts";
 import { makeBrowserAutomationHost } from "../../browserAutomation/Layers/BrowserAutomationHost.ts";
@@ -93,6 +93,23 @@ import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 // context characters per round without adding authority or safety.
 const AGENT_GATEWAY_INSTRUCTIONS =
   "Synara tools are thread-scoped. Use browser_* only for Synara's shared in-app browser runtime; follow the provider-delivered <synara_host_context> for full policy.";
+
+/**
+ * The instructions this server announces, plus the computer family's shared
+ * notes when that family is actually registered.
+ *
+ * Eleven computer tools carried the same three paragraphs each — how a
+ * coordinate is read, what the post-action screenshot is, what a delivery
+ * verdict means — because MCP has no other place to say something once. It
+ * does: `initialize.instructions`. Appended rather than made unconditional so a
+ * host with no desktop backend, which never sees a computer tool, pays nothing
+ * for the notes describing them.
+ */
+function agentGatewayInstructions(computerNotes: string | undefined): string {
+  return computerNotes === undefined
+    ? AGENT_GATEWAY_INSTRUCTIONS
+    : `${AGENT_GATEWAY_INSTRUCTIONS}\n\n${computerNotes}`;
+}
 
 function readThreadGoalArg(args: Record<string, unknown>): string {
   if (!("goal" in args)) {
@@ -740,7 +757,13 @@ export const makeAgentGateway = Effect.gen(function* () {
   }): Effect.Effect<void> => {
     const callerThreadId = input.context.callerThreadId;
     const callerTurnId = input.context.callerTurnId;
-    const dedupeKey = `${callerThreadId}:${callerTurnId ?? "no-turn"}`;
+    // Keyed by which grants are missing as well as by the turn. One card per
+    // turn is right for the same gap reported by ten calls; it was wrong for a
+    // second, different gap discovered in the same turn — a run that lost
+    // Accessibility after already reporting Screen Recording showed the user
+    // one card naming the wrong permission and nothing about the other.
+    const missingKey = [...input.missing].sort().join(",");
+    const dedupeKey = `${callerThreadId}:${callerTurnId ?? "no-turn"}:${missingKey}`;
     if (surfacedComputerSetupPrompts.has(dedupeKey)) return Effect.void;
     // FIFO eviction, not a wholesale clear: clearing forgets every live turn's
     // dedupe key at once and would let each of them surface a duplicate card.
@@ -752,6 +775,10 @@ export const makeAgentGateway = Effect.gen(function* () {
       kind: "computer-setup-required",
       threadId: callerThreadId,
       turnId: callerTurnId,
+      // Part of the identity for the same reason it is part of the dedupe key:
+      // two cards naming different grants are two different cards, and sharing
+      // one command id would make the second a replay of the first.
+      missing: missingKey,
     });
     const createdAt = isoNow();
     return orchestrationEngine
@@ -815,12 +842,19 @@ export const makeAgentGateway = Effect.gen(function* () {
       : []),
   ];
 
+  const computerNotes =
+    computerService?.supported === true
+      ? computerToolInstructions({
+          deliversWithoutRaising: computerService.manager.deliversToNamedWindowRegardlessOfStacking,
+        })
+      : undefined;
+
   return {
     handleMcpPost: makeAgentGatewayMcpTransport({
       credentials,
       snapshotQuery,
       tools,
-      instructions: AGENT_GATEWAY_INSTRUCTIONS,
+      instructions: agentGatewayInstructions(computerNotes),
       requireThreadShell,
     }),
   } satisfies AgentGatewayShape;

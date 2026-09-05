@@ -29,7 +29,10 @@ import type {
   ComputerBuildSignature,
   ComputerPermission,
 } from "@synara/contracts";
-import { listComputerPermissions } from "@synara/shared/computerPermissions";
+import {
+  computerPermissionsBlockControl,
+  listComputerPermissions,
+} from "@synara/shared/computerPermissions";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 
@@ -41,6 +44,18 @@ import { ComputerBackendError } from "./ComputerBackend.ts";
  */
 export interface ComputerSetupSignal {
   readonly missing: readonly ComputerPermission[];
+  /**
+   * Whether the missing grant stops the desktop being driven, or only degrades
+   * it.
+   *
+   * The signal used to carry only "something is missing", and the note it
+   * produced told the model to stop and wait. A declined Screen Recording grant
+   * blocks nothing — the window list, the accessibility tree and every input
+   * still work — so for the rest of the session every *successful* call came
+   * back carrying "Stop desktop automation… do not retry", and agents stopped
+   * mid-task over a grant that had cost them only the screenshots.
+   */
+  readonly blocking: boolean;
   /**
    * How the backend's build is signed, when it could say. Carried alongside the
    * grants because an ad-hoc build has a second explanation for a missing one —
@@ -84,8 +99,11 @@ export function computerSetupSignal(input: {
   readonly buildSignature?: ComputerBuildSignature | undefined;
 }): ComputerSetupSignal | undefined {
   if (input.availability?.kind === "permission-required") {
+    // The backend already decided this one blocks: an availability that reports
+    // `permission-required` is the desktop saying it cannot be driven.
     return {
       missing: input.availability.missing,
+      blocking: true,
       buildSignature: input.availability.buildSignature,
     };
   }
@@ -93,9 +111,13 @@ export function computerSetupSignal(input: {
     input.buildSignature === undefined ? {} : { buildSignature: input.buildSignature };
   const missing = input.missing ?? [];
   if (input.error !== undefined && computerFailureNeedsSetup(input.error)) {
-    return { missing, ...signature };
+    // A call that actually failed for want of a grant is blocking whatever the
+    // grant was: whichever one it needed, it did not get it and did not run.
+    return { missing, blocking: true, ...signature };
   }
-  return missing.length > 0 ? { missing, ...signature } : undefined;
+  return missing.length > 0
+    ? { missing, blocking: computerPermissionsBlockControl(missing), ...signature }
+    : undefined;
 }
 
 /**
@@ -115,9 +137,20 @@ export function computerSetupSignal(input: {
 export function computerSetupToolNote(signal: ComputerSetupSignal): string {
   const labels = listComputerPermissions(signal.missing);
   const needed = labels.length > 0 ? labels : "a macOS privacy permission";
+  const asked = `macOS is asking the user right now for ${needed}, and Synara has shown them a setup card.`;
+  if (signal.blocking) {
+    return (
+      `${asked} Nothing on the desktop can be driven without it. ` +
+      "Stop desktop automation, say in one sentence that you are waiting for the user to grant it, " +
+      "and do not retry or work around it until the user says it is granted."
+    );
+  }
+  // Deliberately the opposite instruction, and it has to be explicit: handed the
+  // blocking wording, models abandoned tasks that were still perfectly doable.
   return (
-    `macOS is asking the user right now for ${needed}, and Synara has shown them a setup card. ` +
-    "Stop desktop automation, say in one sentence that you are waiting for the user to grant it, " +
-    "and do not retry or work around it until the user says it is granted."
+    `${asked} This one does not block desktop control — only the pictures: screenshots and the ` +
+    "computer pane will fail while it is missing, and the window list, the accessibility state " +
+    "and every input still work. Do not stop. Carry on with those, say once that you cannot see " +
+    "the screen until the user grants it, and target controls by label rather than by coordinates."
   );
 }

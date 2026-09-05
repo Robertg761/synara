@@ -10,6 +10,7 @@ import {
   pressButtonOnce,
   pressHotkeyStrokes,
   pressKeyStroke,
+  withHeldModifiers,
   type ComputerInputSink,
 } from "./pointerSequencing.ts";
 
@@ -287,5 +288,68 @@ describe("pressButtonOnce", () => {
         sleep: () => Promise.reject(new Error("aborted")),
       }),
     ).rejects.toThrow("aborted");
+  });
+});
+
+describe("withHeldModifiers", () => {
+  it("holds the modifiers across the gesture and releases them in reverse", async () => {
+    const { sink, calls } = recordingSink();
+    await withHeldModifiers({
+      sink,
+      modifierCodes: [EVDEV_KEY_CODES.LeftControl, EVDEV_KEY_CODES.LeftShift],
+      run: async () => {
+        calls.push("gesture");
+      },
+    });
+    expect(calls).toEqual([
+      `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.LeftControl} true`,
+      `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.LeftShift} true`,
+      "gesture",
+      `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.LeftShift} false`,
+      `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.LeftControl} false`,
+    ]);
+  });
+
+  it("does nothing at all when nothing is held", async () => {
+    const { sink, calls } = recordingSink();
+    const answer = await withHeldModifiers({ sink, modifierCodes: [], run: async () => 7 });
+    expect(answer).toBe(7);
+    expect(calls).toEqual([]);
+  });
+
+  it("releases what went down when the gesture throws, and reports the gesture's error", async () => {
+    // A modifier stranded on the human's keyboard by a failed click turns every
+    // subsequent keystroke of theirs into a shortcut.
+    const { sink, calls } = recordingSink();
+    await expect(
+      withHeldModifiers({
+        sink,
+        modifierCodes: [EVDEV_KEY_CODES.LeftShift],
+        run: () => Promise.reject(new Error("the click was refused")),
+      }),
+    ).rejects.toThrow("the click was refused");
+    expect(calls).toEqual([
+      `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.LeftShift} true`,
+      `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.LeftShift} false`,
+    ]);
+  });
+
+  it("releases only the modifiers that actually went down", async () => {
+    const { sink, calls } = recordingSink({
+      failOn: (call) =>
+        call === `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.LeftShift} true`,
+    });
+    await expect(
+      withHeldModifiers({
+        sink,
+        modifierCodes: [EVDEV_KEY_CODES.LeftControl, EVDEV_KEY_CODES.LeftShift],
+        run: async () => undefined,
+      }),
+    ).rejects.toThrow("refused");
+    expect(calls).toEqual([
+      `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.LeftControl} true`,
+      `${POINTER_SEQUENCE_OPERATIONS.keyPress} ${EVDEV_KEY_CODES.LeftShift} true`,
+      `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${EVDEV_KEY_CODES.LeftControl} false`,
+    ]);
   });
 });

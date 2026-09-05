@@ -23,6 +23,25 @@ export const COMPUTER_PERMISSIONS: readonly ComputerPermission[] = [
   "screenRecording",
 ];
 
+/**
+ * The grants without which the desktop cannot be driven at all.
+ *
+ * The distinction is the difference between "stop and wait for the user" and
+ * "carry on with one hand tied": Accessibility gates every synthetic event and
+ * every accessibility read, so nothing works without it, while Screen Recording
+ * only takes away the pictures — the window list, the accessibility tree, and
+ * every input still work. Telling an agent to stop because it cannot take a
+ * screenshot costs the user the whole task for a grant that blocked none of it.
+ */
+export const COMPUTER_BLOCKING_PERMISSIONS: readonly ComputerPermission[] = ["accessibility"];
+
+/** Whether any of these missing grants stops the desktop being driven at all. */
+export function computerPermissionsBlockControl(
+  permissions: readonly ComputerPermission[],
+): boolean {
+  return permissions.some((permission) => COMPUTER_BLOCKING_PERMISSIONS.includes(permission));
+}
+
 /** Exactly what System Settings › Privacy & Security calls each grant. */
 export const COMPUTER_PERMISSION_LABELS: Readonly<Record<ComputerPermission, string>> = {
   accessibility: "Accessibility",
