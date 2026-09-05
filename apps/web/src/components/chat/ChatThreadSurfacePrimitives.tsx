@@ -19,6 +19,7 @@ import { scheduleDeferredChatMount } from "./deferredChatMount";
 const DiffPanel = lazy(() => import("../DiffPanel"));
 export const LazyBrowserPanel = lazy(() => import("../BrowserPanel"));
 export const LazyDevicePanel = lazy(() => import("../DevicePanel"));
+export const LazyComputerPanel = lazy(() => import("../ComputerPanel"));
 
 export const noopChatSurfaceAction = () => {};
 
@@ -101,6 +102,7 @@ export function ChatMountLoader() {
 
 export function DeferredChatView(props: {
   threadId: ThreadId;
+  hideHeader?: boolean;
   paneScopeId: string;
   deferMount: boolean;
   surfaceMode: "single" | "split";
@@ -158,6 +160,7 @@ export function DeferredChatView(props: {
     <ChatView
       key={props.paneScopeId}
       threadId={props.threadId}
+      hideHeader={props.hideHeader ?? false}
       paneScopeId={props.paneScopeId}
       surfaceMode={props.surfaceMode}
       presentationMode={props.presentationMode ?? "default"}

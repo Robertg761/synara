@@ -115,6 +115,10 @@ import type {
   ProjectListDirectoriesResult,
   ProjectReadFileInput,
   ProjectReadFileResult,
+  ProjectPrewarmSearchIndexInput,
+  ProjectPrewarmSearchIndexResult,
+  ProjectResolveWorkspaceFileReferencesInput,
+  ProjectResolveWorkspaceFileReferencesResult,
   ProjectResolveOutOfRootFileReferenceInput,
   ProjectResolveOutOfRootFileReferenceResult,
   ProjectRunDevServerInput,
@@ -163,6 +167,23 @@ import type {
   DeviceTypeTextInput,
   ThreadDeviceState,
 } from "./device";
+import type {
+  ComputerActionResult,
+  ComputerEvent,
+  ComputerGetScreenSizeInput,
+  ComputerGetScreenSizeResult,
+  ComputerGetStatusInput,
+  ComputerInputClickInput,
+  ComputerInputKeyInput,
+  ComputerInputScrollInput,
+  ComputerListWindowsInput,
+  ComputerProvisionInput,
+  ComputerProvisionResult,
+  ComputerListWindowsResult,
+  ComputerStatusResult,
+  ComputerThreadInput,
+  ThreadComputerState,
+} from "./computer";
 import type { StudioListThreadOutputsInput, StudioListThreadOutputsResult } from "./studio";
 import type {
   ServerConfig,
@@ -216,6 +237,8 @@ import type {
   OrchestrationListProviderDeliveryBlockersResult,
   OrchestrationReconcileProviderDeliveryInput,
   OrchestrationReconcileProviderDeliveryResult,
+  OrchestrationPrepareQuitResumeInput,
+  OrchestrationPrepareQuitResumeResult,
   OrchestrationGetTurnDiffInput,
   OrchestrationGetTurnDiffResult,
   OrchestrationEvent,
@@ -375,6 +398,8 @@ export interface BrowserSetPanelBoundsInput {
   threadId: ThreadId;
   bounds: BrowserPanelBounds | null;
   surface?: "native" | "renderer";
+  /** Guest page zoom for a presentation surface; omitted/1 keeps the normal 100% viewport. */
+  pageZoomFactor?: number;
 }
 
 export interface BrowserAttachWebviewInput extends BrowserTabInput {
@@ -507,6 +532,44 @@ export interface DesktopWindowState {
   isFullscreen: boolean;
 }
 
+/** Main → renderer: ask whether quit should proceed while chats are running. */
+export type DesktopQuitConfirmationPresentation = "native" | "in-app";
+
+export interface DesktopQuitConfirmationRequest {
+  readonly requestId: string;
+  readonly presentation: DesktopQuitConfirmationPresentation;
+}
+
+export interface DesktopQuitConfirmationChat {
+  readonly id: string;
+  readonly title: string;
+}
+
+/**
+ * Renderer → main: first ack that the UI received the request, then the user's
+ * Stay / Quit decision. `ready` with `runningCount === 0` is treated as allow.
+ */
+export type DesktopQuitConfirmationResponse =
+  | {
+      readonly requestId: string;
+      readonly phase: "ready";
+      readonly runningCount: number;
+      readonly chats: ReadonlyArray<DesktopQuitConfirmationChat>;
+    }
+  | {
+      readonly requestId: string;
+      readonly phase: "decision";
+      readonly allow: boolean;
+    };
+
+/** Windows/Linux frameless title bar preference vs the live BrowserWindow frame. */
+export interface DesktopCustomTitleBarState {
+  supported: boolean;
+  preference: boolean;
+  active: boolean;
+  restartRequired: boolean;
+}
+
 export const DesktopAppIcon = Schema.Literals(["default", "icon", "dark"]);
 export type DesktopAppIcon = typeof DesktopAppIcon.Type;
 
@@ -552,7 +615,20 @@ export interface DesktopBridge {
     getState: () => Promise<DesktopWindowState>;
     onState: (listener: (state: DesktopWindowState) => void) => () => void;
   };
+  /**
+   * Windows/Linux only. `frame` is fixed at BrowserWindow creation, so changing
+   * the preference requires a relaunch before `active` catches up.
+   */
+  customTitleBar?: {
+    getState: () => Promise<DesktopCustomTitleBarState>;
+    setPreference: (enabled: boolean) => Promise<DesktopCustomTitleBarState>;
+    relaunch: () => Promise<void>;
+  };
   onMenuAction: (listener: (action: string) => void) => () => void;
+  onQuitConfirmationRequest: (
+    listener: (request: DesktopQuitConfirmationRequest) => void,
+  ) => () => void;
+  replyQuitConfirmation: (response: DesktopQuitConfirmationResponse) => void;
   /** Current `webContents` page zoom (1 = 100%). Used to keep macOS traffic-light gutter aligned. */
   getZoomFactor: () => number;
   onZoomFactorChange: (listener: (zoomFactor: number) => void) => () => void;
@@ -625,7 +701,16 @@ export interface NativeApi {
       input: ProjectSearchLocalEntriesInput,
     ) => Promise<ProjectSearchLocalEntriesResult>;
     searchContent: (input: ProjectSearchContentInput) => Promise<ProjectSearchContentResult>;
-    readFile: (input: ProjectReadFileInput) => Promise<ProjectReadFileResult>;
+    prewarmSearchIndex: (
+      input: ProjectPrewarmSearchIndexInput,
+    ) => Promise<ProjectPrewarmSearchIndexResult>;
+    readFile: (
+      input: ProjectReadFileInput,
+      options?: { readonly signal?: AbortSignal },
+    ) => Promise<ProjectReadFileResult>;
+    resolveWorkspaceFileReferences: (
+      input: ProjectResolveWorkspaceFileReferencesInput,
+    ) => Promise<ProjectResolveWorkspaceFileReferencesResult>;
     resolveOutOfRootFileReference: (
       input: ProjectResolveOutOfRootFileReferenceInput,
     ) => Promise<ProjectResolveOutOfRootFileReferenceResult>;
@@ -813,6 +898,9 @@ export interface NativeApi {
     reconcileProviderDelivery: (
       input: OrchestrationReconcileProviderDeliveryInput,
     ) => Promise<OrchestrationReconcileProviderDeliveryResult>;
+    prepareQuitResume: (
+      input: OrchestrationPrepareQuitResumeInput,
+    ) => Promise<OrchestrationPrepareQuitResumeResult>;
     subscribeShell: () => Promise<void>;
     unsubscribeShell: () => Promise<void>;
     subscribeThread: (input: OrchestrationSubscribeThreadInput) => Promise<void>;
@@ -864,5 +952,19 @@ export interface NativeApi {
     describeUi: (input: DeviceDescribeUiInput) => Promise<DeviceDescribeUiResult>;
     scrollToElement: (input: DeviceScrollToElementInput) => Promise<DeviceScrollToElementResult>;
     onEvent: (callback: (event: DeviceEvent) => void) => () => void;
+  };
+  computer: {
+    /** Thread-independent backend status for surfaces outside any conversation. */
+    getStatus: (input: ComputerGetStatusInput) => Promise<ComputerStatusResult>;
+    /** Install or compile whatever this desktop is missing, on user request. */
+    provision: (input: ComputerProvisionInput) => Promise<ComputerProvisionResult>;
+    getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
+    listWindows: (input: ComputerListWindowsInput) => Promise<ComputerListWindowsResult>;
+    getScreenSize: (input: ComputerGetScreenSizeInput) => Promise<ComputerGetScreenSizeResult>;
+    /** User input from the computer dock pane; needs no agent turn in flight. */
+    inputClick: (input: ComputerInputClickInput) => Promise<ComputerActionResult>;
+    inputScroll: (input: ComputerInputScrollInput) => Promise<ComputerActionResult>;
+    inputKey: (input: ComputerInputKeyInput) => Promise<ComputerActionResult>;
+    onEvent: (callback: (event: ComputerEvent) => void) => () => void;
   };
 }

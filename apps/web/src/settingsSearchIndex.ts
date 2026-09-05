@@ -158,6 +158,14 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     target: null,
   },
   {
+    id: "appearance:custom-title-bar",
+    section: "appearance",
+    title: "Use custom title bar",
+    keywords:
+      "frameless window system title bar Windows Linux caption controls minimize maximize close chrome",
+    target: null,
+  },
+  {
     id: "appearance:system-ui-font",
     section: "appearance",
     title: "Use system UI font",
@@ -263,6 +271,39 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
       "Input Monitoring and Screen Recording permissions for AppSnap in macOS System Settings. privacy security recheck grant",
     // Renders only in the macOS desktop app, so no stable anchor on other platforms.
     target: null,
+  },
+
+  // ── Computer use ──────────────────────────────────────────────────────────────
+  {
+    id: "computer:status",
+    section: "computer",
+    title: "Desktop backend",
+    keywords:
+      "Whether agents can see and control this computer's desktop right now. beta availability health kwin hyprland nested wayland linux computer use control status set up install plugin repair",
+    // The status row's title is dynamic (Ready / Reconnecting / Unavailable), so
+    // link to the section rather than an anchored row.
+    target: null,
+  },
+  {
+    id: "computer:open-automatically",
+    section: "computer",
+    title: "Open automatically",
+    keywords:
+      "Open the Computer pane the first time an agent acts on the desktop in a chat. auto open dock computer use",
+  },
+  {
+    id: "computer:start-new-chats-with-computer-control",
+    section: "computer",
+    title: "Start new chats with computer control",
+    keywords:
+      "New chats follow your last computer-control choice; flipping the per-chat switch updates this default. sticky default enable computer use desktop control new chat",
+  },
+  {
+    id: "computer:enabling-computer-control",
+    section: "computer",
+    title: "Enabling computer control",
+    keywords:
+      "Computer control is switched on per chat from the composer's mode menu. full access toggle desktop agent computer use",
   },
 
   // ── Behavior ──────────────────────────────────────────────────────────────────

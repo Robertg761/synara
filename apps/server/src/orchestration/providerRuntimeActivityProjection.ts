@@ -109,7 +109,33 @@ function truncateDetail(value: string, limit = 180): string {
   return value.length > limit ? `${value.slice(0, limit - 3)}...` : value;
 }
 
-function stringifyJsonLike(value: unknown): string {
+function isPlainJsonTree(value: unknown, seen: Set<object>): boolean {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  ) {
+    return true;
+  }
+  if (typeof value !== "object") {
+    return false;
+  }
+  if (seen.has(value)) {
+    return false;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.every((entry) => isPlainJsonTree(entry, seen));
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+  return Object.values(value).every((entry) => isPlainJsonTree(entry, seen));
+}
+
+function stringifyJsonLikeFallback(value: unknown): string {
   const seen = new WeakSet<object>();
   return (
     JSON.stringify(value, (_key, entry) => {
@@ -128,6 +154,21 @@ function stringifyJsonLike(value: unknown): string {
       return entry;
     }) ?? "null"
   );
+}
+
+function serializeJsonLike(value: unknown): {
+  readonly text: string;
+  readonly plain: boolean;
+} {
+  const plain = isPlainJsonTree(value, new Set<object>());
+  return {
+    text: plain ? (JSON.stringify(value) ?? "null") : stringifyJsonLikeFallback(value),
+    plain,
+  };
+}
+
+function stringifyJsonLike(value: unknown): string {
+  return serializeJsonLike(value).text;
 }
 
 function truncateJsonString(value: string, limit: number): string {
@@ -250,9 +291,10 @@ function truncateJsonValue(
 }
 
 function boundActivityData(value: unknown): unknown {
-  const serialized = stringifyJsonLike(value);
+  const serialization = serializeJsonLike(value);
+  const serialized = serialization.text;
   if (serialized.length <= MAX_ACTIVITY_DATA_JSON_CHARS) {
-    return JSON.parse(serialized);
+    return serialization.plain ? value : JSON.parse(serialized);
   }
 
   const withTruncationMetadata = (bounded: unknown): Record<string, unknown> => {
@@ -340,7 +382,11 @@ function buildContextWindowActivityPayload(
   const hasPercentUsage =
     typeof usage.usedPercent === "number" && Number.isFinite(usage.usedPercent);
   const hasKnownWindow = typeof usage.maxTokens === "number" && Number.isFinite(usage.maxTokens);
-  if (!hasTokenUsage && !hasPercentUsage && !hasKnownWindow) {
+  const hasProcessedTokens =
+    typeof usage.totalProcessedTokens === "number" &&
+    Number.isFinite(usage.totalProcessedTokens) &&
+    usage.totalProcessedTokens > 0;
+  if (!hasTokenUsage && !hasPercentUsage && !hasKnownWindow && !hasProcessedTokens) {
     return undefined;
   }
   // Stamp the emitting provider so token stats can attribute usage to the
@@ -435,11 +481,16 @@ export function runtimeTurnState(
 
 function requestKindFromCanonicalRequestType(
   requestType: string | undefined,
-): "command" | "file-read" | "file-change" | "permissions" | undefined {
+): "command" | "file-read" | "file-change" | "permissions" | "tool" | undefined {
   if (requestType === "command_execution_approval" || requestType === "exec_command_approval")
     return "command";
   if (requestType === "file_read_approval") return "file-read";
   if (requestType === "permissions_approval") return "permissions";
+  if (requestType === "tool_approval") return "tool";
+  // Legacy Claude classification: generic/MCP tool approvals were labelled with the
+  // item type instead of the canonical "tool_approval". Kept so persisted events
+  // still resolve to a renderable kind.
+  if (requestType === "dynamic_tool_call") return "tool";
   return requestType === "file_change_approval" || requestType === "apply_patch_approval"
     ? "file-change"
     : undefined;
@@ -465,6 +516,60 @@ function sessionApprovalAvailable(
   return typeof args?.sessionApprovalAvailable === "boolean"
     ? args.sessionApprovalAvailable
     : undefined;
+}
+
+// Approval cards render `toolParamsDisplay` entries as name/value rows, so a raw
+// tool-input object has to be flattened into that shape. Values are stringified
+// here rather than passed through as nested JSON: the card prints one compact line
+// per parameter, and pre-formatting keeps the persisted payload small.
+function toolParamsDisplayFromToolInput(
+  input: Record<string, unknown> | undefined,
+): ReadonlyArray<{ readonly name: string; readonly value: string }> | undefined {
+  if (!input) {
+    return undefined;
+  }
+  const entries = Object.entries(input).map(([name, value]) => ({
+    name,
+    value:
+      typeof value === "string" ? value : (safeStringifyToolParamValue(value) ?? String(value)),
+  }));
+  return entries.length > 0 ? entries : undefined;
+}
+
+function safeStringifyToolParamValue(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function requestedMcpToolCallPresentation(
+  event: Extract<ProviderRuntimeEvent, { type: "request.opened" }>,
+): { toolName?: string; toolParamsDisplay?: unknown } {
+  // "dynamic_tool_call" is the legacy Claude request type for the same approval.
+  if (
+    event.payload.requestType !== "tool_approval" &&
+    event.payload.requestType !== "dynamic_tool_call"
+  ) {
+    return {};
+  }
+  const args = asObject(event.payload.args);
+  // Codex ships presentation through MCP elicitation `_meta`; Claude's canUseTool
+  // request carries the tool name and the raw tool input instead.
+  const metadata = asObject(args?._meta);
+  const toolName = asString(metadata?.tool_name) ?? asString(args?.toolName);
+  const toolParamsDisplay = Array.isArray(metadata?.tool_params_display)
+    ? boundActivityData(metadata.tool_params_display)
+    : boundActivityDataOrUndefined(toolParamsDisplayFromToolInput(asObject(args?.input)));
+  return {
+    ...(toolName ? { toolName } : {}),
+    ...(toolParamsDisplay !== undefined ? { toolParamsDisplay } : {}),
+  };
+}
+
+function boundActivityDataOrUndefined(value: unknown): unknown {
+  return value === undefined ? undefined : boundActivityData(value);
 }
 
 export function projectProviderRuntimeActivities(
@@ -538,6 +643,8 @@ export function projectProviderRuntimeActivities(
         event.type === "request.opened" ? requestedPermissionProfile(event) : undefined;
       const canApproveForSession =
         event.type === "request.opened" ? sessionApprovalAvailable(event) : undefined;
+      const toolCallPresentation =
+        event.type === "request.opened" ? requestedMcpToolCallPresentation(event) : {};
       const requestId = nonEmptyTrimmed(event.requestId);
       return [
         {
@@ -556,7 +663,9 @@ export function projectProviderRuntimeActivities(
                     ? "File-change approval requested"
                     : requestKind === "permissions"
                       ? "Permission approval requested"
-                      : "Approval requested",
+                      : requestKind === "tool"
+                        ? "Tool approval requested"
+                        : "Approval requested",
           payload: toActivityPayload({
             // Omitted, never `undefined`: `Schema.Json` rejects a member that is
             // explicitly present and undefined.
@@ -570,6 +679,7 @@ export function projectProviderRuntimeActivities(
               ? { detail: truncateDetail(event.payload.detail) }
               : {}),
             ...(permissionProfile ? { permissionProfile } : {}),
+            ...toolCallPresentation,
             ...(canApproveForSession !== undefined
               ? { sessionApprovalAvailable: canApproveForSession }
               : {}),
@@ -624,11 +734,9 @@ export function projectProviderRuntimeActivities(
           kind: "runtime.warning",
           summary: isBackgroundMove
             ? "Moved to background"
-            : (event.provider === "opencode" || event.provider === "kilo") &&
+            : event.provider === "opencode" &&
                 (nativeType === "session.next.retried" || nativeType === "session.status")
-              ? event.provider === "opencode"
-                ? "OpenCode retrying"
-                : "Kilo retrying"
+              ? "OpenCode retrying"
               : "Runtime warning",
           // Keep the user-visible message even when raw detail is structured.
           payload: toActivityPayload({
@@ -1025,6 +1133,62 @@ export function projectProviderRuntimeActivities(
               ? { cumulativeCostUsd: event.payload.cumulativeCostUsd }
               : {}),
             ...(errorMessage ? { errorMessage } : {}),
+          }),
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
+    case "hook.started":
+    case "hook.progress":
+      // Hook lifecycle is operational evidence, not transcript content. The
+      // canonical runtime journal retains it for replay and diagnostics.
+      return [];
+
+    case "hook.completed": {
+      const status = event.payload.status;
+      // Successful hooks are routine, and cancelled hooks normally reflect an
+      // interrupted turn. Neither should add rows or transcript height churn.
+      if (
+        event.payload.outcome === "success" ||
+        (event.payload.outcome === "cancelled" && !status)
+      ) {
+        return [];
+      }
+      const hookLabel = event.payload.hookEvent ?? "Lifecycle";
+      const summary =
+        status === "blocked"
+          ? `${hookLabel} hook blocked an action`
+          : status === "stopped"
+            ? `${hookLabel} hook stopped execution`
+            : `${hookLabel} hook failed`;
+      const message = truncateDetail(
+        event.payload.statusMessage ??
+          event.payload.stderr ??
+          event.payload.output ??
+          event.payload.stdout ??
+          summary,
+        500,
+      );
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: status === "failed" || event.payload.outcome === "error" ? "error" : "info",
+          kind: "runtime.warning",
+          summary,
+          payload: toActivityPayload({
+            message,
+            detail: message,
+            hookId: event.payload.hookId,
+            ...(event.payload.hookName ? { hookName: event.payload.hookName } : {}),
+            ...(event.payload.hookEvent ? { hookEvent: event.payload.hookEvent } : {}),
+            outcome: event.payload.outcome,
+            ...(status ? { status } : {}),
+            ...(event.payload.durationMs !== undefined
+              ? { durationMs: event.payload.durationMs }
+              : {}),
           }),
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,

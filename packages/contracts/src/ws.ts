@@ -78,6 +78,8 @@ import {
   ProjectDiscoverScriptsInput,
   ProjectListDirectoriesInput,
   ProjectReadFileInput,
+  ProjectPrewarmSearchIndexInput,
+  ProjectResolveWorkspaceFileReferencesInput,
   ProjectResolveOutOfRootFileReferenceInput,
   ProjectRunDevServerInput,
   ProjectSearchEntriesInput,
@@ -112,6 +114,7 @@ import {
   DeviceThreadInput,
   DeviceTypeTextInput,
 } from "./device";
+import { COMPUTER_WS_CHANNELS, ComputerEvent } from "./computer";
 import { OpenInEditorInput } from "./editor";
 import {
   ServerConfigUpdatedPayload,
@@ -167,7 +170,9 @@ export const WS_METHODS = {
   projectsSearchEntries: "projects.searchEntries",
   projectsSearchLocalEntries: "projects.searchLocalEntries",
   projectsSearchContent: "projects.searchContent",
+  projectsPrewarmSearchIndex: "projects.prewarmSearchIndex",
   projectsReadFile: "projects.readFile",
+  projectsResolveWorkspaceFileReferences: "projects.resolveWorkspaceFileReferences",
   projectsResolveOutOfRootFileReference: "projects.resolveOutOfRootFileReference",
   projectsCreateLocalFilePreviewGrant: "projects.createLocalFilePreviewGrant",
   projectsWriteFile: "projects.writeFile",
@@ -344,7 +349,12 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(WS_METHODS.projectsSearchEntries, ProjectSearchEntriesInput),
   tagRequestBody(WS_METHODS.projectsSearchLocalEntries, ProjectSearchLocalEntriesInput),
   tagRequestBody(WS_METHODS.projectsSearchContent, ProjectSearchContentInput),
+  tagRequestBody(WS_METHODS.projectsPrewarmSearchIndex, ProjectPrewarmSearchIndexInput),
   tagRequestBody(WS_METHODS.projectsReadFile, ProjectReadFileInput),
+  tagRequestBody(
+    WS_METHODS.projectsResolveWorkspaceFileReferences,
+    ProjectResolveWorkspaceFileReferencesInput,
+  ),
   tagRequestBody(
     WS_METHODS.projectsResolveOutOfRootFileReference,
     ProjectResolveOutOfRootFileReferenceInput,
@@ -529,6 +539,7 @@ export interface WsPushPayloadByChannel {
   readonly [WS_CHANNELS.terminalEvent]: typeof TerminalEvent.Type;
   readonly [WS_CHANNELS.projectDevServerEvent]: typeof ProjectDevServerEvent.Type;
   readonly [DEVICE_WS_CHANNELS.event]: typeof DeviceEvent.Type;
+  readonly [COMPUTER_WS_CHANNELS.event]: typeof ComputerEvent.Type;
   readonly [ORCHESTRATION_WS_CHANNELS.domainEvent]: OrchestrationEvent;
   readonly [ORCHESTRATION_WS_CHANNELS.shellEvent]: OrchestrationShellStreamItem;
   readonly [ORCHESTRATION_WS_CHANNELS.threadEvent]: OrchestrationThreadStreamItem;
@@ -587,6 +598,7 @@ export const WsPushProjectDevServerEvent = makeWsPushSchema(
   ProjectDevServerEvent,
 );
 export const WsPushDeviceEvent = makeWsPushSchema(DEVICE_WS_CHANNELS.event, DeviceEvent);
+export const WsPushComputerEvent = makeWsPushSchema(COMPUTER_WS_CHANNELS.event, ComputerEvent);
 export const WsPushOrchestrationDomainEvent = makeWsPushSchema(
   ORCHESTRATION_WS_CHANNELS.domainEvent,
   OrchestrationEvent,
@@ -613,6 +625,7 @@ export const WsPushChannelSchema = Schema.Literals([
   WS_CHANNELS.terminalEvent,
   WS_CHANNELS.projectDevServerEvent,
   DEVICE_WS_CHANNELS.event,
+  COMPUTER_WS_CHANNELS.event,
   ORCHESTRATION_WS_CHANNELS.domainEvent,
   ORCHESTRATION_WS_CHANNELS.shellEvent,
   ORCHESTRATION_WS_CHANNELS.threadEvent,
@@ -632,6 +645,7 @@ export const WsPush = Schema.Union([
   WsPushTerminalEvent,
   WsPushProjectDevServerEvent,
   WsPushDeviceEvent,
+  WsPushComputerEvent,
   WsPushOrchestrationDomainEvent,
   WsPushOrchestrationShellEvent,
   WsPushOrchestrationThreadEvent,

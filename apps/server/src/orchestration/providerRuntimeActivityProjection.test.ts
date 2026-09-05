@@ -354,6 +354,44 @@ describe("provider runtime activity projection", () => {
     expect(providerActivityUpdateFingerprint(activity!)).toContain('"kind":"tool.updated"');
   });
 
+  it("keeps the fast JSON fingerprint byte-identical to the legacy JSON-like serializer", () => {
+    const [activity] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "tool.progress",
+        eventId: "tool-progress-fingerprint",
+        turnId: TURN_ID,
+        payload: {
+          toolUseId: "tool-fingerprint",
+          toolName: "mcp__github__fetch_pr",
+          summary: "Fetching PR",
+          elapsedSeconds: 2.4,
+        },
+      }),
+    );
+    const legacyFingerprint = JSON.stringify(
+      {
+        kind: activity!.kind,
+        summary: activity!.summary,
+        payload: activity!.payload,
+        turnId: activity!.turnId,
+      },
+      (() => {
+        const seen = new WeakSet<object>();
+        return (_key: string, entry: unknown) => {
+          if (typeof entry === "bigint") return entry.toString();
+          if (typeof entry === "function" || typeof entry === "symbol") return undefined;
+          if (entry && typeof entry === "object") {
+            if (seen.has(entry)) return "[Circular]";
+            seen.add(entry);
+          }
+          return entry;
+        };
+      })(),
+    );
+
+    expect(providerActivityUpdateFingerprint(activity!)).toBe(legacyFingerprint);
+  });
+
   it.each(["antigravity", "codex"] as const)(
     "projects %s tool lifecycle events through the same canonical activities",
     (provider) => {
@@ -472,6 +510,35 @@ describe("provider runtime activity projection", () => {
       },
     });
 
+    const toolApproval = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "request.opened",
+        eventId: "tool-approval-request",
+        requestId: ApprovalRequestId.makeUnsafe("tool-request-1"),
+        payload: {
+          requestType: "tool_approval",
+          detail: "Allow Synara to launch the calculator?",
+          args: {
+            _meta: {
+              tool_name: "computer_launch_app",
+              tool_params_display: [{ name: "app", value: "kcalc", display_name: "app" }],
+            },
+          },
+        },
+      }),
+    )[0];
+    expect(toolApproval).toMatchObject({
+      kind: "approval.requested",
+      summary: "Tool approval requested",
+      payload: {
+        requestKind: "tool",
+        requestType: "tool_approval",
+        detail: "Allow Synara to launch the calculator?",
+        toolName: "computer_launch_app",
+        toolParamsDisplay: [{ name: "app", value: "kcalc", display_name: "app" }],
+      },
+    });
+
     const userInput = [
       runtimeEvent({
         type: "user-input.requested",
@@ -520,6 +587,66 @@ describe("provider runtime activity projection", () => {
     ]);
   });
 
+  it.each(["tool_approval", "dynamic_tool_call"] as const)(
+    "renders Claude-shaped %s approvals as tool approvals with parameter rows",
+    (requestType) => {
+      const [approval] = projectProviderRuntimeActivities(
+        runtimeEvent({
+          type: "request.opened",
+          provider: "claudeAgent",
+          eventId: `claude-${requestType}-request`,
+          requestId: ApprovalRequestId.makeUnsafe(`claude-${requestType}-1`),
+          payload: {
+            requestType,
+            detail: "mcp__synara__computer_launch_app: {}",
+            args: {
+              toolName: "mcp__synara__computer_launch_app",
+              input: { app: "kcalc", args: ["--hidpi"], headless: false },
+              sessionApprovalAvailable: true,
+              toolUseId: "toolu_01",
+            },
+          },
+        }),
+      );
+
+      expect(approval).toMatchObject({
+        kind: "approval.requested",
+        summary: "Tool approval requested",
+        payload: {
+          requestKind: "tool",
+          requestType,
+          toolName: "mcp__synara__computer_launch_app",
+          toolParamsDisplay: [
+            { name: "app", value: "kcalc" },
+            { name: "args", value: '["--hidpi"]' },
+            { name: "headless", value: "false" },
+          ],
+          sessionApprovalAvailable: true,
+        },
+      });
+      expect(() => decodeActivityAppendCommand(approval!)).not.toThrow();
+    },
+  );
+
+  it("omits tool presentation when a Claude tool approval carries no input", () => {
+    const [approval] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "request.opened",
+        provider: "claudeAgent",
+        eventId: "claude-tool-approval-empty-input",
+        requestId: ApprovalRequestId.makeUnsafe("claude-tool-approval-empty"),
+        payload: {
+          requestType: "tool_approval",
+          detail: "Agent: {}",
+          args: { toolName: "Agent", input: {}, sessionApprovalAvailable: false },
+        },
+      }),
+    );
+
+    expect(approval?.payload).toMatchObject({ requestKind: "tool", toolName: "Agent" });
+    expect(approval?.payload).not.toHaveProperty("toolParamsDisplay");
+  });
+
   it("bounds pathological tool payloads before persistence", () => {
     const data = Object.fromEntries(
       Array.from({ length: 120 }, (_, index) => [
@@ -563,6 +690,23 @@ describe("provider runtime activity projection", () => {
         usedTokens: 1_200,
         maxTokens: 200_000,
         usedPercent: 0.6,
+        provider: "claudeAgent",
+      },
+    });
+
+    const [accountingOnlyUsage] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "thread.token-usage.updated",
+        eventId: "context-usage-accounting-only",
+        provider: "claudeAgent",
+        payload: { usage: { usedTokens: 0, totalProcessedTokens: 340_000 } },
+      }),
+    );
+    expect(accountingOnlyUsage).toMatchObject({
+      kind: "context-window.updated",
+      payload: {
+        usedTokens: 0,
+        totalProcessedTokens: 340_000,
         provider: "claudeAgent",
       },
     });
@@ -687,5 +831,122 @@ describe("provider runtime activity projection", () => {
         }),
       ),
     ).toEqual([]);
+  });
+
+  it("keeps routine hook lifecycle internal and surfaces only consequential completions", () => {
+    expect(
+      projectProviderRuntimeActivities(
+        runtimeEvent({
+          type: "hook.started",
+          eventId: "hook-started",
+          turnId: TURN_ID,
+          payload: {
+            hookId: "hook-run-1",
+            hookName: "/Users/example/.codex/hooks.json",
+            hookEvent: "preToolUse",
+          },
+        }),
+      ),
+    ).toEqual([]);
+    expect(
+      projectProviderRuntimeActivities(
+        runtimeEvent({
+          type: "hook.progress",
+          eventId: "hook-progress",
+          turnId: TURN_ID,
+          payload: {
+            hookId: "hook-run-1",
+            stdout: "Still running.",
+          },
+        }),
+      ),
+    ).toEqual([]);
+    expect(
+      projectProviderRuntimeActivities(
+        runtimeEvent({
+          type: "hook.completed",
+          eventId: "hook-success",
+          turnId: TURN_ID,
+          payload: {
+            hookId: "hook-run-1",
+            hookName: "/Users/example/.codex/hooks.json",
+            hookEvent: "preToolUse",
+            outcome: "success",
+            status: "completed",
+            durationMs: 8,
+          },
+        }),
+      ),
+    ).toEqual([]);
+    expect(
+      projectProviderRuntimeActivities(
+        runtimeEvent({
+          type: "hook.completed",
+          eventId: "hook-cancelled",
+          turnId: TURN_ID,
+          payload: {
+            hookId: "hook-run-2",
+            outcome: "cancelled",
+          },
+        }),
+      ),
+    ).toEqual([]);
+
+    const [failed] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "hook.completed",
+        eventId: "hook-failed",
+        turnId: TURN_ID,
+        payload: {
+          hookId: "hook-run-3",
+          hookName: "/Users/example/.codex/hooks.json",
+          hookEvent: "postToolUse",
+          outcome: "error",
+          status: "failed",
+          statusMessage: "Hook process exited with code 1.",
+          durationMs: 20,
+        },
+      }),
+    );
+    expect(failed).toMatchObject({
+      tone: "error",
+      kind: "runtime.warning",
+      summary: "postToolUse hook failed",
+      payload: {
+        message: "Hook process exited with code 1.",
+        hookId: "hook-run-3",
+        hookEvent: "postToolUse",
+        outcome: "error",
+        status: "failed",
+        durationMs: 20,
+      },
+    });
+    expect(() => decodeActivityAppendCommand(failed!)).not.toThrow();
+
+    const [blocked] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "hook.completed",
+        eventId: "hook-blocked",
+        turnId: TURN_ID,
+        payload: {
+          hookId: "hook-run-4",
+          hookEvent: "preToolUse",
+          outcome: "cancelled",
+          status: "blocked",
+          statusMessage: "Policy blocked the command.",
+        },
+      }),
+    );
+    expect(blocked).toMatchObject({
+      tone: "info",
+      kind: "runtime.warning",
+      summary: "preToolUse hook blocked an action",
+      payload: {
+        message: "Policy blocked the command.",
+        outcome: "cancelled",
+        status: "blocked",
+      },
+    });
+    expect(() => decodeActivityAppendCommand(blocked!)).not.toThrow();
   });
 });

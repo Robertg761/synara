@@ -16,11 +16,14 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
   CommandId,
+  EventId,
   SYNARA_GATEWAY_MAX_THREADS_PER_OPERATION,
   MessageId,
   THREAD_GOAL_MAX_CHARS,
   ThreadId,
+  TurnId,
   type ProviderKind,
   type RuntimeMode,
   type ServerProviderStatus,
@@ -30,6 +33,7 @@ import { runtimeModeEscalatesPrivilege } from "@synara/shared/runtimeMode";
 import { Effect, Layer, Option } from "effect";
 
 import { GitCore } from "../../git/Services/GitCore.ts";
+import { GitManager } from "../../git/Services/GitManager.ts";
 import { ServerConfig } from "../../config.ts";
 import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -51,7 +55,7 @@ import {
   type AgentGatewayProviderAvailability,
 } from "../targetResolver.ts";
 import { mcpToolResultError, mcpToolResultJson } from "../protocol.ts";
-import { gatewayIsoNow as isoNow } from "../creationUtils.ts";
+import { gatewayIsoNow as isoNow, stableGatewayDigest } from "../creationUtils.ts";
 import {
   MODEL_SELECTION_INPUT_SCHEMA,
   PROVIDER_KINDS,
@@ -72,6 +76,8 @@ import { makeAgentGatewayAutomationTools } from "../automationTools.ts";
 import { makeAgentGatewayBrowserTools } from "../browserTools.ts";
 import { makeAgentGatewayDeviceTools } from "../deviceTools.ts";
 import { DeviceService } from "../../device/Services/DeviceService.ts";
+import { COMPUTER_CONTROL_CAPABILITY, makeAgentGatewayComputerTools } from "../computerTools.ts";
+import { ComputerService } from "../../computer/Services/ComputerService.ts";
 import { BrowserAutomationHost } from "../../browserAutomation/Services/BrowserAutomationHost.ts";
 import { makeBrowserAutomationHost } from "../../browserAutomation/Layers/BrowserAutomationHost.ts";
 import { makeThreadReadTools } from "../threadReadTools.ts";
@@ -112,6 +118,7 @@ export const makeAgentGateway = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const automationService = yield* AutomationService;
   const git = yield* GitCore;
+  const gitManager = yield* GitManager;
   const providerDiscovery = yield* ProviderDiscoveryService;
   const providerHealth = yield* ProviderHealth;
   const serverSettings = yield* ServerSettingsService;
@@ -130,6 +137,7 @@ export const makeAgentGateway = Effect.gen(function* () {
   // it) the agent never sees the device_* tools at all, rather than being
   // offered eleven tools that can only report an unsupported platform.
   const deviceService = Option.getOrUndefined(yield* Effect.serviceOption(DeviceService));
+  const computerService = Option.getOrUndefined(yield* Effect.serviceOption(ComputerService));
   const loadProviderAvailabilities = Effect.gen(function* () {
     const [settings, statuses] = yield* Effect.all([
       serverSettings.getSettings,
@@ -544,6 +552,70 @@ export const makeAgentGateway = Effect.gen(function* () {
       }).pipe(Effect.catch((error) => Effect.succeed(mcpToolResultError(errorText(error))))),
   };
 
+  const setThreadPullRequest: ToolEntry = {
+    requiredCapability: "thread:write",
+    requiresActiveTurn: true,
+    definition: {
+      name: "synara_set_thread_pull_request",
+      description:
+        "Associate a pull request with a Synara thread. Use this after successfully creating the pull request that represents that thread's own deliverable. Do not associate pull requests that the thread only reviews, references, or discusses. Defaults to your own thread when threadId is omitted.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: {
+            type: "string",
+            description: "Thread that owns the pull request. Defaults to your own thread.",
+          },
+          reference: {
+            type: "string",
+            description: "GitHub pull request URL or number resolvable from the thread repository.",
+          },
+        },
+        required: ["reference"],
+        additionalProperties: false,
+      },
+      annotations: { title: "Associate a pull request", ...WRITE_TOOL_ANNOTATIONS },
+    },
+    handler: (args, context) =>
+      Effect.gen(function* () {
+        const threadId = readStringArg(args, "threadId") ?? context.callerThreadId;
+        const reference = readStringArg(args, "reference", { required: true })!;
+        const caller = yield* requireThreadShell(context.callerThreadId);
+        const target = yield* requireThreadShell(threadId);
+        yield* assertCallerMayDriveThread(caller, target);
+
+        const project = Option.getOrUndefined(
+          yield* snapshotQuery
+            .getProjectShellById(target.projectId)
+            .pipe(Effect.mapError((error) => new ToolInputError(errorText(error)))),
+        );
+        if (!project) {
+          return yield* Effect.fail(
+            new ToolInputError(`Project for thread "${threadId}" was not found.`),
+          );
+        }
+        const cwd = resolveThreadWorkspaceCwd({ thread: target, projects: [project] });
+        if (!cwd) {
+          return yield* Effect.fail(
+            new ToolInputError(`Git workspace for thread "${threadId}" is unavailable.`),
+          );
+        }
+
+        const { pullRequest } = yield* gitManager
+          .resolvePullRequest({ cwd, reference })
+          .pipe(Effect.mapError((error) => new ToolInputError(errorText(error))));
+        yield* orchestrationEngine
+          .dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.makeUnsafe(`agent:${randomUUID()}:pull-request`),
+            threadId: target.id,
+            lastKnownPr: pullRequest,
+          })
+          .pipe(Effect.mapError((error) => new ToolInputError(errorText(error))));
+        return mcpToolResultJson({ threadId: target.id, pullRequest });
+      }).pipe(Effect.catch((error) => Effect.succeed(mcpToolResultError(errorText(error))))),
+  };
+
   const setThreadArchived: ToolEntry = {
     requiredCapability: "thread:write",
     requiresActiveTurn: true,
@@ -725,6 +797,7 @@ export const makeAgentGateway = Effect.gen(function* () {
     sendMessage,
     interruptThread,
     setThreadTitle,
+    setThreadPullRequest,
     setThreadArchived,
     setThreadGoal,
     ...automationTools,
@@ -732,7 +805,63 @@ export const makeAgentGateway = Effect.gen(function* () {
     ...(deviceService?.supported === true
       ? makeAgentGatewayDeviceTools({ manager: deviceService.manager })
       : []),
+    ...(computerService?.supported === true
+      ? makeAgentGatewayComputerTools({ manager: computerService.manager })
+      : []),
   ];
+  // One denial activity per (thread, turn): agents typically retry the denied
+  // tool several times in a row, and repeated cards would bury the chat. The
+  // decider appends activities verbatim, so the dedupe lives here.
+  const surfacedComputerControlDenials = new Set<string>();
+  const SURFACED_DENIALS_MAX = 512;
+  const surfaceCapabilityDenial: NonNullable<
+    Parameters<typeof makeAgentGatewayMcpTransport>[0]["onCapabilityDenied"]
+  > = (denial) => {
+    // Only computer control has a user-facing switch to point at; other
+    // capability denials stay plain tool errors.
+    if (denial.requiredCapability !== COMPUTER_CONTROL_CAPABILITY) return Effect.void;
+    const dedupeKey = `${denial.callerThreadId}:${denial.callerTurnId ?? "no-turn"}`;
+    if (surfacedComputerControlDenials.has(dedupeKey)) return Effect.void;
+    // FIFO eviction, not a wholesale clear: clearing forgets every live turn's
+    // dedupe key at once and would let each of them surface a duplicate card.
+    while (surfacedComputerControlDenials.size >= SURFACED_DENIALS_MAX) {
+      surfacedComputerControlDenials.delete(surfacedComputerControlDenials.keys().next().value!);
+    }
+    surfacedComputerControlDenials.add(dedupeKey);
+    const marker = stableGatewayDigest({
+      kind: "computer-control-denied",
+      threadId: denial.callerThreadId,
+      turnId: denial.callerTurnId,
+    });
+    const createdAt = isoNow();
+    return orchestrationEngine
+      .dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.makeUnsafe(`agent:${marker}:computer-control-denied`),
+        threadId: ThreadId.makeUnsafe(denial.callerThreadId),
+        activity: {
+          id: EventId.makeUnsafe(`gateway:${marker}:computer-control-denied`),
+          tone: "error",
+          kind: COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
+          summary: "Computer control is off for this chat",
+          payload: { toolName: denial.toolName },
+          turnId: denial.callerTurnId === null ? null : TurnId.makeUnsafe(denial.callerTurnId),
+          createdAt,
+        },
+        createdAt,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("agent gateway could not surface computer-control denial", {
+            callerThreadId: denial.callerThreadId,
+            toolName: denial.toolName,
+            error: errorText(error),
+          }),
+        ),
+        Effect.asVoid,
+      );
+  };
+
   return {
     handleMcpPost: makeAgentGatewayMcpTransport({
       credentials,
@@ -740,6 +869,7 @@ export const makeAgentGateway = Effect.gen(function* () {
       tools,
       instructions: AGENT_GATEWAY_INSTRUCTIONS,
       requireThreadShell,
+      onCapabilityDenied: surfaceCapabilityDenial,
     }),
   } satisfies AgentGatewayShape;
 });

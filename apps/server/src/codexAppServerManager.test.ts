@@ -29,6 +29,7 @@ import {
 import {
   buildCodexInitializeParams,
   buildCodexThreadOpenRequest,
+  shouldWarnCodexFreshStartWithoutResume,
   CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
   CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
   __codexCliVersionGateTesting,
@@ -48,6 +49,7 @@ import { CodexJsonlFramer, CodexJsonlWriter } from "./codexAppServerTransport";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces";
 import { SYNARA_HARNESS_POLICY_MARKER } from "./agentGateway/harnessPolicy.ts";
 import {
+  AGENT_GATEWAY_NO_CAPABILITIES,
   AGENT_GATEWAY_TURN_AUTHORITY_RETIRED,
   acquireAgentGatewaySessionLease,
 } from "./agentGateway/sessionLease.ts";
@@ -79,6 +81,8 @@ describe("Codex Synara harness policy", () => {
       expect(instructions).toContain(SYNARA_HARNESS_POLICY_MARKER);
       expect(instructions.split(SYNARA_HARNESS_POLICY_MARKER)).toHaveLength(2);
       expect(instructions).toContain("Synara is the host and harness");
+      expect(instructions).toContain("Make every final response self-contained");
+      expect(instructions).toContain("contain all context the user needs to decide");
       expect(instructions).toContain("one exact synara_create_threads plan");
       expect(instructions).toContain("tools.mcp__synara__browser_open");
       for (const name of BROWSER_TOOL_NAMES) {
@@ -546,6 +550,7 @@ describe("Codex app-server teardown", () => {
       },
       threadId,
       "codex",
+      AGENT_GATEWAY_NO_CAPABILITIES,
     );
     const context = {
       gatewaySessionLease,
@@ -616,6 +621,7 @@ describe("Codex app-server teardown", () => {
       },
       threadId,
       "codex",
+      AGENT_GATEWAY_NO_CAPABILITIES,
     );
     const context = {
       gatewaySessionLease,
@@ -1448,6 +1454,29 @@ describe("buildCodexThreadOpenRequest", () => {
   });
 });
 
+describe("shouldWarnCodexFreshStartWithoutResume", () => {
+  it("warns only when a previously bound thread is opened with thread/start", () => {
+    expect(
+      shouldWarnCodexFreshStartWithoutResume({
+        threadOpenMethod: "thread/start",
+        previouslyBound: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldWarnCodexFreshStartWithoutResume({
+        threadOpenMethod: "thread/start",
+        previouslyBound: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldWarnCodexFreshStartWithoutResume({
+        threadOpenMethod: "thread/resume",
+        previouslyBound: true,
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("formatCodexThreadResumeError", () => {
   it("explains how to resolve an active writer conflict", () => {
     const formatted = formatCodexThreadResumeError(
@@ -1531,6 +1560,43 @@ describe("resolveCodexModelForAccount", () => {
 });
 
 describe("startSession", () => {
+  it("emits session/started after any successful thread open", () => {
+    const manager = new CodexAppServerManager();
+    const methods: string[] = [];
+    manager.on("event", (event) => {
+      methods.push(event.method);
+    });
+    const context = {
+      session: {
+        provider: "codex" as const,
+        status: "connecting" as const,
+        threadId: asThreadId("thread-1"),
+        runtimeMode: "full-access" as const,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        resumeCursor: undefined as unknown,
+      },
+    };
+
+    for (const threadOpenMethod of ["thread/start", "thread/resume", "thread/fork"] as const) {
+      methods.length = 0;
+      (
+        manager as unknown as {
+          markSessionReadyAfterThreadOpen: (
+            context: unknown,
+            input: { threadOpenMethod: string; providerThreadId: string },
+          ) => void;
+        }
+      ).markSessionReadyAfterThreadOpen(context, {
+        threadOpenMethod,
+        providerThreadId: "native-thread-1",
+      });
+      expect(methods).toEqual(["session/threadOpenResolved", "session/ready", "session/started"]);
+      expect(context.session.status).toBe("ready");
+      expect(context.session.resumeCursor).toEqual({ threadId: "native-thread-1" });
+    }
+  });
+
   it("enables Codex experimental api capabilities during initialize", () => {
     expect(buildCodexInitializeParams()).toEqual({
       clientInfo: {
@@ -2103,6 +2169,113 @@ describe("steerTurn", () => {
 });
 
 describe("CodexAppServerManager discovery", () => {
+  it("restarts the idle grace period after a discovery request settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const manager = new CodexAppServerManager(undefined, {
+        discoverySessionIdleMs: 15_000,
+      });
+      const context = {
+        discovery: true,
+        session: { cwd: "/repo" },
+        pending: new Map(),
+        pendingApprovals: new Map(),
+        pendingUserInputs: new Map(),
+        nextRequestId: 1,
+        stopping: false,
+      };
+      (
+        manager as unknown as {
+          discoverySessions: Map<string, unknown>;
+        }
+      ).discoverySessions.set("/repo", context);
+      vi.spyOn(
+        manager as unknown as {
+          writeMessage: () => Promise<void>;
+        },
+        "writeMessage",
+      ).mockResolvedValue(undefined);
+      const stopDiscoverySession = vi
+        .spyOn(
+          manager as unknown as {
+            stopDiscoverySession: (cwd: string) => Promise<void>;
+          },
+          "stopDiscoverySession",
+        )
+        .mockResolvedValue(undefined);
+
+      (
+        manager as unknown as {
+          scheduleDiscoverySessionIdleStop: (cwd: string) => void;
+        }
+      ).scheduleDiscoverySessionIdleStop("/repo");
+      const request = (
+        manager as unknown as {
+          sendRequest: (context: unknown, method: string, params: unknown) => Promise<unknown>;
+        }
+      ).sendRequest(context, "model/list", {});
+
+      await vi.advanceTimersByTimeAsync(14_999);
+      (
+        manager as unknown as {
+          handleResponse: (context: unknown, response: unknown) => void;
+        }
+      ).handleResponse(context, { id: 1, result: {} });
+      await request;
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(stopDiscoverySession).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(stopDiscoverySession).toHaveBeenCalledOnce();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops an idle discovery session after its configured grace period", async () => {
+    vi.useFakeTimers();
+    try {
+      const manager = new CodexAppServerManager(undefined, {
+        discoverySessionIdleMs: 15_000,
+      });
+      (
+        manager as unknown as {
+          discoverySessions: Map<string, unknown>;
+        }
+      ).discoverySessions.set("/repo", {
+        stopping: false,
+        pending: new Map(),
+        pendingApprovals: new Map(),
+        pendingUserInputs: new Map(),
+      });
+      const stopDiscoverySession = vi
+        .spyOn(
+          manager as unknown as {
+            stopDiscoverySession: (cwd: string) => Promise<void>;
+          },
+          "stopDiscoverySession",
+        )
+        .mockResolvedValue(undefined);
+
+      (
+        manager as unknown as {
+          scheduleDiscoverySessionIdleStop: (cwd: string) => void;
+        }
+      ).scheduleDiscoverySessionIdleStop("/repo");
+
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(stopDiscoverySession).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(stopDiscoverySession).toHaveBeenCalledOnce();
+      expect(stopDiscoverySession).toHaveBeenCalledWith("/repo");
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("wires model discovery through model/list", async () => {
     const manager = new CodexAppServerManager();
     const context = {
@@ -3237,6 +3410,179 @@ describe("respondToRequest", () => {
       context,
       expect.objectContaining({
         id: 101,
+      }),
+    );
+  });
+
+  it("auto-resolves pending MCP tool approvals with session persistence when advertised", async () => {
+    const { manager, context, writeMessage } = createPendingApprovalHarness();
+
+    await handleServerRequestForTest(manager, context, {
+      id: 100,
+      method: "mcpServer/elicitation/request",
+      params: {
+        turnId: "turn_2",
+        mode: "form",
+        message: "Approve this tool call",
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          persist: ["session"],
+          tool_name: "computer_launch_app",
+          tool_params_display: [{ name: "app", value: "kcalc" }],
+        },
+      },
+    });
+
+    const mcpRequest = [...context.pendingApprovals.values()].find(
+      (request) => String(request.method) === "mcpServer/elicitation/request",
+    );
+    if (!mcpRequest) {
+      throw new Error("Expected the MCP tool approval to remain pending.");
+    }
+
+    await manager.respondToRequest(
+      asThreadId("thread_1"),
+      ApprovalRequestId.makeUnsafe("req-approval-1"),
+      "acceptForSession",
+    );
+
+    expect(writeMessage).toHaveBeenCalledWith(context, {
+      id: 100,
+      result: {
+        action: "accept",
+        content: null,
+        _meta: { persist: "session" },
+      },
+    });
+    expect(context.pendingApprovals.has(mcpRequest.requestId)).toBe(false);
+  });
+});
+
+describe("MCP tool call elicitation approvals", () => {
+  const approvalParams = (persist: ReadonlyArray<string> = ["session"]) => ({
+    threadId: "provider_parent",
+    turnId: "turn_mcp",
+    serverName: "synara",
+    mode: "form",
+    message: "Allow Synara to launch the calculator?",
+    requestedSchema: { type: "object", properties: {} },
+    _meta: {
+      codex_approval_kind: "mcp_tool_call",
+      persist,
+      tool_name: "computer_launch_app",
+      tool_params: { app: "kcalc" },
+      tool_params_display: [{ name: "app", value: "kcalc", display_name: "app" }],
+    },
+  });
+
+  it("tracks approval elicitations as tool requests and accepts them with the MCP response shape", async () => {
+    const { manager, context, emitEvent, writeMessage } = createCollabNotificationHarness();
+
+    await handleServerRequestForTest(manager, context, {
+      id: 70,
+      method: "mcpServer/elicitation/request",
+      params: approvalParams(),
+    });
+
+    const pendingRequest = Array.from(context.pendingApprovals.values())[0];
+    expect(pendingRequest).toEqual(
+      expect.objectContaining({
+        method: "mcpServer/elicitation/request",
+        requestKind: "tool",
+        mcpSessionPersistenceAdvertised: true,
+      }),
+    );
+    expect(emitEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "request",
+        requestKind: "tool",
+        payload: expect.objectContaining({
+          _meta: expect.objectContaining({
+            tool_name: "computer_launch_app",
+            tool_params_display: [{ name: "app", value: "kcalc", display_name: "app" }],
+          }),
+        }),
+      }),
+    );
+
+    await manager.respondToRequest(asThreadId("thread_1"), pendingRequest.requestId, "accept");
+
+    expect(writeMessage).toHaveBeenCalledWith(context, {
+      id: 70,
+      result: { action: "accept", content: null, _meta: null },
+    });
+  });
+
+  it.each([
+    ["acceptForSession", ["session"], { persist: "session" }],
+    ["acceptForSession", ["always"], null],
+  ] as const)(
+    "maps %s with persist=%j to the protocol response",
+    async (decision, persist, meta) => {
+      const { manager, context, writeMessage } = createCollabNotificationHarness();
+
+      await handleServerRequestForTest(manager, context, {
+        id: 71,
+        method: "mcpServer/elicitation/request",
+        params: approvalParams(persist),
+      });
+      const pendingRequest = Array.from(context.pendingApprovals.values())[0];
+      await manager.respondToRequest(asThreadId("thread_1"), pendingRequest.requestId, decision);
+
+      expect(writeMessage).toHaveBeenCalledWith(context, {
+        id: 71,
+        result: { action: "accept", content: null, _meta: meta },
+      });
+    },
+  );
+
+  it.each(["decline", "cancel"] as const)(
+    "maps %s to the matching elicitation action",
+    async (decision) => {
+      const { manager, context, writeMessage } = createCollabNotificationHarness();
+
+      await handleServerRequestForTest(manager, context, {
+        id: 72,
+        method: "mcpServer/elicitation/request",
+        params: approvalParams(),
+      });
+      const pendingRequest = Array.from(context.pendingApprovals.values())[0];
+      await manager.respondToRequest(asThreadId("thread_1"), pendingRequest.requestId, decision);
+
+      expect(writeMessage).toHaveBeenCalledWith(context, {
+        id: 72,
+        result: { action: decision, content: null, _meta: null },
+      });
+    },
+  );
+
+  it("cancels non-approval elicitations and emits a warning instead of an unsupported-request error", async () => {
+    const { manager, context, emitEvent, writeMessage } = createCollabNotificationHarness();
+
+    await handleServerRequestForTest(manager, context, {
+      id: 73,
+      method: "mcpServer/elicitation/request",
+      params: {
+        mode: "url",
+        message: "Authenticate with the MCP server",
+        url: "https://example.test/auth",
+      },
+    });
+
+    expect(context.pendingApprovals.size).toBe(0);
+    expect(writeMessage).toHaveBeenCalledWith(context, {
+      id: 73,
+      result: { action: "cancel", content: null, _meta: null },
+    });
+    expect(writeMessage).not.toHaveBeenCalledWith(
+      context,
+      expect.objectContaining({ error: expect.objectContaining({ code: -32601 }) }),
+    );
+    expect(emitEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "error",
+        method: "mcpServer/elicitation/request/unrenderable",
+        message: "Synara declined an MCP elicitation it cannot render yet.",
       }),
     );
   });

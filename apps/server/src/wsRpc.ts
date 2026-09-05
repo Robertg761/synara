@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 
 import {
   CommandId,
+  COMPUTER_WS_METHODS,
   DEFAULT_TERMINAL_ID,
   DEVICE_WS_METHODS,
   ORCHESTRATION_WS_METHODS,
@@ -13,11 +14,13 @@ import {
   WS_METHODS,
   WsBootstrapRpcGroup,
   WsCompatibilityError,
+  WsComputerRpcGroup,
   WsDeviceRpcGroup,
   WsFeatureRpcGroup,
   WsRpcError,
   PullRequestsUnavailableError,
   type DeviceEvent,
+  type ComputerEvent,
   type GitActionProgressEvent,
   type GitHubProjectProvisionProgressEvent,
   type GitWorktreeSetupProgressEvent,
@@ -65,6 +68,9 @@ import { DevServerManager, findProjectDevServerForLocalServer } from "./devServe
 import { DeviceService } from "./device/Services/DeviceService";
 import { makeWsDeviceHandlers } from "./device/wsDeviceHandlers";
 import { makeDeviceFrameRouteLayer } from "./device/deviceFrameRoute";
+import { ComputerService } from "./computer/Services/ComputerService";
+import { makeWsComputerHandlers } from "./computer/wsComputerHandlers";
+import { makeComputerFrameRouteLayer } from "./computer/computerFrameRoute";
 import { GitCore } from "./git/Services/GitCore";
 import { GitHubCli } from "./git/Services/GitHubCli";
 import { GitManager } from "./git/Services/GitManager";
@@ -89,9 +95,11 @@ import {
 } from "./managedAttachmentPrincipal";
 import { Open, resolveAvailableEditors } from "./open";
 import { makeDispatchCommandNormalizer } from "./orchestration/dispatchCommandNormalization";
+import { prepareQuitResume } from "./orchestration/quitResume";
 import { makeImportThreadHandler } from "./orchestration/importThreadRoute";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
 import { ProviderCommandReactor } from "./orchestration/Services/ProviderCommandReactor";
+import { SidechatExpiryReactor } from "./orchestration/Services/SidechatExpiryReactor";
 import { ProjectionStateIncompleteError } from "./persistence/Errors";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { shouldPublishThreadShellForEvent } from "./orchestration/threadShellEvents";
@@ -99,6 +107,7 @@ import { ProviderDiscoveryService } from "./provider/Services/ProviderDiscoveryS
 import { discoverSkillsCatalog, synaraSkillsDir } from "./provider/skillsCatalog";
 import { recoverUnregisteredGitHubCheckout } from "./project/githubProjectRegistration";
 import { ProviderAdapterRegistry } from "./provider/Services/ProviderAdapterRegistry";
+import { getEnabledProviderAdapter } from "./provider/enabledProviderAdapter";
 import { ProviderHealth } from "./provider/Services/ProviderHealth";
 import { ProviderService } from "./provider/Services/ProviderService";
 import { listProviderUsage } from "./providerUsage";
@@ -178,12 +187,11 @@ class WsRequestAdmissionMiddleware extends RpcMiddleware.Service<WsRequestAdmiss
   { error: WsRpcError, requiredForClient: false },
 ) {}
 
-// The device group is defined separately in contracts because its engine is
-// macOS-only, but it is served on the same socket: one connection, one
-// admission middleware, one exhaustive handler map.
-const AdmittedWsFeatureRpcGroup = WsFeatureRpcGroup.merge(WsDeviceRpcGroup).middleware(
-  WsRequestAdmissionMiddleware,
-);
+// Optional device and computer groups are served on the same socket: one
+// connection, one admission middleware, one exhaustive handler map.
+const AdmittedWsFeatureRpcGroup = WsFeatureRpcGroup.merge(WsDeviceRpcGroup)
+  .merge(WsComputerRpcGroup)
+  .middleware(WsRequestAdmissionMiddleware);
 
 const wsRequestAdmissionMiddlewareLayer = Layer.effect(
   WsRequestAdmissionMiddleware,
@@ -219,7 +227,9 @@ interface ProcessTableRow {
 }
 
 function redactAndTruncateProcessArgs(args: string): string {
-  const redacted = redactSensitiveProcessArgs(args);
+  const redacted = redactSensitiveProcessArgs(args, {
+    truncateSensitiveEnvironmentRemainder: true,
+  });
   return redacted.length > MAX_DIAGNOSTIC_ARGS_CHARS
     ? `${redacted.slice(0, Math.max(0, MAX_DIAGNOSTIC_ARGS_CHARS - 15))}... [truncated]`
     : redacted;
@@ -348,6 +358,7 @@ const makeWsRpcHandlersLayer = () =>
       const open = yield* Open;
       const orchestrationEngine = yield* OrchestrationEngineService;
       const providerCommandReactor = yield* ProviderCommandReactor;
+      const sidechatExpiryReactor = yield* SidechatExpiryReactor;
       const path = yield* Path.Path;
       const pullRequests = yield* PullRequestService;
       const profileStatsQuery = yield* ProfileStatsQuery;
@@ -369,6 +380,7 @@ const makeWsRpcHandlersLayer = () =>
       // group without a device engine; the handlers below then refuse cleanly
       // with the same unsupported-platform answer the backend would give.
       const deviceService = Option.getOrUndefined(yield* Effect.serviceOption(DeviceService));
+      const computerService = Option.getOrUndefined(yield* Effect.serviceOption(ComputerService));
       const githubProjectProvisioner = yield* makeGitHubProjectProvisioner({
         homeDir: config.homeDir,
         fileSystem,
@@ -402,6 +414,14 @@ const makeWsRpcHandlersLayer = () =>
               ),
             ),
       });
+      const trackSidechatVisibility =
+        (threadId: ThreadId) =>
+        <A, E, R>(stream: Stream.Stream<A, E, R>): Stream.Stream<A, E, R> =>
+          Stream.unwrap(
+            Effect.acquireRelease(sidechatExpiryReactor.viewStarted(threadId), () =>
+              sidechatExpiryReactor.viewEnded(threadId),
+            ).pipe(Effect.as(stream)),
+          );
       const recordThreadStreamDrop = (threadId: string, report: LiveUiStreamDropReport) =>
         threadDiagnostics
           .recordOperationalDiagnostic({
@@ -604,6 +624,7 @@ const makeWsRpcHandlersLayer = () =>
         projectionSnapshotQuery: projectionReadModelQuery,
         providerAdapterRegistry,
         providerService,
+        serverSettings,
       });
 
       const dispatchOrchestrationCommand = (command: OrchestrationCommand) =>
@@ -927,6 +948,20 @@ const makeWsRpcHandlersLayer = () =>
             }),
             "Failed to load provider delivery blockers",
           ),
+        [ORCHESTRATION_WS_METHODS.prepareQuitResume]: (input) =>
+          rpcEffect(
+            // Gated as a whole (not just its dispatches) so the record can never be
+            // written while startup is still claiming the previous quit's record.
+            runtimeStartup.enqueueCommand(
+              prepareQuitResume({
+                request: input,
+                recordPath: config.quitResumeStatePath,
+                getReadModel: orchestrationEngine.getReadModel,
+                dispatch: dispatchOrchestrationCommand,
+              }),
+            ),
+            "Failed to prepare chats for resume after quit",
+          ),
         [ORCHESTRATION_WS_METHODS.reconcileProviderDelivery]: (input) =>
           rpcEffect(
             Effect.gen(function* () {
@@ -1107,6 +1142,7 @@ const makeWsRpcHandlersLayer = () =>
                       }),
                     );
               }),
+              trackSidechatVisibility(input.threadId),
             ),
           ),
         [ORCHESTRATION_WS_METHODS.unsubscribeThread]: () => Effect.void,
@@ -1128,12 +1164,22 @@ const makeWsRpcHandlersLayer = () =>
           rpcEffect(workspaceEntries.search(input), "Failed to search workspace entries"),
         [WS_METHODS.projectsSearchContent]: (input) =>
           rpcEffect(workspaceEntries.searchContent(input), "Failed to search workspace content"),
+        [WS_METHODS.projectsPrewarmSearchIndex]: (input) =>
+          rpcEffect(
+            workspaceEntries.prewarmSearchIndex(input),
+            "Failed to prewarm workspace search index",
+          ),
         [WS_METHODS.projectsDiscoverScripts]: (input) =>
           rpcEffect(workspaceEntries.discoverScripts(input), "Failed to discover project scripts"),
         [WS_METHODS.projectsSearchLocalEntries]: (input) =>
           rpcEffect(workspaceEntries.searchLocal(input), "Failed to search local entries"),
         [WS_METHODS.projectsReadFile]: (input) =>
           rpcEffect(workspaceFileSystem.readFile(input), "Failed to read workspace file"),
+        [WS_METHODS.projectsResolveWorkspaceFileReferences]: (input) =>
+          rpcEffect(
+            workspaceEntries.resolveFileReferences(input),
+            "Failed to resolve workspace file references",
+          ),
         [WS_METHODS.projectsResolveOutOfRootFileReference]: (input) =>
           rpcEffect(
             Effect.promise(async () => ({
@@ -1710,12 +1756,30 @@ const makeWsRpcHandlersLayer = () =>
           ),
         [WS_METHODS.serverPrewarmVoice]: (input) =>
           rpcEffect(
-            providerAdapterRegistry
-              .getByProvider(input.provider)
-              .pipe(
+            getEnabledProviderAdapter(input.provider, serverSettings, providerAdapterRegistry).pipe(
+              Effect.flatMap((adapter) =>
+                adapter.prewarmVoice
+                  ? adapter.prewarmVoice(input)
+                  : Effect.fail(
+                      new Error(
+                        `Voice transcription is unavailable for provider '${input.provider}'.`,
+                      ),
+                    ),
+              ),
+            ),
+            "Voice transcription prewarm failed",
+          ),
+        [WS_METHODS.serverTranscribeVoice]: (input) =>
+          rpcEffect(
+            voiceUploadAdmissionGate.run(
+              getEnabledProviderAdapter(
+                input.provider,
+                serverSettings,
+                providerAdapterRegistry,
+              ).pipe(
                 Effect.flatMap((adapter) =>
-                  adapter.prewarmVoice
-                    ? adapter.prewarmVoice(input)
+                  adapter.transcribeVoice
+                    ? adapter.transcribeVoice(input)
                     : Effect.fail(
                         new Error(
                           `Voice transcription is unavailable for provider '${input.provider}'.`,
@@ -1723,24 +1787,6 @@ const makeWsRpcHandlersLayer = () =>
                       ),
                 ),
               ),
-            "Voice transcription prewarm failed",
-          ),
-        [WS_METHODS.serverTranscribeVoice]: (input) =>
-          rpcEffect(
-            voiceUploadAdmissionGate.run(
-              providerAdapterRegistry
-                .getByProvider(input.provider)
-                .pipe(
-                  Effect.flatMap((adapter) =>
-                    adapter.transcribeVoice
-                      ? adapter.transcribeVoice(input)
-                      : Effect.fail(
-                          new Error(
-                            `Voice transcription is unavailable for provider '${input.provider}'.`,
-                          ),
-                        ),
-                  ),
-                ),
             ),
             "Voice transcription failed",
           ),
@@ -2016,6 +2062,26 @@ const makeWsRpcHandlersLayer = () =>
                   { label: "device.events" },
                 ),
           ),
+
+        ...makeWsComputerHandlers(computerService),
+        [COMPUTER_WS_METHODS.subscribeEvents]: (_, { clientId }) =>
+          streamAdmission.guard(
+            clientId,
+            { key: "computer.events" },
+            computerService?.supported !== true
+              ? Stream.never
+              : bufferLiveUiStream(
+                  Stream.callback<ComputerEvent>((queue) =>
+                    Effect.gen(function* () {
+                      const unsubscribe = computerService.manager.onEvent((event) => {
+                        Effect.runFork(Queue.offer(queue, event).pipe(Effect.asVoid));
+                      });
+                      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+                    }),
+                  ),
+                  { label: "computer.events" },
+                ),
+          ),
       });
     }),
   );
@@ -2101,6 +2167,9 @@ export function authorizeDeviceFrameWebSocketUpgrade(input: {
     Effect.orElseSucceed(() => false),
   );
 }
+
+/** Computer still frames use the same trusted-origin and authentication policy. */
+export const authorizeComputerFrameWebSocketUpgrade = authorizeDeviceFrameWebSocketUpgrade;
 
 export function makeWebsocketRpcRouteLayer<R>(
   rpcWebSocketHttpEffectSource: Effect.Effect<
@@ -2311,8 +2380,25 @@ const deviceFrameRouteLayer = makeDeviceFrameRouteLayer({
     }),
 });
 
+const computerFrameRouteLayer = makeComputerFrameRouteLayer({
+  authorizeUpgrade: (request) =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig;
+      const serverAuth = yield* ServerAuth;
+      const url = trustedWebSocketRequestUrl(request, config);
+      if (url === null) return false;
+      return yield* authorizeComputerFrameWebSocketUpgrade({
+        config,
+        legacyToken: url.searchParams.get("token"),
+        request: makeEffectAuthRequest(request),
+        serverAuth,
+      });
+    }),
+});
+
 export const websocketRpcRouteLayer = Layer.mergeAll(
   deviceFrameRouteLayer,
+  computerFrameRouteLayer,
   makeWebsocketNegotiationRouteLayer(),
   // The registry must be provided here so the upgrade route and the RPC
   // middleware (built from the same source effect) share one instance.

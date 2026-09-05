@@ -8,6 +8,7 @@ import type {
 } from "@synara/contracts";
 import { mutationOptions, queryOptions, type QueryClient } from "@tanstack/react-query";
 import { ensureNativeApi } from "~/nativeApi";
+import { EXPENSIVE_READ_RETRY_OPTIONS } from "./expensiveReadRetry";
 
 export const LOCAL_SERVERS_VISIBLE_REFETCH_INTERVAL_MS = 10_000;
 const LOCAL_SERVERS_DEFAULT_STALE_TIME_MS = 3_000;
@@ -22,6 +23,7 @@ export const serverQueryKeys = {
   localServers: () => ["server", "localServers"] as const,
   providerUsage: (provider: ProviderKind | null | undefined, homePath?: string | null) =>
     ["server", "providerUsage", provider ?? null, homePath ?? null] as const,
+  providerUsageRoot: () => ["server", "providerUsage"] as const,
   allProviderUsage: () => ["server", "allProviderUsage"] as const,
   profileStats: (utcOffsetMinutes: number) =>
     ["server", "profileStats", "peak-hour-v2", utcOffsetMinutes] as const,
@@ -29,6 +31,7 @@ export const serverQueryKeys = {
     ["server", "profileTokenStats", utcOffsetMinutes] as const,
   studioThreadOutputs: (threadId: ThreadId | null) =>
     ["server", "studioThreadOutputs", threadId] as const,
+  computerStatus: () => ["server", "computerStatus"] as const,
 };
 
 export const serverMutationKeys = {
@@ -44,6 +47,39 @@ export function serverConfigQueryOptions() {
     },
     staleTime: Infinity,
   });
+}
+
+/** Polled while the Computer use settings panel is visible, so keep it refetchable. */
+export const COMPUTER_STATUS_VISIBLE_REFETCH_INTERVAL_MS = 10_000;
+
+export function computerStatusQueryOptions() {
+  return queryOptions({
+    queryKey: serverQueryKeys.computerStatus(),
+    queryFn: async () => {
+      const api = ensureNativeApi();
+      // Desktop-bridge NativeApi implementations update out of band and may
+      // predate the computer namespace.
+      if (!api.computer) {
+        throw new Error("This app build cannot read computer status.");
+      }
+      return api.computer.getStatus({});
+    },
+    staleTime: LOCAL_SERVERS_DEFAULT_STALE_TIME_MS,
+  });
+}
+
+/**
+ * Installs or compiles whatever this desktop is missing.
+ *
+ * Not a query: it is the one computer call that changes the machine, and it
+ * only ever runs because a user pressed the button that does it.
+ */
+export async function provisionComputer() {
+  const api = ensureNativeApi();
+  if (!api.computer?.provision) {
+    throw new Error("This app build cannot set up computer control.");
+  }
+  return api.computer.provision({});
 }
 
 interface ProviderStatusSnapshot {
@@ -263,6 +299,7 @@ export function studioThreadOutputsQueryOptions(input: {
     staleTime: STUDIO_THREAD_OUTPUTS_STALE_TIME_MS,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
+    ...EXPENSIVE_READ_RETRY_OPTIONS,
   });
 }
 
@@ -305,6 +342,15 @@ export function serverProviderUsageSnapshotQueryOptions(input: {
 export async function fetchAllProviderUsage(input: ServerListProviderUsageInput = {}) {
   const api = ensureNativeApi();
   return api.server.listProviderUsage(input);
+}
+
+/** Provider enablement changes alter the membership of the batch and invalidate any
+ * provider-scoped result that may otherwise survive after a provider is disabled. */
+export async function invalidateProviderUsageQueries(queryClient: QueryClient): Promise<void> {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: serverQueryKeys.allProviderUsage() }),
+    queryClient.invalidateQueries({ queryKey: serverQueryKeys.providerUsageRoot() }),
+  ]);
 }
 
 // Local profile + shareable-card core statistics. The client passes its own fixed

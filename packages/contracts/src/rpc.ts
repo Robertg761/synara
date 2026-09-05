@@ -63,6 +63,39 @@ import {
   DeviceTypeTextInput,
   ThreadDeviceState,
 } from "./device";
+import {
+  COMPUTER_WS_METHODS,
+  ComputerActionResult,
+  ComputerClickInput,
+  ComputerDoubleClickInput,
+  ComputerDragInput,
+  ComputerEvent,
+  ComputerGetScreenSizeInput,
+  ComputerGetScreenSizeResult,
+  ComputerGetStateInput,
+  ComputerGetStatusInput,
+  ComputerHotkeyInput,
+  ComputerInputClickInput,
+  ComputerInputKeyInput,
+  ComputerInputScrollInput,
+  ComputerLaunchAppInput,
+  ComputerLaunchAppResult,
+  ComputerListWindowsInput,
+  ComputerProvisionInput,
+  ComputerProvisionResult,
+  ComputerListWindowsResult,
+  ComputerMoveCursorInput,
+  ComputerPerformActionInput,
+  ComputerPressKeyInput,
+  ComputerRightClickInput,
+  ComputerScrollInput,
+  ComputerSetValueInput,
+  ComputerTypeTextInput,
+  ComputerState,
+  ComputerStatusResult,
+  ComputerThreadInput,
+  ThreadComputerState,
+} from "./computer";
 import { FilesystemBrowseInput, FilesystemBrowseResult } from "./filesystem";
 import {
   GitHubProjectProvisionInput,
@@ -166,6 +199,10 @@ import {
   ProjectListDirectoriesResult,
   ProjectReadFileInput,
   ProjectReadFileResult,
+  ProjectPrewarmSearchIndexInput,
+  ProjectPrewarmSearchIndexResult,
+  ProjectResolveWorkspaceFileReferencesInput,
+  ProjectResolveWorkspaceFileReferencesResult,
   ProjectResolveOutOfRootFileReferenceInput,
   ProjectResolveOutOfRootFileReferenceResult,
   ProjectRunDevServerInput,
@@ -336,6 +373,15 @@ export const WsOrchestrationReconcileProviderDeliveryRpc = Rpc.make(
   },
 );
 
+export const WsOrchestrationPrepareQuitResumeRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.prepareQuitResume,
+  {
+    payload: OrchestrationRpcSchemas.prepareQuitResume.input,
+    success: OrchestrationRpcSchemas.prepareQuitResume.output,
+    error: WsRpcError,
+  },
+);
+
 export const WsOrchestrationSubscribeShellRpc = Rpc.make(ORCHESTRATION_WS_METHODS.subscribeShell, {
   payload: OrchestrationRpcSchemas.subscribeShell.input,
   success: OrchestrationShellStreamItem,
@@ -411,11 +457,26 @@ export const WsProjectsSearchContentRpc = Rpc.make(WS_METHODS.projectsSearchCont
   error: WsRpcError,
 });
 
+export const WsProjectsPrewarmSearchIndexRpc = Rpc.make(WS_METHODS.projectsPrewarmSearchIndex, {
+  payload: ProjectPrewarmSearchIndexInput,
+  success: ProjectPrewarmSearchIndexResult,
+  error: WsRpcError,
+});
+
 export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
   payload: ProjectReadFileInput,
   success: ProjectReadFileResult,
   error: WsRpcError,
 });
+
+export const WsProjectsResolveWorkspaceFileReferencesRpc = Rpc.make(
+  WS_METHODS.projectsResolveWorkspaceFileReferences,
+  {
+    payload: ProjectResolveWorkspaceFileReferencesInput,
+    success: ProjectResolveWorkspaceFileReferencesResult,
+    error: WsRpcError,
+  },
+);
 
 export const WsProjectsResolveOutOfRootFileReferenceRpc = Rpc.make(
   WS_METHODS.projectsResolveOutOfRootFileReference,
@@ -634,6 +695,172 @@ export const WsDeviceRpcGroup = RpcGroup.make(
   WsDeviceDescribeUiRpc,
   WsDeviceScrollToElementRpc,
   WsSubscribeDeviceEventsRpc,
+);
+
+// ── Computer control ────────────────────────────────────────────────
+// Two callers, two gates. The agent reaches these methods through the MCP
+// gateway only, gated on the session's `computer:control` capability lease;
+// the human pane reaches them through its own authenticated WebSocket with no
+// turn attached and no gateway in between. The group is kept separate so both
+// admission rules stay visible next to the contract they guard.
+
+export const WsComputerGetStatusRpc = Rpc.make(COMPUTER_WS_METHODS.getStatus, {
+  payload: ComputerGetStatusInput,
+  success: ComputerStatusResult,
+  error: WsRpcError,
+});
+
+export const WsComputerProvisionRpc = Rpc.make(COMPUTER_WS_METHODS.provision, {
+  payload: ComputerProvisionInput,
+  success: ComputerProvisionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerListWindowsRpc = Rpc.make(COMPUTER_WS_METHODS.listWindows, {
+  payload: ComputerListWindowsInput,
+  success: ComputerListWindowsResult,
+  error: WsRpcError,
+});
+
+export const WsComputerGetStateRpc = Rpc.make(COMPUTER_WS_METHODS.getState, {
+  payload: ComputerGetStateInput,
+  success: ComputerState,
+  error: WsRpcError,
+});
+
+export const WsComputerGetScreenSizeRpc = Rpc.make(COMPUTER_WS_METHODS.getScreenSize, {
+  payload: ComputerGetScreenSizeInput,
+  success: ComputerGetScreenSizeResult,
+  error: WsRpcError,
+});
+
+export const WsComputerLaunchAppRpc = Rpc.make(COMPUTER_WS_METHODS.launchApp, {
+  payload: ComputerLaunchAppInput,
+  success: ComputerLaunchAppResult,
+  error: WsRpcError,
+});
+
+export const WsComputerClickRpc = Rpc.make(COMPUTER_WS_METHODS.click, {
+  payload: ComputerClickInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerDoubleClickRpc = Rpc.make(COMPUTER_WS_METHODS.doubleClick, {
+  payload: ComputerDoubleClickInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerRightClickRpc = Rpc.make(COMPUTER_WS_METHODS.rightClick, {
+  payload: ComputerRightClickInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerMoveCursorRpc = Rpc.make(COMPUTER_WS_METHODS.moveCursor, {
+  payload: ComputerMoveCursorInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerDragRpc = Rpc.make(COMPUTER_WS_METHODS.drag, {
+  payload: ComputerDragInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerScrollRpc = Rpc.make(COMPUTER_WS_METHODS.scroll, {
+  payload: ComputerScrollInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerTypeTextRpc = Rpc.make(COMPUTER_WS_METHODS.typeText, {
+  payload: ComputerTypeTextInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerPressKeyRpc = Rpc.make(COMPUTER_WS_METHODS.pressKey, {
+  payload: ComputerPressKeyInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerHotkeyRpc = Rpc.make(COMPUTER_WS_METHODS.hotkey, {
+  payload: ComputerHotkeyInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerSetValueRpc = Rpc.make(COMPUTER_WS_METHODS.setValue, {
+  payload: ComputerSetValueInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerPerformActionRpc = Rpc.make(COMPUTER_WS_METHODS.performAction, {
+  payload: ComputerPerformActionInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerGetThreadStateRpc = Rpc.make(COMPUTER_WS_METHODS.getThreadState, {
+  payload: ComputerThreadInput,
+  success: ThreadComputerState,
+  error: WsRpcError,
+});
+
+export const WsComputerInputClickRpc = Rpc.make(COMPUTER_WS_METHODS.inputClick, {
+  payload: ComputerInputClickInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerInputScrollRpc = Rpc.make(COMPUTER_WS_METHODS.inputScroll, {
+  payload: ComputerInputScrollInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsComputerInputKeyRpc = Rpc.make(COMPUTER_WS_METHODS.inputKey, {
+  payload: ComputerInputKeyInput,
+  success: ComputerActionResult,
+  error: WsRpcError,
+});
+
+export const WsSubscribeComputerEventsRpc = Rpc.make(COMPUTER_WS_METHODS.subscribeEvents, {
+  payload: Schema.Struct({}),
+  success: ComputerEvent,
+  error: WsRpcError,
+  stream: true,
+});
+
+/** Linux computer control and perception surface. */
+export const WsComputerRpcGroup = RpcGroup.make(
+  WsComputerGetStatusRpc,
+  WsComputerProvisionRpc,
+  WsComputerListWindowsRpc,
+  WsComputerGetStateRpc,
+  WsComputerGetScreenSizeRpc,
+  WsComputerLaunchAppRpc,
+  WsComputerClickRpc,
+  WsComputerDoubleClickRpc,
+  WsComputerRightClickRpc,
+  WsComputerMoveCursorRpc,
+  WsComputerDragRpc,
+  WsComputerScrollRpc,
+  WsComputerTypeTextRpc,
+  WsComputerPressKeyRpc,
+  WsComputerHotkeyRpc,
+  WsComputerSetValueRpc,
+  WsComputerPerformActionRpc,
+  WsComputerGetThreadStateRpc,
+  WsComputerInputClickRpc,
+  WsComputerInputScrollRpc,
+  WsComputerInputKeyRpc,
+  WsSubscribeComputerEventsRpc,
 );
 
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
@@ -1213,6 +1440,7 @@ export const WsFeatureRpcGroup = RpcGroup.make(
   WsOrchestrationReplayEventsRpc,
   WsOrchestrationListProviderDeliveryBlockersRpc,
   WsOrchestrationReconcileProviderDeliveryRpc,
+  WsOrchestrationPrepareQuitResumeRpc,
   WsOrchestrationSubscribeShellRpc,
   WsOrchestrationUnsubscribeShellRpc,
   WsOrchestrationSubscribeThreadRpc,
@@ -1223,7 +1451,9 @@ export const WsFeatureRpcGroup = RpcGroup.make(
   WsProjectsSearchEntriesRpc,
   WsProjectsSearchLocalEntriesRpc,
   WsProjectsSearchContentRpc,
+  WsProjectsPrewarmSearchIndexRpc,
   WsProjectsReadFileRpc,
+  WsProjectsResolveWorkspaceFileReferencesRpc,
   WsProjectsResolveOutOfRootFileReferenceRpc,
   WsProjectsCreateLocalFilePreviewGrantRpc,
   WsProjectsWriteFileRpc,
