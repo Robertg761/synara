@@ -1,20 +1,31 @@
 import type { ComputerActionResult, ComputerScreenSize, ThreadId } from "@synara/contracts";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
+import { useComputerDesktopControl } from "~/hooks/useComputerDesktopControl";
+import { useProvisionComputer } from "~/hooks/useProvisionComputer";
 import { useThreadComputerStateSeed } from "~/hooks/useThreadComputerStateSeed";
 import { disclosureFadeClassName } from "~/lib/disclosureMotion";
 import type { DockPaneRuntimeMode } from "~/lib/dockPaneActivation";
-import { CursorClickIcon, LoaderCircleIcon, MonitorIcon, XIcon } from "~/lib/icons";
+import { CursorClickIcon, LoaderCircleIcon, MonitorIcon, StopIcon, XIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
 import { ensureNativeApi } from "~/nativeApi";
 
-import { selectThreadComputerState, useComputerStateStore } from "../computerStateStore";
+import {
+  selectThreadComputerAction,
+  selectThreadComputerState,
+  useComputerStateStore,
+} from "../computerStateStore";
 import {
   clampComputerScrollDelta,
+  computerActionLabel,
+  computerCanvasLabel,
   computerContainRect,
   computerCursorPosition,
+  computerDeliveryWarning,
   computerKeyCommand,
+  computerPaneInputMode,
   computerReleaseControlHint,
+  computerStopControlLabel,
   computerStreamRegion,
   computerViewportPointToDesktop,
   computerWheelScrollDelta,
@@ -103,23 +114,49 @@ export default function ComputerPanel(props: {
     screenSize,
     containRect,
   });
+  const lastAction = useComputerStateStore(selectThreadComputerAction(threadId));
+  const lastActionLabel = computerActionLabel(lastAction);
+  // Shared with the chat-level banner so the two cannot disagree about whether
+  // the machine is being driven, or about what stopping means.
+  const desktopControl = useComputerDesktopControl(threadId);
+  const { agentActive, visibleDesktop, stopRequested } = desktopControl;
+  // The one blocked state the user can clear without leaving the pane. Same
+  // server-side provision, same single-flight, same words as the chat card's
+  // Set up and the settings panel's.
+  const permissionRequired =
+    threadState?.availability.kind === "permission-required" ? threadState.availability : null;
+  const needsPermissionSetup = permissionRequired !== null;
+  const setup = useProvisionComputer({
+    ...(permissionRequired ? { missing: permissionRequired.missing } : {}),
+    notify: true,
+  });
   // The emergency release is a KWin compositor shortcut, so this is null on
   // every other backend rather than an unbound key the human would trust.
   const releaseControlHint = computerReleaseControlHint({
     availability: threadState?.availability,
-    visibleDesktop: threadState?.capabilities.visibleDesktop ?? false,
-    agentActive: threadState?.agentActive ?? false,
+    visibleDesktop,
+    agentActive,
   });
-
   // ── User input ─────────────────────────────────────────────────────
   //
   // Input is opt-in: a pane that forwarded clicks while it was merely being
   // watched would fight the agent for the same seat, and a stray click on a
-  // live desktop is not undoable.
+  // live desktop is not undoable. On a visible desktop it is not offered at all
+  // — see `computerPaneInputMode`.
   const [interactive, setInteractive] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
   const [inputError, setInputError] = useState<string | null>(null);
-  const canInteract = streamEnabled;
+  const [inputWarning, setInputWarning] = useState<string | null>(null);
+  const inputMode = computerPaneInputMode({
+    streamEnabled,
+    visibleDesktop,
+    agentActive,
+  });
+  const canInteract = inputMode === "available";
+
+  // The pane's own stop, for the case the compositor hotkey cannot cover — see
+  // `computerStopControlLabel`.
+  const stopControlLabel = computerStopControlLabel({ agentActive, visibleDesktop });
 
   const inputQueue = useMemo(
     () =>
@@ -136,8 +173,14 @@ export default function ComputerPanel(props: {
   const sendInput = useCallback(
     (send: () => Promise<ComputerActionResult>) => {
       inputQueue.push(async () => {
-        await send();
+        const result = await send();
         setInputError(null);
+        // The backend answers every input with what it could establish about
+        // delivery, and the pane used to throw that away — so an input the
+        // desktop accepted but could not see arrive looked identical to one that
+        // worked. Only `unconfirmed` is worth saying; see
+        // `computerDeliveryWarning`.
+        setInputWarning(computerDeliveryWarning(result));
       });
     },
     [inputQueue],
@@ -160,6 +203,7 @@ export default function ComputerPanel(props: {
     if (canInteract) return;
     setInteractive(false);
     setInputError(null);
+    setInputWarning(null);
   }, [canInteract]);
 
   useEffect(() => {
@@ -271,8 +315,13 @@ export default function ComputerPanel(props: {
   // The pane's own input failure outranks the session's last error: it is the
   // one the human just caused and can act on. The row keeps its height either
   // way, so an empty message stays invisible rather than showing a bare rule.
-  const errorMessage = inputError ?? threadState?.lastError ?? "";
+  const errorMessage = desktopControl.stopError ?? inputError ?? threadState?.lastError ?? "";
   const hasError = errorMessage.length > 0;
+  // A delivery the desktop could not confirm is not an error — the input was
+  // sent — so it never displaces one, and it reads as a caution rather than a
+  // failure.
+  const noticeMessage = hasError ? "" : (inputWarning ?? "");
+  const hasNotice = noticeMessage.length > 0;
 
   const header = (
     <div className="flex h-full w-full min-w-0 items-center gap-2">
@@ -313,24 +362,49 @@ export default function ComputerPanel(props: {
           <span className="size-1.5 rounded-full bg-current" />
           Another conversation is controlling
         </span>
-      ) : threadState?.agentActive ? (
+      ) : agentActive ? (
         <span className="flex shrink-0 items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400">
-          <span className="size-1.5 animate-pulse rounded-full bg-current" />
-          Agent controlling
+          <span className="size-1.5 animate-pulse rounded-full bg-current motion-reduce:animate-none" />
+          {visibleDesktop ? "Agent controlling this computer" : "Agent controlling"}
         </span>
       ) : null}
       <div className="ml-auto flex shrink-0 items-center gap-0.5">
-        <Button
-          variant={interactive ? "outline" : "ghost"}
-          size="icon-sm"
-          aria-pressed={interactive}
-          disabled={!canInteract}
-          onClick={() => setInteractive((current) => !current)}
-          title={interactive ? "Stop controlling the desktop" : "Control the desktop"}
-          aria-label={interactive ? "Stop controlling the desktop" : "Control the desktop"}
-        >
-          <CursorClickIcon />
-        </Button>
+        {stopControlLabel ? (
+          <Button
+            variant="outline"
+            size="xs"
+            className="gap-1 text-destructive"
+            disabled={stopRequested}
+            onClick={desktopControl.stop}
+            title={stopControlLabel}
+            aria-label={stopControlLabel}
+          >
+            <StopIcon className="size-3" />
+            {stopRequested ? "Stopping…" : "Stop"}
+          </Button>
+        ) : null}
+        {/* Not rendered at all on a desktop the user is already sitting at: the
+            pane is a mirror of their own screen there, so "control the desktop"
+            through it is a slower way to do what their mouse already does. */}
+        {visibleDesktop ? null : (
+          <Button
+            variant={interactive ? "outline" : "ghost"}
+            size="icon-sm"
+            aria-pressed={interactive}
+            disabled={!canInteract}
+            onClick={() => setInteractive((current) => !current)}
+            title={
+              interactive
+                ? "Stop controlling the desktop"
+                : inputMode === "blocked-by-agent"
+                  ? "The agent is using the desktop. Stop it first to take over."
+                  : "Control the desktop"
+            }
+            aria-label={interactive ? "Stop controlling the desktop" : "Control the desktop"}
+          >
+            <CursorClickIcon />
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="icon-sm"
@@ -354,6 +428,20 @@ export default function ComputerPanel(props: {
           <ComputerAvailabilityMessage
             title={availabilityView.title}
             description={availabilityView.description}
+            {...(needsPermissionSetup
+              ? {
+                  action: (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={setup.isPending}
+                      onClick={setup.provision}
+                    >
+                      {setup.isPending ? "Setting up…" : "Set up"}
+                    </Button>
+                  ),
+                }
+              : {})}
           />
         ) : runtimeMode === "preview" ? (
           <button
@@ -372,7 +460,10 @@ export default function ComputerPanel(props: {
             */}
             <canvas
               ref={canvasRef}
-              aria-label="Linux desktop"
+              aria-label={computerCanvasLabel({
+                availability: threadState?.availability,
+                visibleDesktop,
+              })}
               tabIndex={interactive ? 0 : -1}
               className={cn(
                 "absolute inset-0 h-full w-full object-contain outline-none ring-inset",
@@ -388,6 +479,15 @@ export default function ComputerPanel(props: {
               onBlur={() => setInputFocused(false)}
             />
             <div className="pointer-events-none absolute inset-x-0 bottom-3 flex flex-col items-center gap-0.5 px-4 text-center text-[10px] text-white/70">
+              {/* What the agent last did to this desktop, in words. The server
+                  has always pushed `computer.action` and the store has always
+                  kept the newest one per thread; until now nothing read it, so a
+                  user watching a silent screen change had no way to tell a click
+                  from a keystroke, or an action that failed from one that did
+                  nothing visible. */}
+              {lastActionLabel ? (
+                <p className={disclosureFadeClassName(agentActive)}>{lastActionLabel}</p>
+              ) : null}
               {releaseControlHint ? (
                 <p className={disclosureFadeClassName(releaseControlHint.visible)}>
                   {releaseControlHint.text}
@@ -412,7 +512,7 @@ export default function ComputerPanel(props: {
                 viewBox="0 0 14 16"
                 className={cn(
                   "pointer-events-none absolute h-4 w-3.5 overflow-visible [filter:drop-shadow(0_0_3px_rgba(124,58,237,0.9))_drop-shadow(0_0_7px_rgba(124,58,237,0.65))]",
-                  threadState?.agentActive ? "opacity-100" : "opacity-65",
+                  agentActive ? "opacity-100" : "opacity-65",
                 )}
                 style={{ left: cursorPosition.left, top: cursorPosition.top }}
               >
@@ -431,26 +531,38 @@ export default function ComputerPanel(props: {
       <p
         role="status"
         className={disclosureFadeClassName(
-          hasError,
+          hasError || hasNotice,
           cn(
-            "line-clamp-2 flex shrink-0 items-center border-t px-3 text-destructive text-xs",
-            hasError ? "border-border" : "border-transparent",
+            "line-clamp-2 flex shrink-0 items-center border-t px-3 text-xs",
+            hasError ? "text-destructive" : "text-amber-600 dark:text-amber-400",
+            hasError || hasNotice ? "border-border" : "border-transparent",
           ),
         )}
         style={{ height: "1.875rem" }}
       >
-        {errorMessage}
+        {hasError ? errorMessage : noticeMessage}
       </p>
     </DiffPanelShell>
   );
 }
 
-function ComputerAvailabilityMessage(props: { title: string; description: string }) {
+function ComputerAvailabilityMessage(props: {
+  title: string;
+  description: string;
+  /**
+   * Offered only for a blocked state the user can actually clear from here. The
+   * pane was a dead end on `permission-required`: it named the grant macOS was
+   * withholding and then left the user to find the same button in Settings, or
+   * to wait for an agent to fail again so the chat would offer it.
+   */
+  action?: ReactNode;
+}) {
   return (
     <div className="max-w-sm px-6 text-center text-white/80" role="status">
       <MonitorIcon className="mx-auto mb-3 size-8 text-white/45" />
       <p className="font-medium text-sm text-white">{props.title}</p>
       <p className="mt-1 text-xs leading-5 text-white/60">{props.description}</p>
+      {props.action ? <div className="mt-3 flex justify-center">{props.action}</div> : null}
     </div>
   );
 }

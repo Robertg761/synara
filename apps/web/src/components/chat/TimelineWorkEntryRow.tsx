@@ -568,6 +568,7 @@ export const TimelineWorkEntryRow = memo(function TimelineWorkEntryRow(props: {
           {...(computerSetupRequired.buildSignature
             ? { buildSignature: computerSetupRequired.buildSignature }
             : {})}
+          {...(computerSetupRequired.bundleId ? { bundleId: computerSetupRequired.bundleId } : {})}
           {...(computerControlReady !== undefined ? { computerControlReady } : {})}
           textFontSizePx={textFontSizePx}
           metaFontSizePx={chatMetaFontSizePx}

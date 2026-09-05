@@ -7,25 +7,26 @@ import {
   COMPUTER_RELEASE_CONTROL_HOTKEY,
   COMPUTER_RELEASE_HOTKEY_BACKENDS,
   type ComputerCapabilities,
+  type ComputerPermission,
 } from "@synara/contracts";
 import {
   COMPUTER_PERMISSION_LABELS,
   listComputerPermissions,
 } from "@synara/shared/computerPermissions";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 
 import type { AppSettingsBinding } from "~/appSettings";
 import {
+  computerBackendIsVisibleDesktop,
   computerStatusNeedsSetup,
   resolveComputerAvailabilityView,
 } from "~/components/ComputerPanel.logic";
 import { Button } from "~/components/ui/button";
 import { Switch } from "~/components/ui/switch";
+import { useProvisionComputer } from "~/hooks/useProvisionComputer";
 import {
   COMPUTER_STATUS_VISIBLE_REFETCH_INTERVAL_MS,
   computerStatusQueryOptions,
-  provisionComputer,
-  serverQueryKeys,
 } from "~/lib/serverReactQuery";
 import { cn } from "~/lib/utils";
 import { SettingResetButton } from "./SettingControls";
@@ -35,6 +36,9 @@ import {
   SettingsSectionShell,
   SettingsSection,
 } from "./SettingsPanelPrimitives";
+
+/** Stable identity, so the provision hook's toast copy is not rebuilt every render. */
+const EMPTY_PERMISSIONS: readonly ComputerPermission[] = [];
 
 const BACKEND_DISPLAY_NAMES: Record<string, string> = {
   kwin: "KWin plugin (KDE)",
@@ -85,20 +89,24 @@ export function ComputerSettingsPanel({
     refetchInterval: active ? COMPUTER_STATUS_VISIBLE_REFETCH_INTERVAL_MS : false,
   });
 
-  const queryClient = useQueryClient();
-  const setupMutation = useMutation({
-    mutationFn: provisionComputer,
-    onSuccess: (result) => {
-      // The call already returns the refreshed status, so the card repaints
-      // from the same round trip rather than racing a refetch against a
-      // backend that has only just rebuilt its providers.
-      queryClient.setQueryData(serverQueryKeys.computerStatus(), result.status);
-    },
-  });
+  const status = statusQuery.data;
+  /**
+   * The grants the OS is withholding, named. The availability message already
+   * explains what to do; the row below is the checklist — the thing a user can
+   * glance at after flipping a switch to see whether the other one is still off.
+   */
+  const missingPermissions =
+    status?.availability.kind === "permission-required"
+      ? status.availability.missing
+      : EMPTY_PERMISSIONS;
+  // The same provision the chat's setup card runs, through the same hook: one
+  // call in flight at a time whichever surface started it, and one account of
+  // what happened. This surface keeps that account inline rather than as a
+  // toast, because it has room for it and is where the user is already looking.
+  const setup = useProvisionComputer({ missing: missingPermissions });
 
   if (!active) return null;
 
-  const status = statusQuery.data;
   const availabilityView = statusQuery.isError
     ? {
         kind: "blocked" as const,
@@ -148,27 +156,10 @@ export function ComputerSettingsPanel({
    * looks like a bug in Synara rather than a limitation of the release.
    */
   const backgroundInputDegraded = health?.backgroundInputDegraded === true;
-  const setupNote = setupMutation.isPending
-    ? "Setting up the agent's desktop. This installs or builds whatever this machine still needs, and may ask for your password or for desktop permissions. The first run can take a few minutes."
-    : setupMutation.isError
-      ? `Setting up failed. ${
-          setupMutation.error instanceof Error && setupMutation.error.message
-            ? setupMutation.error.message
-            : "The server gave no reason."
-        }`
-      : setupMutation.isSuccess
-        ? setupMutation.data.summary
-        : undefined;
+  const paneAutoOpenApplies = !computerBackendIsVisibleDesktop(status);
   // Shared with the chat's setup card, which asks the same question of the same
   // status after pressing the same server-side Set up.
   const needsSetup = computerStatusNeedsSetup(status);
-  /**
-   * The grants the OS is withholding, named. The availability message already
-   * explains what to do; this row is the checklist — the thing a user can glance
-   * at after flipping a switch to see whether the other one is still off.
-   */
-  const missingPermissions =
-    status?.availability.kind === "permission-required" ? status.availability.missing : [];
   const healthNotes = [
     ...(health && health.reconnects > 0
       ? [
@@ -196,16 +187,16 @@ export function ComputerSettingsPanel({
               <Button
                 size="xs"
                 variant="default"
-                disabled={setupMutation.isPending}
-                onClick={() => setupMutation.mutate()}
+                disabled={setup.isPending}
+                onClick={setup.provision}
               >
-                {setupMutation.isPending ? "Setting up…" : "Set up"}
+                {setup.isPending ? "Setting up…" : "Set up"}
               </Button>
             ) : null}
             <Button
               size="xs"
               variant="outline"
-              disabled={statusQuery.isFetching || setupMutation.isPending}
+              disabled={statusQuery.isFetching || setup.isPending}
               onClick={() => void statusQuery.refetch()}
             >
               {statusQuery.isFetching ? "Checking…" : "Refresh"}
@@ -232,7 +223,7 @@ export function ComputerSettingsPanel({
               </span>
             }
             description={availabilityView.description}
-            status={[setupNote, ...healthNotes].filter(Boolean).join(" ") || undefined}
+            status={[setup.note, ...healthNotes].filter(Boolean).join(" ") || undefined}
           />
           {backend ? (
             <SettingsRow
@@ -290,31 +281,38 @@ export function ComputerSettingsPanel({
         </SettingsCard>
       </SettingsSectionShell>
 
-      <SettingsSection title="Computer pane">
-        <SettingsRow
-          title="Open automatically"
-          description="Open the Computer pane the first time an agent acts on the desktop in a chat. Closing the pane keeps it closed for the rest of that chat's run."
-          resetAction={
-            settings.autoOpenComputerPane !== defaults.autoOpenComputerPane ? (
-              <SettingResetButton
-                label="open automatically"
-                onClick={() =>
-                  updateSettings({ autoOpenComputerPane: defaults.autoOpenComputerPane })
+      {/* Hidden on a backend that drives the visible desktop, where the server
+          never requests a pane at all (`ComputerManager.surfacePaneForAgent`
+          returns early): the agent's actions are already happening on the screen
+          the user is looking at. A switch that cannot change anything is worse
+          than an absent one — it reads as a feature that is broken. */}
+      {paneAutoOpenApplies ? (
+        <SettingsSection title="Computer pane">
+          <SettingsRow
+            title="Open automatically"
+            description="Open the Computer pane the first time an agent acts on the desktop in a chat. Closing the pane keeps it closed for the rest of that chat's run."
+            resetAction={
+              settings.autoOpenComputerPane !== defaults.autoOpenComputerPane ? (
+                <SettingResetButton
+                  label="open automatically"
+                  onClick={() =>
+                    updateSettings({ autoOpenComputerPane: defaults.autoOpenComputerPane })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Switch
+                checked={settings.autoOpenComputerPane}
+                onCheckedChange={(checked) =>
+                  updateSettings({ autoOpenComputerPane: Boolean(checked) })
                 }
+                aria-label="Open the Computer pane automatically when an agent drives the desktop"
               />
-            ) : null
-          }
-          control={
-            <Switch
-              checked={settings.autoOpenComputerPane}
-              onCheckedChange={(checked) =>
-                updateSettings({ autoOpenComputerPane: Boolean(checked) })
-              }
-              aria-label="Open the Computer pane automatically when an agent drives the desktop"
-            />
-          }
-        />
-      </SettingsSection>
+            }
+          />
+        </SettingsSection>
+      ) : null}
 
       <SettingsSection title="Computer control">
         <SettingsRow

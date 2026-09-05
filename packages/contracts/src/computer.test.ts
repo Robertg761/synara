@@ -46,11 +46,12 @@ describe("ComputerAvailability permission-required", () => {
 });
 
 describe("ComputerSetupRequiredPayload", () => {
-  it("round-trips the tool, the grants and the build signature", () => {
+  it("round-trips the tool, the grants, the build signature and the responsible app", () => {
     const payload = {
       toolName: "computer_list_windows",
       missing: ["accessibility"],
       buildSignature: "adhoc",
+      bundleId: "com.emanueledipietro.synara.dev",
     } as const;
     const decoded = Schema.decodeUnknownSync(ComputerSetupRequiredPayload)(payload);
     expect(decoded).toEqual(payload);

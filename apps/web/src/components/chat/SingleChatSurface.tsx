@@ -28,6 +28,7 @@ import { useDockPaneRuntimeActivation } from "../../hooks/useDockPaneRuntimeActi
 import { useHandleNewThread } from "../../hooks/useHandleNewThread";
 import { useDeviceEventBridge } from "../../hooks/useDeviceEventBridge";
 import { useComputerEventBridge } from "../../hooks/useComputerEventBridge";
+import { useComputerSupport } from "~/hooks/useComputerSupport";
 import { useDeviceSupport } from "../../hooks/useDeviceSupport";
 import { useRepoDiffTotals } from "../../hooks/useRepoDiffTotals";
 import {
@@ -254,11 +255,13 @@ export function SingleChatSurface(props: {
     isGitRepo: hasGitRepository,
   });
   const hasDeviceSupport = useDeviceSupport();
+  const hasComputerSupport = useComputerSupport();
   const dockLauncherItems = resolveRightDockLauncherItems({
     hasWorkspace: workspaceRoot !== null,
     hasGitRepository,
     hasReview: dockDiffTotals.fileCount > 0,
     hasDeviceSupport,
+    hasComputerSupport,
   });
   const availableDockPaneKinds = dockLauncherItems.map(({ kind }) => kind);
   const projects = useStore((store) => store.projects);
