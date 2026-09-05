@@ -12,6 +12,7 @@ import {
   type ComputerCapabilities,
   type ComputerEvent,
   type ComputerHealth,
+  type ComputerInputModifier,
   type ComputerScreenshot,
   type ComputerGetScreenSizeResult,
   type ComputerListWindowsResult,
@@ -32,6 +33,7 @@ import {
   COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
   computerBackendActionResult,
   ComputerBackendError,
+  type ComputerAgentDialect,
   type ComputerBackend,
   type ComputerBackendActionResult,
   type ComputerCaptureRequest,
@@ -301,10 +303,34 @@ export class ComputerManager {
     return this.backend.deliversToNamedWindowRegardlessOfStacking === true;
   }
 
+  /**
+   * Which desktop vocabulary the tool descriptions must speak. See
+   * `ComputerAgentDialect`: the shortcut form, the semantic action names, and
+   * the shape of an application identifier all differ, and describing the wrong
+   * family's answer teaches the model calls this desktop will always refuse.
+   */
+  get agentDialect(): ComputerAgentDialect {
+    return this.backend.agentDialect ?? "linux";
+  }
+
   private get backendCapabilities(): ComputerCapabilities {
     return this.backend.capabilities();
   }
   private lastActionObservation: ActionObservationMemory | undefined;
+  /**
+   * The window ids the last window read saw, kept so a post-action read can be
+   * diffed against it without paying for a second one.
+   *
+   * Maintained by `readWindows`, which every window read inside this class goes
+   * through, and by the backend's own `windows-changed` events.
+   */
+  private lastKnownWindowIds: ReadonlySet<string> | undefined;
+  /**
+   * The window ids that existed when the action now running started. The
+   * baseline for "did this action open a window?", which is the question a
+   * byte-identical post-action screenshot cannot answer on its own.
+   */
+  private preActionWindowIds: ReadonlySet<string> | undefined;
   private streamAttached = false;
   private streamDesired = false;
   private streamEpoch = 0;
@@ -342,6 +368,7 @@ export class ComputerManager {
     if (options.backend.onEvent) {
       this.backendUnsubscribe = options.backend.onEvent((event) => {
         if (event.type === "windows-changed") {
+          this.lastKnownWindowIds = windowIdSet(event.windows);
           for (const state of this.threads.values()) state.windows = event.windows;
           this.emit({ type: "computer.windows-changed", windows: event.windows });
           this.scheduleWindowsPublish();
@@ -463,11 +490,24 @@ export class ComputerManager {
     return { summary, status: await this.getStatus() };
   }
 
+  /**
+   * Every window read this class makes, with the resulting id set remembered.
+   *
+   * The memory is what lets the post-action observer answer "did this action
+   * open a window?" without paying for a read it would otherwise not need: the
+   * baseline is whatever the last read already saw.
+   */
+  private async readWindows(): Promise<readonly ComputerWindow[]> {
+    const windows = await this.backend.listWindows();
+    this.lastKnownWindowIds = windowIdSet(windows);
+    return windows;
+  }
+
   async listWindows(): Promise<ComputerListWindowsResult> {
     this.engageBackend();
     const [availability, windows] = await Promise.all([
       this.backend.availability(),
-      this.backend.listWindows(),
+      this.readWindows(),
     ]);
     return { computerId: this.computerId, windows, availability };
   }
@@ -494,14 +534,22 @@ export class ComputerManager {
     } = {},
   ): Promise<ComputerState> {
     this.engageBackend();
-    const state = await this.backend.getState({
-      ...(options.includeScreenshot !== undefined
-        ? { includeScreenshot: options.includeScreenshot }
-        : {}),
-      includeTree: options.includeTree ?? options.includeText === true,
-    });
-    if (options.includeText !== true || !state.root) return state;
-    return { ...state, text: describeComputerUiTree(state.root) };
+    // Availability rides alongside, as it already does on the window-list and
+    // screen-size reads. Without it the primary perception tool was the one
+    // result that could not say "the OS is withholding a grant", so the setup
+    // card never fired for the call an agent makes first.
+    const [state, availability] = await Promise.all([
+      this.backend.getState({
+        ...(options.includeScreenshot !== undefined
+          ? { includeScreenshot: options.includeScreenshot }
+          : {}),
+        includeTree: options.includeTree ?? options.includeText === true,
+      }),
+      this.backend.availability(),
+    ]);
+    const withAvailability = { ...state, availability: this.correctedAvailability(availability) };
+    if (options.includeText !== true || !withAvailability.root) return withAvailability;
+    return { ...withAvailability, text: describeComputerUiTree(withAvailability.root) };
   }
 
   /** Zoomed capture of one window or desktop region, with its pixel mapping. */
@@ -579,7 +627,7 @@ export class ComputerManager {
     }
     if (windowIdHint !== undefined) {
       try {
-        return this.observeCapture(
+        return await this.observeActionCapture(
           {
             screenshot: await this.backend.captureScreenshot({
               kind: "window",
@@ -592,7 +640,7 @@ export class ComputerManager {
         );
       } catch {
         try {
-          const stillListed = (await this.backend.listWindows()).some(
+          const stillListed = (await this.readWindows()).some(
             (window) => window.id === windowIdHint,
           );
           if (!stillListed) return { targetWindowClosed: true };
@@ -606,7 +654,7 @@ export class ComputerManager {
       const pointWindowId = await this.windowIdAtActionPoint(actionPoint);
       if (pointWindowId !== undefined) {
         try {
-          return this.observeCapture(
+          return await this.observeActionCapture(
             {
               screenshot: await this.backend.captureScreenshot({
                 kind: "window",
@@ -625,7 +673,7 @@ export class ComputerManager {
       }
     }
     try {
-      return this.observeCapture(
+      return await this.observeActionCapture(
         await this.captureFocusedWindow(COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION, {
           agentFocusOnly: true,
         }),
@@ -634,6 +682,85 @@ export class ComputerManager {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * The observation, with one more question asked before an unchanged frame is
+   * reported: did this action open a window the capture could not have shown?
+   *
+   * The observer photographs exactly one window — the one the action named, or
+   * the one under its coordinates — so a click that opens a dialog, a menu, or
+   * a new browser window photographs the *old* window, which very often did not
+   * change a pixel. The result was `screenshotUnchanged` plus a note telling the
+   * agent its action had not landed, at the precise moment the action had landed
+   * hardest. Diffing the window list against what existed before the action
+   * answers it truthfully: a window that was not there before is the outcome,
+   * so photograph that instead.
+   *
+   * Paid for only on the unchanged path, which is the rare one, and only when a
+   * baseline exists. Everything about it is best effort — the action already
+   * happened, and a perception failure must never turn its success into an
+   * error.
+   */
+  private async observeActionCapture(
+    capture: ComputerCapturedWindow,
+    threadId?: string,
+  ): Promise<ComputerActionObservation> {
+    const observation = this.observeCapture(capture, threadId);
+    if (!("screenshotUnchanged" in observation)) return observation;
+    const appeared = await this.windowOpenedByAction(capture.windowId);
+    if (appeared === undefined) return observation;
+    try {
+      return this.observeCapture(
+        {
+          screenshot: await this.backend.captureScreenshot({
+            kind: "window",
+            windowId: appeared.id,
+            maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+          }),
+          windowId: appeared.id,
+        },
+        threadId,
+      );
+    } catch {
+      return observation;
+    }
+  }
+
+  /**
+   * A capturable window that did not exist when the running action started, or
+   * nothing — including when there is no baseline to compare against, because a
+   * guess here would photograph a window the action had no hand in.
+   *
+   * The topmost such window wins: a click that spawns a dialog over its own
+   * parent produces the dialog on top, and that is the one the agent needs to
+   * see.
+   */
+  private async windowOpenedByAction(
+    excludeWindowId: string | undefined,
+  ): Promise<ComputerWindow | undefined> {
+    const baseline = this.preActionWindowIds;
+    if (baseline === undefined) return undefined;
+    let windows: readonly ComputerWindow[];
+    try {
+      windows = await this.readWindows();
+    } catch {
+      return undefined;
+    }
+    return windows
+      .filter(
+        (window) =>
+          !baseline.has(window.id) &&
+          window.id !== excludeWindowId &&
+          window.bounds !== undefined &&
+          window.visible &&
+          !window.minimized,
+      )
+      .toSorted(
+        (first, second) =>
+          (first.stackingIndex ?? Number.MAX_SAFE_INTEGER) -
+          (second.stackingIndex ?? Number.MAX_SAFE_INTEGER),
+      )[0];
   }
 
   /**
@@ -694,7 +821,7 @@ export class ComputerManager {
    */
   private async windowIdAtActionPoint(point: ComputerPoint): Promise<string | undefined> {
     try {
-      return topmostWindowAtPoint(await this.backend.listWindows(), point)?.id;
+      return topmostWindowAtPoint(await this.readWindows(), point)?.id;
     } catch {
       return undefined;
     }
@@ -712,7 +839,7 @@ export class ComputerManager {
   private async focusedCapturableWindow(
     agentFocusOnly = false,
   ): Promise<ComputerWindow | undefined> {
-    const candidates = (await this.backend.listWindows()).filter(
+    const candidates = (await this.readWindows()).filter(
       (window) => window.bounds !== undefined && window.visible && !window.minimized,
     );
     const agentFocused = candidates.find((window) => window.focused);
@@ -753,52 +880,141 @@ export class ComputerManager {
     return (await this.publish(threadId, false)) ?? this.threadSnapshot(threadId, state);
   }
 
-  async click(threadId: string | undefined, target: ComputerTarget): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved);
-    const result = await this.injectScoped("computer_click", resolved, () =>
-      this.backend.click(resolved.point, resolved.windowId),
-    );
-    return this.actionResult(threadId, "computer_click", resolved.point, result, resolved.windowId);
+  async click(
+    threadId: string | undefined,
+    target: ComputerTarget,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerActionResult> {
+    return await this.pointerClick("computer_click", threadId, target, modifiers);
   }
 
   async doubleClick(
     threadId: string | undefined,
     target: ComputerTarget,
+    modifiers?: readonly ComputerInputModifier[],
   ): Promise<ComputerActionResult> {
-    await this.claimDesktopControl(threadId);
-    const resolved = await this.resolvePointTarget(target);
-    await this.prepareResolvedTarget(resolved);
-    const result = await this.injectScoped("computer_double_click", resolved, () =>
-      this.backend.doubleClick(resolved.point, resolved.windowId),
-    );
-    return this.actionResult(
-      threadId,
-      "computer_double_click",
-      resolved.point,
-      result,
-      resolved.windowId,
-    );
+    return await this.pointerClick("computer_double_click", threadId, target, modifiers);
+  }
+
+  async tripleClick(
+    threadId: string | undefined,
+    target: ComputerTarget,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerActionResult> {
+    return await this.pointerClick("computer_triple_click", threadId, target, modifiers);
   }
 
   async rightClick(
     threadId: string | undefined,
     target: ComputerTarget,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerActionResult> {
+    return await this.pointerClick("computer_right_click", threadId, target, modifiers);
+  }
+
+  /**
+   * The four click gestures, which differ only in which backend method carries
+   * them. They were four copies of the same eight lines; adding modifiers and a
+   * triple click to each copy is exactly the duplication this collapses.
+   */
+  private async pointerClick(
+    action:
+      | "computer_click"
+      | "computer_double_click"
+      | "computer_triple_click"
+      | "computer_right_click",
+    threadId: string | undefined,
+    target: ComputerTarget,
+    modifiers: readonly ComputerInputModifier[] | undefined,
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
+    const inject = this.clickInjector(action);
     const resolved = await this.resolvePointTarget(target);
     await this.prepareResolvedTarget(resolved);
-    const result = await this.injectScoped("computer_right_click", resolved, () =>
-      this.backend.rightClick(resolved.point, resolved.windowId),
+    const result = await this.injectScoped(action, resolved, () =>
+      inject(resolved.point, resolved.windowId, modifiers),
     );
-    return this.actionResult(
-      threadId,
-      "computer_right_click",
-      resolved.point,
-      result,
-      resolved.windowId,
-    );
+    return this.actionResult(threadId, action, resolved.point, result, resolved.windowId);
+  }
+
+  /**
+   * The backend call behind one click action, refused up front when the backend
+   * has none. Only the triple click is optional, and its absence is a real
+   * refusal rather than a degradation: three separate clicks are three carets,
+   * not a line selection, so approximating it would answer a request the
+   * application never received.
+   */
+  private clickInjector(
+    action:
+      | "computer_click"
+      | "computer_double_click"
+      | "computer_triple_click"
+      | "computer_right_click",
+  ): (
+    point: ComputerPoint,
+    windowId: string | undefined,
+    modifiers: readonly ComputerInputModifier[] | undefined,
+  ) => Promise<ComputerBackendActionResult | void> {
+    switch (action) {
+      case "computer_double_click":
+        return (point, windowId, modifiers) => this.backend.doubleClick(point, windowId, modifiers);
+      case "computer_right_click":
+        return (point, windowId, modifiers) => this.backend.rightClick(point, windowId, modifiers);
+      case "computer_triple_click": {
+        const tripleClick = this.backend.tripleClick?.bind(this.backend);
+        if (!tripleClick) throw tripleClickUnsupportedError();
+        return (point, windowId, modifiers) => tripleClick(point, windowId, modifiers);
+      }
+      default:
+        return (point, windowId, modifiers) => this.backend.click(point, windowId, modifiers);
+    }
+  }
+
+  /**
+   * Bring one window forward, and aim the agent seat's keyboard at it.
+   *
+   * The one computer action whose whole effect is on what the human sees, so it
+   * is deliberately not folded into the pointer path: `prepareResolvedTarget`
+   * raises only on backends that need the raise to deliver input at all, and
+   * that difference is what stopped every scoped click from reordering the
+   * user's windows. This is the explicit, approval-gated way to ask for the
+   * restack anyway, for the case the description names — a delivery that came
+   * back unconfirmed because the target application ignores input to an
+   * inactive window.
+   *
+   * A backend that cannot restack refuses rather than pretending: reporting
+   * success for a window that never moved is the failure the whole delivery
+   * ladder exists to avoid.
+   *
+   * Nothing is restored when the turn ends, and that is deliberate rather than
+   * missing. Neither backend takes anything from the human here that could be
+   * given back: the macOS helper raises with `AXRaise` inside the target's own
+   * application and never activates it, so which application is frontmost does
+   * not change, and the Linux tiers hand the compositor a restack it owns from
+   * then on. Re-raising whatever was in front when the turn ends would be a
+   * second, uninvited window change at the moment the agent stops working — a
+   * new disruption, not the undoing of one. The turn-scoped machinery that does
+   * exist (`releaseDesktopControl`, and the helper's own per-gesture focus debt)
+   * covers the foreground rung, which this path does not use.
+   */
+  async activateWindow(
+    threadId: string | undefined,
+    windowId: string,
+  ): Promise<ComputerActionResult> {
+    await this.claimDesktopControl(threadId);
+    const raise = this.backend.raiseWindow?.bind(this.backend);
+    if (!raise || !this.backendCapabilities.activation) {
+      throw activationUnsupportedError();
+    }
+    const windows = await this.readWindows();
+    if (!windows.some((candidate) => candidate.id === windowId)) {
+      throw windowNotFoundError(windowId);
+    }
+    await raise(windowId);
+    // Aiming after the raise, never before: a raise that refuses must not leave
+    // the keyboard pointed at a window this call just declined to move.
+    await this.backend.focusWindow?.(windowId);
+    return this.actionResult(threadId, "computer_activate_window", undefined, undefined, windowId);
   }
 
   async moveCursor(
@@ -864,7 +1080,7 @@ export class ComputerManager {
   ): Promise<ComputerActionResult> {
     await this.claimDesktopControl(threadId);
     const resolved = await this.prepareScrollTarget(target);
-    const result = await this.injectScroll(resolved, deltaX, deltaY);
+    const result = await this.injectScroll(resolved, deltaX, deltaY, undefined);
     return this.actionResult(
       threadId,
       "computer_scroll",
@@ -906,7 +1122,11 @@ export class ComputerManager {
     target: ComputerTarget | null,
     deltaX: number,
     deltaY: number,
-    options: { readonly observe: boolean },
+    options: {
+      readonly observe: boolean;
+      /** Held down for every injected leg of this scroll, released after each. */
+      readonly modifiers?: readonly ComputerInputModifier[];
+    },
   ): Promise<{
     readonly result: ComputerActionResult;
     readonly observation?: ComputerActionObservation;
@@ -948,7 +1168,7 @@ export class ComputerManager {
       Math.abs(deltaY) > SCROLL_PROBE_TRIGGER_PX
     ) {
       const probe = Math.sign(deltaY) * SCROLL_PROBE_PX;
-      result = await this.injectScroll(resolved, 0, probe);
+      result = await this.injectScroll(resolved, 0, probe, options.modifiers);
       injectedY += probe;
       const probeLeg = await this.settleAndMeasure(observedWindowId, before, probe);
       after = probeLeg.capture;
@@ -966,7 +1186,7 @@ export class ComputerManager {
       const legX = this.scrollGearing.plan(observedWindowId, deltaX);
       const legY = this.scrollGearing.plan(observedWindowId, remainder);
       if (legX !== 0 || legY !== 0) {
-        result = await this.injectScroll(resolved, legX, legY);
+        result = await this.injectScroll(resolved, legX, legY, options.modifiers);
         injectedX += legX;
         injectedY += legY;
         if (after) {
@@ -983,7 +1203,7 @@ export class ComputerManager {
     } else {
       injectedX = this.scrollGearing.plan(observedWindowId, deltaX);
       injectedY = this.scrollGearing.plan(observedWindowId, deltaY);
-      result = await this.injectScroll(resolved, injectedX, injectedY);
+      result = await this.injectScroll(resolved, injectedX, injectedY, options.modifiers);
       if (before) {
         const leg = await this.settleAndMeasure(observedWindowId, before, injectedY);
         after = leg.capture;
@@ -1042,7 +1262,7 @@ export class ComputerManager {
     const state = await this.backend.getState({ includeTree: false });
     const match = state.root ? resolveComputerWindowTarget(state.root, windowId) : undefined;
     if (match) return { point: match.point, windowId };
-    const windows = await this.backend.listWindows();
+    const windows = await this.readWindows();
     const window = windows.find((candidate) => candidate.id === windowId);
     if (!window) throw windowNotFoundError(windowId);
     const bounds = window.bounds;
@@ -1064,9 +1284,10 @@ export class ComputerManager {
     resolved: ResolvedPointTarget | null,
     deltaX: number,
     deltaY: number,
+    modifiers: readonly ComputerInputModifier[] | undefined,
   ): Promise<ComputerBackendActionResult | void> {
     return this.injectScoped("computer_scroll", resolved ?? {}, () =>
-      this.backend.scroll(resolved?.point ?? null, deltaX, deltaY, resolved?.windowId),
+      this.backend.scroll(resolved?.point ?? null, deltaX, deltaY, resolved?.windowId, modifiers),
     );
   }
 
@@ -1327,6 +1548,13 @@ export class ComputerManager {
     this.engageBackend();
     const owner = agentThreadId(threadId);
     if (owner === undefined) return;
+    // The window list as it stood before this action, so the observer can tell
+    // "nothing happened" apart from "a window opened that the capture could not
+    // see". Free after the first action: every publish and every targeting read
+    // refreshes the cache, and only a process that has never listed windows pays
+    // for a read here.
+    this.preActionWindowIds =
+      this.lastKnownWindowIds ?? (await this.readWindows().then(windowIdSet, () => undefined));
     const now = this.now();
     const held = this.lease;
     if (held && held.threadId !== owner && !this.isLeaseStale(held, now)) {
@@ -1590,7 +1818,7 @@ export class ComputerManager {
     point: ComputerPoint,
     windowId: string,
   ): Promise<readonly ComputerWindow[]> {
-    const windows = await this.backend.listWindows();
+    const windows = await this.readWindows();
     const window = windows.find((candidate) => candidate.id === windowId);
     if (!window) throw windowNotFoundError(windowId);
     const bounds = window.bounds;
@@ -1665,7 +1893,7 @@ export class ComputerManager {
    */
   private async prepareKeyboardTarget(windowId: string | undefined): Promise<void> {
     if (windowId === undefined) return;
-    const windows = await this.backend.listWindows();
+    const windows = await this.readWindows();
     if (!windows.some((candidate) => candidate.id === windowId)) {
       throw windowNotFoundError(windowId);
     }
@@ -1715,7 +1943,7 @@ export class ComputerManager {
     point: ComputerPoint,
     windowId: string,
   ): Promise<readonly ComputerWindow[]> {
-    const windows = await this.backend.listWindows().catch(() => []);
+    const windows = await this.readWindows().catch(() => []);
     return windowsCoveringPoint(windows, windowId, point);
   }
 
@@ -1844,7 +2072,7 @@ export class ComputerManager {
       if (this.backendEngaged) {
         const [availability, windows, screenSize] = await Promise.all([
           this.backend.availability(),
-          this.backend.listWindows(),
+          this.readWindows(),
           this.backend.getScreenSize(),
         ]);
         if (this.disposed || this.threads.get(threadId) !== state) return undefined;
@@ -2047,6 +2275,10 @@ function round2(value: number): number {
  * no thread — the human at the computer pane. Attribution and the desktop lease
  * must agree on who that is, so both read it here.
  */
+function windowIdSet(windows: readonly ComputerWindow[]): ReadonlySet<string> {
+  return new Set(windows.map((window) => window.id));
+}
+
 function agentThreadId(threadId: string | undefined): string | undefined {
   const trimmed = threadId?.trim();
   return trimmed ? trimmed : undefined;
@@ -2144,6 +2376,21 @@ function refusedInjectionError(
       "also have closed since it was listed. Aim nearer the middle of the control, target it by " +
       "label instead of a coordinate, or drop window_id to act on whatever is topmost there.",
   });
+}
+
+function tripleClickUnsupportedError(): ComputerBackendError {
+  return new ComputerBackendError(
+    "This desktop backend cannot send a triple click. Select the line another way — " +
+      "click at its start and shift-click at its end, or use the application's own " +
+      "select-all shortcut with computer_hotkey.",
+  );
+}
+
+function activationUnsupportedError(): ComputerBackendError {
+  return new ComputerBackendError(
+    "This desktop backend cannot bring a window forward. Ask the user to click the window " +
+      "they want in front, or aim the action at it with window_id instead.",
+  );
 }
 
 function clipboardUnsupportedError(): ComputerBackendError {

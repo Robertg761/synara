@@ -8,6 +8,7 @@ import {
   type ComputerDeliveryVerification,
   type ComputerHealth,
   type ComputerId,
+  type ComputerInputModifier,
   type ComputerLaunchAppResult,
   type ComputerPermission,
   type ComputerPoint,
@@ -20,25 +21,36 @@ import {
   type ComputerWindow,
 } from "@synara/contracts";
 
-/** Longest screenshot side in pixels before a capture is downscaled. */
-export const DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION = 2_048;
 /**
- * The budget a post-action observation spends, rather than the perception one.
+ * The longest side, in pixels, of any screenshot handed to a model.
  *
- * Image tokens scale with pixel area — roughly `width * height / 750` — so the
- * temptation is to shrink every after-action shot hard. A tighter 1024 budget
- * did save tokens, but it lost the precision the agent needs to read a dense
- * form or aim at a small field, and the cost came back as mis-aimed clicks and
- * extra re-screenshots that were both slower and more expensive than the shot
- * they replaced. So this matches the height of a typical application window:
- * a browser or editor at ~1400 px tall is captured at full resolution, only a
- * genuinely large capture is scaled, and the real savings comes from the
- * byte-identical dedupe (`screenshotUnchanged`) that never resends a frame that
- * did not change — a token win with no quality cost at all. When still more
- * detail is needed, `computer_screenshot` zooms in at the perception budget with
- * the identical `region`/`scale` mapping.
+ * This is a correctness bound before it is a cost one. Vision APIs downscale an
+ * image whose long edge exceeds roughly 1568 px before the model ever sees it,
+ * and the model then reads coordinates off a picture the server never produced:
+ * at the old 2048 budget every pixel the model pointed at was mapped against an
+ * image 1.33x larger than the one it looked at, so every click landed short and
+ * consistently up-and-left. Nothing in this pipeline may depend on API-side
+ * resizing — Synara does the downscale itself, records the resulting frame, and
+ * maps the model's pixels through the frame it actually delivered.
+ *
+ * 1536 rather than something smaller because image tokens scale with area and
+ * the temptation is to shrink hard: a 1024 budget did save tokens, but it lost
+ * the precision needed to read a dense form or aim at a small field, and the
+ * cost came back as mis-aimed clicks and extra re-screenshots that were slower
+ * and more expensive than the shot they replaced. At 1536 a browser or editor
+ * window comes back at full resolution, only a genuinely large capture is
+ * scaled, and the real savings comes from the byte-identical dedupe
+ * (`screenshotUnchanged`) that never resends an unchanged frame at all.
  */
-export const COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION = 1_536;
+export const COMPUTER_AGENT_IMAGE_MAX_DIMENSION = 1_536;
+/**
+ * Longest screenshot side in pixels before a capture is downscaled. Identical
+ * to the observation budget, and for the identical reason: both pictures are
+ * read by the same eyes and pointed at through the same frame registry.
+ */
+export const DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION = COMPUTER_AGENT_IMAGE_MAX_DIMENSION;
+/** The budget a post-action observation spends. See the constant above. */
+export const COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION = COMPUTER_AGENT_IMAGE_MAX_DIMENSION;
 /** Native per-side image limit enforced by the KWin capture path. */
 export const MAX_COMPUTER_CAPTURE_MAX_DIMENSION = 16_384;
 /**
@@ -177,8 +189,27 @@ export const NO_COMPUTER_CAPABILITIES: ComputerCapabilities = {
   visibleDesktop: false,
 };
 
+/**
+ * Which desktop vocabulary a backend speaks.
+ *
+ * Not a platform label for its own sake: three agent-facing descriptions are
+ * only true of one family — what a keyboard shortcut may contain, which
+ * semantic action names the accessibility layer accepts, and what an
+ * application identifier looks like — and describing the other family's answer
+ * teaches the model to send calls that are guaranteed to be refused. The tool
+ * surface branches on this rather than on a delivery flag that happened to
+ * correlate with the platform.
+ */
+export type ComputerAgentDialect = "linux" | "macos";
+
 /** Provider-side contract shared by real display backends and the CI fake. */
 export interface ComputerBackend {
+  /**
+   * The vocabulary this desktop speaks, for the tool descriptions that differ
+   * by family. Absent means `"linux"`: the evdev + AT-SPI pair every backend
+   * but the macOS one uses.
+   */
+  readonly agentDialect?: ComputerAgentDialect;
   readonly computerId: ComputerId;
   /**
    * Whether this host could drive a desktop, answered without doing anything to
@@ -331,9 +362,33 @@ export interface ComputerBackend {
    * on a partially covered window reach the window the caller meant rather than
    * the one drawn on top of it.
    */
-  click(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult | void>;
-  doubleClick(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult | void>;
-  rightClick(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult | void>;
+  click(
+    point: ComputerPoint,
+    windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult | void>;
+  doubleClick(
+    point: ComputerPoint,
+    windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult | void>;
+  /**
+   * Three clicks close enough together for a toolkit to pair them, which is
+   * what selects a whole line or paragraph. Optional because it is not the same
+   * gesture as three separate clicks — the click count has to reach the target
+   * as one number — so a backend that cannot express it must refuse rather than
+   * approximate it with a loop the application reads as three carets.
+   */
+  tripleClick?(
+    point: ComputerPoint,
+    windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult | void>;
+  rightClick(
+    point: ComputerPoint,
+    windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult | void>;
   moveCursor(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult | void>;
   drag(
     from: ComputerPoint,
@@ -346,6 +401,7 @@ export interface ComputerBackend {
     deltaX: number,
     deltaY: number,
     windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
   ): Promise<ComputerBackendActionResult | void>;
   typeText(text: string): Promise<ComputerBackendActionResult | void>;
   pressKey(key: string): Promise<ComputerBackendActionResult | void>;

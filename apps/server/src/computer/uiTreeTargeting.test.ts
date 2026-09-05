@@ -199,6 +199,7 @@ describe("actionableElements", () => {
 
     expect(actionableElements(desktop)).toEqual({
       complete: true,
+      omitted: 0,
       items: [
         { role: "push button", label: "Reload", windowId: windowId("browser") },
         { role: "entry", label: "Email", value: "", windowId: windowId("browser") },

@@ -9,6 +9,7 @@ import {
   type ComputerDeliveryVerification,
   type ComputerHealth,
   type ComputerId,
+  type ComputerInputModifier,
   type ComputerLaunchAppResult,
   type ComputerPermission,
   type ComputerPoint,
@@ -998,16 +999,36 @@ export class MacComputerBackend implements ComputerBackend {
     };
   }
 
-  async click(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction(MAC_HELPER_METHODS.click, point, windowId);
+  async click(
+    point: ComputerPoint,
+    windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction(MAC_HELPER_METHODS.click, point, windowId, modifiers);
   }
 
-  async doubleClick(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction(MAC_HELPER_METHODS.doubleClick, point, windowId);
+  async doubleClick(
+    point: ComputerPoint,
+    windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction(MAC_HELPER_METHODS.doubleClick, point, windowId, modifiers);
   }
 
-  async rightClick(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction(MAC_HELPER_METHODS.rightClick, point, windowId);
+  async tripleClick(
+    point: ComputerPoint,
+    windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction(MAC_HELPER_METHODS.tripleClick, point, windowId, modifiers);
+  }
+
+  async rightClick(
+    point: ComputerPoint,
+    windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction(MAC_HELPER_METHODS.rightClick, point, windowId, modifiers);
   }
 
   async moveCursor(point: ComputerPoint, windowId?: string): Promise<ComputerBackendActionResult> {
@@ -1045,10 +1066,12 @@ export class MacComputerBackend implements ComputerBackend {
     deltaX: number,
     deltaY: number,
     windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
   ): Promise<ComputerBackendActionResult> {
     const origin = this.currentOrigin();
     const params: Record<string, unknown> = { deltaX, deltaY };
     if (windowId) params.windowId = windowId;
+    if (modifiers && modifiers.length > 0) params.modifiers = [...new Set(modifiers)];
     if (point) {
       params.x = point.x + origin.x;
       params.y = point.y + origin.y;
@@ -1183,6 +1206,9 @@ export class MacComputerBackend implements ComputerBackend {
    */
   readonly deliversToNamedWindowRegardlessOfStacking = true;
 
+  /** AX action names, `open`-style app identifiers, single-chord shortcuts. */
+  readonly agentDialect = "macos" as const;
+
   /**
    * Points the helper's keyboard at a window without raising or activating it,
    * so a `computer_type_text` that names a window reaches it even when the last
@@ -1190,6 +1216,25 @@ export class MacComputerBackend implements ComputerBackend {
    */
   async focusWindow(windowId: string): Promise<void> {
     await this.call(MAC_HELPER_METHODS.focusWindow, { windowId });
+  }
+
+  /**
+   * Bring one window forward inside its own application.
+   *
+   * The only call in this backend that moves anything the human can see, which
+   * is why `deliversToNamedWindowRegardlessOfStacking` keeps it off the ordinary
+   * pointer path: input stamped with a window id reaches that window whatever
+   * covers it, so the raise the Linux tiers need before every scoped click has
+   * no purpose here and used to pull the user's front application out from under
+   * them. It is reached only by `computer_activate_window`, where bringing the
+   * window forward is the request itself.
+   *
+   * The helper does not activate the owning application and has no fallback that
+   * would: a window still not frontmost after `AXRaise` comes back as a refusal
+   * rather than a focus steal.
+   */
+  async raiseWindow(windowId: string): Promise<void> {
+    await this.call(MAC_HELPER_METHODS.raiseWindow, { windowId });
   }
 
   async setDrivingAgent(name: string | null): Promise<void> {
@@ -1265,6 +1310,7 @@ export class MacComputerBackend implements ComputerBackend {
     method: string,
     point: ComputerPoint,
     windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
   ): Promise<ComputerBackendActionResult> {
     const origin = this.currentOrigin();
     const payload = asRecord(
@@ -1275,6 +1321,9 @@ export class MacComputerBackend implements ComputerBackend {
         // topmost window at the point, so a click meant for a partially
         // covered window landed on whatever was drawn over it.
         ...(windowId ? { windowId } : {}),
+        // Held down across the gesture and released after it. Omitted entirely
+        // when empty, so an older helper sees the request it always saw.
+        ...(modifiers && modifiers.length > 0 ? { modifiers: [...new Set(modifiers)] } : {}),
       }),
     );
     // The helper reports where the pointer actually landed when the display

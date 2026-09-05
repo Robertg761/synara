@@ -50,6 +50,13 @@ export const MAC_HELPER_METHODS = {
   move: "move",
   click: "click",
   doubleClick: "double-click",
+  /**
+   * Three clicks with the click state carried through as one gesture, which is
+   * what selects a line or a paragraph. Not expressible as three `click` calls:
+   * the count reaches the target as a number on the event, and three separate
+   * events are three carets.
+   */
+  tripleClick: "triple-click",
   rightClick: "right-click",
   drag: "drag",
   scroll: "scroll",
@@ -59,6 +66,14 @@ export const MAC_HELPER_METHODS = {
   setValue: "set-value",
   performAction: "perform-action",
   focusWindow: "focus-window",
+  /**
+   * `AXRaise` on the matching AX window: brings it forward inside its own
+   * application without activating that application, and aims the keyboard at
+   * it once the raise is observed. `notDelivered` when the window is still not
+   * frontmost afterwards, because there is deliberately no activation fallback
+   * that would pull the human's front application out from under them.
+   */
+  raiseWindow: "raise-window",
   readClipboard: "read-clipboard",
   writeClipboard: "write-clipboard",
   setAgentCursor: "set-agent-cursor",

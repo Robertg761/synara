@@ -4,6 +4,7 @@ import type {
   ComputerCapabilities,
   ComputerHealth,
   ComputerId,
+  ComputerInputModifier,
   ComputerLaunchAppResult,
   ComputerPermission,
   ComputerPoint,
@@ -265,16 +266,36 @@ export class FakeComputerBackend implements ComputerBackend {
     this.currentWindows = this.currentWindows.map((item) => ({ ...item, focused: false }));
   }
 
-  async click(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction("click", point);
+  async click(
+    point: ComputerPoint,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction("click", point, modifiers);
   }
 
-  async doubleClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction("doubleClick", point);
+  async doubleClick(
+    point: ComputerPoint,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction("doubleClick", point, modifiers);
   }
 
-  async rightClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    return await this.pointerAction("rightClick", point);
+  async tripleClick(
+    point: ComputerPoint,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction("tripleClick", point, modifiers);
+  }
+
+  async rightClick(
+    point: ComputerPoint,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.pointerAction("rightClick", point, modifiers);
   }
 
   async moveCursor(point: ComputerPoint): Promise<ComputerBackendActionResult> {
@@ -297,8 +318,13 @@ export class FakeComputerBackend implements ComputerBackend {
     point: ComputerPoint | null,
     deltaX: number,
     deltaY: number,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
   ): Promise<ComputerBackendActionResult> {
-    this.record("scroll", point, deltaX, deltaY);
+    // Recorded only when present, so every existing assertion on a plain
+    // scroll keeps matching its three-argument shape.
+    if (modifiers && modifiers.length > 0) this.record("scroll", point, deltaX, deltaY, modifiers);
+    else this.record("scroll", point, deltaX, deltaY);
     this.throwIfFailed("scroll");
     if (point) this.validatePoint(point);
     return point ? { point } : {};
@@ -480,10 +506,14 @@ export class FakeComputerBackend implements ComputerBackend {
   }
 
   private async pointerAction(
-    method: "click" | "doubleClick" | "rightClick" | "moveCursor",
+    method: "click" | "doubleClick" | "tripleClick" | "rightClick" | "moveCursor",
     point: ComputerPoint,
+    modifiers?: readonly ComputerInputModifier[],
   ): Promise<ComputerBackendActionResult> {
-    this.record(method, point);
+    // Recorded only when present, so every existing assertion on a plain
+    // pointer call keeps matching its two-argument shape.
+    if (modifiers && modifiers.length > 0) this.record(method, point, modifiers);
+    else this.record(method, point);
     this.throwIfFailed(method);
     this.validatePoint(point);
     return { point };

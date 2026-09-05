@@ -6,6 +6,7 @@
  * twin — takes the same codes. A further backend reuses these tables verbatim
  * rather than restating them.
  */
+import type { ComputerInputModifier } from "@synara/contracts";
 
 /** Linux input-event codes used by every evdev-shaped injection API. */
 export const EVDEV_KEY_CODES = {
@@ -295,4 +296,26 @@ export function keyStrokeForKey(key: string): QwertyKeyStroke {
   const named = NAMED_KEYS[normalized];
   if (named !== undefined) return { code: named, shift: false };
   throw new UnsupportedQwertyKeyError(key);
+}
+
+/**
+ * The evdev key each shared modifier name maps to, so the pane's chord keys and
+ * an agent's modifier-held gesture press the identical physical key.
+ *
+ * The left-hand key in every case: a toolkit reads the modifier bit, not which
+ * of the pair produced it, and picking one keeps the release unambiguous.
+ */
+export const EVDEV_MODIFIER_KEY_CODES: Readonly<Record<ComputerInputModifier, number>> = {
+  ctrl: EVDEV_KEY_CODES.LeftControl,
+  alt: EVDEV_KEY_CODES.LeftAlt,
+  shift: EVDEV_KEY_CODES.LeftShift,
+  meta: EVDEV_KEY_CODES.LeftMeta,
+};
+
+/** The evdev codes for a modifier list, deduplicated and in the order given. */
+export function evdevModifierCodes(
+  modifiers: readonly ComputerInputModifier[] | undefined,
+): readonly number[] {
+  if (!modifiers || modifiers.length === 0) return [];
+  return [...new Set(modifiers)].map((modifier) => EVDEV_MODIFIER_KEY_CODES[modifier]);
 }

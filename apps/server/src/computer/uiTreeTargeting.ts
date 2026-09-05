@@ -258,6 +258,23 @@ export interface ComputerActionableElements {
    * should say so — an element missing from a truncated digest still exists.
    */
   readonly complete: boolean;
+  /**
+   * How many matching elements did not fit, so the caller can say how much it
+   * is not showing rather than only that it is not showing everything.
+   *
+   * Knowing the number is what makes the answer actionable: "3 more" means
+   * scroll or look again, while "412 more" means narrow the query, and the
+   * filters exist precisely for the second case.
+   */
+  readonly omitted: number;
+}
+
+/** Narrows the digest before the length cap applies, never after it. */
+export interface ComputerActionableElementFilter {
+  /** Only controls owned by this window. */
+  readonly windowId?: string | undefined;
+  /** Only controls whose label contains this text, case-insensitively. */
+  readonly labelContains?: string | undefined;
 }
 
 /**
@@ -272,37 +289,48 @@ export interface ComputerActionableElements {
  * the next digest. Duplicate labels are kept: two same-labeled controls is
  * real ambiguity the caller should see rather than have silently resolved.
  */
-export function actionableElements(root: ComputerUiNode): ComputerActionableElements {
+export function actionableElements(
+  root: ComputerUiNode,
+  filter: ComputerActionableElementFilter = {},
+): ComputerActionableElements {
   const items: ComputerActionableElement[] = [];
-  let overflow = false;
+  const wanted = filter.labelContains?.toLocaleLowerCase();
+  let omitted = 0;
   const walk = (node: ComputerUiNode): void => {
-    if (overflow) return;
+    const label = matchableLabel(node);
     const collectible =
       ACTIONABLE_ROLES.has(node.role) &&
       node.onScreen &&
       node.windowId !== null &&
-      matchableLabel(node) !== "";
-    if (collectible && items.length < ELEMENT_DIGEST_MAX_LENGTH) {
-      const label = clampTextToLength(matchableLabel(node), ELEMENT_TEXT_MAX_LENGTH);
-      items.push({
-        role: node.role,
-        label,
-        // An entry's empty value is real information — "this field is blank" —
-        // so presence, not truthiness, decides.
-        ...(node.value !== null && node.value !== undefined
-          ? { value: clampTextToLength(node.value, 40) }
-          : {}),
-        windowId: node.windowId,
-      });
-    } else if (collectible && items.length >= ELEMENT_DIGEST_MAX_LENGTH) {
-      // The list is full and something actionable did not fit: that has to be
-      // said out loud, or the caller reads a truncated digest as the truth.
-      overflow = true;
+      label !== "" &&
+      (filter.windowId === undefined || node.windowId === filter.windowId) &&
+      (wanted === undefined || label.toLocaleLowerCase().includes(wanted));
+    if (collectible) {
+      if (items.length < ELEMENT_DIGEST_MAX_LENGTH) {
+        items.push({
+          role: node.role,
+          label: clampTextToLength(label, ELEMENT_TEXT_MAX_LENGTH),
+          // An entry's empty value is real information — "this field is blank" —
+          // so presence, not truthiness, decides.
+          ...(node.value !== null && node.value !== undefined
+            ? { value: clampTextToLength(node.value, 40) }
+            : {}),
+          windowId: node.windowId,
+        });
+      } else {
+        // The list is full and something actionable did not fit: that has to be
+        // said out loud, or the caller reads a truncated digest as the truth.
+        omitted += 1;
+      }
     }
+    // The walk continues past the cap on purpose. Abandoning it made the count
+    // unknowable and the digest prefix-biased by window order — whatever the
+    // desktop happened to enumerate first filled the list, and the rest of the
+    // screen was not merely unlisted but uncounted.
     for (const child of node.children) walk(child);
   };
   walk(root);
-  return { items, complete: !overflow };
+  return { items, complete: omitted === 0, omitted };
 }
 
 export function describeTarget(target: ComputerTarget): string {

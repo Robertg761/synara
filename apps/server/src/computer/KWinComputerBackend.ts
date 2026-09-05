@@ -12,6 +12,7 @@ import {
   type ComputerCapabilities,
   type ComputerHealth,
   type ComputerId,
+  type ComputerInputModifier,
   type ComputerLaunchAppResult,
   type ComputerPoint,
   type ComputerRect,
@@ -77,7 +78,12 @@ import {
   type KWinComputerPluginApi,
 } from "./kwinDbus.ts";
 import { sessionBusNameHasOwner } from "./sessionBusNames.ts";
-import { EVDEV_BUTTON_CODES, keyStrokeForKey, qwertyTextKeyStrokes } from "./evdevInput.ts";
+import {
+  EVDEV_BUTTON_CODES,
+  evdevModifierCodes,
+  keyStrokeForKey,
+  qwertyTextKeyStrokes,
+} from "./evdevInput.ts";
 import {
   provisionKWinPlugin,
   readPrebuiltManifest,
@@ -91,6 +97,7 @@ import {
   pressButtonOnce,
   pressHotkeyStrokes,
   pressKeyStroke,
+  withHeldModifiers,
   type ComputerInputSink,
 } from "./pointerSequencing.ts";
 import {
@@ -811,23 +818,66 @@ export class KWinComputerBackend implements ComputerBackend {
     });
   }
 
-  async click(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    const moved = await this.moveCursor(point);
-    await this.pressButton(EVDEV_BUTTON_CODES.left);
-    return moved;
+  async click(
+    point: ComputerPoint,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.clickRepeated(point, EVDEV_BUTTON_CODES.left, 1, modifiers);
   }
 
-  async doubleClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
-    const moved = await this.moveCursor(point);
-    await this.pressButton(EVDEV_BUTTON_CODES.left);
-    await this.sleep(60);
-    await this.pressButton(EVDEV_BUTTON_CODES.left);
-    return moved;
+  async doubleClick(
+    point: ComputerPoint,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.clickRepeated(point, EVDEV_BUTTON_CODES.left, 2, modifiers);
   }
 
-  async rightClick(point: ComputerPoint): Promise<ComputerBackendActionResult> {
+  async tripleClick(
+    point: ComputerPoint,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.clickRepeated(point, EVDEV_BUTTON_CODES.left, 3, modifiers);
+  }
+
+  async rightClick(
+    point: ComputerPoint,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
+  ): Promise<ComputerBackendActionResult> {
+    return await this.clickRepeated(point, EVDEV_BUTTON_CODES.right, 1, modifiers);
+  }
+
+  /**
+   * The pointer glide, then `count` presses spaced closely enough for a toolkit
+   * to pair them into a double or triple click, with any modifiers held across
+   * the whole sequence.
+   *
+   * The glide happens outside the held modifiers: a modifier is state the
+   * application reads when the button goes down, and holding one across a
+   * multi-hundred-millisecond cursor animation would show the user a modifier
+   * pressed for no visible reason.
+   */
+  private async clickRepeated(
+    point: ComputerPoint,
+    button: number,
+    count: number,
+    modifiers: readonly ComputerInputModifier[] | undefined,
+  ): Promise<ComputerBackendActionResult> {
     const moved = await this.moveCursor(point);
-    await this.pressButton(EVDEV_BUTTON_CODES.right);
+    const plugin = await this.ensurePlugin();
+    await withHeldModifiers({
+      sink: this.inputSink(plugin),
+      modifierCodes: evdevModifierCodes(modifiers),
+      run: async () => {
+        for (let index = 0; index < count; index += 1) {
+          if (index > 0) await this.sleep(60);
+          await this.pressButton(button);
+        }
+      },
+    });
     return moved;
   }
 
@@ -868,10 +918,16 @@ export class KWinComputerBackend implements ComputerBackend {
     point: ComputerPoint | null,
     deltaX: number,
     deltaY: number,
+    _windowId?: string,
+    modifiers?: readonly ComputerInputModifier[],
   ): Promise<ComputerBackendActionResult> {
     const plugin = await this.ensurePlugin();
     const moved = point ? await this.moveCursor(point) : {};
-    await this.pluginSuccess("axis", () => plugin.axis(deltaX, deltaY));
+    await withHeldModifiers({
+      sink: this.inputSink(plugin),
+      modifierCodes: evdevModifierCodes(modifiers),
+      run: () => this.pluginSuccess("axis", () => plugin.axis(deltaX, deltaY)),
+    });
     return moved;
   }
 
