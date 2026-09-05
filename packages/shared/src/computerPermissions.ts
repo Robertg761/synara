@@ -12,8 +12,6 @@
  */
 import type { ComputerBuildSignature, ComputerPermission } from "@synara/contracts";
 
-import { SYNARA_PRODUCTION_BUNDLE_ID } from "@synara/shared/desktopIdentity";
-
 /**
  * Fixed order, most consequential first: without Accessibility nothing can be
  * driven, while without Screen Recording the desktop is merely unseeable.
@@ -77,26 +75,35 @@ export function listComputerPermissions(permissions: readonly ComputerPermission
  * (`MacComputerBackend.requestMissingPermissions`), so the user's part is a
  * dialog rather than a Terminal command. The command survives here only as the
  * fallback for the case where no dialog arrives at all.
+ *
+ * `bundleId` is the *responsible* app's identifier — the Synara the grant is
+ * actually filed against, which `.dev` and `.canary` builds do not share with a
+ * released one. It is optional because nothing can derive it: a server started
+ * outside the desktop shell has no app behind it, and the desktop tells the
+ * backend which flavor it is through
+ * `SYNARA_DESKTOP_BUNDLE_ID_ENV`. When it is unknown the whole `tccutil`
+ * sentence is withheld rather than printed with a guess, because the guess a
+ * user would paste into Terminal resets a *different* Synara's grants — the one
+ * they have installed — and leaves this one exactly as broken as before.
  */
 export function computerStaleGrantAdvice(
   permissions: readonly ComputerPermission[],
   buildSignature: ComputerBuildSignature,
+  bundleId?: string | undefined,
 ): string | null {
   if (buildSignature !== "adhoc") return null;
   const sorted = sortComputerPermissions(permissions);
   if (sorted.length === 0) return null;
-  const commands = sorted
-    .map(
-      (permission) =>
-        `tccutil reset ${TCC_SERVICE_NAMES[permission]} ${SYNARA_PRODUCTION_BUNDLE_ID}`,
-    )
-    .join(", then ");
-  return (
+  const base =
     "This is a locally built copy of Synara, so macOS may already list it with the switch on from " +
     "an earlier build — that grant no longer applies to this one. Synara has cleared the stale " +
-    "entry and asked again, so allow the dialog when it appears. If none appears, run " +
-    `\`${commands}\` in Terminal and try again.`
-  );
+    "entry and asked again, so allow the dialog when it appears.";
+  const responsibleBundleId = bundleId?.trim();
+  if (!responsibleBundleId) return base;
+  const commands = sorted
+    .map((permission) => `tccutil reset ${TCC_SERVICE_NAMES[permission]} ${responsibleBundleId}`)
+    .join(", then ");
+  return `${base} If none appears, run \`${commands}\` in Terminal and try again.`;
 }
 
 /**
@@ -106,12 +113,13 @@ export function computerStaleGrantAdvice(
 export function computerPermissionSetupMessage(
   permissions: readonly ComputerPermission[],
   buildSignature: ComputerBuildSignature,
+  bundleId?: string | undefined,
 ): string {
   const labels = listComputerPermissions(permissions);
   const base =
     labels.length > 0
       ? `Synara needs ${labels} to control this Mac. Turn Synara on in System Settings › Privacy & Security › ${labels}, then try again.`
       : "Synara needs a macOS privacy permission to control this Mac. Grant it in System Settings › Privacy & Security, then try again.";
-  const advice = computerStaleGrantAdvice(permissions, buildSignature);
+  const advice = computerStaleGrantAdvice(permissions, buildSignature, bundleId);
   return advice ? `${base} ${advice}` : base;
 }

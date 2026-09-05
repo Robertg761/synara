@@ -37,6 +37,7 @@ describe("resolveRightDockLauncherItems", () => {
         hasWorkspace: true,
         hasGitRepository: false,
         hasReview: false,
+        hasComputerSupport: true,
       }).map(({ kind, label }) => [kind, label]),
     ).toEqual([
       ["terminal", "Terminal"],
@@ -53,6 +54,7 @@ describe("resolveRightDockLauncherItems", () => {
         hasWorkspace: true,
         hasGitRepository: true,
         hasReview: true,
+        hasComputerSupport: true,
       }).map(({ kind }) => kind),
     ).toEqual(["diff", "terminal", "browser", "explorer", "sidechat", "computer", "git"]);
   });
@@ -63,6 +65,7 @@ describe("resolveRightDockLauncherItems", () => {
         hasWorkspace: false,
         hasGitRepository: false,
         hasReview: false,
+        hasComputerSupport: true,
       }).map(({ kind }) => kind),
     ).toEqual(["terminal", "browser", "sidechat", "computer"]);
   });
@@ -73,6 +76,7 @@ describe("resolveRightDockLauncherItems", () => {
         hasWorkspace: true,
         hasGitRepository: true,
         hasReview: false,
+        hasComputerSupport: true,
       }).map(({ kind }) => kind),
     ).toEqual(["terminal", "browser", "explorer", "sidechat", "computer", "git"]);
   });
@@ -86,6 +90,7 @@ describe("resolveRightDockLauncherItems", () => {
         hasGitRepository: false,
         hasReview: false,
         hasDeviceSupport: true,
+        hasComputerSupport: true,
       }).map(({ kind }) => kind),
     ).toEqual(["terminal", "browser", "explorer", "sidechat", "device", "computer"]);
 
@@ -97,6 +102,30 @@ describe("resolveRightDockLauncherItems", () => {
         hasDeviceSupport: false,
       }).map(({ kind }) => kind),
     ).not.toContain("device");
+  });
+
+  it("offers the desktop only when the server can drive one", () => {
+    // A Windows server, or a Linux one with no Wayland session Synara can reach,
+    // has no desktop to show — and a launcher that opens a pane which can only
+    // say "unavailable" is worse than no launcher.
+    expect(
+      resolveRightDockLauncherItems({
+        hasWorkspace: true,
+        hasGitRepository: false,
+        hasReview: false,
+        hasComputerSupport: false,
+      }).map(({ kind }) => kind),
+    ).not.toContain("computer");
+  });
+
+  it("omits the desktop when support is unknown, so the entry cannot flicker in", () => {
+    expect(
+      resolveRightDockLauncherItems({
+        hasWorkspace: true,
+        hasGitRepository: false,
+        hasReview: false,
+      }).map(({ kind }) => kind),
+    ).not.toContain("computer");
   });
 
   it("omits the simulator when support is unknown, so the entry cannot flicker in", () => {

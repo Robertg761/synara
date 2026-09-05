@@ -1,6 +1,8 @@
 import {
   COMPUTER_RELEASE_CONTROL_HOTKEY,
   COMPUTER_RELEASE_HOTKEY_BACKENDS,
+  type ComputerActionEvent,
+  type ComputerActionResult,
   type ComputerAvailability,
   type ComputerFrameHeader,
   type ComputerHealth,
@@ -131,8 +133,19 @@ export function resolveComputerAvailabilityView(
  * do" from "not ready" is whether a backend resolved, whether it can currently
  * capture, and only then whether it claims the two abilities. A platform that
  * can never run this is not a machine with something left to install.
+ *
+ * Typed on the three fields rather than on `ComputerStatusResult`, because the
+ * thread-scoped state a chat receives by push carries the same three and has to
+ * be answerable by the same question — the chat's setup card reads the live
+ * thread state, the settings panel reads the polled status, and a second copy
+ * of this rule for the other shape is how they would start disagreeing.
  */
-export function computerStatusNeedsSetup(status: ComputerStatusResult | undefined): boolean {
+export type ComputerSetupProbe = Pick<
+  ComputerStatusResult,
+  "availability" | "health" | "capabilities"
+>;
+
+export function computerStatusNeedsSetup(status: ComputerSetupProbe | undefined): boolean {
   if (!status) return false;
   if (status.availability.kind === "unsupported-platform") return false;
   return (
@@ -142,6 +155,46 @@ export function computerStatusNeedsSetup(status: ComputerStatusResult | undefine
     !status.capabilities.input ||
     !status.capabilities.capture
   );
+}
+
+/**
+ * What the chat's setup card should say right now, from live state alone.
+ *
+ * The card used to latch: a boolean was set once inside the provision callback
+ * and never cleared, so every later card in that conversation claimed "Computer
+ * control is ready" — including after a rebuild invalidated the cdhash the
+ * grant was pinned to. And because only that callback could set it, the
+ * *expected* path — the user allowing the dialog macOS had already put on
+ * screen, without pressing anything in Synara — left the card saying "needs
+ * Accessibility" forever.
+ *
+ * So there is no remembered answer here at all: `unknown` while no live state
+ * has arrived (the conservative reading — offer Set up rather than claim
+ * readiness), and otherwise whatever the desktop currently reports.
+ */
+export type ComputerControlReadiness = "unknown" | "ready" | "needs-setup";
+
+export function computerControlReadiness(
+  state: ComputerSetupProbe | undefined,
+): ComputerControlReadiness {
+  if (!state) return "unknown";
+  return computerStatusNeedsSetup(state) ? "needs-setup" : "ready";
+}
+
+/**
+ * Whether the desktop this backend drives is the one the user is looking at.
+ *
+ * The distinction decides real UI, not just wording. On a shared desktop the
+ * server never asks Synara to open a Computer pane — the actions are already
+ * happening on the screen in front of the user, and
+ * `ComputerManager.surfacePaneForAgent` returns early — so the "Open
+ * automatically" preference controls nothing, and the pane's interactive mode
+ * would be a second cursor fighting the user's own on their real machine.
+ */
+export function computerBackendIsVisibleDesktop(
+  state: Pick<ComputerStatusResult, "capabilities"> | undefined,
+): boolean {
+  return state?.capabilities.visibleDesktop === true;
 }
 
 export interface ComputerHealthBadge {
@@ -226,6 +279,130 @@ export function computerReleaseControlHint(input: {
     text: `Press ${COMPUTER_RELEASE_CONTROL_HOTKEY} to stop the agent at any time.`,
     visible: input.agentActive,
   };
+}
+
+/**
+ * What the canvas is a picture of, for a screen reader.
+ *
+ * It said "Linux desktop" on every backend, including the Mac one, which is
+ * both wrong and the single most important fact about the surface: whether the
+ * agent is driving a sandbox or the machine the user is sitting at.
+ */
+export function computerCanvasLabel(input: {
+  readonly availability: ComputerAvailability | undefined;
+  readonly visibleDesktop: boolean;
+}): string {
+  const backend = input.availability?.kind === "available" ? input.availability.backend : undefined;
+  if (backend === "mac") return "This Mac's desktop";
+  if (backend === "nested-kwin") return "The agent's own desktop";
+  if (input.visibleDesktop) return "This computer's desktop";
+  return "The agent's desktop";
+}
+
+/**
+ * Whether the pane may forward the user's own clicks and keys to the desktop.
+ *
+ * Two separate refusals, and the first is not a policy but a category error: on
+ * a backend that shows the desktop the user is already sitting at, the pane is a
+ * mirror. Clicking it means clicking a picture of your own screen — including a
+ * picture of Synara, recursively — to reach something you could reach directly,
+ * with a round trip's worth of staleness in between. There is nothing to
+ * interact *with* that the mouse in the user's hand cannot reach first.
+ *
+ * The second is the desktop lease: while an agent is acting, pane input and the
+ * agent's input interleave on the same seat with no ordering between them, so a
+ * stray click lands in the middle of a drag. The pane does not take a lease, so
+ * the gate is the only thing standing between the two.
+ */
+export function computerPaneInputMode(input: {
+  readonly streamEnabled: boolean;
+  readonly visibleDesktop: boolean;
+  readonly agentActive: boolean;
+}): "hidden" | "blocked-by-agent" | "available" {
+  if (input.visibleDesktop) return "hidden";
+  if (!input.streamEnabled) return "hidden";
+  return input.agentActive ? "blocked-by-agent" : "available";
+}
+
+/**
+ * Whether to offer "Stop the agent" in the pane header, and what it means here.
+ *
+ * On a shared desktop this is the *only* stop there is: the emergency release is
+ * a compositor shortcut the KWin and Hyprland plugins register, and macOS has no
+ * such global — so `computerReleaseControlHint` is correctly null there and the
+ * user is left watching their own machine being driven with nothing to press.
+ * Stopping the turn is what actually ends it: the desktop lease is released the
+ * moment the owning thread stops being able to drive
+ * (`ComputerManager.releaseDesktopControl`, on turn end).
+ */
+export function computerStopControlLabel(input: {
+  readonly agentActive: boolean;
+  readonly visibleDesktop: boolean;
+}): string | null {
+  if (!input.agentActive) return null;
+  return input.visibleDesktop
+    ? "Stop the agent controlling this computer"
+    : "Stop the agent controlling the desktop";
+}
+
+/**
+ * "The agent is acting" without the flicker.
+ *
+ * `agentActive` is `callsInFlight > 0`, and an agent working through a screen
+ * loop has a gap between every call — so the badge, the cursor's opacity and
+ * (now) a stop control blinked several times a second through a perfectly steady
+ * run. Rising edges show immediately, because the user must be told at once that
+ * their machine is being driven; falling edges are held, because a gap between
+ * two calls is not the end of anything.
+ */
+export const COMPUTER_AGENT_ACTIVE_LINGER_MS = 1_500;
+
+export function nextComputerAgentActiveState(input: {
+  readonly current: boolean;
+  readonly reported: boolean;
+}): { readonly value: boolean; readonly scheduleClearAfterMs: number | null } {
+  if (input.reported) return { value: true, scheduleClearAfterMs: null };
+  if (!input.current) return { value: false, scheduleClearAfterMs: null };
+  return { value: true, scheduleClearAfterMs: COMPUTER_AGENT_ACTIVE_LINGER_MS };
+}
+
+/**
+ * The one delivery verdict a person needs to see.
+ *
+ * `confirmed` and `unverifiable` are both "nothing is wrong" — most native
+ * controls expose no readable value at all, so `unverifiable` is the ordinary
+ * answer and reporting it would train the user to ignore the row. `unconfirmed`
+ * is the backend saying it looked and could not see its own input arrive, which
+ * is the one case where what is on screen may not be what was asked for.
+ */
+export function computerDeliveryWarning(
+  result: Pick<ComputerActionResult, "delivery"> | undefined,
+): string | null {
+  return result?.delivery?.verified === "unconfirmed"
+    ? "The desktop accepted that input but could not confirm it arrived. Check the screen before relying on it."
+    : null;
+}
+
+/**
+ * The newest desktop action, in the words a person would use.
+ *
+ * The backend's `action` is a tool-shaped identifier (`computer_double_click`,
+ * `type_text`) and the pane is not a log viewer, so it is spoken rather than
+ * printed. A failure keeps its message, because that is the only part of a
+ * failed action worth the space.
+ */
+export function computerActionLabel(
+  action: Pick<ComputerActionEvent, "action" | "ok" | "message"> | undefined,
+): string | null {
+  if (!action) return null;
+  const spoken = action.action
+    .replace(/^computer[_.]/, "")
+    .replace(/[_.]+/g, " ")
+    .trim();
+  if (spoken.length === 0) return null;
+  const capitalized = `${spoken[0]!.toUpperCase()}${spoken.slice(1)}`;
+  if (action.ok) return capitalized;
+  return action.message ? `${capitalized} failed: ${action.message}` : `${capitalized} failed`;
 }
 
 export function shouldSubscribeToComputerStream(input: {

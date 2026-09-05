@@ -900,8 +900,26 @@ function readClaudeResumeState(resumeCursor: unknown): ClaudeResumeState | undef
   };
 }
 
-function classifyToolItemType(toolName: string): CanonicalItemType {
+/** How Synara's own agent-gateway tools reach a provider, lowercased. */
+const SYNARA_GATEWAY_TOOL_PREFIX = "mcp__synara__";
+
+/** Exported for the classification tests; nothing outside this module calls it. */
+export function classifyToolItemType(toolName: string): CanonicalItemType {
   const normalized = toolName.toLowerCase();
+  // Synara's own gateway tools are named by namespace, not described by it, so
+  // the substring heuristics below read the name as prose and get it wrong:
+  // `mcp__synara__computer_write_clipboard` matched "write" and became a *file
+  // change*, which asked the user to "approve this file change" for a clipboard
+  // write and dropped its argument rows on the way. These tools are known
+  // exactly — Synara publishes them — so their classification is decided from
+  // the namespace rather than inferred from the rest of the name.
+  //
+  // Deliberately scoped to this gateway. A third-party MCP server's
+  // `write_file` really is a file change, and the heuristics remain the only
+  // thing that can tell.
+  if (normalized.startsWith(SYNARA_GATEWAY_TOOL_PREFIX)) {
+    return "mcp_tool_call";
+  }
   if (
     normalized === "todowrite" ||
     normalized.includes("todo") ||

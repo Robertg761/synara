@@ -30,8 +30,28 @@ import type {
   ComputerPermission,
 } from "@synara/contracts";
 import { listComputerPermissions } from "@synara/shared/computerPermissions";
+import { SYNARA_DESKTOP_BUNDLE_ID_ENV } from "@synara/shared/desktopIdentity";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
+
+/**
+ * The app the OS files this server's TCC decisions against, or undefined when
+ * nothing is responsible for it.
+ *
+ * Read here rather than passed down from the backend because it is a property
+ * of the *process*, not of a tool call or a helper: the desktop shell sets it on
+ * the environment it starts the server in, and a server started any other way —
+ * a bare `bun run`, a remote host — genuinely has no responsible app. Its
+ * absence is the meaningful case, and it is why the card's recovery advice is
+ * withheld rather than printed against a guessed identifier that would reset a
+ * different Synara's grants.
+ */
+export function responsibleDesktopBundleId(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): string | undefined {
+  const value = env[SYNARA_DESKTOP_BUNDLE_ID_ENV]?.trim();
+  return value ? value : undefined;
+}
 
 /**
  * A missing-grant state worth putting in front of the user, with the grants
@@ -48,6 +68,13 @@ export interface ComputerSetupSignal {
    * offer it without this.
    */
   readonly buildSignature?: ComputerBuildSignature;
+  /**
+   * The app the missing grant is filed against, when this server has one behind
+   * it. Carried with the signal rather than resolved by the card because only
+   * the server knows which flavor of Synara is running, and the card's advice
+   * has to name that one or none at all.
+   */
+  readonly bundleId?: string;
 }
 
 /**
@@ -82,20 +109,28 @@ export function computerSetupSignal(input: {
    * a blocking grant.
    */
   readonly buildSignature?: ComputerBuildSignature | undefined;
+  /**
+   * The responsible app, defaulted from the environment. A parameter only so
+   * tests can drive both branches; nothing else passes it.
+   */
+  readonly bundleId?: string | undefined;
 }): ComputerSetupSignal | undefined {
+  const resolvedBundleId = input.bundleId?.trim() || responsibleDesktopBundleId();
+  const app = resolvedBundleId === undefined ? {} : { bundleId: resolvedBundleId };
   if (input.availability?.kind === "permission-required") {
     return {
       missing: input.availability.missing,
       buildSignature: input.availability.buildSignature,
+      ...app,
     };
   }
   const signature =
     input.buildSignature === undefined ? {} : { buildSignature: input.buildSignature };
   const missing = input.missing ?? [];
   if (input.error !== undefined && computerFailureNeedsSetup(input.error)) {
-    return { missing, ...signature };
+    return { missing, ...signature, ...app };
   }
-  return missing.length > 0 ? { missing, ...signature } : undefined;
+  return missing.length > 0 ? { missing, ...signature, ...app } : undefined;
 }
 
 /**

@@ -11,6 +11,7 @@ import { type ReactNode } from "react";
 
 import { cn } from "~/lib/utils";
 import { ComposerAutomationSetupBanner } from "./ComposerAutomationSetupBanner";
+import { ComposerComputerControlBanner } from "./ComposerComputerControlBanner";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
 import { COMPOSER_INPUT_SURFACE_BANNER_CLASS_NAME } from "./composerPickerStyles";
 
@@ -23,15 +24,29 @@ interface ComposerInputBannersProps {
   // Setup-mode control while gathering an automation's task/schedule (the exchange
   // itself renders as bubbles in the transcript).
   automationSetup: { onCancel: () => void } | null;
+  // An agent is driving the desktop the user is sitting at. Null on every other
+  // backend and whenever nothing is being driven.
+  computerControl: { stopRequested: boolean; onStop: () => void } | null;
 }
 
 export function ComposerInputBanners({
   roundedTopReset,
   planFollowUp,
   automationSetup,
+  computerControl,
 }: ComposerInputBannersProps) {
   let content: ReactNode = null;
-  if (planFollowUp) {
+  // Outranks everything else here. The others are about what the conversation
+  // should do next; this one is about the machine the user is sitting at being
+  // driven right now, and it carries the only control that stops it.
+  if (computerControl) {
+    content = (
+      <ComposerComputerControlBanner
+        stopRequested={computerControl.stopRequested}
+        onStop={computerControl.onStop}
+      />
+    );
+  } else if (planFollowUp) {
     content = <ComposerPlanFollowUpBanner key={planFollowUp.id} planTitle={planFollowUp.title} />;
   } else if (automationSetup) {
     content = <ComposerAutomationSetupBanner onCancel={automationSetup.onCancel} />;

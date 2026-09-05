@@ -295,11 +295,11 @@ describe("MacComputerBackend", () => {
     expect(message).not.toContain("tccutil");
   });
 
-  it("explains a stale grant only on an ad-hoc build", async () => {
+  it("explains a stale grant only on an ad-hoc build, naming the responsible app", async () => {
     const helper = new FakeMacHelper({
       capabilities: capabilitiesResponse({ accessibility: false, signature: "adhoc" }),
     });
-    const backend = makeBackend(helper);
+    const backend = makeBackend(helper, { env: desktopEnv() });
 
     const availability = await backend.availability();
     expect(availability).toMatchObject({ kind: "permission-required", buildSignature: "adhoc" });
@@ -309,7 +309,25 @@ describe("MacComputerBackend", () => {
     // rebuild replaced. The server clears that row itself now, so the user's
     // part is the dialog and the command is only the fallback.
     expect(message).toContain("allow the dialog when it appears");
-    expect(message).toContain("tccutil reset Accessibility com.emanueledipietro.synara");
+    // The flavor that is actually running, not the released identifier: the
+    // command has to repair *this* app's row, and resetting the release build's
+    // would revoke a separately installed Synara's working grants.
+    expect(message).toContain(`tccutil reset Accessibility ${SYNARA_DEVELOPMENT_BUNDLE_ID}`);
+  });
+
+  it("withholds the tccutil fallback when no desktop shell is responsible", async () => {
+    // A server started outside the desktop app cannot know which Synara macOS
+    // files the grant against, and a guessed identifier in a command the user
+    // pastes into Terminal resets the wrong app.
+    const helper = new FakeMacHelper({
+      capabilities: capabilitiesResponse({ accessibility: false, signature: "adhoc" }),
+    });
+    const backend = makeBackend(helper);
+
+    const availability = await backend.availability();
+    const message = availability.kind === "permission-required" ? availability.message : "";
+    expect(message).toContain("allow the dialog when it appears");
+    expect(message).not.toContain("tccutil");
   });
 
   it("keeps the desktop available when only Screen Recording is missing", async () => {

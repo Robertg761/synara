@@ -128,6 +128,13 @@ export interface WorkLogComputerSetupRequired {
    * System Settings show the switch on while the grant does not apply.
    */
   buildSignature?: ComputerBuildSignature;
+  /**
+   * The app macOS files this Synara's grants against, when a desktop shell told
+   * the server which flavor it is. The card's `tccutil` advice names it, and
+   * absent means that advice is withheld rather than guessed — a guessed
+   * identifier resets a different Synara's grants.
+   */
+  bundleId?: string;
 }
 
 export interface WorkLogSynaraCreatedThread {
@@ -646,10 +653,12 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   }
   if (activity.kind === COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND) {
     const buildSignature = asComputerBuildSignature(payload?.buildSignature);
+    const bundleId = asTrimmedString(payload?.bundleId);
     entry.computerSetupRequired = {
       toolName: asTrimmedString(payload?.toolName),
       missing: asComputerPermissions(payload?.missing),
       ...(buildSignature ? { buildSignature } : {}),
+      ...(bundleId ? { bundleId } : {}),
     };
   }
   const readableTitle =

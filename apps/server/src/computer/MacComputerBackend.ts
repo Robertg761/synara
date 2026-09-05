@@ -26,7 +26,6 @@ import {
   listComputerPermissions,
   TCC_SERVICE_NAMES,
 } from "@synara/shared/computerPermissions";
-import { SYNARA_DESKTOP_BUNDLE_ID_ENV } from "@synara/shared/desktopIdentity";
 
 import {
   clampComputerMessage,
@@ -60,6 +59,7 @@ import {
   windowInAgentSpace,
 } from "./computerGeometry.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
+import { responsibleDesktopBundleId } from "./computerSetupSignal.ts";
 import { StillFramePublisher } from "./stillFramePublisher.ts";
 import {
   MacComputerHelperClient,
@@ -651,7 +651,11 @@ export class MacComputerBackend implements ComputerBackend {
           kind: "permission-required",
           missing,
           message: clampComputerMessage(
-            computerPermissionSetupMessage(missing, capabilities.signature),
+            computerPermissionSetupMessage(
+              missing,
+              capabilities.signature,
+              responsibleDesktopBundleId(this.env),
+            ),
             "Synara needs a macOS privacy permission to control this Mac.",
           ),
           buildSignature: capabilities.signature,
@@ -785,7 +789,11 @@ export class MacComputerBackend implements ComputerBackend {
     // The stale-grant sentence belongs here too: "Set up" is exactly where a user
     // with an ad-hoc build sees Synara already switched on and concludes Synara
     // is broken.
-    const advice = computerStaleGrantAdvice(missing, capabilities.signature);
+    const advice = computerStaleGrantAdvice(
+      missing,
+      capabilities.signature,
+      responsibleDesktopBundleId(this.env),
+    );
     return (
       `${started} the bundled macOS computer-use helper and asked macOS for ` +
       `${listComputerPermissions(missing)}. Allow it when macOS asks, or turn Synara on in ` +
@@ -1526,7 +1534,7 @@ export class MacComputerBackend implements ComputerBackend {
     // that is actually stale and throws away a separately installed release
     // build's real permissions. A server with no desktop behind it — a CLI run,
     // a test — has no responsible app at all, and leaves TCC alone.
-    const bundleId = this.env[SYNARA_DESKTOP_BUNDLE_ID_ENV]?.trim();
+    const bundleId = responsibleDesktopBundleId(this.env);
     if (!bundleId) return;
     // Narrowed to what the probe actually reports missing, which is wider than
     // it looks: a live refusal offers *both* grants when it cannot say which

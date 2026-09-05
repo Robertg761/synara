@@ -208,6 +208,14 @@ export type ComputerBuildSignature = typeof ComputerBuildSignature.Type;
  * already shows Synara switched on (an ad-hoc build's grant is pinned to a
  * cdhash a rebuild replaced) instead of leaving the user staring at a switch
  * that looks correct.
+ *
+ * `bundleId` is the identifier of the app the grant is *filed against* — the
+ * desktop shell that started this server, which on a `.dev` or `.canary` build
+ * is not the released Synara. It rides along because the card's recovery advice
+ * names it in a `tccutil reset` command, and a command naming the wrong app
+ * revokes a different Synara's grants while fixing nothing. Optional for the
+ * same reason it cannot be guessed: a server started outside the desktop shell
+ * has no responsible app, and the card must then omit the command entirely.
  */
 export const ComputerSetupRequiredPayload = Schema.Struct({
   /** The tool whose call raised the card; never empty. */
@@ -215,6 +223,7 @@ export const ComputerSetupRequiredPayload = Schema.Struct({
   /** Empty means the backend refused without naming a grant, and the card falls back. */
   missing: Schema.Array(ComputerPermission).check(Schema.isMaxLength(8)),
   buildSignature: Schema.optional(ComputerBuildSignature),
+  bundleId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
 });
 export type ComputerSetupRequiredPayload = typeof ComputerSetupRequiredPayload.Type;
 

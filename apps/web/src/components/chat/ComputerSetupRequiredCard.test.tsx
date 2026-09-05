@@ -62,6 +62,33 @@ describe("ComputerSetupRequiredCard", () => {
     expect(signed).not.toContain("tccutil");
   });
 
+  it("names the responsible app in the tccutil fallback, and withholds it when unknown", () => {
+    // The command has to repair *this* Synara's TCC row. `.dev` and `.canary`
+    // are separate bundle identifiers, so a guessed production id would revoke a
+    // separately installed release build's working grants and fix nothing here.
+    const known = renderToStaticMarkup(
+      <ComputerSetupRequiredCard
+        missing={["accessibility"]}
+        buildSignature="adhoc"
+        bundleId="com.emanueledipietro.synara.dev"
+        onSetUp={() => undefined}
+      />,
+    );
+    expect(known).toContain("tccutil reset Accessibility com.emanueledipietro.synara.dev");
+
+    // A server with no desktop shell behind it has no responsible app, and the
+    // card must say nothing rather than guess.
+    const unknown = renderToStaticMarkup(
+      <ComputerSetupRequiredCard
+        missing={["accessibility"]}
+        buildSignature="adhoc"
+        onSetUp={() => undefined}
+      />,
+    );
+    expect(unknown).toContain("allow the dialog when it appears");
+    expect(unknown).not.toContain("tccutil");
+  });
+
   it("drops the button once the grants have landed", () => {
     const markup = renderToStaticMarkup(
       <ComputerSetupRequiredCard

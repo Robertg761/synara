@@ -107,6 +107,13 @@ export function resolveRightDockLauncherItems(input: {
    * from this machine to make it work.
    */
   hasDeviceSupport?: boolean;
+  /**
+   * Desktop control needs a server on macOS, or a Wayland session on Linux that
+   * Synara can reach. Hidden rather than disabled off those, for the same reason
+   * as the simulator: there is nothing the user could do from this machine to
+   * make it work.
+   */
+  hasComputerSupport?: boolean;
 }): readonly RightDockLauncherItem[] {
   return RIGHT_DOCK_LAUNCHER_ORDER.flatMap((kind) => {
     if (kind === "diff" && !input.hasReview) {
@@ -119,6 +126,9 @@ export function resolveRightDockLauncherItems(input: {
       return [];
     }
     if (kind === "device" && input.hasDeviceSupport !== true) {
+      return [];
+    }
+    if (kind === "computer" && input.hasComputerSupport !== true) {
       return [];
     }
     const meta = getRightDockPaneMeta(kind);

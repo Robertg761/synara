@@ -67,6 +67,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useEffectEvent,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -101,7 +102,6 @@ import {
 import { projectSearchEntriesQueryOptions } from "~/lib/projectReactQuery";
 import {
   hasReconciledServerProviderStatuses,
-  provisionComputer,
   serverConfigQueryOptions,
   serverQueryKeys,
   serverSettingsQueryOptions,
@@ -613,7 +613,11 @@ import {
   revokeUserMessagePreviewUrls,
 } from "./ChatView.logic";
 import { clearPendingTurnDispatch, markPendingTurnDispatch } from "../pendingTurnDispatch";
-import { computerStatusNeedsSetup } from "./ComputerPanel.logic";
+import { selectThreadComputerState, useComputerStateStore } from "../computerStateStore";
+import { interruptThreadTurn } from "~/lib/threadTurnInterrupt";
+import { useComputerControlReadiness } from "~/hooks/useComputerControlReadiness";
+import { useComputerDesktopControl } from "~/hooks/useComputerDesktopControl";
+import { useProvisionComputer } from "~/hooks/useProvisionComputer";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerSlashCommands } from "../hooks/useComposerSlashCommands";
 import { useFeatureFlags } from "../featureFlags";
@@ -5059,11 +5063,30 @@ export default function ChatView({
     },
     [persistRuntimeModeChange],
   );
-  // The thread whose setup card has since seen the grants land. Keyed by thread
-  // rather than a bare boolean so switching chats cannot carry one chat's
-  // "ready" confirmation onto another chat's card.
-  const [computerControlReadyThreadId, setComputerControlReadyThreadId] = useState<ThreadId | null>(
-    null,
+  // Whether this chat's desktop is set up, read from live state on every render
+  // rather than remembered from a button press — see `computerControlReadiness`.
+  // This is also what makes the expected path work: the user allows the macOS
+  // dialog, presses nothing in Synara, and the card notices.
+  const { readiness: computerControlReadinessState, missing: computerMissingPermissions } =
+    useComputerControlReadiness(threadId);
+  const computerControlReady = computerControlReadinessState === "ready";
+  // Drives the chat-level "an agent is controlling this computer" banner. Shares
+  // its debounce and its stop with the Computer pane's header control.
+  const computerDesktopControl = useComputerDesktopControl(threadId);
+  // What a pending desktop approval needs to be answerable: the window list, so
+  // an opaque `window_id` becomes an app and a title, and the computer to draw a
+  // live frame from. Read from the pushed thread state, so it costs nothing in a
+  // chat that has never touched a desktop.
+  const computerThreadState = useComputerStateStore(selectThreadComputerState(threadId));
+  const computerApprovalContext = useMemo(
+    () =>
+      computerThreadState
+        ? {
+            computerId: computerThreadState.computerId,
+            windows: computerThreadState.windows,
+          }
+        : undefined,
+    [computerThreadState],
   );
   // "Set up" on a computer-setup card.
   //
@@ -5071,44 +5094,24 @@ export default function ChatView({
   // deliberately not a second mechanism: the server owns the helper that the
   // grants are actually filed against, so it is the only place that can ask
   // macOS at the moment an agent needs the grant *and* ask again for a user who
-  // dismissed the dialog. Once the grants are present the card confirms it and
-  // the composer is prefilled with a retry, deliberately not auto-sent: the user
-  // should see and approve what goes back to the agent.
+  // dismissed the dialog. Once the grants are present the composer is prefilled
+  // with a retry, deliberately not auto-sent: the user should see and approve
+  // what goes back to the agent. The card's own "ready" wording comes from the
+  // live readiness above, not from this callback.
+  const onComputerControlReady = useEffectEvent(() => {
+    if (promptRef.current.trim().length === 0) {
+      setPrompt("Computer control is set up now — try again.");
+    }
+  });
+  const { provision: provisionComputerControl } = useProvisionComputer({
+    missing: computerMissingPermissions,
+    notify: true,
+    onReady: onComputerControlReady,
+  });
   const handleSetUpComputerControl = useCallback(() => {
     scheduleComposerFocus();
-    const requestedThreadId = threadId;
-    toastManager.add({
-      type: "info",
-      title: "Setting up computer control",
-      description: "macOS may ask for Screen Recording and Accessibility for Synara.",
-    });
-    void provisionComputer()
-      .then((result) => {
-        // The call already returns the refreshed status, so every surface
-        // reading it repaints from this round trip rather than racing a refetch.
-        queryClient.setQueryData(serverQueryKeys.computerStatus(), result.status);
-        if (computerStatusNeedsSetup(result.status)) {
-          toastManager.add({
-            type: "warning",
-            title: "Computer control still needs a permission",
-            description: result.summary,
-          });
-          return;
-        }
-        setComputerControlReadyThreadId(requestedThreadId);
-        if (prompt.trim().length === 0) {
-          setPrompt("Computer control is set up now — try again.");
-        }
-      })
-      .catch((error: unknown) => {
-        toastManager.add({
-          type: "error",
-          title: "Couldn't set up computer control",
-          description: error instanceof Error ? error.message : String(error),
-        });
-      });
-  }, [prompt, queryClient, scheduleComposerFocus, setPrompt, threadId]);
-  const computerControlReady = computerControlReadyThreadId === threadId;
+    provisionComputerControl();
+  }, [provisionComputerControl, scheduleComposerFocus]);
 
   useEffect(() => {
     if (
@@ -6263,14 +6266,8 @@ export default function ChatView({
   ]);
 
   const onInterrupt = useCallback(async () => {
-    const api = readNativeApi();
-    if (!api || !activeThread) return;
-    await api.orchestration.dispatchCommand({
-      type: "thread.turn.interrupt",
-      commandId: newCommandId(),
-      threadId: activeThread.id,
-      createdAt: new Date().toISOString(),
-    });
+    if (!activeThread) return;
+    await interruptThreadTurn(activeThread.id);
   }, [activeThread]);
 
   // A rejected interrupt (orchestration dispatch timeout, dead runtime) leaves the
@@ -11546,6 +11543,7 @@ export default function ChatView({
                         activePendingApproval.lifecycleGeneration,
                       ),
                     )}
+                    computer={computerApprovalContext}
                     onRespond={onRespondToApproval}
                   />
                 </div>
@@ -11598,6 +11596,16 @@ export default function ChatView({
                     pendingAutomationConversation &&
                     pendingAutomationConversation.threadId === threadId
                       ? { onCancel: cancelAutomationConversation }
+                      : null
+                  }
+                  computerControl={
+                    // Only where the desktop being driven is the user's own; see
+                    // ComposerComputerControlBanner.
+                    computerDesktopControl.agentActive && computerDesktopControl.visibleDesktop
+                      ? {
+                          stopRequested: computerDesktopControl.stopRequested,
+                          onStop: computerDesktopControl.stop,
+                        }
                       : null
                   }
                 />

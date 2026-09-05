@@ -35,6 +35,7 @@ import { ProviderAdapterRequestError, ProviderAdapterValidationError } from "../
 import { ClaudeAdapter } from "../Services/ClaudeAdapter.ts";
 import {
   buildEmbeddedClaudeSystemPromptAppend,
+  classifyToolItemType,
   makeClaudeAdapterLive as makeClaudeAdapterLiveBase,
   type ClaudeAdapterLiveOptions,
   type ClaudeOwnedProcess,
@@ -10372,5 +10373,31 @@ describe("ClaudeAdapterLive forkThread", () => {
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(layer),
     );
+  });
+});
+
+describe("classifyToolItemType", () => {
+  it("classifies Synara's gateway tools by namespace, before the prose heuristics", () => {
+    // `computer_write_clipboard` matched the substring "write" and became a
+    // *file change*, so the approval card asked the user to "approve this file
+    // change" for a clipboard write and dropped its argument rows on the way.
+    assert.equal(classifyToolItemType("mcp__synara__computer_write_clipboard"), "mcp_tool_call");
+    assert.equal(classifyToolItemType("mcp__synara__computer_click"), "mcp_tool_call");
+    // "agent" and "create" are the other two heuristics these names trip.
+    assert.equal(classifyToolItemType("mcp__synara__create_task"), "mcp_tool_call");
+    assert.equal(classifyToolItemType("MCP__SYNARA__computer_type_text"), "mcp_tool_call");
+  });
+
+  it("leaves a third-party MCP server to the heuristics, whose names really are descriptive", () => {
+    // A filesystem server's `write_file` genuinely is a file change, and the
+    // heuristics are the only thing that can tell.
+    assert.equal(classifyToolItemType("mcp__filesystem__write_file"), "file_change");
+    assert.equal(classifyToolItemType("mcp__shell__run_command"), "command_execution");
+  });
+
+  it("still classifies the provider's own built-in tools", () => {
+    assert.equal(classifyToolItemType("Bash"), "command_execution");
+    assert.equal(classifyToolItemType("Edit"), "file_change");
+    assert.equal(classifyToolItemType("TodoWrite"), "plan");
   });
 });

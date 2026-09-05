@@ -7,9 +7,19 @@
 // Layer: Chat composer UI
 // Exports: ComposerPendingApprovalPanel
 
-import { type ApprovalRequestId, type ProviderApprovalDecision } from "@synara/contracts";
-import { type KeyboardEvent } from "react";
+import {
+  type ApprovalRequestId,
+  type ComputerId,
+  type ComputerWindow,
+  type ProviderApprovalDecision,
+} from "@synara/contracts";
+import { type KeyboardEvent, useRef } from "react";
 import { type PendingApproval } from "../../session-logic";
+import { useComputerImageStream } from "~/components/computer/useComputerImageStream";
+import {
+  describeComputerToolCall,
+  type ComputerToolCallDescription,
+} from "~/lib/computerToolPresentation";
 import { cn } from "~/lib/utils";
 import { ComposerChoiceRow, type ComposerChoiceTone } from "./ComposerChoiceRow";
 import { COMPOSER_INPUT_SURFACE_CLASS_NAME } from "./composerPickerStyles";
@@ -18,6 +28,17 @@ interface ComposerPendingApprovalPanelProps {
   approval: PendingApproval;
   pendingCount: number;
   isResponding: boolean;
+  /**
+   * The desktop this thread's agent is driving, when there is one. Supplied so a
+   * computer approval can be answered on its merits: what is on that screen
+   * right now, and which window an opaque `window_id` refers to.
+   */
+  computer?:
+    | {
+        readonly computerId: ComputerId | null;
+        readonly windows: readonly ComputerWindow[];
+      }
+    | undefined;
   onRespond: (
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
@@ -81,10 +102,20 @@ export const ComposerPendingApprovalPanel = function ComposerPendingApprovalPane
   approval,
   pendingCount,
   isResponding,
+  computer,
   onRespond,
 }: ComposerPendingApprovalPanelProps) {
   const parsed = parseApprovalDetail(approval.detail);
   const requestId = approval.requestId;
+  // A desktop action is the one approval where the raw call is nearly useless:
+  // "computer_click x 812 y 344" does not say what is at 812, 344. The curated
+  // description answers the question actually being asked, and the frame below
+  // shows the screen the coordinates refer to.
+  const computerCall = describeComputerToolCall({
+    toolName: approval.toolName ?? parsed.tool,
+    args: approvalArguments(approval, parsed),
+    ...(computer ? { windows: computer.windows } : {}),
+  });
   const actions =
     approval.sessionApprovalAvailable === false
       ? APPROVAL_ACTIONS.filter((action) => action.decision !== "acceptForSession")
@@ -117,7 +148,7 @@ export const ComposerPendingApprovalPanel = function ComposerPendingApprovalPane
     >
       <div className="flex items-start justify-between gap-3">
         <p className="min-w-0 text-[13px] font-medium leading-snug text-foreground/90">
-          {KIND_PROMPT[approval.requestKind]}
+          {computerCall ? "Approve this action on the desktop?" : KIND_PROMPT[approval.requestKind]}
           {(approval.toolName ?? parsed.tool) ? (
             <span className="ml-1.5 text-[11px] font-normal text-muted-foreground/50">
               {approval.toolName ?? parsed.tool}
@@ -130,12 +161,20 @@ export const ComposerPendingApprovalPanel = function ComposerPendingApprovalPane
           </span>
         ) : null}
       </div>
-      <ApprovalDetail
-        parsed={parsed}
-        {...(approval.permissionProfile ? { permissionProfile: approval.permissionProfile } : {})}
-        {...(approval.toolName ? { toolName: approval.toolName } : {})}
-        {...(approval.toolParamsDisplay ? { toolParamsDisplay: approval.toolParamsDisplay } : {})}
-      />
+      {computerCall ? (
+        <ComputerApprovalDetail
+          call={computerCall}
+          computerId={computer?.computerId ?? null}
+          parsed={parsed}
+        />
+      ) : (
+        <ApprovalDetail
+          parsed={parsed}
+          {...(approval.permissionProfile ? { permissionProfile: approval.permissionProfile } : {})}
+          {...(approval.toolName ? { toolName: approval.toolName } : {})}
+          {...(approval.toolParamsDisplay ? { toolParamsDisplay: approval.toolParamsDisplay } : {})}
+        />
+      )}
       <div className="mt-2.5 space-y-0.5">
         {actions.map((action, index) => (
           <ComposerChoiceRow
@@ -159,6 +198,97 @@ export const ComposerPendingApprovalPanel = function ComposerPendingApprovalPane
     </div>
   );
 };
+
+/**
+ * A desktop approval, answered with what the user needs: the action in words,
+ * its arguments named, and the screen the coordinates refer to.
+ *
+ * The frame is the live still stream — the same one the Computer pane draws — so
+ * "the latest observation" is literally the desktop as it is while the decision
+ * is being made, rather than a screenshot from some earlier point in the turn.
+ * It subscribes only while this card is mounted, which is only while a human is
+ * deciding.
+ */
+function ComputerApprovalDetail({
+  call,
+  computerId,
+  parsed,
+}: {
+  call: ComputerToolCallDescription;
+  computerId: ComputerId | null;
+  parsed: ParsedApproval;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const { status } = useComputerImageStream({
+    canvasRef,
+    computerId,
+    enabled: computerId !== null,
+  });
+  const showFrame = computerId !== null && status.kind !== "unsupported" && status.kind !== "error";
+  return (
+    <div className="mt-2 flex items-start gap-2.5">
+      {showFrame ? (
+        <div className="w-32 shrink-0 overflow-hidden rounded-md border border-[color:var(--color-border-light)] bg-black/80">
+          <canvas
+            ref={canvasRef}
+            // Decorative: everything the frame conveys that a decision depends
+            // on — the verb, the coordinates, the window — is in the text beside
+            // it, and no alternative text can describe an arbitrary desktop.
+            aria-hidden
+            className="block aspect-video h-auto w-full object-contain"
+          />
+        </div>
+      ) : null}
+      <div className="min-w-0 flex-1">
+        <p className="text-[12.5px] font-medium leading-snug text-foreground/90">{call.summary}</p>
+        {call.params.length > 0 ? (
+          <dl className="mt-1.5 space-y-1 rounded-md bg-[var(--color-background-elevated-secondary)] px-2.5 py-2 text-[11px] leading-snug">
+            {call.params.map((parameter) => (
+              <div className="grid grid-cols-[auto_1fr] gap-x-2" key={parameter.name}>
+                <dt className="font-medium text-muted-foreground/65">{parameter.name}</dt>
+                <dd className="min-w-0 break-words font-mono text-foreground/80">
+                  {parameter.value}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        ) : parsed.fallback ? (
+          <p className="mt-1 text-[11.5px] leading-snug text-muted-foreground/70">
+            {parsed.fallback}
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The tool's arguments as an object, from whichever of the two shapes the
+ * provider supplied: structured parameter rows when it sent them, otherwise the
+ * JSON inside the `detail` string. `detail` is clamped server-side and can
+ * arrive truncated, so a parse failure is normal and simply yields no
+ * arguments — the card then falls back to its raw rendering rather than
+ * inventing a description.
+ */
+function approvalArguments(
+  approval: PendingApproval,
+  parsed: ParsedApproval,
+): Record<string, unknown> | undefined {
+  if (approval.toolParamsDisplay && approval.toolParamsDisplay.length > 0) {
+    return Object.fromEntries(
+      approval.toolParamsDisplay.map((parameter) => [parameter.name, parameter.value]),
+    );
+  }
+  const detail = approval.detail;
+  if (!detail) return undefined;
+  const colonIdx = detail.indexOf(": ");
+  const payload = stripTrailingEllipsis(colonIdx === -1 ? detail : detail.slice(colonIdx + 2));
+  const parsedPayload = tryParseJson(payload);
+  if (parsedPayload && typeof parsedPayload === "object" && !Array.isArray(parsedPayload)) {
+    return parsedPayload as Record<string, unknown>;
+  }
+  return parsed.command ? { label: parsed.command } : undefined;
+}
 
 function ApprovalDetail({
   parsed,

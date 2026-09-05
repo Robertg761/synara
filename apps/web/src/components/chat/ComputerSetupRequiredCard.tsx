@@ -20,6 +20,7 @@ import { MonitorIcon } from "~/lib/icons";
 export function ComputerSetupRequiredCard({
   missing,
   buildSignature,
+  bundleId,
   computerControlReady,
   textFontSizePx,
   metaFontSizePx,
@@ -38,8 +39,19 @@ export function ComputerSetupRequiredCard({
    * which is the difference between "grant it" and "the switch lies to you".
    */
   readonly buildSignature?: ComputerBuildSignature;
-  // Live setup state: once the grants land, the card flips to a confirmation
-  // instead of offering a button that would do nothing.
+  /**
+   * The app macOS files this Synara's grants against, as the server reported it.
+   * The stale-grant advice names it in a `tccutil reset`, and there is no safe
+   * default: the `.dev` and `.canary` flavors are separate bundle identifiers,
+   * so guessing the released one hands the user a command that revokes a
+   * different Synara's working permissions. Absent means the advice omits the
+   * command entirely.
+   */
+  readonly bundleId?: string;
+  // Live setup state, derived from the desktop's current availability rather
+  // than remembered from a button press: once the grants land — including when
+  // the user simply allows the dialog macOS already showed — the card flips to a
+  // confirmation instead of offering a button that would do nothing.
   readonly computerControlReady?: boolean;
   readonly textFontSizePx?: number;
   readonly metaFontSizePx?: number;
@@ -51,7 +63,9 @@ export function ComputerSetupRequiredCard({
   // signed build the switch in System Settings means what it says, and the
   // extra paragraph would be a red herring.
   const staleGrantAdvice =
-    !ready && buildSignature ? computerStaleGrantAdvice(missing ?? [], buildSignature) : null;
+    !ready && buildSignature
+      ? computerStaleGrantAdvice(missing ?? [], buildSignature, bundleId)
+      : null;
   return (
     <div className="flex items-center gap-3 rounded-xl border border-[color:var(--color-border-light)] bg-[var(--color-background-elevated-primary)] px-3 py-2.5">
       <span className="flex size-11 shrink-0 items-center justify-center rounded-lg border border-[color:var(--color-border-light)] bg-[var(--color-background-elevated-secondary)] text-amber-500">

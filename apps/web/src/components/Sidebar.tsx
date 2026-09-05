@@ -359,6 +359,8 @@ import {
   SIDEBAR_ROW_LABEL_TEXT_CLASS_NAME,
   SIDEBAR_SECTION_LABEL_CLASS_NAME,
 } from "../sidebarRowStyles";
+import { computerBackendIsVisibleDesktop } from "./ComputerPanel.logic";
+import { useCachedComputerStatus } from "~/hooks/useCachedComputerStatus";
 import { SettingsSidebarNav } from "./SettingsSidebarNav";
 import {
   ComposerPickerMenuPopup,
@@ -1435,6 +1437,18 @@ export default function Sidebar(props: { chrome?: SidebarChrome }) {
   const isOnSettings = useLocation({
     select: (loc) => loc.pathname === "/settings",
   });
+  // Which conditionally-rendered settings rows exist on this machine, for the
+  // settings search. Read from the cache rather than fetched: the search must
+  // never be the thing that engages a desktop backend, and until some surface
+  // has read the status this reports the permissive default, which offers a row
+  // rather than hiding one that does exist.
+  const cachedComputerStatus = useCachedComputerStatus();
+  const settingsSearchContext = useMemo(
+    () => ({
+      computerBackendIsVisibleDesktop: computerBackendIsVisibleDesktop(cachedComputerStatus),
+    }),
+    [cachedComputerStatus],
+  );
   const isOnStudioRoute = pathname.startsWith("/studio");
   const isOnKanban = pathname.startsWith("/kanban");
   const isOnAutomations = pathname.startsWith("/automations");
@@ -5878,6 +5892,7 @@ export default function Sidebar(props: { chrome?: SidebarChrome }) {
           <SidebarGroup className="p-0">
             <SettingsSidebarNav
               activeSection={activeSettingsSection}
+              searchContext={settingsSearchContext}
               onBack={handleBackToAppFromSettings}
               onSelectSection={(section, options) => {
                 void navigate({
