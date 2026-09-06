@@ -292,6 +292,21 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("reveals a hover target without changing keyboard aim", async () => {
+    const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
+    const manager = new ComputerManager({ backend });
+    // An untargeted move takes the lease first, so the hover below runs with
+    // control already held and must not clear the pinned focus again.
+    await manager.moveCursor("thread-1", { x: 100, y: 100 });
+    const cleared = backend.callsFor("clearFocusWindow").length;
+    await manager.moveCursor("thread-1", { x: 1_100, y: 200, windowId: "fake-calculator" });
+    expect(backend.callsFor("raiseWindow").at(-1)?.args).toEqual(["fake-calculator"]);
+    expect(backend.callsFor("focusWindow")).toHaveLength(0);
+    expect(backend.callsFor("clearFocusWindow")).toHaveLength(cleared);
+    expect(backend.callsFor("moveCursor").at(-1)?.args[0]).toEqual({ x: 1_100, y: 200 });
+    await manager.dispose();
+  });
+
   it("raises a target window before focusing it and scopes a coordinate click to it", async () => {
     const backend = new FakeComputerBackend({ windows: coveredCalculatorWindows() });
     const manager = new ComputerManager({ backend });
@@ -414,7 +429,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
     const focusCalls = backend.callsFor("focusWindow").length;
     await expect(manager.typeText("thread-1", "9")).resolves.not.toHaveProperty("windowId");
     expect(backend.callsFor("focusWindow")).toHaveLength(focusCalls);
-    expect(backend.callsFor("clearFocusWindow")).toHaveLength(0);
+    expect(backend.callsFor("clearFocusWindow")).toHaveLength(1);
 
     // A stale id fails before any key is sent rather than typing into whatever
     // holds focus instead.
@@ -1080,7 +1095,8 @@ describe("ComputerManager and FakeComputerBackend", () => {
         capture: true,
         input: true,
         clipboard: false,
-        activation: false,
+        focus: false,
+        raise: false,
         ghostCursor: false,
         visibleDesktop: false,
       },
@@ -1467,8 +1483,11 @@ describe("ComputerManager and FakeComputerBackend", () => {
     try {
       const first = await manager.captureActionScreenshot("fake-terminal");
       const second = await manager.captureActionScreenshot("fake-terminal");
-      expect(first).toHaveProperty("screenshot");
-      expect(second).toEqual(first);
+      if (!first || !("screenshot" in first)) throw new Error("Expected a captured screenshot");
+      expect(second).toEqual({
+        ...first,
+        screenshot: { ...first.screenshot, capturedAt: expect.any(String) },
+      });
       expect(backend.callsFor("captureScreenshot")).toHaveLength(2);
     } finally {
       await manager.dispose();
