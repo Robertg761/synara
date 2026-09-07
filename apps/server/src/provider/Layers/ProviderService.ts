@@ -53,6 +53,7 @@ import {
 } from "effect";
 import { nonEmptyTrimmed } from "@synara/shared/text";
 
+import { computerApprovalGate } from "../../computer/ComputerApprovalGate.ts";
 import { ProviderValidationError } from "../Errors.ts";
 import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
@@ -2393,6 +2394,18 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
 
     const respondToInteraction = (response: InteractionResponse) => {
       const { input } = response;
+      if (response.kind === "approval" && input.requestId.startsWith("computer:")) {
+        return Effect.gen(function* () {
+          if (
+            !computerApprovalGate.respond(input.threadId, input.requestId, response.input.decision)
+          ) {
+            return yield* toValidationError(
+              "ProviderService.respondToRequest",
+              "This computer approval expired or belongs to another conversation.",
+            );
+          }
+        });
+      }
       const operation =
         response.kind === "approval"
           ? "ProviderService.respondToRequest"

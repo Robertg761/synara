@@ -263,6 +263,11 @@ enum SkyLight {
   /// window it had, a background click into a web view is dropped, and
   /// `DeliveryWatch` promotes that application to the visible rung the same way
   /// it does for anything else that drops one.
+  static func makeKeyWindow(pid: pid_t, windowID: CGWindowID) {
+    guard let target = process(owning: windowID, pid: pid) else { return }
+    makeKeyWindow(windowID: windowID, in: target)
+  }
+
   private static func makeKeyWindow(windowID: CGWindowID, in psn: ProcessSerial) {
     guard keyWindowRecordIsSafe else { return }
     var bytes = [UInt8](repeating: 0, count: 0xF8)

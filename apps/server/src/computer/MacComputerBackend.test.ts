@@ -827,13 +827,15 @@ describe("MacComputerBackend", () => {
     expect(helper.callsFor("click")).toHaveLength(0);
   });
 
-  it("falls back to click-and-type when no node path is addressable", async () => {
+  it("refuses replacement when no node path is addressable", async () => {
     const helper = new FakeMacHelper();
     const backend = makeBackend(helper);
-    await backend.setValue(resolvedTarget({ windowId: "5" }), "typed");
+    await expect(backend.setValue(resolvedTarget({ windowId: "5" }), "typed")).rejects.toThrow(
+      "requires an addressable",
+    );
     expect(helper.callsFor("set-value")).toHaveLength(0);
-    expect(helper.callsFor("click")).toHaveLength(1);
-    expect(helper.callsFor("type")[0]).toEqual({ text: "typed" });
+    expect(helper.callsFor("click")).toHaveLength(0);
+    expect(helper.callsFor("type")).toHaveLength(0);
   });
 
   it("passes typed text, keys, and hotkeys straight to the helper", async () => {

@@ -1,5 +1,7 @@
 # macOS computer use — reference and design
 
+**Current implementation:** Keyboard delivery is always PID-addressed, complete desktop operations are serialized and cancellable, menus have explicit AX roots, and both capture paths compose per display. The helper's [protocol reference](../apps/server/native/computer-use-macos/HEADER.md) and [native test instructions](../apps/server/native/computer-use-macos/Tests/README.md) describe the current behavior and reproducible checks. Earlier mechanism notes below describe the original investigation.
+
 Status: **Being implemented.** This began as reverse-engineering research for the Linux design (`docs/computer-use-design.md`) and is now the design for Synara's macOS backend, which lands alongside the Linux tiers on the way to `main`. The mechanism below is what the backend and native helper implement:
 
 - `apps/server/src/computer/MacComputerBackend.ts` — the `ComputerBackend` implementation (coordinate translation, health supervision, still-frame publishing, lazy build-and-spawn of the helper).

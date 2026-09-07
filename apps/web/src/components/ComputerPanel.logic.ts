@@ -14,6 +14,7 @@ import {
   type ComputerRect,
   type ComputerScreenSize,
   type ComputerStatusResult,
+  type ComputerWindow,
   type ThreadComputerState,
 } from "@synara/contracts";
 import { isComputerNamedKey } from "@synara/shared/computerKeyNames";
@@ -640,4 +641,23 @@ export function computerCursorPosition(input: {
     top:
       input.containRect.top + (input.cursor.y / input.screenSize.height) * input.containRect.height,
   };
+}
+
+/** The action, target application, and actual delivery mode for the desktop overlay. */
+export function computerActionStatusLabel(
+  action:
+    | Pick<ComputerActionEvent, "action" | "ok" | "message" | "windowId" | "delivery">
+    | undefined,
+  windows: readonly ComputerWindow[] | undefined,
+): string | null {
+  const label = computerActionLabel(action);
+  if (!label) return null;
+  const app = windows?.find((window) => window.id === action?.windowId)?.appName;
+  const path = action?.delivery?.path;
+  const delivery = path
+    ? path.includes("foreground")
+      ? "Brought app forward"
+      : "Background input"
+    : undefined;
+  return [label, app, delivery].filter(Boolean).join(" · ");
 }

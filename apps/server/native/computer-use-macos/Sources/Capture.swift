@@ -71,27 +71,52 @@ enum Capture {
           source: .screenCaptureKit)
       }
     }
-    let origin = (x: Geometry.clampToInt32(rect.origin.x), y: Geometry.clampToInt32(rect.origin.y))
-    let size = (
-      width: Geometry.clampToInt32(rect.width), height: Geometry.clampToInt32(rect.height)
-    )
-    let args = [
-      "-x",  // no capture sound
-      "-o",  // no window shadow
-      "-t", "png",
-      "-R",
-      "\(origin.x),\(origin.y),\(size.width),\(size.height)",
-    ]
-    let png = try runScreencapture(extraArgs: args)
-    return Result(
-      pngBase64: try downscaleAndEncode(png, maxDimension: maxDimension),
-      // `screencapture -R` honours the origin but silently clips the extent to
-      // what is actually on a display. Returning the *requested* rect made the
-      // Node side derive the screenshot scale from a size the pixels never
-      // covered, and every coordinate an agent read off that image then mapped
-      // back to the wrong place on the desktop.
-      region: coveredRect(requested: rect, png: png),
-      source: .screencapture)
+    let size = outputPixelSize(points: rect.size, scale: Geometry.scaleFactor(for: rect), maxDimension: maxDimension)
+    guard let canvas = CaptureCanvas(region: rect, width: size.width, height: size.height) else {
+      throw RPCError(.internalError, "Could not allocate the screenshot")
+    }
+    var captured = false
+    for display in Geometry.displayFrames() {
+      let tile = display.intersection(rect)
+      guard !tile.isNull, tile.width >= 1, tile.height >= 1 else { continue }
+      let args = ["-x", "-o", "-t", "png", "-R",
+        "\(Int(tile.minX)),\(Int(tile.minY)),\(Int(tile.width)),\(Int(tile.height))"]
+      let raw = try runScreencapture(extraArgs: args)
+      let covered = coveredRect(requested: tile, png: raw)
+      guard abs(covered.width - tile.width) <= 1, abs(covered.height - tile.height) <= 1 else {
+        throw RPCError(.internalError, "The fallback screenshot did not cover the requested display region")
+      }
+      let png = try maskHostWindows(raw, region: covered)
+      guard let source = CGImageSourceCreateWithData(png as CFData, nil),
+        let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        throw RPCError(.internalError, "Could not decode the display screenshot")
+      }
+      canvas.draw(image, covering: covered)
+      captured = true
+    }
+    guard captured, let image = canvas.image(), let png = pngData(image) else {
+      throw RPCError(.internalError, "No display intersects the screenshot region")
+    }
+    return Result(pngBase64: png.base64EncodedString(), region: rect, source: .screencapture)
+  }
+
+  private static func maskHostWindows(_ png: Data, region: CGRect) throws -> Data {
+    guard let source = CGImageSourceCreateWithData(png as CFData, nil),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+      let canvas = CaptureCanvas(region: region, width: image.width, height: image.height),
+      let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
+    else { throw RPCError(.internalError, "Could not exclude Synara from the fallback screenshot") }
+    canvas.draw(image, covering: region)
+    for window in windows {
+      guard let pid = window[kCGWindowOwnerPID as String] as? NSNumber, Windows.isHostOwned(pid.int32Value),
+        let raw = window[kCGWindowBounds as String] as? [String: Any],
+        let frame = CGRect(dictionaryRepresentation: raw as CFDictionary) else { continue }
+      canvas.mask(frame)
+    }
+    guard let masked = canvas.image(), let encoded = pngData(masked) else {
+      throw RPCError(.internalError, "Could not encode the masked screenshot")
+    }
+    return encoded
   }
 
   /// Capture one window by its `CGWindowID`. The returned region is the window's
@@ -212,59 +237,33 @@ enum Capture {
   {
     guard rect.width >= 1, rect.height >= 1, let content = shareableContent() else { return nil }
 
-    // Pick the display the request lands on. A rect that overlaps two displays
-    // cannot be served by one `SCContentFilter`, so it takes the `screencapture`
-    // fallback, which composites the global space; the common case is one
-    // display, where the rect is simply clipped to it.
-    var best: (display: SCDisplay, bounds: CGRect, overlap: CGFloat)?
-    var overlappedDisplays = 0
+    let size = outputPixelSize(points: rect.size, scale: Geometry.scaleFactor(for: rect), maxDimension: maxDimension)
+    guard let canvas = CaptureCanvas(region: rect, width: size.width, height: size.height) else { return nil }
+    let scaleX = CGFloat(size.width) / rect.width
+    let scaleY = CGFloat(size.height) / rect.height
+    let exclusions = hostWindows(in: content)
+    var captured = false
     for display in content.displays {
       let bounds = CGDisplayBounds(display.displayID)
-      let intersection = bounds.intersection(rect)
-      guard !intersection.isNull, intersection.width >= 1, intersection.height >= 1 else { continue }
-      overlappedDisplays += 1
-      let area = intersection.width * intersection.height
-      if area > (best?.overlap ?? -1) {
-        best = (display, bounds, area)
+      let clipped = bounds.intersection(rect)
+      guard !clipped.isNull, clipped.width >= 1, clipped.height >= 1 else { continue }
+      let filter = SCContentFilter(display: display, excludingWindows: exclusions)
+      let configuration = SCStreamConfiguration()
+      configuration.sourceRect = clipped.offsetBy(dx: -bounds.minX, dy: -bounds.minY)
+      configuration.width = max(1, Int((clipped.width * scaleX).rounded()))
+      configuration.height = max(1, Int((clipped.height * scaleY).rounded()))
+      apply(commonSettings: configuration)
+      if #available(macOS 14.2, *) {
+        configuration.ignoreShadowsDisplay = true
+        configuration.ignoreGlobalClipDisplay = true
       }
+      guard let image = captureImage(filter: filter, configuration: configuration) else { return nil }
+      // Core Graphics destinations are bottom-left; source geometry is top-left.
+      canvas.draw(image, covering: clipped)
+      captured = true
     }
-    guard overlappedDisplays == 1, let chosen = best else { return nil }
-    let clipped = chosen.bounds.intersection(rect).integral
-
-    // Synara's own windows are cut out of every display capture.
-    //
-    // The whole-desktop still that feeds the Computer pane goes through here, so
-    // with an empty exclusion list the pane photographed itself: every still
-    // contained the pane showing the previous still, which is both an infinite
-    // mirror and — because the pane redraws on every frame — a guarantee that no
-    // two stills are ever byte-identical. The Node side's dedupe
-    // (`stillFrameDedupe.ts`) therefore never fired, and an open pane cost an SCK
-    // capture, a PNG encode and a ~1 MB JSON line twice a second for as long as
-    // it was open. The agent loses nothing: it cannot drive Synara either (see
-    // `Windows.enumerate`), so those pixels were never actionable.
-    let filter = SCContentFilter(
-      display: chosen.display, excludingWindows: hostWindows(in: content))
-    let configuration = SCStreamConfiguration()
-    // `sourceRect` is display-local points; everything else on the wire is global.
-    configuration.sourceRect = CGRect(
-      x: clipped.origin.x - chosen.bounds.origin.x,
-      y: clipped.origin.y - chosen.bounds.origin.y,
-      width: clipped.width,
-      height: clipped.height)
-    let size = outputPixelSize(
-      points: clipped.size, scale: CGFloat(filter.pointPixelScale), maxDimension: maxDimension)
-    configuration.width = size.width
-    configuration.height = size.height
-    apply(commonSettings: configuration)
-    if #available(macOS 14.2, *) {
-      configuration.ignoreShadowsDisplay = true
-      configuration.ignoreGlobalClipDisplay = true
-    }
-
-    guard let image = captureImage(filter: filter, configuration: configuration),
-      let png = pngData(image)
-    else { return nil }
-    return (png, clipped)
+    guard captured, let image = canvas.image(), let png = pngData(image) else { return nil }
+    return (png, rect)
   }
 
   @available(macOS 14.0, *)

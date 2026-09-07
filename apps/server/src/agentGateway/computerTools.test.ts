@@ -1191,10 +1191,7 @@ describe("agent gateway computer tools", () => {
     // every leg rather than becoming an empty target object.
     // 120 screenshot pixels of the downscaled workspace frame is 150 desktop
     // pixels: the probe takes 48 of them and the remainder carries 102.
-    expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([
-      [null, 0, 48],
-      [null, 0, 102],
-    ]);
+    expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([[null, 0, 150]]);
   });
 
   it("reports scroll travel and spends no extra capture doing it", async () => {

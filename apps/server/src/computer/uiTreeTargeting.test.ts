@@ -23,6 +23,7 @@ function node(partial: Partial<ComputerUiNode> & { readonly role: string }): Com
     activationPoint: partial.activationPoint ?? null,
     onScreen: partial.onScreen ?? true,
     windowId: partial.windowId ?? null,
+    ...(partial.truncated === undefined ? {} : { truncated: partial.truncated }),
     children: partial.children ?? [],
   };
 }
@@ -199,6 +200,7 @@ describe("actionableElements", () => {
 
     expect(actionableElements(desktop)).toEqual({
       complete: true,
+      sourceIncomplete: false,
       omitted: 0,
       items: [
         { role: "push button", label: "Reload", windowId: windowId("browser") },
@@ -299,4 +301,19 @@ describe("actionableElements", () => {
     expect(elements.items).toHaveLength(60);
     expect(elements.complete).toBe(false);
   });
+});
+
+it("includes native macOS controls and reports a partial accessibility source", () => {
+  const tree = node({
+    role: "desktop",
+    truncated: true,
+    children: [
+      node({ role: "AXButton", label: "Save", windowId: windowId("native") }),
+      node({ role: "AXMenuBarItem", label: "File", windowId: windowId("native") }),
+    ],
+  });
+  const result = actionableElements(tree);
+  expect(result.items.map((item) => item.label)).toEqual(["Save", "File"]);
+  expect(result.complete).toBe(false);
+  expect(result.sourceIncomplete).toBe(true);
 });

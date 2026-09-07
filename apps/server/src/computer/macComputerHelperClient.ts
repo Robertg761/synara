@@ -115,7 +115,11 @@ export interface MacHelperTransport {
    * anyway so a connect pays the spawn instead of the first agent action.
    */
   start(): void;
-  request(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  request(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: { readonly signal?: AbortSignal | undefined },
+  ): Promise<unknown>;
   dispose(): Promise<void>;
 }
 
@@ -252,7 +256,11 @@ export class MacComputerHelperClient implements MacHelperTransport {
     child.on("close", (code, signal) => this.terminate("closed", code, signal));
   }
 
-  async request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  async request(
+    method: string,
+    params: Record<string, unknown> = {},
+    options: { readonly signal?: AbortSignal | undefined } = {},
+  ): Promise<unknown> {
     // `dispose()` clears `process` and sets `exited`, so without this a request
     // arriving afterwards took the "not started yet" path and spawned a fresh
     // child that nothing owned or would ever shut down.
@@ -278,15 +286,47 @@ export class MacComputerHelperClient implements MacHelperTransport {
         "Computer helper transport is not ready",
       );
     }
+    const signal = options.signal;
+    signal?.throwIfAborted();
+    let requestId: unknown;
+    const cancel = () => {
+      if (requestId !== undefined) {
+        void writer
+          .write({ jsonrpc: "2.0", method: "cancel-request", params: { id: requestId } })
+          .catch(() => undefined);
+      }
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+    // Input budgets include the requested gesture plus acknowledgement/AX overhead.
+    const duration =
+      method === "drag" && typeof params.durationMs === "number"
+        ? Math.min(30_000, Math.max(0, params.durationMs))
+        : method === "type" && typeof params.text === "string"
+          ? params.text.length * 16
+          : 0;
     try {
-      return await registry.request(method, params, (message) => writer.write(message));
+      const result = await registry.request(
+        method,
+        params,
+        (message) => {
+          requestId = (message as { id: unknown }).id;
+          const written = writer.write(message);
+          if (signal?.aborted) cancel();
+          return written;
+        },
+        this.requestTimeoutMs + duration,
+      );
+      signal?.throwIfAborted();
+      return result;
     } catch (error) {
-      if (error instanceof MacComputerHelperError) throw error;
+      if (signal?.aborted || error instanceof MacComputerHelperError) throw error;
       throw new MacComputerHelperError(
         "helper_write_failed",
         error instanceof Error ? error.message : String(error),
         { cause: error },
       );
+    } finally {
+      signal?.removeEventListener("abort", cancel);
     }
   }
 

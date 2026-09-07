@@ -92,7 +92,8 @@ func handle(method: String, params: Params) throws -> Any {
     // fills every window's `focused` flag, so the two can never disagree. Nil
     // when the front application owns no window the agent may drive (Synara
     // itself, or an app showing only a panel).
-    let focused = Windows.frontmost()
+    let focused = input.currentKeyboardTarget()
+    let active = Windows.frontmost()
     // `minimized` is the owning application's own answer, and it is only asked
     // about windows WindowServer is not compositing — an on-screen window is
     // never minimized. See `Accessibility.minimizedWindowIDs`: deriving it from
@@ -102,7 +103,7 @@ func handle(method: String, params: Params) throws -> Any {
     let payload = windows.map { window in
       Windows.dictionary(
         window, occluders: Windows.occluders(of: window, in: windows),
-        focusedWindowID: focused?.windowNumber,
+        focusedWindowID: focused?.windowNumber, activeWindowID: active?.windowNumber,
         minimized: minimized.contains(window.windowNumber))
     }
     var result: [String: Any] = [
@@ -222,7 +223,8 @@ func handle(method: String, params: Params) throws -> Any {
     let resolved = try input.drag(
       from: from, to: to, durationMs: params.optionalInt("durationMs", default: 220), mode: mode,
       window: try optionalWindowId(from: params))
-    return ["ok": true, "path": resolved.path, "verified": resolved.verified.rawValue]
+    return ["ok": true, "path": resolved.path, "verified": resolved.verified.rawValue,
+      "windowId": input.currentKeyboardTarget().map { String($0.windowNumber) } as Any? ?? NSNull()]
 
   case "scroll":
     let x = params.optionalDouble("x")
@@ -233,36 +235,50 @@ func handle(method: String, params: Params) throws -> Any {
       at: point, deltaX: try params.double("deltaX"), deltaY: try params.double("deltaY"),
       window: try optionalWindowId(from: params),
       modifiers: try pointerModifiers(from: params))
-    return ["ok": true, "path": scrolled.path, "verified": scrolled.verified.rawValue]
+    return ["ok": true, "path": scrolled.path, "verified": scrolled.verified.rawValue,
+      "windowId": input.currentKeyboardTarget().map { String($0.windowNumber) } as Any? ?? NSNull()]
 
   case "type":
+    try aimKeyboard(from: params)
     let outcome = try input.typeText(
       try params.text("text"), mode: try DeliveryMode(param: params.optionalString("deliveryMode")))
-    return ["ok": true, "path": outcome.path, "verified": outcome.verified.rawValue]
+    return ["ok": true, "path": outcome.path, "verified": outcome.verified.rawValue,
+      "windowId": input.currentKeyboardTarget().map { String($0.windowNumber) } as Any? ?? NSNull()]
 
   case "press-key":
+    try aimKeyboard(from: params)
     let pressed = try input.pressKey(
       try params.string("key"), modifiers: params.stringArray("modifiers"),
       mode: try DeliveryMode(param: params.optionalString("deliveryMode")))
-    return ["ok": true, "path": pressed.path, "verified": pressed.verified.rawValue]
+    return ["ok": true, "path": pressed.path, "verified": pressed.verified.rawValue,
+      "windowId": input.currentKeyboardTarget().map { String($0.windowNumber) } as Any? ?? NSNull()]
 
   case "hotkey":
+    try aimKeyboard(from: params)
     let keys = params.stringArray("keys")
     guard !keys.isEmpty else { throw RPCError(.invalidParams, "hotkey needs a non-empty keys array") }
     let chord = try input.hotkey(
       keys, mode: try DeliveryMode(param: params.optionalString("deliveryMode")))
-    return ["ok": true, "path": chord.path, "verified": chord.verified.rawValue]
+    return ["ok": true, "path": chord.path, "verified": chord.verified.rawValue,
+      "windowId": input.currentKeyboardTarget().map { String($0.windowNumber) } as Any? ?? NSNull()]
 
   case "set-value":
     let windowId = try windowId(from: params)
     try Accessibility.setValue(
-      windowId: windowId, path: intArray(params, "nodePath"), value: try params.text("value"))
+      windowId: windowId, path: intArray(params, "nodePath"), value: try params.text("value"), accessibilityRoot: params.optionalString("accessibilityRoot") ?? "window")
     return ["ok": true]
 
   case "perform-action":
     let windowId = try windowId(from: params)
+    let activeBefore = SkyLight.frontmostPID()
     try Accessibility.performAction(
-      windowId: windowId, path: intArray(params, "nodePath"), action: try params.string("action"))
+      windowId: windowId, path: intArray(params, "nodePath"), action: try params.string("action"), accessibilityRoot: params.optionalString("accessibilityRoot") ?? "window")
+    return ["ok": true, "windowId": String(windowId),
+      "path": activeBefore == SkyLight.frontmostPID() ? "accessibility" : "foreground-accessibility",
+      "verified": "unverifiable"]
+
+  case "clear-focus-window":
+    input.setKeyboardTarget(nil)
     return ["ok": true]
 
   case "focus-window":
@@ -321,6 +337,16 @@ func handle(method: String, params: Params) throws -> Any {
 }
 
 // MARK: - Method helpers
+
+func aimKeyboard(from params: Params) throws {
+  guard let id = try optionalWindowId(from: params) else { return }
+  guard let window = Windows.window(withNumber: id) else {
+    throw RPCError(.targetMissing, "no window has id \(id)")
+  }
+  input.setKeyboardTarget(window)
+  Accessibility.focusWindowForKeyboard(window)
+}
+
 
 /// The window the caller named for this action, if any. Absent means "whatever
 /// is topmost at the point", which is how a bare coordinate behaves.
@@ -567,9 +593,17 @@ func handleLine(_ line: Data) {
     return
   }
   let params = Params(raw: object["params"] as? [String: Any] ?? [:])
+  if method == "cancel-request" {
+    InputCancellation.cancel(params.raw["id"])
+    return
+  }
+  let cancellation = InputCancellation.register(id)
   // Parsing happens on the reader thread; the work itself goes to the lane that
   // owns this method so a capture never queues behind a click, or vice versa.
   Lanes.queue(for: method).async {
+    InputCancellation.enter(cancellation)
+    defer { InputCancellation.finish(id) }
+
     // The overlay hides itself a few seconds after the agent stops acting, so
     // an idle helper — which on a Mac with the Computer pane open means most of
     // the session — is not leaving a second arrow on the human's desktop. Armed
@@ -577,6 +611,7 @@ func handleLine(_ line: Data) {
     // pane's own 2 Hz polling would hold the arrow on screen forever.
     defer { if Lanes.isAction(method) { cursor.markIdle() } }
     do {
+      try InputCancellation.check()
       let result = try handle(method: method, params: params)
       writeResult(id: id, result: result)
     } catch let error as RPCError {

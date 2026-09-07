@@ -88,7 +88,9 @@ xcrun swiftc \
   "$SOURCE_DIR/Sources/Capability.swift" \
   "$SOURCE_DIR/Sources/Geometry.swift" \
   "$SOURCE_DIR/Sources/Dispatch.swift" \
+  "$SOURCE_DIR/Sources/Cancellation.swift" \
   "$SOURCE_DIR/Sources/Windows.swift" \
+  "$SOURCE_DIR/Sources/CaptureCanvas.swift" \
   "$SOURCE_DIR/Sources/Capture.swift" \
   "$SOURCE_DIR/Sources/Accessibility.swift" \
   "$SOURCE_DIR/Sources/SkyLight.swift" \

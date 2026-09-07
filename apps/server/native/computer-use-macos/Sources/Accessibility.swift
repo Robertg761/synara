@@ -72,6 +72,7 @@ enum Accessibility {
     guard isTrusted() else {
       throw RPCError(.permissionDenied, "Accessibility is not granted to this app")
     }
+    let maxDepth = min(64, max(0, maxDepth))
     let windows = Windows.list().filter { window in
       // A window WindowServer is not compositing — minimized, or on another
       // Space — has no useful geometry for the agent to act on, and walking it
@@ -92,8 +93,12 @@ enum Accessibility {
 
     var children: [[String: Any]] = []
     var remaining = maxNodesPerDesktop
+    let deadline = Date().addingTimeInterval(3)
+    var truncated = false
+    var failedWindows: [String] = []
+    var menuApps = Set<pid_t>()
     for window in windows {
-      if remaining <= 0 { break }
+      if remaining <= 0 || Date() >= deadline { truncated = true; break }
       let application: Application
       if let existing = applications[window.ownerPID] {
         application = existing
@@ -101,29 +106,37 @@ enum Accessibility {
         application = Application(pid: window.ownerPID)
         applications[window.ownerPID] = application
       }
-      guard let axWindow = application.match(window) else { continue }
-      AXUIElementSetMessagingTimeout(axWindow, windowMessagingTimeout)
-
-      var budget = Budget(remaining: min(maxNodesPerWindow, remaining))
-      guard
-        var windowNode = node(
-          from: axWindow,
-          windowId: window.windowNumber,
-          windowBounds: window.bounds,
-          depth: 0,
-          maxDepth: maxDepth,
-          path: [],
-          budget: &budget)
-      else { continue }
-      if budget.truncated { windowNode["truncated"] = true }
+      var budget = Budget(remaining: min(maxNodesPerWindow, remaining), deadline: deadline)
+      if menuApps.insert(window.ownerPID).inserted {
+        for (attribute, root) in [(kAXMenuBarAttribute, "menu-bar"), ("AXExtrasMenuBar", "menu-bar-extra")] {
+          if let menu = elementAttribute(application.element, attribute),
+            let menuNode = node(from: menu, windowId: window.windowNumber,
+              windowBounds: Geometry.workspaceRect(), depth: 0, maxDepth: maxDepth,
+              path: [], budget: &budget, accessibilityRoot: root) {
+            children.append(menuNode)
+          }
+        }
+      }
+      if let axWindow = application.match(window) {
+        AXUIElementSetMessagingTimeout(axWindow, windowMessagingTimeout)
+        if var windowNode = node(from: axWindow, windowId: window.windowNumber,
+          windowBounds: window.bounds, depth: 0, maxDepth: maxDepth, path: [], budget: &budget) {
+          if budget.truncated { windowNode["truncated"] = true }
+          children.append(windowNode)
+        }
+      } else {
+        failedWindows.append(String(window.windowNumber))
+      }
       remaining -= budget.used
-      children.append(windowNode)
+      truncated = truncated || budget.truncated
     }
 
     let workspace = Geometry.workspaceRect()
     return [
       "root": [
         "role": "desktop",
+        "truncated": truncated || !failedWindows.isEmpty,
+        "unavailableWindowIds": failedWindows,
         "label": NSNull(),
         "value": NSNull(),
         "description": "macOS desktop",
@@ -135,8 +148,9 @@ enum Accessibility {
   }
 
   /// Resolve `windowId` + `nodePath` to a live element and set its value.
-  static func setValue(windowId: CGWindowID, path: [Int], value: String) throws {
-    let element = try resolve(windowId: windowId, path: path)
+  static func setValue(windowId: CGWindowID, path: [Int], value: String, accessibilityRoot: String = "window") throws {
+    let element = try resolve(windowId: windowId, path: path, accessibilityRoot: accessibilityRoot)
+    try InputCancellation.check()
     let status = AXUIElementSetAttributeValue(
       element, kAXValueAttribute as CFString, value as CFTypeRef)
     guard status == .success else {
@@ -145,9 +159,10 @@ enum Accessibility {
   }
 
   /// Resolve `windowId` + `nodePath` to a live element and perform an action.
-  static func performAction(windowId: CGWindowID, path: [Int], action: String) throws {
-    let element = try resolve(windowId: windowId, path: path)
+  static func performAction(windowId: CGWindowID, path: [Int], action: String, accessibilityRoot: String = "window") throws {
+    let element = try resolve(windowId: windowId, path: path, accessibilityRoot: accessibilityRoot)
     let axAction = mapAction(action)
+    try InputCancellation.check()
     let status = AXUIElementPerformAction(element, axAction as CFString)
     guard status == .success else {
       throw RPCError(
@@ -215,12 +230,14 @@ enum Accessibility {
     else { return .notApplicable }
     // swiftlint:disable:next force_cast
     let focused = value as! AXUIElement
+    guard windowID(of: focused) == window.windowNumber else { return .notApplicable }
     AXUIElementSetMessagingTimeout(focused, windowMessagingTimeout)
     let valueBefore = stringAttribute(focused, kAXValueAttribute)
     let role = stringAttribute(focused, kAXRoleAttribute) ?? ""
     let inWebArea = hasAncestor(focused, role: "AXWebArea")
-    guard textRoles.contains(role) || inWebArea else { return .notApplicable }
+    guard textRoles.contains(role), !inWebArea else { return .notApplicable }
     guard isSettable(focused, kAXSelectedTextAttribute) else { return .notApplicable }
+    guard (try? InputCancellation.check()) != nil else { return .refused("cancelled") }
     let status = AXUIElementSetAttributeValue(
       focused, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
     guard status == .success else {
@@ -447,6 +464,31 @@ enum Accessibility {
   /// name and uses `AXRaise`. Setting only `AXFocused`, and only when the app
   /// does not already consider this its focused window, is enough to route keys
   /// and moves nothing.
+  /// Only the explicitly reported foreground rung may select a window in a
+  /// way that can raise it. The background preparation never writes AXMain.
+  static func focusKeyboardWindowVisibly(_ window: DesktopWindow) throws {
+    let application = Application(pid: window.ownerPID, enhanceUserInterface: false, messagingTimeout: windowMessagingTimeout)
+    guard let target = application.match(window) else { throw RPCError(.targetMissing, "The target window closed") }
+    try InputCancellation.check()
+    AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
+    AXUIElementSetAttributeValue(target, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    for _ in 0..<10 {
+      if keyboardWindowMatches(window) { return }
+      try InputCancellation.check()
+      usleep(20_000)
+    }
+    throw RPCError(.notDelivered, "The application could not select the requested window")
+  }
+
+  static func keyboardWindowMatches(_ window: DesktopWindow) -> Bool {
+    let application = AXUIElementCreateApplication(window.ownerPID)
+    AXUIElementSetMessagingTimeout(application, windowMessagingTimeout)
+    guard let focused = elementAttribute(application, kAXFocusedWindowAttribute) else { return false }
+    if let number = windowID(of: focused) { return number == window.windowNumber }
+    guard let ownWindow = matchWindow(attributeElements(application, kAXWindowsAttribute), to: window) else { return false }
+    return CFEqual(focused, ownWindow)
+  }
+
   static func focusWindowForKeyboard(_ window: DesktopWindow) {
     guard isTrusted() else { return }
     let application = Application(
@@ -462,6 +504,9 @@ enum Accessibility {
       return
     }
     AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    AXUIElementSetAttributeValue(application.element, kAXFocusedWindowAttribute as CFString, axWindow)
+    SkyLight.makeKeyWindow(pid: window.ownerPID, windowID: window.windowNumber)
+    usleep(20_000)
   }
 
   /// Which of `candidates` the owning application says are actually minimized.
@@ -557,6 +602,7 @@ enum Accessibility {
   /// whether the cap actually cut the tree short.
   private struct Budget {
     var remaining: Int
+    let deadline: Date
     var used = 0
     var truncated = false
   }
@@ -577,13 +623,14 @@ enum Accessibility {
     depth: Int,
     maxDepth: Int,
     path: [Int],
-    budget: inout Budget
+    budget: inout Budget,
+    accessibilityRoot: String = "window"
   ) -> [String: Any]? {
     // Belt and braces: every caller checks the budget before descending — that
     // is where truncation is *recorded*, because only the caller knows whether
     // a node was actually left unemitted. Marking the tree truncated here as
     // well claimed a cut whenever the budget merely ran out exactly.
-    guard budget.remaining > 0 else { return nil }
+    guard budget.remaining > 0, Date() < budget.deadline else { budget.truncated = true; return nil }
     let snapshot = read(element)
     let frame = snapshot.frame ?? .zero
     // Off-screen scroll content: a real frame that misses the window entirely is
@@ -601,7 +648,7 @@ enum Accessibility {
       for (index, child) in snapshot.children.enumerated() {
         // The cap cut this window's tree short exactly when a child still
         // existed and there was no budget left to emit it.
-        guard budget.remaining > 0 else {
+        guard budget.remaining > 0, Date() < budget.deadline else {
           budget.truncated = true
           break
         }
@@ -614,11 +661,13 @@ enum Accessibility {
           depth: depth + 1,
           maxDepth: maxDepth,
           path: path + [index],
-          budget: &budget)
+          budget: &budget, accessibilityRoot: accessibilityRoot)
         {
           children.append(childNode)
         }
       }
+    } else if !snapshot.children.isEmpty {
+      budget.truncated = true
     }
 
     var payload: [String: Any] = [
@@ -639,7 +688,8 @@ enum Accessibility {
     ]
     // The window root is addressed by its window id alone; every node below it
     // carries the absolute child-index route from that root.
-    if depth > 0 { payload["nodePath"] = path }
+    if depth > 0 || accessibilityRoot != "window" { payload["nodePath"] = path }
+    payload["accessibilityRoot"] = accessibilityRoot
     return payload
   }
 
@@ -675,7 +725,7 @@ enum Accessibility {
     }
   }
 
-  private static func resolve(windowId: CGWindowID, path: [Int]) throws -> AXUIElement {
+  private static func resolve(windowId: CGWindowID, path: [Int], accessibilityRoot: String) throws -> AXUIElement {
     guard isTrusted() else {
       throw RPCError(.permissionDenied, "Accessibility is not granted to this app")
     }
@@ -684,10 +734,16 @@ enum Accessibility {
     }
     let application = Application(pid: window.ownerPID)
     defer { application.restore() }
-    guard let axWindow = application.match(window) else {
-      throw RPCError(.targetMissing, "no accessibility window matched id \(windowId)")
+    let root: AXUIElement?
+    switch accessibilityRoot {
+    case "menu-bar": root = elementAttribute(application.element, kAXMenuBarAttribute)
+    case "menu-bar-extra": root = elementAttribute(application.element, "AXExtrasMenuBar")
+    case "window": root = application.match(window)
+    default: throw RPCError(.invalidParams, "Unknown accessibility root")
     }
-    var current = axWindow
+    guard var current = root else {
+      throw RPCError(.targetMissing, "no accessibility root matched id \(windowId)")
+    }
     for index in path {
       let kids = attributeElements(current, kAXChildrenAttribute)
       guard index >= 0, index < kids.count else {
@@ -770,6 +826,13 @@ enum Accessibility {
       let array = value as? [AXUIElement]
     else { return [] }
     return array
+  }
+
+  private static func elementAttribute(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+      let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return (value as! AXUIElement)
   }
 
   private static func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {

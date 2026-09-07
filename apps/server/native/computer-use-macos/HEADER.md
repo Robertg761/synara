@@ -751,3 +751,14 @@ they can only be exercised by a helper the app itself spawned.
 Release builds ship the helper as a signed nested app bundle; source development
 retains the build-and-cache fallback. It never runs on the Linux CI host, where
 the backend reports `backend-unavailable` from its passive probe.
+
+## September 2026 protocol hardening
+
+- `cancel-request` is a notification with `{id}` referring to a live request. It is handled immediately on the stdin reader, including while input is running. The cancelled request finishes only after held input has been released.
+- `clear-focus-window` clears the agent keyboard target on the input lane. Ownership release and transfer use it after draining the prior operation.
+- `type`, `press-key` and `hotkey` accept `windowId` and return the actual target `windowId`. `list-windows.focused` represents agent aim; `active` represents the human's active window.
+- Keyboard events always use PID delivery, including foreground fallbacks. A foreground fallback selects and verifies the requested window, stops when the user changes apps, and reports its actual delivery path.
+- `set-value` and `perform-action` accept `accessibilityRoot` (`window`, `menu-bar`, `menu-bar-extra`) beside `windowId` and `nodePath`.
+- `describe-ui` enforces a wall-clock budget as well as depth/node limits, and reports truncation and unavailable window IDs. Callers pass `windowIds` when scoping a read.
+- Region capture composes displays at one output scale. SCK excludes host windows; CLI fallback masks them. Both preserve the global top-left coordinate frame.
+- See `Tests/` and `src/computer/macComputerInput.integration.test.ts` for opt-in tests against owned applications, including real hover, two-window input, menus, interruption and button release.

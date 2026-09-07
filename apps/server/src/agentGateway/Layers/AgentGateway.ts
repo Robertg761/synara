@@ -80,6 +80,7 @@ import { makeAgentGatewayDeviceTools } from "../deviceTools.ts";
 import { DeviceService } from "../../device/Services/DeviceService.ts";
 import { computerToolInstructions, makeAgentGatewayComputerTools } from "../computerTools.ts";
 import { ComputerService } from "../../computer/Services/ComputerService.ts";
+import { computerApprovalGate } from "../../computer/ComputerApprovalGate.ts";
 import { BrowserAutomationHost } from "../../browserAutomation/Services/BrowserAutomationHost.ts";
 import { makeBrowserAutomationHost } from "../../browserAutomation/Layers/BrowserAutomationHost.ts";
 import { makeThreadReadTools } from "../threadReadTools.ts";
@@ -841,6 +842,51 @@ export const makeAgentGateway = Effect.gen(function* () {
       ? makeAgentGatewayComputerTools({
           manager: computerService.manager,
           onSetupRequired: surfaceComputerSetupRequired,
+          authorizeAction: async (name, args, context, signal) => {
+            await Effect.runPromise(context.assertCallerTurnActive(), { signal });
+            const caller = await Effect.runPromise(
+              snapshotQuery.getThreadShellById(ThreadId.makeUnsafe(context.callerThreadId)),
+              { signal },
+            );
+            if (Option.isNone(caller)) return false;
+            if (caller.value.runtimeMode === "full-access") return true;
+            return computerApprovalGate.request({
+              threadId: context.callerThreadId,
+              signal,
+              publish: async (requestId, decision) => {
+                const createdAt = isoNow();
+                const eventKey = `${requestId}:${decision === undefined ? "open" : "resolved"}`;
+                await Effect.runPromise(
+                  orchestrationEngine.dispatch({
+                    type: "thread.activity.append",
+                    commandId: CommandId.makeUnsafe(eventKey),
+                    threadId: ThreadId.makeUnsafe(context.callerThreadId),
+                    activity: {
+                      id: EventId.makeUnsafe(eventKey),
+                      tone: "info",
+                      kind: decision === undefined ? "approval.requested" : "approval.resolved",
+                      summary:
+                        decision === undefined
+                          ? "Computer action needs approval"
+                          : "Computer approval resolved",
+                      payload: {
+                        requestId,
+                        requestKind: "tool",
+                        requestType: "tool",
+                        toolName: name,
+                        toolParamsDisplay: JSON.stringify(args),
+                        sessionApprovalAvailable: false,
+                        ...(decision === undefined ? {} : { decision }),
+                      },
+                      turnId: context.callerTurnId ? TurnId.makeUnsafe(context.callerTurnId) : null,
+                      createdAt,
+                    },
+                    createdAt,
+                  }),
+                );
+              },
+            });
+          },
         })
       : []),
   ];

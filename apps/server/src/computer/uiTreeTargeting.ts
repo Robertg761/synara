@@ -213,6 +213,22 @@ export function computerTargetCandidates(root: ComputerUiNode): readonly Compute
  * can be done with.
  */
 const ACTIONABLE_ROLES = new Set([
+  "AXButton",
+  "AXCheckBox",
+  "AXRadioButton",
+  "AXPopUpButton",
+  "AXComboBox",
+  "AXTextField",
+  "AXTextArea",
+  "AXSearchField",
+  "AXSecureTextField",
+  "AXLink",
+  "AXMenuBarItem",
+  "AXMenuItem",
+  "AXSlider",
+  "AXIncrementor",
+  "AXTab",
+  "AXSwitch",
   // Buttons.
   "push button",
   "button",
@@ -254,10 +270,11 @@ export interface ComputerActionableElement {
 export interface ComputerActionableElements {
   readonly items: readonly ComputerActionableElement[];
   /**
-   * False when the tree carried more actionable elements than fit. The caller
-   * should say so — an element missing from a truncated digest still exists.
+   * False when the source tree is partial or more actionable elements exist
+   * than fit. Missing controls may still exist in the application.
    */
   readonly complete: boolean;
+  readonly sourceIncomplete: boolean;
   /**
    * How many matching elements did not fit, so the caller can say how much it
    * is not showing rather than only that it is not showing everything.
@@ -296,7 +313,9 @@ export function actionableElements(
   const items: ComputerActionableElement[] = [];
   const wanted = filter.labelContains?.toLocaleLowerCase();
   let omitted = 0;
+  let sourceIncomplete = false;
   const walk = (node: ComputerUiNode): void => {
+    if (node.truncated) sourceIncomplete = true;
     const label = matchableLabel(node);
     const collectible =
       ACTIONABLE_ROLES.has(node.role) &&
@@ -330,7 +349,7 @@ export function actionableElements(
     for (const child of node.children) walk(child);
   };
   walk(root);
-  return { items, complete: omitted === 0, omitted };
+  return { items, complete: omitted === 0 && !sourceIncomplete, omitted, sourceIncomplete };
 }
 
 export function describeTarget(target: ComputerTarget): string {

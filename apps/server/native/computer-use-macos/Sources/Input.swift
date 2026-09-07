@@ -102,7 +102,7 @@ enum PendingFocusRestore {
   /// A focus record pair was posted; undo it with the inverse pair.
   case recordPair(previousPID: pid_t, previousWindowID: CGWindowID, targetPID: pid_t)
   /// The target was genuinely activated; give the human's app back.
-  case activation(previousPID: pid_t)
+  case activation(previousPID: pid_t, targetPID: pid_t)
 }
 
 /// How well an action's effect could actually be observed.
@@ -156,6 +156,13 @@ final class InputController {
   /// mid-type cannot pull the agent's remaining keystrokes into another window
   /// (the macOS analog of the Linux keyboard re-stamp fix).
   private var keyboardTarget: DesktopWindow?
+  private let targetLock = NSLock()
+  private var foregroundKeyboardPID: pid_t?
+
+  func currentKeyboardTarget() -> DesktopWindow? {
+    targetLock.lock(); defer { targetLock.unlock() }
+    return keyboardTarget
+  }
 
   /// What is logically held down right now, for the unwind path. Guarded by a
   /// lock because unwind runs from the signal source on the main queue while a
@@ -170,12 +177,6 @@ final class InputController {
   private var heldButton: HeldButton?
   private var heldModifiers: [(code: CGKeyCode, flags: CGEventFlags)] = []
   private var heldModifierTarget: DesktopWindow?
-  /// Which stream the held modifiers went down on. A modifier pressed on the
-  /// session tap is held by WindowServer for the whole session, so releasing it
-  /// with a pid-targeted event would not clear it: the human would be left with
-  /// a latched Command key and every keystroke turning into a shortcut. The
-  /// unwind must answer on the stream that took the press.
-  private var heldModifiersOnSessionTap = false
   /// The focus record pair a background gesture has posted and not yet undone.
   private var pendingFocusRestore: PendingFocusRestore?
 
@@ -202,6 +203,11 @@ final class InputController {
   /// method below returns the point it was asked for and the agent believes a
   /// click landed that was never delivered.
   private func requireInputPermission() throws {
+    try InputCancellation.check()
+    if let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+      session["CGSSessionScreenIsLocked"] as? Bool == true {
+      throw RPCError(.notDelivered, "The Mac is locked. Unlock it before continuing computer use.")
+    }
     guard AXIsProcessTrusted() else {
       throw RPCError(
         .permissionDenied,
@@ -211,23 +217,15 @@ final class InputController {
 
   // MARK: - Pointer
 
-  /// Move the *agent's* overlay. Posts no event, and — deliberately — does not
-  /// aim.
-  ///
-  /// This used to go through `aim`, which writes `keyboardTarget`. So hovering
-  /// over the human's editor and then calling `type` without a `windowId` typed
-  /// the agent's text into the human's editor: a read-only-looking hover had
-  /// silently re-pointed the keyboard. Only the gestures that actually post an
-  /// event (click/double/right/drag/scroll) and the two explicit aiming
-  /// methods (`focus-window`, `raise-window`) may change where keys go.
-  ///
-  /// A named window is still resolved, and refused when it is gone, so the reply
-  /// is not a claim about a window that no longer exists.
+  /// Deliver real window-addressed hover and move the overlay without changing
+  /// keyboard aim or the human's physical pointer.
   func move(to point: CGPoint, window: CGWindowID? = nil) throws {
     try requireInputPermission()
     if let window, Windows.window(withNumber: window) == nil {
       throw RPCError(.targetMissing, "no window has id \(window)")
     }
+    let target = window.flatMap { Windows.window(withNumber: $0) } ?? Windows.topmost(at: point)
+    try prime(at: point, target: target, group: Self.newClickGroup())
     cursor.glide(to: point)
   }
 
@@ -417,7 +415,7 @@ final class InputController {
       }
       target = named
     } else {
-      target = keyboardTarget
+      target = try resolveKeyboardTarget()
     }
     // Where the wheel turns. A window-scoped scroll with no point used to leave
     // the event at its default (0,0) *and* unstamped with a window-local
@@ -471,7 +469,8 @@ final class InputController {
   /// Keys go to `window` from now on, whatever the last pointer gesture aimed
   /// at. `raise-window` and `focus-window` call this: the Node side points the
   /// helper at the window the agent named immediately before typing into it.
-  func setKeyboardTarget(_ window: DesktopWindow) {
+  func setKeyboardTarget(_ window: DesktopWindow?) {
+    targetLock.lock(); defer { targetLock.unlock() }
     keyboardTarget = window
   }
 
@@ -484,14 +483,14 @@ final class InputController {
     // web content on its own terms — an accessibility write into a page cannot
     // be read back — and falls through to rung 2 rather than to the visible one.
     let skipInvisibleRungs = Self.needsForegroundKeyboard(target)
-    if mode == .foreground || skipInvisibleRungs {
+    if mode == .foreground || skipInvisibleRungs || !Accessibility.keyboardWindowMatches(target) {
       // An explicitly requested foreground rung takes exactly the path rung 3
       // takes. Posting pid-routed Unicode here instead — which it used to — put
       // this rung's one reason to exist on the wrong side of the activation:
       // Chromium ignores a key posted to a pid whether or not its app is front,
       // so the visible flicker bought nothing.
       let valueBefore = Accessibility.focusedValue(in: target)
-      try withForeground(target) { try self.postTextThroughSessionTap(text) }
+      try withForeground(target) { try self.postForegroundText(text) }
       return TypeOutcome(
         path: mode == .foreground ? "foreground" : "foreground-keys",
         verified: verifyText(text, reached: target, before: valueBefore))
@@ -544,16 +543,16 @@ final class InputController {
       Self.rememberForegroundOnly(target.ownerPID)
     }
 
-    // Rung 3: what a real keyboard does. Reached only when rung 2 was posted,
+    // Rung 3: foreground keycodes, still addressed to the target process. Reached only when rung 2 was posted,
     // was readable, and demonstrably changed nothing — an application that
     // really does drop keys addressed at its pid. Chromium is no longer such an
     // application: with the window made key by the focus prelude a background
     // page receives the keydown and its field gains the text, so this rung is
     // now a genuine last resort rather than the web's default path. Unlike a
-    // mouse event, a key event on the session tap has no pointer component, so
+    // mouse event, a key event on the foreground route has no pointer component, so
     // this cannot move the human's cursor; it only needs the target frontmost,
     // which `withForeground` arranges and then undoes.
-    try withForeground(target) { try self.postTextThroughSessionTap(text) }
+    try withForeground(target) { try self.postForegroundText(text) }
     return TypeOutcome(
       path: "foreground-keys", verified: verifyText(text, reached: target, before: valueBefore))
   }
@@ -574,7 +573,7 @@ final class InputController {
     return after != before && after.contains(text) ? .confirmed : .unconfirmed
   }
 
-  /// Key events on the session tap — the path a physical keyboard takes.
+  /// PID-addressed key events while the target is visibly active.
   ///
   /// These carry a real virtual keycode, not just a Unicode payload. A
   /// `virtualKey: 0` event with `keyboardSetUnicodeString` is enough for AppKit,
@@ -583,7 +582,7 @@ final class InputController {
   /// attached so characters outside the ANSI table come through as themselves.
   ///
   /// Only meaningful while the target is frontmost, which the caller arranges.
-  private func postTextThroughSessionTap(_ text: String) throws {
+  private func postForegroundText(_ text: String) throws {
     for character in text {
       let units = Array(String(character).utf16)
       // A character the tables cannot express has no keycode to send, and
@@ -593,44 +592,34 @@ final class InputController {
       // for a character no key produces.
       guard let stroke = KeyMap.keystroke(for: character) else {
         for down in [true, false] {
-          try postSessionTapKey(0, down: down, flags: [], units: units)
+          try postForegroundKey(0, down: down, flags: [], units: units)
         }
         usleep(6_000)
         continue
       }
       let flags: CGEventFlags = stroke.shift ? [.maskShift] : []
-      try withSessionTapShift(stroke.shift) {
+      try withForegroundShift(stroke.shift) {
         for down in [true, false] {
-          try self.postSessionTapKey(stroke.code, down: down, flags: flags, units: units)
+          try self.postForegroundKey(stroke.code, down: down, flags: flags, units: units)
         }
       }
       usleep(6_000)
     }
   }
 
-  /// Hold left-Shift on the session tap for the duration of `body`, and record
-  /// it as held while it is down.
-  ///
-  /// The recording is the whole point. This is the one stream a pid-targeted
-  /// release cannot clear — a modifier pressed on the session tap is session-wide
-  /// state WindowServer holds — and the press used to be invisible to
-  /// `heldModifiers`/`heldModifiersOnSessionTap`, so a throw part way through a
-  /// string, or a SIGTERM mid-`type`, ran `unwind()` with nothing to release and
-  /// left the human with a latched Shift: every subsequent keystroke of theirs
-  /// arriving capitalised or as a shortcut. `postChord` has always recorded its
-  /// modifiers this way; this is the same bookkeeping for the typing path.
-  private func withSessionTapShift(_ needed: Bool, _ body: () throws -> Void) throws {
+  /// Hold Shift only in the target process, and retain its owner for unwind.
+  private func withForegroundShift(_ needed: Bool, _ body: () throws -> Void) throws {
     guard needed else {
       try body()
       return
     }
     let shift = KeyMap.shiftModifier
-    try postSessionTapKey(shift.code, down: true, flags: [.maskShift], units: nil)
-    recordHeldModifiers([shift], target: nil, onSessionTap: true)
+    try postForegroundKey(shift.code, down: true, flags: [.maskShift], units: nil)
+    recordHeldModifiers([shift], target: currentKeyboardTarget())
     // Runs on a throw as well as on the ordinary path, so the only window in
     // which Shift is held without being releasable is the one `unwind()` covers.
     defer {
-      try? postSessionTapKey(shift.code, down: false, flags: [], units: nil)
+      try? postForegroundKey(shift.code, down: false, flags: [], units: nil)
       clearHeldModifiers()
     }
     try body()
@@ -641,9 +630,7 @@ final class InputController {
   ///
   /// Same shape and the same bookkeeping as `postChord`, deliberately: each
   /// modifier goes down as a real key transition posted to the *target pid*
-  /// (never the session tap — a mouse-path gesture must not put session-wide
-  /// state on the human's keyboard, and `deliver` is the only stream any of this
-  /// uses), accumulating flags as it goes; every press is recorded through
+  /// through `deliver`, accumulating flags as it goes; every press is recorded through
   /// `recordHeldModifiers` while it is down, so a throw between the down and the
   /// up, or a SIGTERM mid-gesture, runs `unwind()` with something to release
   /// instead of latching Command on the human's desktop; and the releases go out
@@ -676,7 +663,7 @@ final class InputController {
       flags.insert(modifier.flags)
       try postKey(modifier.code, down: true, flags: flags, to: target)
       pressed.append(modifier)
-      recordHeldModifiers(pressed, target: target, onSessionTap: false)
+      recordHeldModifiers(pressed, target: target)
       usleep(8_000)
     }
     try body()
@@ -692,13 +679,11 @@ final class InputController {
   /// Note that `modifiers` are logically down, so `unwind()` can release them on
   /// whichever stream took the press.
   private func recordHeldModifiers(
-    _ modifiers: [(code: CGKeyCode, flags: CGEventFlags)], target: DesktopWindow?,
-    onSessionTap: Bool
+    _ modifiers: [(code: CGKeyCode, flags: CGEventFlags)], target: DesktopWindow?
   ) {
     heldLock.lock()
     heldModifiers = modifiers
     heldModifierTarget = target
-    heldModifiersOnSessionTap = onSessionTap
     heldLock.unlock()
   }
 
@@ -708,11 +693,16 @@ final class InputController {
     heldLock.lock()
     heldModifiers = []
     heldModifierTarget = nil
-    heldModifiersOnSessionTap = false
     heldLock.unlock()
   }
 
-  private func postSessionTapKey(
+  private func assertKeyboardWindow(_ target: DesktopWindow?) throws {
+    guard let target, Accessibility.keyboardWindowMatches(target) else {
+      throw RPCError(.notDelivered, "The application did not focus the requested window; refusing to type into a different window. Click the intended control and try again.")
+    }
+  }
+
+  private func postForegroundKey(
     _ code: CGKeyCode, down: Bool, flags: CGEventFlags, units: [UniChar]?
   ) throws {
     guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else {
@@ -722,7 +712,12 @@ final class InputController {
     if var mutable = units, !mutable.isEmpty {
       event.keyboardSetUnicodeString(stringLength: mutable.count, unicodeString: &mutable)
     }
-    event.post(tap: .cgSessionEventTap)
+    let target = down ? try resolveKeyboardTarget() : currentKeyboardTarget()
+    if down, let expected = foregroundKeyboardPID, SkyLight.frontmostPID() != expected {
+      throw RPCError(.notDelivered, "Input interrupted because the user switched applications. Read the target before continuing.")
+    }
+    // PID delivery closes the race between checking activation and posting.
+    try deliver(event, to: target, localPoint: nil)
     usleep(2_000)
   }
 
@@ -781,21 +776,14 @@ final class InputController {
     heldLock.lock()
     let modifiers = heldModifiers
     let modifierTarget = heldModifierTarget
-    let onSessionTap = heldModifiersOnSessionTap
     heldModifiers = []
-    heldModifiersOnSessionTap = false
     heldLock.unlock()
 
-    // Modifiers come up in reverse, each with the flags that remain held, and on
-    // the stream they went down on — a session-tap press is session-wide state
-    // that a pid-targeted release does not touch.
+    // All rungs use PID-addressed events. Release against the saved owner even
+    // if its window has since closed or the keyboard aim has been cleared.
     var flags = modifiers.reduce(CGEventFlags()) { $0.union($1.flags) }
     for modifier in modifiers.reversed() {
       flags.remove(modifier.flags)
-      if onSessionTap {
-        try? postSessionTapKey(modifier.code, down: false, flags: flags, units: nil)
-        continue
-      }
       if let event = CGEvent(keyboardEventSource: source, virtualKey: modifier.code, keyDown: false)
       {
         event.flags = flags
@@ -868,7 +856,8 @@ final class InputController {
     case .recordPair(let previousPID, let previousWindowID, let targetPID):
       _ = SkyLight.restoreActivation(
         to: previousPID, windowID: previousWindowID, from: targetPID)
-    case .activation(let previousPID):
+    case .activation(let previousPID, let targetPID):
+      guard SkyLight.frontmostPID() == targetPID else { return }
       NSRunningApplication(processIdentifier: previousPID)?.activate(options: [])
     }
   }
@@ -947,13 +936,17 @@ final class InputController {
       for target: DesktopWindow?, cursor: AgentCursor, controller: InputController,
       mode: DeliveryMode = .background
     ) -> Focus {
+      if let target {
+        SkyLight.makeKeyWindow(pid: target.ownerPID, windowID: target.windowNumber)
+        usleep(20_000)
+      }
       let ownPID = ProcessInfo.processInfo.processIdentifier
       let front = SkyLight.frontmostPID()
       let previous = front.flatMap { $0 == ownPID ? nil : $0 }
       guard let target, let previous, previous != target.ownerPID else {
         // Nothing to arrange — but "nothing to arrange" is not the same as
         // "the target is active", and reporting the latter unconditionally is
-        // how `withForeground` came to post session-tap keys with nothing
+        // how `withForeground` came to post foreground keys with nothing
         // verified frontmost: with no target at all, or with no previous app,
         // this branch used to claim success and the agent's text went into
         // whatever the human was looking at. The flag is an observation now.
@@ -974,7 +967,7 @@ final class InputController {
         // instant the target comes forward the human's app is owed its place
         // back, and a SIGTERM in between would otherwise leave the target
         // sitting on top of whatever the human was looking at.
-        controller.setPendingFocusRestore(.activation(previousPID: previous))
+        controller.setPendingFocusRestore(.activation(previousPID: previous, targetPID: target.ownerPID))
         let forward =
           NSRunningApplication(processIdentifier: target.ownerPID)?.activate(options: [])
           ?? SkyLight.setFrontProcess(pid: target.ownerPID, windowID: target.windowNumber)
@@ -995,7 +988,7 @@ final class InputController {
         // `forward` is only the synchronous return of an asynchronous request,
         // and `NSRunningApplication.activate` reports false for an activation
         // that then happens anyway. What this rung promises its callers is that
-        // the target really is frontmost — session-tap keys go wherever that is
+        // the target really is frontmost — foreground keys go wherever that is
         // — so the settled observation alone is the answer.
         return Focus(
           target: target, previousPID: previous, previousWindowID: 0,
@@ -1039,11 +1032,11 @@ final class InputController {
       usleep(50_000)
       let frontNow = SkyLight.frontmostPID()
       let owed: PendingFocusRestore?
-      if broughtForward || frontNow == target.ownerPID {
+      if frontNow == target.ownerPID {
         // The target really is front now — either because this was the
         // foreground rung or because the gesture itself raised it (a first
         // click in some apps does). Give the human their app back.
-        owed = .activation(previousPID: previousPID)
+        owed = .activation(previousPID: previousPID, targetPID: target.ownerPID)
       } else if activatedWithoutRaise {
         // Nothing moved on screen; undo the belief we planted so the human's app
         // stops thinking it was deactivated and the target stops thinking it is
@@ -1077,11 +1070,9 @@ final class InputController {
   /// The foreground rung for keyboard actions: bring the target forward, act,
   /// restore the previous application.
   ///
-  /// The guard is the whole safety of this rung. Its body posts to the session
-  /// tap, which delivers to whatever is *actually* frontmost — so an activation
-  /// that did not take would have typed the agent's text into the human's own
-  /// document. Refusing is the only safe answer, and `end()` still hands back
-  /// whatever the failed attempt disturbed.
+  /// Delivery remains PID-addressed. Activation and key-window guards ensure
+  /// that the requested window is ready; each key also checks for a human app
+  /// switch. `end()` restores focus only while our target still owns it.
   private func withForeground(_ target: DesktopWindow?, _ body: () throws -> Void) throws {
     let focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: .foreground)
     defer { focus.end() }
@@ -1089,6 +1080,9 @@ final class InputController {
       throw RPCError(
         .notDelivered, "target did not become frontmost; refusing to type into whatever is")
     }
+    if let target { try Accessibility.focusKeyboardWindowVisibly(target) }
+    foregroundKeyboardPID = target?.ownerPID
+    defer { foregroundKeyboardPID = nil }
     try body()
   }
 
@@ -1121,11 +1115,11 @@ final class InputController {
       guard let target = Windows.window(withNumber: named) else {
         throw RPCError(.targetMissing, "no window has id \(named)")
       }
-      keyboardTarget = target
+      setKeyboardTarget(target)
       return target
     }
     let target = Windows.topmost(at: point)
-    keyboardTarget = target
+    setKeyboardTarget(target)
     return target
   }
 
@@ -1432,6 +1426,7 @@ final class InputController {
   /// event because Chromium infers modifier state from them and would otherwise
   /// see an uppercase letter as Shift+letter with the Shift leaking onward.
   private func postText(_ text: String, to target: DesktopWindow?) throws {
+    try assertKeyboardWindow(target)
     let units = Array(text.utf16)
     var index = 0
     while index < units.count {
@@ -1487,12 +1482,12 @@ final class InputController {
     }
     // The chord itself, written once and parameterised on how a single
     // transition is posted. The two rungs differ in nothing else — pid-routed
-    // for the invisible path, session tap for the visible one, which is reached
+    // for the invisible path, foreground route for the visible one, which is reached
     // only for an app already caught dropping background input — and a second
     // copy of this would be a second place for a modifier to latch.
     let body: (
-      _ post: (CGKeyCode, Bool, CGEventFlags) throws -> Void, _ onSessionTap: Bool
-    ) throws -> Void = { post, onSessionTap in
+      _ post: (CGKeyCode, Bool, CGEventFlags) throws -> Void
+    ) throws -> Void = { post in
       // Sampled here, after whichever focus arrangement the caller made and
       // before the first transition of the chord.
       signatureBefore = Accessibility.focusedElementSignature(in: target)
@@ -1515,7 +1510,7 @@ final class InputController {
         flags.insert(modifier.flags)
         try post(modifier.code, true, flags)
         pressed.append(modifier)
-        self.recordHeldModifiers(pressed, target: target, onSessionTap: onSessionTap)
+        self.recordHeldModifiers(pressed, target: target)
         usleep(8_000)
       }
       try post(code, true, flags)
@@ -1526,11 +1521,11 @@ final class InputController {
     let throughPid: (CGKeyCode, Bool, CGEventFlags) throws -> Void = { code, down, flags in
       try self.postKey(code, down: down, flags: flags, to: target)
     }
-    let throughSessionTap: (CGKeyCode, Bool, CGEventFlags) throws -> Void = { code, down, flags in
-      try self.postSessionTapKey(code, down: down, flags: flags, units: nil)
+    let throughForeground: (CGKeyCode, Bool, CGEventFlags) throws -> Void = { code, down, flags in
+      try self.postForegroundKey(code, down: down, flags: flags, units: nil)
     }
     if mode == .foreground || Self.needsForegroundKeyboard(target) {
-      try withForeground(target) { try body(throughSessionTap, true) }
+      try withForeground(target) { try body(throughForeground) }
       return KeyOutcome(path: "foreground", verified: verification())
     }
     let focus = Focus.begin(for: target, cursor: cursor, controller: self)
@@ -1538,13 +1533,13 @@ final class InputController {
     // synthetic active state hit-tests as background and drops the chord
     // silently, so it is worth the visible rung rather than reporting a shortcut
     // that never ran. Reported as what happened, not as what was asked for.
-    if !focus.targetBelievesItIsActive {
+    if !focus.targetBelievesItIsActive || !Accessibility.keyboardWindowMatches(target) {
       focus.end()
-      try withForeground(target) { try body(throughSessionTap, true) }
+      try withForeground(target) { try body(throughForeground) }
       return KeyOutcome(path: "foreground", verified: verification())
     }
     defer { focus.end() }
-    try body(throughPid, false)
+    try body(throughPid)
     return KeyOutcome(path: "keystrokes", verified: verification())
   }
 
@@ -1586,7 +1581,7 @@ final class InputController {
   /// inherit it. Re-resolving also refreshes the bounds the window-local stamp
   /// is computed from.
   private func resolveKeyboardTarget() throws -> DesktopWindow {
-    guard let aimed = keyboardTarget else {
+    guard let aimed = currentKeyboardTarget() else {
       throw RPCError(
         .targetMissing,
         "no window is aimed for keyboard input; click, focus, or raise a window first")
@@ -1594,13 +1589,13 @@ final class InputController {
     guard let current = Windows.window(withNumber: aimed.windowNumber),
       current.ownerPID == aimed.ownerPID
     else {
-      keyboardTarget = nil
+      setKeyboardTarget(nil)
       throw RPCError(
         .targetMissing,
         "the window keyboard input was aimed at (\(aimed.windowNumber)) no longer exists; "
           + "click, focus, or raise a window again")
     }
-    keyboardTarget = current
+    setKeyboardTarget(current)
     if SkyLight.frontmostPID() != current.ownerPID {
       Accessibility.focusWindowForKeyboard(current)
     }
@@ -1618,6 +1613,16 @@ final class InputController {
   /// is refused instead, so the backend reports an unresolved target rather than
   /// hijacking the pointer.
   private func deliver(_ event: CGEvent, to target: DesktopWindow?, localPoint: CGPoint?) throws {
+    let releasing = [.keyUp, .leftMouseUp, .rightMouseUp, .otherMouseUp].contains(event.type)
+    if !releasing { try InputCancellation.check() }
+    if event.type == .keyDown { try assertKeyboardWindow(target) }
+
+    if !releasing, let target {
+      guard let current = Windows.window(withNumber: target.windowNumber),
+        current.ownerPID == target.ownerPID, current.onScreen else {
+        throw RPCError(.targetMissing, "The input target closed or is no longer on screen")
+      }
+    }
     // There is no frontmost fallback for either kind of event. An unstamped
     // pointer event is posted at the frontmost app carrying the global
     // coordinate the agent aimed somewhere else, so it clicks that coordinate
@@ -1687,7 +1692,7 @@ enum KeyMap {
   /// for a letter: `!` is already its own lowercase, so the "is it uppercase"
   /// test says no shift, and the character is in neither `named` nor `ansi`. The
   /// result was keycode 0 — the `A` key — for every symbol on this row, so an
-  /// email address typed through the session tap arrived as `robertaexample`.
+  /// email address typed through the foreground route arrived as `robertaexample`.
   private static let shiftedAnsi: [Character: CGKeyCode] = [
     "!": 18, "@": 19, "#": 20, "$": 21, "%": 23, "^": 22, "&": 26, "*": 28, "(": 25, ")": 29,
     "_": 27, "+": 24, "{": 33, "}": 30, "|": 42, ":": 41, "\"": 39, "<": 43, ">": 47, "?": 44,
@@ -1704,7 +1709,7 @@ enum KeyMap {
     "fn": (63, .maskSecondaryFn),
   ]
 
-  /// Left shift, for the session-tap typing path, which asserts it directly
+  /// Left shift, for the foreground typing path, which asserts it directly
   /// rather than going through the caller-supplied modifier list.
   static let shiftModifier: (code: CGKeyCode, flags: CGEventFlags) = (56, .maskShift)
 

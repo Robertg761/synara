@@ -346,6 +346,7 @@ export interface ComputerBackend {
      * asked for it.
      */
     readonly includeTree?: boolean;
+    readonly windowId?: string;
   }): Promise<ComputerState>;
   /**
    * Zoomed perception. `getState` downscales the whole multi-monitor workspace
@@ -435,9 +436,9 @@ export interface ComputerBackend {
     windowId?: string,
     modifiers?: readonly ComputerInputModifier[],
   ): Promise<ComputerBackendActionResult | void>;
-  typeText(text: string): Promise<ComputerBackendActionResult | void>;
-  pressKey(key: string): Promise<ComputerBackendActionResult | void>;
-  hotkey(keys: readonly string[]): Promise<ComputerBackendActionResult | void>;
+  typeText(text: string, windowId?: string): Promise<ComputerBackendActionResult | void>;
+  pressKey(key: string, windowId?: string): Promise<ComputerBackendActionResult | void>;
+  hotkey(keys: readonly string[], windowId?: string): Promise<ComputerBackendActionResult | void>;
   /**
    * The system clipboard the human user shares, not an agent-private one.
    * Toolkits bind their data device to the session's primary seat whichever

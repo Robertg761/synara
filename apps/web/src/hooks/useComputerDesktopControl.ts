@@ -53,7 +53,11 @@ export interface ComputerDesktopControl {
 
 export function useComputerDesktopControl(threadId: ThreadId): ComputerDesktopControl {
   const threadState = useComputerStateStore(selectThreadComputerState(threadId));
-  const agentActive = useSteadyComputerAgentActive(threadState?.agentActive ?? false);
+  const owner = threadState?.controlOwnerThreadId;
+  const agentActive = useSteadyComputerAgentActive(
+    owner !== undefined || (threadState?.agentActive ?? false),
+  );
+  const ownerThreadId = owner ?? threadId;
   const [stopRequested, setStopRequested] = useState(false);
   const [stopError, setStopError] = useState<string | null>(null);
 
@@ -64,7 +68,7 @@ export function useComputerDesktopControl(threadId: ThreadId): ComputerDesktopCo
     // turn is what releases the desktop lease
     // (`ComputerManager.releaseDesktopControl`), so a second mechanism could
     // only ever disagree with this one.
-    void interruptThreadTurn(threadId).catch((error: unknown) => {
+    void interruptThreadTurn(ownerThreadId).catch((error: unknown) => {
       setStopRequested(false);
       setStopError(
         error instanceof Error && error.message.length > 0
@@ -72,7 +76,7 @@ export function useComputerDesktopControl(threadId: ThreadId): ComputerDesktopCo
           : "The stop request failed. Try again in a moment.",
       );
     });
-  }, [threadId]);
+  }, [ownerThreadId]);
 
   useEffect(() => {
     // Re-arm once the agent has actually stopped: a stop that did not take must

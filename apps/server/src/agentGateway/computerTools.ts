@@ -1,3 +1,8 @@
+import {
+  assertDesktopOperationActive,
+  desktopOperationSignal,
+} from "../computer/DesktopOperationQueue.ts";
+import { setTimeout as waitForComputer } from "node:timers/promises";
 /** Agent-facing desktop perception and control tools. */
 import { Effect } from "effect";
 
@@ -86,7 +91,7 @@ export const COMPUTER_APPROVAL_REQUIRED_TOOLS = new Set([
   "computer_triple_click",
   "computer_right_click",
   // `computer_move_cursor` is deliberately absent: it moves the agent's own
-  // overlay, posts no event, and no longer aims the keyboard, so there is
+  // overlay, posts only mouse movement, and never aims the keyboard, so there is
   // nothing for a human to approve. It was gated when a hover still re-pointed
   // the keyboard at whatever it passed over.
   "computer_drag",
@@ -126,6 +131,12 @@ export function computerToolRequiresApproval(name: string): boolean {
 
 export interface AgentGatewayComputerToolsOptions {
   readonly manager: ComputerManager;
+  readonly authorizeAction?: (
+    name: string,
+    args: Record<string, unknown>,
+    context: ToolContext,
+    signal: AbortSignal,
+  ) => Promise<boolean>;
   /**
    * Called when a tool call failed because the OS is withholding a privacy
    * grant Synara needs. The gateway turns it into one actionable chat card;
@@ -248,7 +259,7 @@ const SEMANTIC_TARGETING_NOTE =
  * agent that cannot read a label in it must know the answer is one
  * `computer_screenshot` away rather than that the label is unreadable.
  */
-const ACTION_SCREENSHOT_NOTE = `Every mutating computer tool returns a screenshot taken after the action settled, zoomed to the window the action affected — the window it named, or the window under its coordinates — falling back to the whole workspace when neither identifies one, capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side so a typical application window comes back at full resolution. It becomes the screenshot your next x/y are measured in: read the next state from it and aim your next action at its pixels instead of making a separate screenshot call, and call computer_screenshot only when this one is too small to read the detail you need. Pass include_screenshot: false on an action whose picture you will not read — an action in the middle of a chain in one response — and never on the last one, because skipping it and then calling computer_screenshot costs the extra round trip the attached screenshot exists to avoid. When the new capture is byte-identical to the one the previous action returned, the result reports screenshotUnchanged instead of repeating the image: keep reading the previous one, which remains the screenshot your coordinates refer to. Unchanged means the pixels did not move, not that the action failed — the screen may not have settled yet, and Synara has already checked whether the action opened a new window and photographed that instead if it did — so use computer_wait or a fresh computer_get_state before concluding it missed, and do not blind-retry the same action more than once. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
+const ACTION_SCREENSHOT_NOTE = `Every mutating computer tool returns a screenshot taken after the action settled, zoomed to the window the action affected — the window it named, or the window under its coordinates — falling back to the whole workspace when neither identifies one, capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side so a typical application window comes back at full resolution. It becomes the screenshot your next x/y are measured in: read the next state from it and aim your next action at its pixels instead of making a separate screenshot call, and call computer_screenshot only when this one is too small to read the detail you need. Pass include_screenshot: false on an action whose picture you will not read — an action in the middle of a chain in one response — and never on the last one, because skipping it and then calling computer_screenshot costs the extra round trip the attached screenshot exists to avoid. When the new capture and its coordinate mapping are identical to the latest screenshot delivered to this conversation, the result reports screenshotUnchanged instead of repeating the image: keep reading the previous one, which remains the screenshot your coordinates refer to. Unchanged means the pixels did not move, not that the action failed — the screen may not have settled yet, and Synara has already checked whether the action opened a new window and photographed that instead if it did — so use computer_wait or a fresh computer_get_state before concluding it missed, and do not blind-retry the same action more than once. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
 
 /** The short form the action tools carry. */
 const ACTION_SCREENSHOT_HINT =
@@ -819,6 +830,7 @@ export function makeAgentGatewayComputerTools(
     screenshot: ComputerScreenshot,
     windowId?: string,
   ): McpToolCallResult => {
+    assertDesktopOperationActive();
     const { bytesBase64, ...metadata } = screenshot;
     const frame = frames.record(threadId, screenshot, windowId);
     return {
@@ -906,19 +918,34 @@ export function makeAgentGatewayComputerTools(
     ) =>
     (args: Record<string, unknown>, context: ToolContext) =>
       Effect.tryPromise({
-        try: async () => {
+        try: async (abortSignal) => {
           if (
             computerToolRequiresApproval(name) &&
             PROVIDERS_WITHOUT_APPROVAL_GATE.has(context.callerProvider)
           ) {
-            return { result: approvalUnavailableResult(name), signal: undefined };
+            if (!options.authorizeAction)
+              return { result: approvalUnavailableResult(name), signal: undefined };
+            if (!(await options.authorizeAction(name, args, context, abortSignal))) {
+              return {
+                result: mcpToolResultError(
+                  "Computer action was denied or cancelled; no input was sent.",
+                ),
+                signal: undefined,
+              };
+            }
           }
           // Recorded before the call, because the call is what claims the
           // desktop, and the badge has to name this thread from the first
           // action rather than from the second.
           manager.setThreadLabel(context.callerThreadId, context.callerThreadLabel);
-          const value = await manager.withAgentActivity(context.callerThreadId, () =>
-            run(args, context),
+          const value = await manager.withAgentActivity(
+            context.callerThreadId,
+            async () => {
+              await Effect.runPromise(context.assertCallerTurnActive(), { signal: abortSignal });
+              abortSignal.throwIfAborted();
+              return run(args, context);
+            },
+            abortSignal,
           );
           // A call can succeed and still report that the desktop is out of
           // reach: a perception read answers with a `permission-required`
@@ -984,7 +1011,7 @@ export function makeAgentGatewayComputerTools(
     run: (args: Record<string, unknown>, context: ToolContext) => Promise<unknown>,
     /**
      * Overrides the write annotations for an action that is not one. Only the
-     * hover uses it: it posts no event, presses nothing, and no longer aims the
+     * hover uses it: it posts mouse movement, presses nothing, and never aims the
      * keyboard, so `destructiveHint: true` was telling every provider to treat
      * a look as a change.
      */
@@ -1022,17 +1049,21 @@ export function makeAgentGatewayComputerTools(
         note: "The window this action targeted no longer exists — the action likely closed it, so no post-action screenshot was taken. Use computer_list_windows or computer_get_state to see the desktop now.",
       };
     }
-    if ("screenshotUnchanged" in capture) {
+    const reused = frames.matchLatest(context.callerThreadId, capture.screenshot, capture.windowId);
+    if (reused) {
       return {
         ...result,
         screenshotUnchanged: true,
-        // Deliberately softened. The old wording asserted "it did not land",
-        // which is a claim byte equality cannot support: a click that opens a
-        // window photographs the old one, and a UI that is still painting is
-        // identical for a moment. Synara has already looked for a window this
-        // action opened and photographed that instead if it found one, so what
-        // is left is genuinely "nothing has changed yet".
-        note: "The screen is byte-for-byte what your previous screenshot showed, so the identical image was not sent again — keep reading that one. This does not prove the action missed: the desktop may not have settled yet, and no new window appeared for it to photograph instead. Wait with computer_wait and look again, or take a fresh computer_get_state, before deciding it failed; if the second look is identical too, check that the control is where you aimed and that the window is not covered.",
+        screenshotId: reused.id,
+        screenshot: {
+          screenshotId: reused.id,
+          windowId: reused.windowId,
+          region: reused.region,
+          width: reused.width,
+          height: reused.height,
+          scale: reused.scale,
+        },
+        note: "The screen is byte-for-byte what your previous screenshot showed, with the same coordinates. Continue using this screenshotId. This does not prove the action missed; wait and look again before repeating an action.",
       };
     }
     return deliverScreenshot(context.callerThreadId, result, capture.screenshot, capture.windowId);
@@ -1198,6 +1229,7 @@ export function makeAgentGatewayComputerTools(
           includeScreenshot: readBooleanArg(args, "include_screenshot") ?? false,
           includeText: wantText,
           includeTree: true,
+          ...(windowId ? { windowId } : {}),
         });
         const { text, root, screenshot, ...rest } = state;
         const elements = root
@@ -1212,6 +1244,7 @@ export function makeAgentGatewayComputerTools(
           ...(elements
             ? {
                 elements: elements.items,
+                ...(elements.sourceIncomplete ? { elementsSourceIncomplete: true } : {}),
                 // Both halves together: "there is more" is only actionable
                 // alongside how much more, which is what decides between
                 // looking again and narrowing the query.
@@ -1324,7 +1357,8 @@ export function makeAgentGatewayComputerTools(
       },
       handler: handle("computer_wait", async (args) => {
         const durationMs = readWaitDurationMs(args);
-        if (durationMs > 0) await new Promise((resolve) => setTimeout(resolve, durationMs));
+        if (durationMs > 0)
+          await waitForComputer(durationMs, undefined, { signal: desktopOperationSignal() });
         return { computerId: manager.computerId, waitedMs: durationMs };
       }),
     },

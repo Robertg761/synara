@@ -477,6 +477,7 @@ export interface ComputerUiNode {
    * pair stays valid across helper restarts while the tree is unchanged.
    */
   readonly nodePath?: readonly number[] | undefined;
+  readonly accessibilityRoot?: "window" | "menu-bar" | "menu-bar-extra" | undefined;
   /** The node accepts a semantic text write (AT-SPI `EditableText`). */
   readonly editable?: boolean | undefined;
   /**
@@ -497,6 +498,7 @@ export const ComputerUiNode: Schema.Schema<ComputerUiNode> = Schema.Struct({
   activationPoint: Schema.NullOr(ComputerUiPoint),
   onScreen: Schema.Boolean,
   windowId: Schema.NullOr(ComputerWindowId),
+  accessibilityRoot: Schema.optional(Schema.Literals(["window", "menu-bar", "menu-bar-extra"])),
   nodePath: Schema.optional(
     Schema.Array(NonNegativeInt).check(Schema.isMaxLength(COMPUTER_NODE_PATH_MAX_DEPTH)),
   ),
@@ -522,6 +524,12 @@ export const ComputerScreenshot = Schema.Struct({
 export type ComputerScreenshot = typeof ComputerScreenshot.Type;
 
 export const ComputerState = Schema.Struct({
+  accessibility: Schema.optional(
+    Schema.Struct({
+      status: Schema.Literals(["complete", "partial", "unavailable"]),
+      unavailableWindowIds: Schema.Array(ComputerWindowId),
+    }),
+  ),
   computerId: ComputerId,
   windows: Schema.Array(ComputerWindow).check(Schema.isMaxLength(COMPUTER_WINDOW_LIST_MAX_LENGTH)),
   screenSize: ComputerScreenSize,
@@ -551,6 +559,11 @@ export const ThreadComputerState = Schema.Struct({
   screenSize: ComputerScreenSize,
   cursor: Schema.optional(ComputerPoint),
   agentActive: Schema.Boolean,
+  /** Current desktop owner; used by the global Stop control between tool calls. */
+  controlOwnerThreadId: Schema.optional(ThreadId),
+  controlOwnerLabel: Schema.optional(
+    Schema.String.check(Schema.isMaxLength(COMPUTER_LABEL_MAX_LENGTH)),
+  ),
   /**
    * Another conversation holds the exclusive desktop lease, so this thread's
    * agent actions are refused until it is released. Perception is unaffected.
@@ -931,6 +944,8 @@ export const ComputerWindowsChangedEvent = Schema.Struct({
 export type ComputerWindowsChangedEvent = typeof ComputerWindowsChangedEvent.Type;
 
 export const ComputerActionEvent = Schema.Struct({
+  windowId: Schema.optional(ComputerWindowId),
+  delivery: ComputerActionResult.fields.delivery,
   type: Schema.Literal("computer.action"),
   action: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
   ok: Schema.Boolean,

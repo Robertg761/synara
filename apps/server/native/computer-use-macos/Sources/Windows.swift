@@ -241,7 +241,7 @@ enum Windows {
   /// only the `list-windows` handler is entitled to pay for it. An on-screen
   /// window is never minimized, so only the off-screen ones cost anything.
   static func dictionary(
-    _ window: DesktopWindow, occluders: [String], focusedWindowID: CGWindowID?, minimized: Bool
+    _ window: DesktopWindow, occluders: [String], focusedWindowID: CGWindowID?, activeWindowID: CGWindowID? = nil, minimized: Bool
   ) -> [String: Any] {
     var payload: [String: Any] = [
       "id": String(window.windowNumber),
@@ -252,6 +252,7 @@ enum Windows {
       // Truthful now. This was hard-coded false, so `list-windows` reported a
       // desktop in which nothing at all was focused.
       "focused": window.windowNumber == focusedWindowID,
+      "active": window.windowNumber == activeWindowID,
       "minimized": minimized,
       "visible": window.onScreen,
       "stackingIndex": window.stackingIndex,
@@ -355,7 +356,16 @@ enum Windows {
       let layer = (entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
       // Layer 0 is the normal application-window layer. Anything above is a
       // panel/menu/overlay the agent must not treat as a target window.
-      if layer != 0 { continue }
+      if layer != 0 {
+        let allowedLayers: Set<Int> = [3, 8, 24, 25, 101]
+        guard allowedLayers.contains(layer),
+          let app = NSRunningApplication(processIdentifier: pid),
+          app.activationPolicy != .prohibited,
+          app.bundleIdentifier != "com.apple.loginwindow",
+          app.bundleIdentifier != "com.apple.systemuiserver",
+          app.bundleIdentifier != "com.apple.controlcenter",
+          app.bundleIdentifier != "com.apple.notificationcenterui" else { continue }
+      }
       if bounds.width < 1 || bounds.height < 1 { continue }
 
       let title = (entry[kCGWindowName as String] as? String) ?? ""

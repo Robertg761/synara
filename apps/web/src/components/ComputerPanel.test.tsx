@@ -181,3 +181,19 @@ describe("ComputerPanel", () => {
     expect(nested).not.toBe(visible);
   });
 });
+
+describe("desktop ownership", () => {
+  it("keeps Stop visible between tool calls and when another conversation owns the computer", () => {
+    const markup = render(
+      threadState({
+        agentActive: false,
+        controlledByOtherThread: true,
+        controlOwnerThreadId: "other-thread" as ThreadId,
+        controlOwnerLabel: "Research assistant",
+      }),
+    );
+    expect(markup).toContain("Research assistant");
+    expect(markup).toContain("Stop");
+    expect(markup).toContain("is controlling");
+  });
+});

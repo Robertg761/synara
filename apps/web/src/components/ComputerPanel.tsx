@@ -17,7 +17,7 @@ import {
 } from "../computerStateStore";
 import {
   clampComputerScrollDelta,
-  computerActionLabel,
+  computerActionStatusLabel,
   computerCanvasLabel,
   computerContainRect,
   computerCursorPosition,
@@ -30,11 +30,11 @@ import {
   computerViewportPointToDesktop,
   computerWheelScrollDelta,
   resolveComputerAvailabilityView,
-  resolveComputerHealthBadge,
   shouldSubscribeToComputerStream,
 } from "./ComputerPanel.logic";
 import { Badge } from "./ui/badge";
 import { createComputerInputQueue } from "./computer/computerInputQueue";
+import { ComputerStatusBadge } from "./computer/ComputerStatusBadge";
 import { useComputerImageStream } from "./computer/useComputerImageStream";
 import { DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
 import { Button } from "./ui/button";
@@ -80,7 +80,6 @@ export default function ComputerPanel(props: {
     return () => observer.disconnect();
   }, []);
 
-  const healthBadge = resolveComputerHealthBadge(threadState?.health);
   const availabilityView = resolveComputerAvailabilityView(
     threadState?.availability,
     threadState?.health,
@@ -115,7 +114,7 @@ export default function ComputerPanel(props: {
     containRect,
   });
   const lastAction = useComputerStateStore(selectThreadComputerAction(threadId));
-  const lastActionLabel = computerActionLabel(lastAction);
+  const lastActionLabel = computerActionStatusLabel(lastAction, threadState?.windows);
   // Shared with the chat-level banner so the two cannot disagree about whether
   // the machine is being driven, or about what stopping means.
   const desktopControl = useComputerDesktopControl(threadId);
@@ -320,7 +319,7 @@ export default function ComputerPanel(props: {
   // A delivery the desktop could not confirm is not an error — the input was
   // sent — so it never displaces one, and it reads as a caution rather than a
   // failure.
-  const noticeMessage = hasError ? "" : (inputWarning ?? "");
+  const noticeMessage = hasError ? "" : (inputWarning ?? computerDeliveryWarning(lastAction) ?? "");
   const hasNotice = noticeMessage.length > 0;
 
   const header = (
@@ -336,38 +335,11 @@ export default function ComputerPanel(props: {
           more than who was holding it, and this thread may still be reading a
           desktop another conversation drives, which is the more useful of those
           two facts. */}
-      {healthBadge ? (
-        <span
-          className={cn(
-            "flex shrink-0 items-center gap-1 text-[10px]",
-            healthBadge.tone === "danger"
-              ? "text-destructive"
-              : "text-amber-600 dark:text-amber-400",
-          )}
-          title={healthBadge.title}
-        >
-          <span
-            className={cn(
-              "size-1.5 rounded-full bg-current",
-              healthBadge.pulse && "animate-pulse motion-reduce:animate-none",
-            )}
-          />
-          {healthBadge.label}
-        </span>
-      ) : threadState?.controlledByOtherThread ? (
-        <span
-          className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground"
-          title="Only one conversation can drive the desktop at a time. This one can still watch it."
-        >
-          <span className="size-1.5 rounded-full bg-current" />
-          Another conversation is controlling
-        </span>
-      ) : agentActive ? (
-        <span className="flex shrink-0 items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400">
-          <span className="size-1.5 animate-pulse rounded-full bg-current motion-reduce:animate-none" />
-          {visibleDesktop ? "Agent controlling this computer" : "Agent controlling"}
-        </span>
-      ) : null}
+      <ComputerStatusBadge
+        state={threadState}
+        agentActive={agentActive}
+        visibleDesktop={visibleDesktop}
+      />
       <div className="ml-auto flex shrink-0 items-center gap-0.5">
         {stopControlLabel ? (
           <Button

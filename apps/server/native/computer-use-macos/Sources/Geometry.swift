@@ -51,6 +51,8 @@ enum Geometry {
 
   /// The union of every screen's frame, in global top-left points — the
   /// workspace the Node backend translates into its 0-based agent space.
+  static func displayFrames() -> [CGRect] { screens().displays.map { $0.frame } }
+
   static func workspaceRect() -> CGRect {
     screens().workspace
   }

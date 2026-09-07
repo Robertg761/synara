@@ -1,3 +1,4 @@
+import { assertDesktopOperationActive, desktopOperationSignal } from "./DesktopOperationQueue.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -912,6 +913,7 @@ export class MacComputerBackend implements ComputerBackend {
   async getState(options: {
     readonly includeScreenshot?: boolean;
     readonly includeTree?: boolean;
+    readonly windowId?: string;
   }): Promise<ComputerState> {
     const [windows, origin] = await this.readWindows();
     const screenSize = screenSizeFromWindows(windows, this.lastWorkspaceGlobal, this.screenScale);
@@ -924,7 +926,10 @@ export class MacComputerBackend implements ComputerBackend {
         ? // AX is an optional perception source: a window with no tree, a helper
           // restarting, or a missing Accessibility grant degrades to
           // windows-only rather than failing the state, as the KWin path does.
-          this.call(MAC_HELPER_METHODS.describeUi).catch(() => undefined)
+          this.call(
+            MAC_HELPER_METHODS.describeUi,
+            options.windowId ? { windowIds: [options.windowId] } : {},
+          ).catch(() => undefined)
         : undefined,
       options.includeScreenshot && this.captureGranted
         ? this.captureWorkspaceScreenshot(origin).catch(() => undefined)
@@ -938,7 +943,22 @@ export class MacComputerBackend implements ComputerBackend {
         // A tree this build cannot parse degrades the same way a missing one does.
       }
     }
+    const unavailableWindowIds = asRecord(asRecord(uiPayload).root).unavailableWindowIds;
     return {
+      ...(options.includeTree
+        ? {
+            accessibility: {
+              status: !root
+                ? ("unavailable" as const)
+                : root.truncated
+                  ? ("partial" as const)
+                  : ("complete" as const),
+              unavailableWindowIds: Array.isArray(unavailableWindowIds)
+                ? unavailableWindowIds.filter((id): id is string => typeof id === "string")
+                : [],
+            },
+          }
+        : {}),
       computerId: this.computerId,
       windows,
       screenSize,
@@ -1115,29 +1135,40 @@ export class MacComputerBackend implements ComputerBackend {
   private static deliveryReport(payload: unknown): ComputerBackendActionResult {
     const record = asRecord(payload);
     const deliveryPath = asString(record.path);
+    const windowId = asString(record.windowId);
     const reported = asString(record.verified);
     const verified =
       reported !== undefined && DELIVERY_VERIFICATIONS.has(reported)
         ? (reported as ComputerDeliveryVerification)
         : undefined;
     return {
+      ...(windowId !== undefined ? { windowId } : {}),
       ...(deliveryPath !== undefined ? { deliveryPath } : {}),
       ...(verified !== undefined ? { verified } : {}),
     };
   }
 
-  async typeText(text: string): Promise<ComputerBackendActionResult> {
-    const payload = await this.call(MAC_HELPER_METHODS.type, { text });
+  async typeText(text: string, windowId?: string): Promise<ComputerBackendActionResult> {
+    const payload = await this.call(MAC_HELPER_METHODS.type, {
+      text,
+      ...(windowId ? { windowId } : {}),
+    });
     return { value: text, ...MacComputerBackend.deliveryReport(payload) };
   }
 
-  async pressKey(key: string): Promise<ComputerBackendActionResult> {
-    const payload = await this.call(MAC_HELPER_METHODS.pressKey, { key });
+  async pressKey(key: string, windowId?: string): Promise<ComputerBackendActionResult> {
+    const payload = await this.call(MAC_HELPER_METHODS.pressKey, {
+      key,
+      ...(windowId ? { windowId } : {}),
+    });
     return MacComputerBackend.deliveryReport(payload);
   }
 
-  async hotkey(keys: readonly string[]): Promise<ComputerBackendActionResult> {
-    const payload = await this.call(MAC_HELPER_METHODS.hotkey, { keys: [...keys] });
+  async hotkey(keys: readonly string[], windowId?: string): Promise<ComputerBackendActionResult> {
+    const payload = await this.call(MAC_HELPER_METHODS.hotkey, {
+      keys: [...keys],
+      ...(windowId ? { windowId } : {}),
+    });
     return MacComputerBackend.deliveryReport(payload);
   }
 
@@ -1177,10 +1208,10 @@ export class MacComputerBackend implements ComputerBackend {
     if (address) {
       await this.call(MAC_HELPER_METHODS.setValue, { ...address, value });
     } else {
-      // No addressable AX node: focus the control with a click, then type — the
-      // same fallback the KWin path takes when AT-SPI cannot address a node.
-      await this.click(target.point);
-      await this.typeText(value);
+      // Clicking and typing cannot guarantee replacement of the old value.
+      throw new ComputerBackendError(
+        "Replacing a value requires an addressable accessibility control. Read the window state again, or explicitly select the text before typing.",
+      );
     }
     return {
       point: target.point,
@@ -1193,8 +1224,8 @@ export class MacComputerBackend implements ComputerBackend {
     target: ComputerResolvedTarget,
     action: string,
   ): Promise<ComputerBackendActionResult> {
-    if (action === "activate" || action === "click") {
-      const clicked = await this.click(target.point);
+    if ((action === "activate" || action === "click") && !this.writeAddress(target)) {
+      const clicked = await this.click(target.point, target.node.windowId ?? undefined);
       return {
         ...clicked,
         point: target.point,
@@ -1208,8 +1239,9 @@ export class MacComputerBackend implements ComputerBackend {
         `macOS computer action ${JSON.stringify(action)} needs an addressable accessibility node.`,
       );
     }
-    await this.call(MAC_HELPER_METHODS.performAction, { ...address, action });
+    const payload = await this.call(MAC_HELPER_METHODS.performAction, { ...address, action });
     return {
+      ...MacComputerBackend.deliveryReport(payload),
       point: target.point,
       ...(target.node.windowId ? { windowId: target.node.windowId } : {}),
       value: action,
@@ -1232,6 +1264,10 @@ export class MacComputerBackend implements ComputerBackend {
    * so a `computer_type_text` that names a window reaches it even when the last
    * pointer gesture aimed somewhere else.
    */
+  async clearFocusWindow(): Promise<void> {
+    await this.call("clear-focus-window");
+  }
+
   async focusWindow(windowId: string): Promise<void> {
     await this.call(MAC_HELPER_METHODS.focusWindow, { windowId });
   }
@@ -1317,11 +1353,23 @@ export class MacComputerBackend implements ComputerBackend {
 
   private writeAddress(
     target: ComputerResolvedTarget,
-  ): { readonly windowId: string; readonly nodePath: readonly number[] } | undefined {
+  ):
+    | {
+        readonly windowId: string;
+        readonly nodePath: readonly number[];
+        readonly accessibilityRoot?: "window" | "menu-bar" | "menu-bar-extra";
+      }
+    | undefined {
     const windowId = target.node.windowId;
     const nodePath = target.node.nodePath;
     if (!windowId || !nodePath || nodePath.length === 0) return undefined;
-    return { windowId, nodePath };
+    return {
+      windowId,
+      nodePath,
+      ...(target.node.accessibilityRoot
+        ? { accessibilityRoot: target.node.accessibilityRoot }
+        : {}),
+    };
   }
 
   private async pointerAction(
@@ -1744,9 +1792,11 @@ export class MacComputerBackend implements ComputerBackend {
    * cheap to respawn, so a timer loop earns nothing.
    */
   private async call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    assertDesktopOperationActive();
     const helper = await this.ensureHelper();
+    assertDesktopOperationActive();
     try {
-      return await helper.request(method, params);
+      return await helper.request(method, params, { signal: desktopOperationSignal() });
     } catch (error) {
       const record = asRecord(error);
       const code = typeof record.code === "string" ? record.code : "";

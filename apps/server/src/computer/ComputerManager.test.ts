@@ -439,7 +439,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
     const focusCalls = backend.callsFor("focusWindow").length;
     await expect(manager.typeText("thread-1", "9")).resolves.not.toHaveProperty("windowId");
     expect(backend.callsFor("focusWindow")).toHaveLength(focusCalls);
-    expect(backend.callsFor("clearFocusWindow")).toHaveLength(0);
+    expect(backend.callsFor("clearFocusWindow")).toHaveLength(1);
 
     // A stale id fails before any key is sent rather than typing into whatever
     // holds focus instead.
@@ -1383,7 +1383,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
-  it("reports an unchanged screen instead of resending identical pixels", async () => {
+  it("returns captures for the gateway to compare with delivered frames", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend, actionSettleMs: 0 });
 
@@ -1392,10 +1392,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
 
     // The fake returns the same PNG every time, which is exactly the live case
     // this exists for: an action the desktop did not visibly react to.
-    expect(await manager.captureActionScreenshot("fake-terminal")).toEqual({
-      screenshotUnchanged: true,
-      windowId: "fake-terminal",
-    });
+    expect(await manager.captureActionScreenshot("fake-terminal")).toHaveProperty("screenshot");
     // The capture still happens — the only thing skipped is sending the bytes.
     expect(backend.callsFor("captureScreenshot")).toHaveLength(2);
 
@@ -1424,10 +1421,9 @@ describe("ComputerManager and FakeComputerBackend", () => {
     expect(firstForB !== undefined && "screenshot" in firstForB).toBe(true);
 
     // The same thread repeating its own view is still a repeat.
-    expect(await manager.captureActionScreenshot("fake-terminal", undefined, "thread-b")).toEqual({
-      screenshotUnchanged: true,
-      windowId: "fake-terminal",
-    });
+    expect(
+      await manager.captureActionScreenshot("fake-terminal", undefined, "thread-b"),
+    ).toHaveProperty("screenshot");
 
     await manager.dispose();
   });
@@ -1441,7 +1437,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
 
     const first = await manager.captureActionScreenshot();
     expect(first !== undefined && "screenshot" in first).toBe(true);
-    expect(await manager.captureActionScreenshot()).toEqual({ screenshotUnchanged: true });
+    expect(await manager.captureActionScreenshot()).toHaveProperty("screenshot");
 
     backend.setScreenSize({ width: 1_280, height: 720, scale: 1 });
     const resized = await manager.captureActionScreenshot();
@@ -1619,7 +1615,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
     expect(second.result.scroll?.traveledY).toBe(0);
     // The after-capture is still the caller's observation, so a screen that did
     // not change comes back as the repeat it is rather than the same image.
-    expect(second.observation).toEqual({ screenshotUnchanged: true, windowId: "fake-calculator" });
+    expect(second.observation).toHaveProperty("screenshot");
     expect(measurements).toEqual([]);
 
     await manager.dispose();

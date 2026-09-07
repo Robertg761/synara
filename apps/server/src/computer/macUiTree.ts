@@ -116,6 +116,9 @@ function parseNode(
     onScreen: record.onScreen === false ? false : isOnScreen(frame, screenSize),
     windowId,
     ...(path ? { nodePath: [...path] } : {}),
+    ...(record.accessibilityRoot === "menu-bar" || record.accessibilityRoot === "menu-bar-extra"
+      ? { accessibilityRoot: record.accessibilityRoot }
+      : {}),
     ...(record.editable === true ? { editable: true } : {}),
     // The helper marks a node whose walk hit its budget. Dropping it here left
     // the agent unable to tell a partial subtree from a complete one.
