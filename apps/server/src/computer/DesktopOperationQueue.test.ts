@@ -117,3 +117,41 @@ it("does not retain a cancelled turn's signal in detached background work", asyn
   expect(await detached).toBeUndefined();
   await queue.close();
 });
+
+it("allows perception during input and waiting without releasing the input lane", async () => {
+  const queue = new DesktopOperationQueue();
+  const entered = deferred();
+  const held = deferred();
+  const input = queue.run(async () => {
+    entered.resolve();
+    await held.promise;
+  });
+  await entered.promise;
+  expect(await queue.read(async () => "desktop")).toBe("desktop");
+  let nextInputRan = false;
+  const next = queue.run(async () => {
+    nextInputRan = true;
+  });
+  await Promise.resolve();
+  expect(nextInputRan).toBe(false);
+  held.resolve();
+  await Promise.all([input, next]);
+  await queue.close();
+});
+
+it("cancels concurrent reads on shutdown and rejects later reads", async () => {
+  const queue = new DesktopOperationQueue();
+  const entered = deferred();
+  const reading = queue.read(async () => {
+    const signal = desktopOperationSignal()!;
+    entered.resolve();
+    await new Promise<void>((resolve) =>
+      signal.addEventListener("abort", () => resolve(), { once: true }),
+    );
+    expect(signal.aborted).toBe(true);
+  });
+  await entered.promise;
+  await queue.close();
+  await reading;
+  await expect(queue.read(async () => undefined)).rejects.toThrow("closed");
+});

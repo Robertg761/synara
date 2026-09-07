@@ -250,7 +250,7 @@ final class InputController {
     modifiers: [(code: CGKeyCode, flags: CGEventFlags)] = []
   ) throws -> PointerOutcome {
     try requireInputPermission()
-    let target = try aim(at: point, named: window)
+    let target = try aim(at: point, named: window, glide: false)
     // Same ladder the keyboard uses, and it now starts on the invisible rung for
     // every surface including web content: the focus prelude makes the target
     // window key as well as its app active, which is what a background Chromium
@@ -267,7 +267,10 @@ final class InputController {
     // Observed before the gesture so the background path can be checked. Only
     // meaningful on the invisible rung: the foreground rung is already the
     // fallback, so there is nothing to learn from it.
-    let watch = mode == .background ? DeliveryWatch(target: target, point: point) : nil
+    var watch: DeliveryWatch?
+    cursor.glide(to: point, window: target) {
+      if mode == .background { watch = DeliveryWatch(target: target, point: point) }
+    }
     var focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: mode)
     defer { focus.end() }
     // A throw between the down and the up would otherwise leave the target in a
@@ -490,9 +493,10 @@ final class InputController {
       // Chromium ignores a key posted to a pid whether or not its app is front,
       // so the visible flicker bought nothing.
       let valueBefore = Accessibility.focusedValue(in: target)
-      try withForeground(target) { try self.postForegroundText(text) }
+      var path = "foreground-keys"
+      try withForeground(target) { path = try self.postForegroundText(text, allowInsertion: mode != .foreground) }
       return TypeOutcome(
-        path: mode == .foreground ? "foreground" : "foreground-keys",
+        path: path,
         verified: try verifyText(text, reached: target, before: valueBefore))
     }
     // Rung 1: an accessibility insert into the focused text element. It lands
@@ -552,9 +556,10 @@ final class InputController {
     // mouse event, a key event on the foreground route has no pointer component, so
     // this cannot move the human's cursor; it only needs the target frontmost,
     // which `withForeground` arranges and then undoes.
-    try withForeground(target) { try self.postForegroundText(text) }
+    var path = "foreground-keys"
+    try withForeground(target) { path = try self.postForegroundText(text) }
     return TypeOutcome(
-      path: "foreground-keys", verified: try verifyText(text, reached: target, before: valueBefore))
+      path: path, verified: try verifyText(text, reached: target, before: valueBefore))
   }
 
   /// Whether the target's focused element gained `text`. Compared against the
@@ -593,7 +598,15 @@ final class InputController {
   /// attached so characters outside the ANSI table come through as themselves.
   ///
   /// Only meaningful while the target is frontmost, which the caller arranges.
-  private func postForegroundText(_ text: String) throws {
+  private func postForegroundText(_ text: String, allowInsertion: Bool = true) throws -> String {
+    // Native editable controls can accept one insertion without clipboard
+    // mutation or a per-character event stream. Web controls decline this path.
+    let target = try resolveKeyboardTarget()
+    try assertKeyboardWindow(target)
+    if let expected = foregroundKeyboardPID, SkyLight.frontmostPID() != expected {
+      throw RPCError(.notDelivered, "Input interrupted because the user switched applications.")
+    }
+    if allowInsertion, case .inserted = Accessibility.insertText(text, into: target) { return "foreground-ax-insert" }
     for character in text {
       let units = Array(String(character).utf16)
       // A character the tables cannot express has no keycode to send, and
@@ -616,6 +629,7 @@ final class InputController {
       }
       usleep(6_000)
     }
+    return "foreground-keys"
   }
 
   /// Hold Shift only in the target process, and retain its owner for unwind.
@@ -947,7 +961,7 @@ final class InputController {
       for target: DesktopWindow?, cursor: AgentCursor, controller: InputController,
       mode: DeliveryMode = .background
     ) -> Focus {
-      if let target {
+      if let target, !Accessibility.keyboardWindowMatches(target) {
         SkyLight.makeKeyWindow(pid: target.ownerPID, windowID: target.windowNumber)
         usleep(20_000)
       }
@@ -1112,7 +1126,7 @@ final class InputController {
   /// whatever happened to be over that coordinate — a click the agent asked to
   /// deliver to a closed window landing in the human's editor instead. An
   /// unresolvable target is the caller's cue to re-read the window list.
-  private func aim(at point: CGPoint, named: CGWindowID? = nil) throws -> DesktopWindow? {
+  private func aim(at point: CGPoint, named: CGWindowID? = nil, glide: Bool = true) throws -> DesktopWindow? {
     let target: DesktopWindow?
     if let named {
       guard let namedTarget = Windows.window(withNumber: named) else {
@@ -1124,7 +1138,7 @@ final class InputController {
     }
     // Resolve before moving so the overlay has the same window as the input.
     // The bounded glide waits for the picture to arrive before posting events.
-    cursor.glide(to: point, window: target)
+    if glide { cursor.glide(to: point, window: target) }
     setKeyboardTarget(target)
     return target
   }
@@ -1192,12 +1206,16 @@ final class InputController {
     /// that went nowhere, and only that may cost a duplicate click.
     func observe() -> Verification {
       guard let probe, let expected else { return .unverifiable }
-      defer { probe.restore() }
-      // Give the app a beat to process the events it was just sent.
-      usleep(120_000)
-      guard let after = probe.focusedSignature() else { return .unverifiable }
-      if after == expected { return .confirmed }
-      return after == focusedBefore ? .unconfirmed : .unverifiable
+      // A changed focus can confirm delivery immediately. Keep the entire
+      // original grace before declaring failure, since failure replays a click.
+      let deadline = DispatchTime.now() + .milliseconds(120)
+      repeat {
+        guard let after = probe.focusedSignature() else { return .unverifiable }
+        if after == expected { return .confirmed }
+        if after != focusedBefore { return .unverifiable }
+        if DispatchTime.now() >= deadline { return .unconfirmed }
+        usleep(10_000)
+      } while true
     }
 
     /// A second look, with a fresh budget, after an escalated replay.

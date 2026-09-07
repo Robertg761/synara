@@ -50,7 +50,11 @@ import {
 } from "../computer/screenshotFrames.ts";
 import { PROVIDERS_WITHOUT_APPROVAL_GATE } from "./approvalGate.ts";
 import { DELIVERY_VERDICT_GUIDANCE } from "./computerGuidance.ts";
-import { mcpToolResultError, mcpToolResultJson, type McpToolCallResult } from "./protocol.ts";
+import {
+  mcpToolResultError,
+  mcpToolResultJson as formatToolResultJson,
+  type McpToolCallResult,
+} from "./protocol.ts";
 import {
   ToolInputError,
   errorText,
@@ -250,7 +254,7 @@ const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
   include_screenshot: {
     type: "boolean",
     description:
-      "Attach the post-action screenshot to the result. Defaults to true. Pass false only when another action follows in this same response and you will read that action's screenshot instead. Never pass false on the last action before you need to see the result: skipping it and then calling computer_screenshot costs the extra round trip the attached screenshot exists to avoid.",
+      "Attach an observation, default true. Skip only intermediate actions. Never pass false on the last action before inspecting its result.",
   },
 } as const;
 
@@ -285,7 +289,7 @@ function keyboardTargetProperty(): Record<string, unknown> {
     window_id: {
       type: "string",
       description:
-        "Optional window id from computer_list_windows. The window is raised and given the agent seat's keyboard focus before the keys are sent, and the result's screenshot is zoomed to it.",
+        "Window id to aim keyboard input at. The window is raised and focused. Defaults to the last aimed window.",
     },
   };
 }
@@ -303,7 +307,7 @@ const MODIFIERS_PROPERTY = {
     items: { type: "string", enum: ["ctrl", "alt", "shift", "meta"] },
     maxItems: COMPUTER_MODIFIERS_MAX_ITEMS,
     description:
-      'Modifier keys held down for the duration of this gesture and released after it — how shift-click extends a selection, ctrl-click (cmd-click on macOS: pass "meta") adds to one, and ctrl-scroll zooms. Omit it for a plain gesture. computer_hotkey cannot express this: it releases its keys before the gesture happens.',
+      "Keys held during this gesture. On macOS, meta is Command. Omit for an unmodified gesture.",
   },
 } as const;
 
@@ -320,27 +324,23 @@ function withActionScreenshotSchema(schema: Record<string, unknown>): Record<str
 const SCREENSHOT_ID_PROPERTY = {
   screenshot_id: {
     type: "string",
-    description:
-      "screenshotId of the screenshot that x/y (and any region) are measured in. Defaults to the most recent screenshot this conversation received. Pass it only when pointing into an earlier screenshot that is still valid, such as a workspace overview taken just before a zoomed window capture.",
+    description: "Coordinate frame id. Defaults to this conversation's latest screenshot.",
   },
 } as const;
 
 const TARGET_PROPERTIES = {
   x: {
     type: "number",
-    description:
-      "X pixel coordinate in the screenshot (the most recent one, or the one named by screenshot_id), measured from its left edge.",
+    description: "X pixel from the screenshot's left edge.",
   },
   y: {
     type: "number",
-    description:
-      "Y pixel coordinate in the screenshot (the most recent one, or the one named by screenshot_id), measured from its top edge.",
+    description: "Y pixel from the screenshot's top edge.",
   },
   ...SCREENSHOT_ID_PROPERTY,
   label: {
     type: "string",
-    description:
-      "Accessible label to resolve from a fresh UI snapshot — use the exact label from computer_get_state's elements list. Matched verbatim, including leading and trailing spaces, so copy it as printed rather than tidying it.",
+    description: "Exact accessible label from computer_get_state, including whitespace.",
   },
   role: { type: "string", description: "Optional accessible role used to disambiguate a label." },
 } as const;
@@ -759,7 +759,7 @@ function withSetupNoteInText(text: string, note: string): string {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return `${text}\n\n${note}`;
   }
-  return JSON.stringify({ ...(parsed as Record<string, unknown>), setupRequired: note }, null, 2);
+  return JSON.stringify({ ...(parsed as Record<string, unknown>), setupRequired: note });
 }
 
 export function makeAgentGatewayComputerTools(
@@ -793,18 +793,14 @@ export function makeAgentGatewayComputerTools(
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              ...payload,
-              screenshot: {
-                ...(frame ? { screenshotId: frame.id } : {}),
-                ...(windowId !== undefined ? { windowId } : {}),
-                ...metadata,
-              },
+          text: JSON.stringify({
+            ...payload,
+            screenshot: {
+              ...(frame ? { screenshotId: frame.id } : {}),
+              ...(windowId !== undefined ? { windowId } : {}),
+              ...metadata,
             },
-            null,
-            2,
-          ),
+          }),
         },
         { type: "image", data: bytesBase64, mimeType: "image/png" },
       ],
@@ -894,7 +890,17 @@ export function makeAgentGatewayComputerTools(
           // desktop, and the badge has to name this thread from the first
           // action rather than from the second.
           manager.setThreadLabel(context.callerThreadId, context.callerThreadLabel);
-          const value = await manager.withAgentActivity(
+          const readOnly = [
+            "computer_get_state",
+            "computer_screenshot",
+            "computer_list_windows",
+            "computer_get_screen_size",
+            "computer_wait",
+          ].includes(name);
+          const withActivity = readOnly
+            ? manager.withAgentReadActivity.bind(manager)
+            : manager.withAgentActivity.bind(manager);
+          const value = await withActivity(
             context.callerThreadId,
             async () => {
               await Effect.runPromise(context.assertCallerTurnActive(), { signal: abortSignal });
@@ -1711,4 +1717,8 @@ function dragLimitNote(dialect: ComputerAgentDialect): string {
   return dialect === "macos"
     ? "Dragging into a browser or Electron window is best effort on this desktop and is not verified, so check the result with computer_screenshot rather than assuming the drop landed."
     : "This desktop injects the drag at screen coordinates, so it works for anything the pointer can sweep — selecting text, moving a slider — but cross-application drag-and-drop and dragging a window by its titlebar are handled by the compositor and may not follow. Check the result with computer_screenshot rather than assuming the drop landed.";
+}
+
+function mcpToolResultJson(value: unknown): McpToolCallResult {
+  return formatToolResultJson(value, true);
 }

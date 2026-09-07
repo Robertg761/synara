@@ -14,7 +14,7 @@ interface Harness {
 }
 
 function makePublisher(
-  capture: () => Promise<Uint8Array | undefined>,
+  capture: (force: boolean) => Promise<Uint8Array | undefined>,
   options: { readonly captureAvailable?: () => boolean; readonly intervalMs?: number } = {},
 ): Harness {
   const frames: ComputerStreamFrame[] = [];
@@ -24,9 +24,9 @@ function makePublisher(
     observed,
     captures: 0,
     publisher: new StillFramePublisher({
-      capture: async () => {
+      capture: async (force) => {
         harness.captures += 1;
-        return await capture();
+        return await capture(force);
       },
       isCaptureAvailable: options.captureAvailable ?? (() => true),
       emit: (frame) => observed.push(frame),
@@ -57,6 +57,25 @@ describe("StillFramePublisher", () => {
     bytes = FRAME_B;
     await harness.publisher.publish();
     expect(harness.frames).toHaveLength(3);
+    await harness.publisher.detach();
+  });
+
+  it("passes keyframe force to native deduplication after idle ticks and reattach", async () => {
+    const forces: boolean[] = [];
+    const harness = makePublisher(async (force) => {
+      forces.push(force);
+      return force ? FRAME_A : undefined;
+    });
+    await harness.publisher.attach((frame) => harness.frames.push(frame));
+    await harness.publisher.publish();
+    await harness.publisher.publish();
+    expect(harness.frames).toHaveLength(1);
+    await harness.publisher.requestKeyframe();
+    expect(harness.frames).toHaveLength(2);
+    await harness.publisher.detach();
+    await harness.publisher.attach((frame) => harness.frames.push(frame));
+    expect(harness.frames).toHaveLength(3);
+    expect(forces).toEqual([true, false, false, true, true]);
     await harness.publisher.detach();
   });
 

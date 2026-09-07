@@ -368,3 +368,27 @@ describe("ScrollGearingStore", () => {
     expect(store.gearing("w2")).toBe(7);
   });
 });
+
+it("yields while reconstructing large captures and reuses an intermediate decode", async () => {
+  const bytes = grayPng(1536, 960, noise(1536, 960, 42));
+  let turns = 0;
+  let running = true;
+  const tick = () => {
+    if (running) {
+      turns += 1;
+      setImmediate(tick);
+    }
+  };
+  setImmediate(tick);
+  try {
+    const first = decodePngLuma(bytes);
+    expect(decodePngLuma(bytes)).toBe(first);
+    const image = await first;
+    expect(image?.width).toBe(1536);
+    // Inflation alone yields once. Scanline reconstruction must yield repeatedly.
+    expect(turns).toBeGreaterThan(10);
+    expect(await decodePngLuma(bytes)).toBe(image);
+  } finally {
+    running = false;
+  }
+});

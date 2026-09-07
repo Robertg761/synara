@@ -818,7 +818,12 @@ describe("MacComputerBackend", () => {
   it("writes a value through the accessibility node path when one is addressable", async () => {
     const helper = new FakeMacHelper({ "set-value": { ok: true } });
     const backend = makeBackend(helper);
-    await backend.setValue(resolvedTarget({ windowId: "5", nodePath: [1, 3] }), "hello");
+    const result = await backend.setValue(
+      resolvedTarget({ windowId: "5", nodePath: [1, 3] }),
+      "hello",
+    );
+    expect(result).toMatchObject({ textLength: 5 });
+    expect(result).not.toHaveProperty("value");
     expect(helper.callsFor("set-value")[0]).toEqual({
       windowId: "5",
       nodePath: [1, 3],
@@ -860,7 +865,7 @@ describe("MacComputerBackend", () => {
 
     // The backend keeps both halves...
     expect(result).toMatchObject({
-      value: "hello",
+      textLength: 5,
       deliveryPath: "keystrokes",
       verified: "unconfirmed",
     });
@@ -899,7 +904,7 @@ describe("MacComputerBackend", () => {
     });
     const backend = makeBackend(helper);
     const result = await backend.typeText("hello");
-    expect(result).toMatchObject({ value: "hello", deliveryPath: "keystrokes" });
+    expect(result).toMatchObject({ textLength: 5, deliveryPath: "keystrokes" });
     expect(result).not.toHaveProperty("verified");
     expect(computerBackendActionResult("mac", "computer_type_text", result)).not.toHaveProperty(
       "delivery",
@@ -1205,6 +1210,80 @@ describe("MacComputerBackend", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("skips native unchanged responses and forces initial, requested, and reattached frames", async () => {
+    vi.useFakeTimers();
+    const helper = new FakeMacHelper({
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      capture: (params: Record<string, unknown>) =>
+        params.deduplicate && !params.force
+          ? { unchanged: true, base64: null }
+          : { base64: PNG_1X1, region: { x: 0, y: 0, width: 100, height: 100 } },
+    });
+    const backend = makeBackend(helper, { stillIntervalMs: 100 });
+    try {
+      const frames: ComputerStreamFrame[] = [];
+      await backend.attachStream((frame) => frames.push(frame));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(frames).toHaveLength(1);
+      expect(helper.callsFor("capture")[0]).toMatchObject({ deduplicate: true, force: true });
+      expect(helper.callsFor("capture")[1]).toMatchObject({ deduplicate: true, force: false });
+      await backend.requestKeyframe();
+      expect(frames).toHaveLength(2);
+      const shot = await backend.captureScreenshot({ kind: "window", windowId: "5" });
+      expect(shot.mimeType).toBe("image/png");
+      expect(helper.callsFor("capture").at(-1)).not.toHaveProperty("deduplicate");
+      await backend.detachStream();
+      await backend.attachStream((frame) => frames.push(frame));
+      expect(frames).toHaveLength(3);
+    } finally {
+      await backend.detachStream();
+      vi.useRealTimers();
+    }
+  });
+
+  it("defers ordinary still ticks during action capture but serves requested keyframes", async () => {
+    vi.useFakeTimers();
+    let finishCapture!: (value: unknown) => void;
+    const helper = new FakeMacHelper({
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      capture: (params: Record<string, unknown>) =>
+        params.kind === "window"
+          ? new Promise((resolve) => {
+              finishCapture = resolve;
+            })
+          : { base64: PNG_1X1 },
+    });
+    const backend = makeBackend(helper, { stillIntervalMs: 100 });
+    try {
+      await backend.attachStream(() => {});
+      const pending = backend.captureScreenshot({ kind: "window", windowId: "5" });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(helper.callsFor("capture")).toHaveLength(2);
+      await backend.requestKeyframe();
+      expect(helper.callsFor("capture")).toHaveLength(3);
+      finishCapture({ base64: PNG_1X1, region: { x: 0, y: 0, width: 100, height: 100 } });
+      await pending;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(helper.callsFor("capture")).toHaveLength(4);
+    } finally {
+      await backend.detachStream();
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses authoritative window capture geometry without another window inventory", async () => {
+    const helper = new FakeMacHelper({
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      capture: { base64: PNG_1X1, region: { x: 200, y: 150, width: 400, height: 500 } },
+    });
+    const backend = makeBackend(helper);
+    await backend.listWindows();
+    const count = helper.callsFor("list-windows").length;
+    await backend.captureScreenshot({ kind: "window", windowId: "5" });
+    await backend.captureScreenshot({ kind: "window", windowId: "5" });
+    expect(helper.callsFor("list-windows")).toHaveLength(count);
   });
 
   it("drops capture health when a capture is refused for a missing grant", async () => {

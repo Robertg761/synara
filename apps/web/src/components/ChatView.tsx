@@ -393,7 +393,7 @@ import {
   useComposerThreadDraft,
   useEffectiveComposerModelState,
 } from "../composerDraftStore";
-import { selectThreadComputerState, useComputerStateStore } from "../computerStateStore";
+import { useThreadComputerAvailability } from "../computerStateStore";
 import { useTemporaryThreadStore } from "../temporaryThreadStore";
 import { useComposerFocusRequestStore } from "../composerFocusRequestStore";
 import { useWorkflowRunUiStore, useWorkflowRunUiThreadState } from "../workflowRunUiStore";
@@ -1915,8 +1915,8 @@ export default function ChatView({
   // The computer-control toggle needs availability before the Computer pane has
   // ever been opened, so the composer seeds the snapshot itself.
   useThreadComputerStateSeed(threadId);
-  const computerThreadState = useComputerStateStore(selectThreadComputerState(threadId));
-  const computerControlAvailable = computerThreadState?.availability.kind === "available";
+  const computerAvailability = useThreadComputerAvailability(threadId);
+  const computerControlAvailable = computerAvailability?.kind === "available";
   // New chats follow the default even while permission setup is pending.
   // First send records the choice; existing chats keep their saved override.
   // `latestTurn` is in the shell, so this does not wait for message hydration.
@@ -1925,15 +1925,15 @@ export default function ChatView({
     (activeThread.latestTurn !== null || activeThread.messages.length > 0);
   const enableComputerControl = resolveEffectiveComputerControl({
     draftOverride: composerDraft.enableComputerControl,
-    availability: computerThreadState?.availability,
+    availability: computerAvailability,
     allowInNewChats: settings.allowComputerControlInNewChats,
     chatHasTurns,
   });
-  const computerControlDisabledReason = computerThreadState
-    ? computerThreadState.availability.kind === "unsupported-platform"
+  const computerControlDisabledReason = computerAvailability
+    ? computerAvailability.kind === "unsupported-platform"
       ? "No computer backend is available on this server."
-      : computerThreadState.availability.kind === "backend-unavailable"
-        ? computerThreadState.availability.message
+      : computerAvailability.kind === "backend-unavailable"
+        ? computerAvailability.message
         : undefined
     : "Checking computer availability.";
   // Local threads reconcile their stored branch to the shared checkout as soon as the
@@ -5140,10 +5140,11 @@ export default function ChatView({
   // goes back to the agent.
   const handleEnableComputerControlFromDenial = useCallback(() => {
     handleComputerControlChange(true);
-    if (prompt.trim().length === 0) {
-      setPrompt("Computer control is on now — try again.");
+    if (promptRef.current.trim().length === 0) {
+      promptRef.current = "Computer control is on now. Try again.";
+      setPrompt(promptRef.current);
     }
-  }, [handleComputerControlChange, prompt, setPrompt]);
+  }, [handleComputerControlChange, setPrompt]);
 
   useEffect(() => {
     if (
@@ -11538,7 +11539,7 @@ export default function ChatView({
     onRuntimeModeChange: handleRuntimeModeChange,
     computerControlEnabled: enableComputerControl,
     computerControlAvailable,
-    computerControlSupported: computerThreadState?.availability.kind !== "unsupported-platform",
+    computerControlSupported: computerAvailability?.kind !== "unsupported-platform",
     computerControlDisabledReason,
     onComputerControlChange: handleComputerControlChange,
     contextWindow: runtimeUsageContextWindow,

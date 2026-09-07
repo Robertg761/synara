@@ -889,6 +889,7 @@ export const ComputerActionResult = Schema.Struct({
   clampedTo: Schema.optional(ComputerPoint),
   windowId: Schema.optional(ComputerWindowId),
   value: Schema.optional(Schema.String.check(Schema.isMaxLength(COMPUTER_TEXT_MAX_LENGTH))),
+  textLength: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   /**
    * Scroll telemetry: what was asked, what was injected after gearing
    * correction, and what the window content measurably did. `traveledY` is in

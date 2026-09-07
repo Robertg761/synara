@@ -1944,3 +1944,35 @@ describe("computer operation ordering", () => {
     }
   });
 });
+
+it("allows pane input while computer_wait is pending", async () => {
+  const { manager, call } = await setup();
+  try {
+    let waited = false;
+    const waiting = call("computer_wait", { duration_ms: 250 }).then((result) => {
+      waited = true;
+      return result;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await manager.typeText(undefined, "human input");
+    expect(waited).toBe(false);
+    expect((await waiting).isError).not.toBe(true);
+  } finally {
+    await manager.dispose();
+  }
+});
+
+it("keeps computer metadata compact and tool schemas below the audit baseline", async () => {
+  const { manager, tools, call } = await setup(
+    Object.assign(new FakeComputerBackend(), { agentDialect: "macos" as const }),
+  );
+  try {
+    expect(JSON.stringify(tools.map((tool) => tool.definition)).length).toBeLessThan(42_000);
+    const result = await call("computer_get_screen_size", {});
+    const text = result.content.find((part) => part.type === "text");
+    expect(text?.type).toBe("text");
+    if (text?.type === "text") expect(text.text).toBe(JSON.stringify(JSON.parse(text.text)));
+  } finally {
+    await manager.dispose();
+  }
+});

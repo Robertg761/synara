@@ -377,10 +377,11 @@ final class AgentCursor {
   /// that eventually signals the semaphore. Called *on* the main thread it
   /// degrades to `move`, because waiting there would deadlock against the
   /// display link.
-  func glide(to global: CGPoint, window: DesktopWindow?) {
+  func glide(to global: CGPoint, window: DesktopWindow?, whileMoving: () -> Void = {}) {
     guard !Thread.isMainThread else {
       targetWindow = window
       retarget(to: global)
+      whileMoving()
       return
     }
     let arrival = DispatchSemaphore(value: 0)
@@ -391,7 +392,9 @@ final class AgentCursor {
       self.targetWindow = window
       self.retarget(to: global)
     }
-    _ = arrival.wait(timeout: .now() + Self.maximumGlideWait)
+    let deadline = DispatchTime.now() + Self.maximumGlideWait
+    whileMoving()
+    _ = arrival.wait(timeout: deadline)
   }
 
   /// Re-order the overlay above its target without moving it. Changing another app's
@@ -626,25 +629,32 @@ final class AgentCursor {
   }
 
   /// Keep the cursor in the target's stacking position, never globally on top.
-  /// Query only that window: the cursor does not need accessibility or the full
-  /// desktop tree. If it closes, minimizes or leaves the active Space, order out
+  /// Compare WindowServer stacking without accessibility traversal. If it closes, minimizes or leaves the active Space, order out
   /// without ending ownership; it can reappear when that same target returns.
   private func presentAboveTarget() {
     guard !hidden, let window else { return }
     guard let targetWindow,
-      let entries = CGWindowListCopyWindowInfo(.optionIncludingWindow, targetWindow.windowNumber)
+      let entries = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID)
         as? [[String: Any]],
-      let entry = entries.first,
-      (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == targetWindow.ownerPID
+      let targetIndex = entries.firstIndex(where: {
+        ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == targetWindow.windowNumber
+      })
     else {
       window.orderOut(nil)
       return
     }
-    guard (entry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true else {
+    let entry = entries[targetIndex]
+    guard (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == targetWindow.ownerPID,
+      (entry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true else {
       window.orderOut(nil)
       return
     }
-    window.order(.above, relativeTo: Int(targetWindow.windowNumber))
+    // The full stacking snapshot lets an idle cursor avoid reordering itself
+    // every 100ms while still following actual restacks by the human.
+    let cursorIndex = entries.firstIndex { ($0[kCGWindowNumber as String] as? NSNumber)?.intValue == window.windowNumber }
+    if cursorIndex != targetIndex - 1 {
+      window.order(.above, relativeTo: Int(targetWindow.windowNumber))
+    }
   }
 
   /// Follow user restacking and minimize/restore changes even while the model

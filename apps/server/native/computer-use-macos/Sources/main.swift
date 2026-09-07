@@ -147,12 +147,14 @@ func handle(method: String, params: Params) throws -> Any {
       guard let rect = params.rect("region") else {
         throw RPCError(.invalidParams, "region capture needs a {x,y,width,height} rect")
       }
-      result = try Capture.region(rect, maxDimension: maxDimension, prefer: prefer)
+      result = try Capture.region(rect, maxDimension: maxDimension, prefer: prefer,
+        deduplicate: params.raw["deduplicate"] as? Bool == true, force: params.raw["force"] as? Bool == true)
     default:
       throw RPCError(.invalidParams, "capture kind must be 'window' or 'region'")
     }
     return [
-      "base64": result.pngBase64,
+      "base64": result.pngBase64 as Any? ?? NSNull(),
+      "unchanged": result.pngBase64 == nil,
       "region": Geometry.rectDictionary(result.region),
       // Which link of the capture chain served this, so the backend can track
       // the fallback rate as a health metric.

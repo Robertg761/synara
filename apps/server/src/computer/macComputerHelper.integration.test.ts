@@ -289,4 +289,45 @@ describe.skipIf(!enabled)("macOS computer-use helper (perception only)", () => {
       expect(["screencapturekit", "screencapture"]).toContain(String(payload.source));
     },
   );
+  it.skipIf(!hostCanCaptureScreen())(
+    "forces complete PNGs after native still deduplication",
+    async () => {
+      const workspace = (await perceive(MAC_HELPER_METHODS.screenSize)) as Record<string, number>;
+      const params = {
+        kind: "region",
+        region: { x: workspace.x ?? 0, y: workspace.y ?? 0, width: 200, height: 200 },
+        maxDimension: 128,
+        deduplicate: true,
+      };
+      const first = (await perceiveIfGranted(MAC_HELPER_METHODS.capture, {
+        ...params,
+        force: true,
+      })) as Record<string, unknown> | null;
+      if (!first) return;
+      expect(first.unchanged).toBe(false);
+      expect(
+        readPngDimensions(Buffer.from(String(first.base64), "base64"), {
+          source: "native keyframe",
+        }).width,
+      ).toBeGreaterThan(0);
+      const next = (await perceive(MAC_HELPER_METHODS.capture, {
+        ...params,
+        force: false,
+      })) as Record<string, unknown>;
+      // The real desktop may animate between captures. Either answer is valid,
+      // but unchanged must not carry an encoded image.
+      if (next.unchanged === true) expect(next.base64).toBeNull();
+      else expect(next.base64).toBeTypeOf("string");
+      const forced = (await perceive(MAC_HELPER_METHODS.capture, {
+        ...params,
+        force: true,
+      })) as Record<string, unknown>;
+      expect(forced.unchanged).toBe(false);
+      expect(
+        readPngDimensions(Buffer.from(String(forced.base64), "base64"), {
+          source: "native forced keyframe",
+        }).width,
+      ).toBeGreaterThan(0);
+    },
+  );
 });

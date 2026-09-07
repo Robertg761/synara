@@ -45,7 +45,7 @@ enum Capability {
       // Which private WindowServer entry points resolved on this OS: the
       // background focus prelude and window-local stamping depend on them.
       "skylight": SkyLight.report(),
-      "signature": signature(),
+      "signature": processSignature,
       "protocolVersion": 1,
     ]
   }
@@ -60,6 +60,8 @@ enum Capability {
    * cannot be read reports "signed": telling a release user to reset their TCC
    * database is worse than saying nothing.
    */
+  private static let processSignature = signature()
+
   private static func signature() -> String {
     var code: SecCode?
     guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return "signed" }

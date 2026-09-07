@@ -11,6 +11,7 @@
  * Everything here is pure: PNG in, numbers out. The manager owns the captures
  * and the injection; this module owns the arithmetic.
  */
+import { setImmediate as yieldToIO } from "node:timers/promises";
 import { inflate } from "node:zlib";
 import { promisify } from "node:util";
 
@@ -45,12 +46,15 @@ const CHANNELS_BY_COLOR_TYPE = new Map<number, number>([
  * already been delivered, so a decode surprise must degrade to "distance
  * unknown" rather than turn a scroll that happened into a failed tool call.
  */
-export async function decodePngLuma(bytes: Uint8Array): Promise<LumaImage | undefined> {
-  try {
-    return await decodePng(bytes);
-  } catch {
-    return undefined;
+const decodedCaptures = new WeakMap<Uint8Array, Promise<LumaImage | undefined>>();
+
+export function decodePngLuma(bytes: Uint8Array): Promise<LumaImage | undefined> {
+  let decoded = decodedCaptures.get(bytes);
+  if (!decoded) {
+    decoded = decodePng(bytes).catch(() => undefined);
+    decodedCaptures.set(bytes, decoded);
   }
+  return decoded;
 }
 
 async function decodePng(bytes: Uint8Array): Promise<LumaImage | undefined> {
@@ -118,12 +122,12 @@ function concat(parts: readonly Uint8Array[], totalBytes: number): Uint8Array {
  * emitting luma as it goes. The previous row is kept unfiltered because every
  * filter but None and Sub refers back to it.
  */
-function unfilterToLuma(
+async function unfilterToLuma(
   raw: Uint8Array,
   width: number,
   height: number,
   channels: number,
-): LumaImage | undefined {
+): Promise<LumaImage | undefined> {
   const stride = width * channels;
   if (raw.length < (stride + 1) * height) return undefined;
   const luma = new Uint8Array(width * height);
@@ -132,6 +136,8 @@ function unfilterToLuma(
   let at = 0;
 
   for (let row = 0; row < height; row += 1) {
+    // Bound reconstruction slices so RPC and stream work can run between them.
+    if (row > 0 && row % Math.max(1, Math.floor(65536 / stride)) === 0) await yieldToIO();
     const filter = raw[at]!;
     at += 1;
     current.set(raw.subarray(at, at + stride));

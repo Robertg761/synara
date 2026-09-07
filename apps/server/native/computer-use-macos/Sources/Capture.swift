@@ -19,7 +19,7 @@
 // macOS 12.3–13.x, where `SCScreenshotManager` does not exist.
 //
 // Reliability rules from the reference, all here: a warm `SCShareableContent`
-// cache (~2 s TTL) so the hot path skips the call that can hang; a single-flight
+// cache (10 s TTL, invalidated by desktop geometry changes) so the hot path skips the call that can hang; a single-flight
 // gate so a hung call can never leak more than the one thread already inside it
 // (the permit is released by the completion handler, never by a timed-out
 // waiter, so every later caller fails fast to the fallback instead of piling
@@ -32,6 +32,7 @@
 // pixel dimensions proportional to the region, which is what the width/height
 // computation below guarantees.
 
+import CryptoKit
 import CoreGraphics
 import CoreVideo
 import Dispatch
@@ -48,7 +49,7 @@ enum Capture {
   }
 
   struct Result {
-    let pngBase64: String
+    let pngBase64: String?
     let region: CGRect
     let source: Source
   }
@@ -61,14 +62,12 @@ enum Capture {
   /// integers — `Int(1e30)` is a trapping conversion, so a region far off the
   /// desktop used to abort the helper outright and take every other in-flight
   /// action with it.
-  static func region(_ requested: CGRect, maxDimension: Int, prefer: Source?) throws -> Result {
+  static func region(_ requested: CGRect, maxDimension: Int, prefer: Source?, deduplicate: Bool = false, force: Bool = false) throws -> Result {
     let rect = try Geometry.clampRectToWorkspace(requested)
     if prefer != .screencapture, #available(macOS 14.0, *) {
       if let capture = captureRegionWithSCK(rect, maxDimension: maxDimension) {
-        return Result(
-          pngBase64: capture.png.base64EncodedString(),
-          region: capture.region,
-          source: .screenCaptureKit)
+        return try encode(capture.image, region: capture.region, source: .screenCaptureKit,
+          deduplicate: deduplicate, force: force)
       }
     }
     let size = outputPixelSize(points: rect.size, scale: Geometry.scaleFactor(for: rect), maxDimension: maxDimension)
@@ -86,21 +85,17 @@ enum Capture {
       guard abs(covered.width - tile.width) <= 1, abs(covered.height - tile.height) <= 1 else {
         throw RPCError(.internalError, "The fallback screenshot did not cover the requested display region")
       }
-      let png = try maskHostWindows(raw, region: covered)
-      guard let source = CGImageSourceCreateWithData(png as CFData, nil),
-        let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-        throw RPCError(.internalError, "Could not decode the display screenshot")
-      }
+      let image = try maskHostWindows(raw, region: covered)
       canvas.draw(image, covering: covered)
       captured = true
     }
-    guard captured, let image = canvas.image(), let png = pngData(image) else {
+    guard captured, let image = canvas.image() else {
       throw RPCError(.internalError, "No display intersects the screenshot region")
     }
-    return Result(pngBase64: png.base64EncodedString(), region: rect, source: .screencapture)
+    return try encode(image, region: rect, source: .screencapture, deduplicate: deduplicate, force: force)
   }
 
-  private static func maskHostWindows(_ png: Data, region: CGRect) throws -> Data {
+  private static func maskHostWindows(_ png: Data, region: CGRect) throws -> CGImage {
     guard let source = CGImageSourceCreateWithData(png as CFData, nil),
       let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
       let canvas = CaptureCanvas(region: region, width: image.width, height: image.height),
@@ -113,10 +108,10 @@ enum Capture {
         let frame = CGRect(dictionaryRepresentation: raw as CFDictionary) else { continue }
       canvas.mask(frame)
     }
-    guard let masked = canvas.image(), let encoded = pngData(masked) else {
+    guard let masked = canvas.image() else {
       throw RPCError(.internalError, "Could not encode the masked screenshot")
     }
-    return encoded
+    return masked
   }
 
   /// Capture one window by its `CGWindowID`. The returned region is the window's
@@ -233,16 +228,18 @@ enum Capture {
 
   @available(macOS 14.0, *)
   private static func captureRegionWithSCK(_ rect: CGRect, maxDimension: Int)
-    -> (png: Data, region: CGRect)?
+    -> (image: CGImage, region: CGRect)?
   {
     guard rect.width >= 1, rect.height >= 1, let content = shareableContent() else { return nil }
 
     let size = outputPixelSize(points: rect.size, scale: Geometry.scaleFactor(for: rect), maxDimension: maxDimension)
-    guard let canvas = CaptureCanvas(region: rect, width: size.width, height: size.height) else { return nil }
     let scaleX = CGFloat(size.width) / rect.width
     let scaleY = CGFloat(size.height) / rect.height
     let exclusions = hostWindows(in: content)
-    var captured = false
+    // Submit independent display captures together; share one deadline and
+    // never draw concurrently into the composition canvas.
+    var captures: [(rect: CGRect, box: Box<CGImage?>, done: DispatchSemaphore)] = []
+    let deadline = DispatchTime.now() + captureDeadlineSeconds
     for display in content.displays {
       let bounds = CGDisplayBounds(display.displayID)
       let clipped = bounds.intersection(rect)
@@ -257,13 +254,27 @@ enum Capture {
         configuration.ignoreShadowsDisplay = true
         configuration.ignoreGlobalClipDisplay = true
       }
-      guard let image = captureImage(filter: filter, configuration: configuration) else { return nil }
-      // Core Graphics destinations are bottom-left; source geometry is top-left.
-      canvas.draw(image, covering: clipped)
-      captured = true
+      // A desktop normally has a handful of displays. Bound outstanding work
+      // even if WindowServer reports a pathological virtual-display count.
+      guard captures.count < 8 else { return nil }
+      let pending = startCaptureImage(filter: filter, configuration: configuration)
+      captures.append((clipped, pending.box, pending.done))
     }
-    guard captured, let image = canvas.image(), let png = pngData(image) else { return nil }
-    return (png, rect)
+    guard !captures.isEmpty else { return nil }
+    var images: [(CGRect, CGImage)] = []
+    for capture in captures {
+      guard capture.done.wait(timeout: deadline) == .success, let image = capture.box.value else { return nil }
+      images.append((capture.rect, image))
+    }
+    // A one-display capture already has the correct dimensions and color space.
+    if images.count == 1, images[0].0 == rect,
+      images[0].1.width == size.width, images[0].1.height == size.height {
+      return (images[0].1, rect)
+    }
+    guard let canvas = CaptureCanvas(region: rect, width: size.width, height: size.height) else { return nil }
+    for (covered, image) in images { canvas.draw(image, covering: covered) }
+    guard let image = canvas.image() else { return nil }
+    return (image, rect)
   }
 
   @available(macOS 14.0, *)
@@ -355,16 +366,8 @@ enum Capture {
   private static func captureImage(filter: SCContentFilter, configuration: SCStreamConfiguration)
     -> CGImage?
   {
-    let box = Box<CGImage?>(nil)
-    let done = DispatchSemaphore(value: 0)
-    SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) {
-      image, error in
-      if let error {
-        logDiagnostic("ScreenCaptureKit capture failed: \(error.localizedDescription)")
-      }
-      box.value = image
-      done.signal()
-    }
+    let pending = startCaptureImage(filter: filter, configuration: configuration)
+    let (box, done) = (pending.box, pending.done)
     guard done.wait(timeout: .now() + captureDeadlineSeconds) == .success else {
       logDiagnostic("ScreenCaptureKit capture exceeded its \(captureDeadlineSeconds)s deadline")
       return nil
@@ -372,13 +375,40 @@ enum Capture {
     return box.value
   }
 
+  private static let captureSlots = DispatchSemaphore(value: 8)
+
+  @available(macOS 14.0, *)
+  private static func startCaptureImage(filter: SCContentFilter, configuration: SCStreamConfiguration)
+    -> (box: Box<CGImage?>, done: DispatchSemaphore)
+  {
+    let box = Box<CGImage?>(nil)
+    let done = DispatchSemaphore(value: 0)
+    // Hold the permit until the OS callback, even after a caller times out.
+    // Repeated timeouts must not accumulate unlimited outstanding captures.
+    guard captureSlots.wait(timeout: .now()) == .success else {
+      done.signal()
+      return (box, done)
+    }
+    SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) {
+      image, error in
+      defer { captureSlots.signal() }
+      if let error {
+        logDiagnostic("ScreenCaptureKit capture failed: \(error.localizedDescription)")
+      }
+      box.value = image
+      done.signal()
+    }
+    return (box, done)
+  }
+
   // MARK: - Shareable content (cached, single-flight, deadlined)
 
   private static let captureDeadlineSeconds: Double = 3
-  private static let contentTTLNanoseconds: UInt64 = 2_000_000_000
+  private static let contentTTLNanoseconds: UInt64 = 10_000_000_000
   private static let contentLock = NSLock()
   private static var cachedContent: SCShareableContent?
   private static var cachedContentAt: UInt64 = 0
+  private static var cachedDesktopSignature: String?
   /// At most one outstanding `SCShareableContent` request, ever — but everyone
   /// else **waits on it** rather than giving up.
   ///
@@ -410,12 +440,33 @@ enum Capture {
     contentLock.unlock()
   }
 
+  /// Cheap WindowServer metadata invalidates cached SCK geometry after moves,
+  /// new windows, host windows, or display changes. Never extends stale frames.
+  private static func desktopSignature() -> String? {
+    guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+      as? [[String: Any]] else { return nil }
+    let entries = windows.compactMap { entry -> String? in
+      guard let id = entry[kCGWindowNumber as String] as? NSNumber,
+        let pid = entry[kCGWindowOwnerPID as String] as? NSNumber,
+        let raw = entry[kCGWindowBounds as String] as? [String: Any],
+        let frame = CGRect(dictionaryRepresentation: raw as CFDictionary) else { return nil }
+      // The helper cursor moves every frame; its geometry is not used for a
+      // window capture or a host exclusion filter.
+      if pid.int32Value == ProcessInfo.processInfo.processIdentifier { return nil }
+      return "\(id):\(pid):\(frame)"
+    }
+    return entries.joined(separator: "|") + String(describing: Geometry.displayFrames())
+  }
+
   /// The cached content, and whether it is inside its TTL.
   private static func cachedShareableContent() -> (content: SCShareableContent?, fresh: Bool) {
     let now = DispatchTime.now().uptimeNanoseconds
+    let signature = desktopSignature()
     contentLock.lock()
     defer { contentLock.unlock() }
-    return (cachedContent, cachedContent != nil && now &- cachedContentAt <= contentTTLNanoseconds)
+    let fresh = signature != nil && signature == cachedDesktopSignature
+      && cachedContent != nil && now &- cachedContentAt <= contentTTLNanoseconds
+    return (cachedContent, fresh)
   }
 
   private static func shareableContent() -> SCShareableContent? {
@@ -438,6 +489,7 @@ enum Capture {
     contentRequestDeadline = Date().addingTimeInterval(captureDeadlineSeconds)
     contentCondition.unlock()
 
+    let signature = desktopSignature()
     let done = DispatchSemaphore(value: 0)
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) {
       content, error in
@@ -445,6 +497,7 @@ enum Capture {
         contentLock.lock()
         cachedContent = content
         cachedContentAt = DispatchTime.now().uptimeNanoseconds
+        cachedDesktopSignature = signature
         contentLock.unlock()
       } else if let error {
         logDiagnostic("SCShareableContent failed: \(error.localizedDescription)")
@@ -542,6 +595,42 @@ enum Capture {
   }
 
   // MARK: - Encoding
+
+  private static let stillDigestLock = NSLock()
+  private static var previousStillDigest: SHA256.Digest?
+
+  /// Compare pixels before PNG and base64 encoding. Only still requests use
+  /// this memo; action observations cannot consume a pane's pending frame.
+  private static func encode(_ image: CGImage, region: CGRect, source: Source,
+    deduplicate: Bool, force: Bool) throws -> Result {
+    if deduplicate {
+      stillDigestLock.lock()
+      defer { stillDigestLock.unlock() }
+      let rowBytes = (image.width * image.bitsPerPixel + 7) / 8
+      if let data = image.dataProvider?.data,
+        CFDataGetLength(data) >= (image.height - 1) * image.bytesPerRow + rowBytes {
+        var hash = SHA256()
+        hash.update(data: Data("\(region):\(image.width):\(image.height):\(image.bytesPerRow):\(image.bitmapInfo.rawValue)".utf8))
+        // Exclude row padding, which can contain allocator-dependent bytes.
+        let pixels = data as Data
+        pixels.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+          for row in 0..<image.height {
+            let start = row * image.bytesPerRow
+            hash.update(bufferPointer: UnsafeRawBufferPointer(rebasing: buffer[start..<(start + rowBytes)]))
+          }
+        }
+        let digest = hash.finalize()
+        if !force, digest == previousStillDigest {
+          return Result(pngBase64: nil, region: region, source: source)
+        }
+        guard let png = pngData(image) else { throw RPCError(.internalError, "Could not encode the screenshot") }
+        previousStillDigest = digest
+        return Result(pngBase64: png.base64EncodedString(), region: region, source: source)
+      }
+    }
+    guard let png = pngData(image) else { throw RPCError(.internalError, "Could not encode the screenshot") }
+    return Result(pngBase64: png.base64EncodedString(), region: region, source: source)
+  }
 
   private static func pngData(_ image: CGImage) -> Data? {
     let output = NSMutableData()

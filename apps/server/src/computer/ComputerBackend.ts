@@ -50,7 +50,7 @@ export const COMPUTER_AGENT_IMAGE_MAX_DIMENSION = 1_536;
  */
 export const DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION = COMPUTER_AGENT_IMAGE_MAX_DIMENSION;
 /** The budget a post-action observation spends. See the constant above. */
-export const COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION = COMPUTER_AGENT_IMAGE_MAX_DIMENSION;
+export const COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION = 1280;
 /** Native per-side image limit enforced by the KWin capture path. */
 export const MAX_COMPUTER_CAPTURE_MAX_DIMENSION = 16_384;
 /**
@@ -116,6 +116,7 @@ export interface ComputerBackendActionResult {
   readonly clampedTo?: ComputerPoint;
   readonly windowId?: string;
   readonly value?: string;
+  readonly textLength?: number;
   /**
    * Which rung of a backend's delivery ladder actually ran, and what the backend
    * could establish about the outcome.
@@ -493,6 +494,7 @@ export function computerBackendActionResult(
     ...(result?.clampedTo ? { clampedTo: result.clampedTo } : {}),
     ...(result?.windowId ? { windowId: result.windowId } : {}),
     ...(result?.value !== undefined ? { value: result.value } : {}),
+    ...(result?.textLength !== undefined ? { textLength: result.textLength } : {}),
     // Both halves or neither: a path with no verdict cannot tell a caller
     // whether the input landed, which is the only question this field answers.
     // The path is clamped here rather than in each backend, because it is copied

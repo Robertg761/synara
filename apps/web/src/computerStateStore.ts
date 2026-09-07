@@ -6,6 +6,7 @@ import type {
   ThreadId,
 } from "@synara/contracts";
 import { create } from "zustand";
+import { useShallow } from "zustand/react/shallow";
 
 type ComputerActionEvent = Extract<ComputerEvent, { type: "computer.action" }>;
 
@@ -61,7 +62,7 @@ export const useComputerStateStore = create<ComputerStateStore>()((set, get) => 
         if (!state || state.windows === windows) {
           continue;
         }
-        nextStates[threadId] = { ...state, windows: [...windows] };
+        nextStates[threadId] = { ...state, windows };
         changed = true;
       }
       return changed ? { ...current, threadStatesByThreadId: nextStates } : current;
@@ -122,4 +123,11 @@ export function selectThreadComputerAction(
   threadId: ThreadId,
 ): (store: ComputerStateStore) => ComputerActionEvent | undefined {
   return (store) => store.lastActionByThreadId[threadId];
+}
+
+/** Composer availability must not subscribe to desktop activity or geometry. */
+export function useThreadComputerAvailability(threadId: ThreadId) {
+  return useComputerStateStore(
+    useShallow((state) => state.threadStatesByThreadId[threadId]?.availability),
+  );
 }

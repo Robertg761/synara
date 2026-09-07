@@ -50,3 +50,15 @@ SYNARA_MAC_INPUT_FIXTURE="$helper_test_dir/input-fixture" \
 To run perception alone, omit `SYNARA_MAC_INPUT_TEST`, `SYNARA_MAC_INPUT_FIXTURE` and the input test file. The perception suite never sends input; unavailable platform capabilities or grants may skip individual checks. The input suite is opt-in and excluded from ordinary runs unless explicitly enabled.
 
 These checks complement the normal server, gateway, provider and web tests. They do not replace installed-build tests for TCC denial/revocation, signed helper updates, real multi-display hot-plugging, multiple Spaces, or end-to-end tasks with actual vision models.
+
+## Performance regression coverage
+
+The perception suite also requests a deduplicated still and then forces another full PNG. A changing real desktop may produce a new image on every request, so the test accepts either a changed image or an explicit `unchanged` response for ordinary polls. Forced requests must always include a decodable PNG.
+
+The backend and publisher tests exercise unchanged replies, force propagation on attachment and reattachment, independent action captures, and reuse of authoritative native window geometry. Run them without desktop permissions:
+
+```sh
+bun run --cwd apps/server test src/computer/MacComputerBackend.test.ts src/computer/stillFramePublisher.test.ts
+```
+
+The performance changes were developed on Linux, where AppKit, ScreenCaptureKit, CryptoKit and the native Swift compiler were unavailable. Passing TypeScript tests does not establish native compilation or delivery timing. Run the native build and opt-in suites above on macOS before claiming those checks passed. Still requests continue capturing and hashing pixels at the normal cadence, usually twice a second; unchanged frames skip PNG encoding, base64 and stdio transport. This does not imply zero idle capture CPU. Use a static desktop to measure idle still encoding, a multi-display desktop to measure capture concurrency, and native plus Chromium text fields to check insertion fallback. The physical-key fallback retains its original pacing and per-event focus checks.

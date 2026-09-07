@@ -494,6 +494,7 @@ export class MacComputerBackend implements ComputerBackend {
 
   /** The still-frame loop, shared with the KWin backend. */
   private readonly stills: StillFramePublisher;
+  private actionCapturesInFlight = 0;
   private readonly windowsChanges: WindowListChangeNotifier;
   /**
    * How many captures each ScreenCaptureKit path has served. The helper names
@@ -545,7 +546,7 @@ export class MacComputerBackend implements ComputerBackend {
       failureFallbackMessage: "The Synara macOS computer backend failed without a message.",
     });
     this.stills = new StillFramePublisher({
-      capture: () => this.captureStillFrame(),
+      capture: (force) => this.captureStillFrame(force),
       // No Screen Recording grant means every capture would fail identically;
       // the tick is skipped rather than spending a round trip to learn that.
       isCaptureAvailable: () => this.captureGranted,
@@ -969,16 +970,20 @@ export class MacComputerBackend implements ComputerBackend {
   }
 
   async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
+    this.actionCapturesInFlight += 1;
+    try {
+      return await this.captureActionScreenshot(request);
+    } finally {
+      this.actionCapturesInFlight -= 1;
+    }
+  }
+
+  private async captureActionScreenshot(
+    request: ComputerCaptureRequest,
+  ): Promise<ComputerScreenshot> {
     const maxDimension = request.maxDimension ?? this.captureMaxDimension;
     if (request.kind === "window") {
-      const [windows, origin] = await this.readWindows();
-      const window = windows.find((candidate) => candidate.id === request.windowId);
-      if (!window) {
-        throw new ComputerBackendError(
-          `No desktop window has id ${JSON.stringify(request.windowId)}. ` +
-            "Call computer_list_windows for the current window ids.",
-        );
-      }
+      const origin = await this.workspaceRect();
       const captured = await this.callCapture({
         kind: "window",
         windowId: request.windowId,
@@ -986,9 +991,20 @@ export class MacComputerBackend implements ComputerBackend {
       });
       // The helper reports the region it actually captured, in globals; the
       // window's own frame is the fallback when it omits one.
-      const globalRegion =
-        captured.region ??
-        shiftRect(requireWindowBounds(window, "a window screenshot"), origin.x, origin.y);
+      let globalRegion = captured.region;
+      if (!globalRegion) {
+        const [windows] = await this.readWindows();
+        const window = windows.find((candidate) => candidate.id === request.windowId);
+        if (!window)
+          throw new ComputerBackendError(
+            `No desktop window has id ${JSON.stringify(request.windowId)}.`,
+          );
+        globalRegion = shiftRect(
+          requireWindowBounds(window, "a window screenshot"),
+          origin.x,
+          origin.y,
+        );
+      }
       return this.screenshot(captured, shiftRect(globalRegion, -origin.x, -origin.y));
     }
 
@@ -1153,7 +1169,7 @@ export class MacComputerBackend implements ComputerBackend {
       text,
       ...(windowId ? { windowId } : {}),
     });
-    return { value: text, ...MacComputerBackend.deliveryReport(payload) };
+    return { textLength: text.length, ...MacComputerBackend.deliveryReport(payload) };
   }
 
   async pressKey(key: string, windowId?: string): Promise<ComputerBackendActionResult> {
@@ -1220,7 +1236,7 @@ export class MacComputerBackend implements ComputerBackend {
     return {
       point: target.point,
       ...(target.node.windowId ? { windowId: target.node.windowId } : {}),
-      value,
+      textLength: value.length,
     };
   }
 
@@ -1422,15 +1438,27 @@ export class MacComputerBackend implements ComputerBackend {
    * watches the pane, would cost two copies and an encode per frame to arrive
    * back where it started.
    */
-  private async captureStillFrame(): Promise<Uint8Array> {
+  private async captureStillFrame(force: boolean): Promise<Uint8Array | undefined> {
+    // A requested keyframe must always run; dropping its force can leave a new
+    // receiver blank on a static desktop. Ordinary ticks can wait until next time.
+    if (!force && this.actionCapturesInFlight > 0) return undefined;
     const global = await this.workspaceRect();
-    const captured = await this.callCapture({
-      kind: "region",
-      region: global,
-      maxDimension: this.captureMaxDimension,
-    });
-    // Fail here rather than in a browser decoder, whose only symptom is a
-    // blank pane: a payload that is not a PNG must be caught at the source.
+    if (!force && this.actionCapturesInFlight > 0) return undefined;
+    const helperGeneration = this.helperGeneration;
+    const payload = asRecord(
+      await this.callCaptureMethod({
+        kind: "region",
+        region: global,
+        maxDimension: this.captureMaxDimension,
+        deduplicate: true,
+        force,
+      }),
+    );
+    if (payload.unchanged === true) {
+      if (force) throw new ComputerBackendError("The macOS helper omitted a requested keyframe.");
+      return undefined;
+    }
+    const captured = this.decodeCapture(payload, helperGeneration);
     readPngDimensions(captured.bytes, { source: "Synara macOS capture" });
     return captured.bytes;
   }
@@ -1735,6 +1763,13 @@ export class MacComputerBackend implements ComputerBackend {
     if (request.region) params.region = request.region;
     const helperGeneration = this.helperGeneration;
     const payload = asRecord(await this.callCaptureMethod(params));
+    return this.decodeCapture(payload, helperGeneration);
+  }
+
+  private decodeCapture(
+    payload: Record<string, unknown>,
+    helperGeneration: number,
+  ): MacCapturedImage {
     // The helper names the ScreenCaptureKit path it actually used, and it falls
     // back when the fast one is unavailable. Counting the answers is what makes
     // the fallback rate a number somebody can look at instead of a guess.
@@ -1746,7 +1781,7 @@ export class MacComputerBackend implements ComputerBackend {
     if (!base64) {
       throw new ComputerBackendError("The macOS capture returned no image data.");
     }
-    const bytes = new Uint8Array(Buffer.from(base64, "base64"));
+    const bytes = Buffer.from(base64, "base64");
     return { bytes, base64, region: this.parseWorkspace(payload.region), helperGeneration };
   }
 

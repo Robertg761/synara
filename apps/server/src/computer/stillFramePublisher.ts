@@ -61,7 +61,7 @@ export interface StillFramePublisherOptions {
    * uses it when a foreground screenshot claimed the capture path). A throw is a
    * real failure and is what the retry bound applies to.
    */
-  readonly capture: () => Promise<Uint8Array | undefined>;
+  readonly capture: (force: boolean) => Promise<Uint8Array | undefined>;
   /**
    * Whether a capture could succeed at all right now. Checked before every
    * publish so a backend whose capture grant is missing never spends a round
@@ -159,7 +159,7 @@ export class StillFramePublisher {
     if (options.force === true) this.forceRetries = 0;
     const force = this.dedupe.takeForce(options.force === true);
     try {
-      const bytes = await this.options.capture();
+      const bytes = await this.options.capture(force);
       if (bytes === undefined) return;
       if (this.listener !== listener) return;
       // An idle desktop encodes the same bytes every tick; republishing them

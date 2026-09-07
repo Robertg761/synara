@@ -82,17 +82,13 @@ enum Accessibility {
       return windowIds.contains(window.windowNumber)
     }
 
-    // One AX application element per distinct owning pid, reused across its
-    // windows, together with that app's window list (one IPC, not one per
-    // window). `AXManualAccessibility` is poked so Chromium/Electron targets
-    // expose a tree at all, and `AXEnhancedUserInterface` is turned on for the
-    // walk because many apps only publish their full hierarchy with it — then
-    // restored, because leaving it on makes some apps resize their windows.
+    // Reuse each app's window list. Only an explicitly targeted app opts into
+    // manual accessibility; background inventory must not reconfigure apps.
     var applications: [pid_t: Application] = [:]
-    defer { for application in applications.values { application.restore() } }
 
     var children: [[String: Any]] = []
     var remaining = maxNodesPerDesktop
+    var textBytesRemaining = 128 * 1024
     let deadline = Date().addingTimeInterval(3)
     var truncated = false
     var failedWindows: [String] = []
@@ -103,11 +99,11 @@ enum Accessibility {
       if let existing = applications[window.ownerPID] {
         application = existing
       } else {
-        application = Application(pid: window.ownerPID)
+        application = Application(pid: window.ownerPID, requestAccessibility: windowIds != nil || window.ownerPID == SkyLight.frontmostPID())
         applications[window.ownerPID] = application
       }
-      var budget = Budget(remaining: min(maxNodesPerWindow, remaining), deadline: deadline)
-      if menuApps.insert(window.ownerPID).inserted {
+      var budget = Budget(remaining: min(maxNodesPerWindow, remaining), deadline: deadline, textBytesRemaining: textBytesRemaining)
+      if windowIds != nil || window.ownerPID == SkyLight.frontmostPID(), menuApps.insert(window.ownerPID).inserted {
         for (attribute, root) in [(kAXMenuBarAttribute, "menu-bar"), ("AXExtrasMenuBar", "menu-bar-extra")] {
           if let menu = elementAttribute(application.element, attribute),
             let menuNode = node(from: menu, windowId: window.windowNumber,
@@ -127,6 +123,7 @@ enum Accessibility {
       } else {
         failedWindows.append(String(window.windowNumber))
       }
+      textBytesRemaining = budget.textBytesRemaining
       remaining -= budget.used
       truncated = truncated || budget.truncated
     }
@@ -176,8 +173,7 @@ enum Accessibility {
   /// the action was accepted; the caller still verifies the stacking.
   static func raise(_ window: DesktopWindow) -> Bool {
     guard isTrusted() else { return false }
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false)
-    defer { application.restore() }
+    let application = Application(pid: window.ownerPID, requestAccessibility: false)
     guard let axWindow = application.match(window) else { return false }
     return AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString) == .success
   }
@@ -220,8 +216,7 @@ enum Accessibility {
     {
       return .notApplicable
     }
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false)
-    defer { application.restore() }
+    let application = Application(pid: window.ownerPID, requestAccessibility: false)
     var raw: CFTypeRef?
     guard
       AXUIElementCopyAttributeValue(
@@ -275,8 +270,7 @@ enum Accessibility {
   /// string a second time.
   static func focusedValue(in window: DesktopWindow) -> String? {
     guard isTrusted() else { return nil }
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false)
-    defer { application.restore() }
+    let application = Application(pid: window.ownerPID, requestAccessibility: false)
     var raw: CFTypeRef?
     guard
       AXUIElementCopyAttributeValue(
@@ -317,7 +311,7 @@ enum Accessibility {
       // more than a fraction of a gesture, so it takes the per-window timeout
       // rather than the per-application one.
       self.application = Application(
-        pid: window.ownerPID, enhanceUserInterface: false,
+        pid: window.ownerPID, requestAccessibility: false,
         messagingTimeout: windowMessagingTimeout)
     }
 
@@ -388,7 +382,6 @@ enum Accessibility {
       return signature(of: focused, isExpired: { self.expired })
     }
 
-    func restore() { application.restore() }
   }
 
   /// A cheap identity for one element: role, title, value, frame.
@@ -419,8 +412,7 @@ enum Accessibility {
   /// exposes no focused element, which is not evidence either way.
   static func focusedElementSignature(in window: DesktopWindow) -> String? {
     guard isTrusted() else { return nil }
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false)
-    defer { application.restore() }
+    let application = Application(pid: window.ownerPID, requestAccessibility: false)
     var raw: CFTypeRef?
     guard
       AXUIElementCopyAttributeValue(
@@ -451,7 +443,7 @@ enum Accessibility {
   /// Select the exact window for the foreground keyboard fallback. Routine
   /// targeting reveals it separately, then uses focusWindowForKeyboard below.
   static func focusKeyboardWindowVisibly(_ window: DesktopWindow) throws {
-    let application = Application(pid: window.ownerPID, enhanceUserInterface: false, messagingTimeout: windowMessagingTimeout)
+    let application = Application(pid: window.ownerPID, requestAccessibility: false, messagingTimeout: windowMessagingTimeout)
     guard let target = application.match(window) else { throw RPCError(.targetMissing, "The target window closed") }
     try InputCancellation.check()
     AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
@@ -476,8 +468,7 @@ enum Accessibility {
   static func focusWindowForKeyboard(_ window: DesktopWindow) {
     guard isTrusted() else { return }
     let application = Application(
-      pid: window.ownerPID, enhanceUserInterface: false, messagingTimeout: windowMessagingTimeout)
-    defer { application.restore() }
+      pid: window.ownerPID, requestAccessibility: false, messagingTimeout: windowMessagingTimeout)
     guard let axWindow = application.match(window) else { return }
     var raw: CFTypeRef?
     if AXUIElementCopyAttributeValue(
@@ -517,47 +508,53 @@ enum Accessibility {
     -> Set<CGWindowID>
   {
     guard isTrusted(), !candidates.isEmpty else { return [] }
+    minimizedLock.lock()
+    defer { minimizedLock.unlock() }
+    let now = DispatchTime.now().uptimeNanoseconds
+    let keys = Set(candidates.map { "\($0.ownerPID):\($0.windowNumber)" })
+    minimizedCache = minimizedCache.filter { keys.contains($0.key) && now &- $0.value.at < 1_000_000_000 }
     let deadline = DispatchTime.now() + budgetSeconds
     var applications: [pid_t: Application] = [:]
-    defer { for application in applications.values { application.restore() } }
     var minimized: Set<CGWindowID> = []
     for window in candidates {
+      let key = "\(window.ownerPID):\(window.windowNumber)"
+      if let cached = minimizedCache[key] {
+        if cached.minimized { minimized.insert(window.windowNumber) }
+        continue
+      }
       guard DispatchTime.now() < deadline else { break }
       let application =
         applications[window.ownerPID]
         ?? Application(
-          pid: window.ownerPID, enhanceUserInterface: false,
+          pid: window.ownerPID, requestAccessibility: false,
           messagingTimeout: windowMessagingTimeout)
       applications[window.ownerPID] = application
+      minimizedCache[key] = (now, false)
       guard let axWindow = application.match(window) else { continue }
-      if boolAttribute(axWindow, kAXMinimizedAttribute) == true {
+      let isMinimized = boolAttribute(axWindow, kAXMinimizedAttribute) == true
+      minimizedCache[key] = (now, isMinimized)
+      if isMinimized {
         minimized.insert(window.windowNumber)
       }
     }
     return minimized
   }
 
+  private static let minimizedLock = NSLock()
+  private static var minimizedCache: [String: (at: UInt64, minimized: Bool)] = [:]
+
   // MARK: - Application handle
 
-  /// One application element plus the bookkeeping that must be undone after the
-  /// walk. Created per pid per request; `restore()` is idempotent.
+  /// One application element and one lazily loaded window list per request.
   private final class Application {
     let element: AXUIElement
     private var windows: [AXUIElement]?
-    private var previousEnhanced: Bool?
-    private var enhanced = false
 
-    init(pid: pid_t, enhanceUserInterface: Bool = true, messagingTimeout: Float? = nil) {
+    init(pid: pid_t, requestAccessibility: Bool = true, messagingTimeout: Float? = nil) {
       element = AXUIElementCreateApplication(pid)
       AXUIElementSetMessagingTimeout(element, messagingTimeout ?? applicationMessagingTimeout)
-      // Chromium/Electron expose no AX tree until asked; harmless elsewhere.
-      AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-      guard enhanceUserInterface else { return }
-      previousEnhanced = boolAttribute(element, "AXEnhancedUserInterface")
-      if previousEnhanced != true {
-        AXUIElementSetAttributeValue(
-          element, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-        enhanced = true
+      if requestAccessibility {
+        AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
       }
     }
 
@@ -568,16 +565,6 @@ enum Accessibility {
       return matchWindow(candidates, to: window)
     }
 
-    /// Put `AXEnhancedUserInterface` back the way it was found. Leaving it on
-    /// makes some apps (AppKit apps with auto-resizing windows especially)
-    /// visibly jump the next time they lay out.
-    func restore() {
-      guard enhanced else { return }
-      enhanced = false
-      AXUIElementSetAttributeValue(
-        element, "AXEnhancedUserInterface" as CFString,
-        (previousEnhanced ?? false) ? kCFBooleanTrue : kCFBooleanFalse)
-    }
   }
 
   // MARK: - Walk
@@ -589,6 +576,7 @@ enum Accessibility {
     let deadline: Date
     var used = 0
     var truncated = false
+    var textBytesRemaining = 128 * 1024
   }
 
   private struct Snapshot {
@@ -598,6 +586,7 @@ enum Accessibility {
     var value: String?
     var frame: CGRect?
     var children: [AXUIElement] = []
+    var textTruncated = false
   }
 
   private static func node(
@@ -615,7 +604,10 @@ enum Accessibility {
     // a node was actually left unemitted. Marking the tree truncated here as
     // well claimed a cut whenever the budget merely ran out exactly.
     guard budget.remaining > 0, Date() < budget.deadline else { budget.truncated = true; return nil }
-    let snapshot = read(element)
+    var snapshot = read(element)
+    snapshot.title = boundedText(snapshot.title, budget: &budget, truncated: &snapshot.textTruncated)
+    snapshot.detail = boundedText(snapshot.detail, budget: &budget, truncated: &snapshot.textTruncated)
+    snapshot.value = boundedText(snapshot.value, budget: &budget, truncated: &snapshot.textTruncated)
     let frame = snapshot.frame ?? .zero
     // Off-screen scroll content: a real frame that misses the window entirely is
     // not something the agent can act on, and those subtrees are where the node
@@ -658,7 +650,7 @@ enum Accessibility {
       "role": snapshot.role,
       "label": (snapshot.title ?? snapshot.detail) as Any? ?? NSNull(),
       "value": snapshot.value as Any? ?? NSNull(),
-      "description": snapshot.detail as Any? ?? NSNull(),
+      "description": (snapshot.title == nil ? nil : snapshot.detail) as Any? ?? NSNull(),
       "frame": Geometry.rectDictionary(frame),
       "activationPoint": [
         "x": Double(frame.midX),
@@ -673,8 +665,27 @@ enum Accessibility {
     // The window root is addressed by its window id alone; every node below it
     // carries the absolute child-index route from that root.
     if depth > 0 || accessibilityRoot != "window" { payload["nodePath"] = path }
+    if snapshot.textTruncated { payload["truncated"] = true; budget.truncated = true }
     payload["accessibilityRoot"] = accessibilityRoot
     return payload
+  }
+
+  /// Bound UTF-8 output before JSON encoding. AX itself may still allocate the
+  /// full value, but it never crosses the helper pipe or accumulates in the tree.
+  private static func boundedText(_ value: String?, budget: inout Budget, truncated: inout Bool) -> String? {
+    guard let value else { return nil }
+    let limit = min(16 * 1024, budget.textBytesRemaining)
+    let prefix = Array(value.utf8.prefix(limit + 1))
+    if prefix.count <= limit {
+      budget.textBytesRemaining -= prefix.count
+      return value
+    }
+    truncated = true
+    var bytes = Array(prefix.prefix(max(0, limit - 3)))
+    while !bytes.isEmpty && String(bytes: bytes, encoding: .utf8) == nil { bytes.removeLast() }
+    let result = (String(bytes: bytes, encoding: .utf8) ?? "") + (limit >= 3 ? "…" : "")
+    budget.textBytesRemaining -= result.utf8.count
+    return result
   }
 
   /// Every attribute this walk needs, in one IPC round trip.
@@ -716,8 +727,7 @@ enum Accessibility {
     guard let window = Windows.window(withNumber: windowId) else {
       throw RPCError(.targetMissing, "no window has id \(windowId)")
     }
-    let application = Application(pid: window.ownerPID)
-    defer { application.restore() }
+    let application = Application(pid: window.ownerPID, requestAccessibility: true)
     let root: AXUIElement?
     switch accessibilityRoot {
     case "menu-bar": root = elementAttribute(application.element, kAXMenuBarAttribute)

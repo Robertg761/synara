@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   ComputerId,
   ComputerPoint,
@@ -229,6 +230,15 @@ export class ComputerManager {
   /** Per-thread publish serialization; see `publish`. */
   private readonly publishChains = new Map<string, Promise<unknown>>();
   private errorRepublishTimer: ReturnType<typeof setTimeout> | undefined;
+  private nextStateVersion = -1;
+  private readonly screenshotBytes = new WeakMap<ComputerScreenshot, Uint8Array>();
+  private geometryEpoch = 0;
+  private readonly geometry = new AsyncLocalStorage<{
+    active: boolean;
+    epoch: number;
+    windows?: Promise<readonly ComputerWindow[]>;
+    screen?: Promise<ComputerScreenSize>;
+  }>();
   private readonly threads = new Map<string, ThreadComputerRuntimeState>();
   /**
    * Agent calls in flight, per thread. Deliberately not a field on the thread
@@ -347,6 +357,7 @@ export class ComputerManager {
     if (options.backend.onEvent) {
       this.backendUnsubscribe = options.backend.onEvent((event) => {
         if (event.type === "windows-changed") {
+          this.invalidateGeometry();
           this.lastKnownWindowIds = windowIdSet(event.windows);
           for (const state of this.threads.values()) state.windows = event.windows;
           this.emit({ type: "computer.windows-changed", windows: event.windows });
@@ -483,8 +494,37 @@ export class ComputerManager {
    * open a window?" without paying for a read it would otherwise not need: the
    * baseline is whatever the last read already saw.
    */
+  private currentGeometry() {
+    const cache = this.geometry.getStore();
+    if (cache && cache.epoch !== this.geometryEpoch) {
+      delete cache.windows;
+      delete cache.screen;
+      cache.epoch = this.geometryEpoch;
+    }
+    return cache;
+  }
+
+  private readScreenSize(): Promise<ComputerScreenSize> {
+    const cache = this.currentGeometry();
+    return cache?.active
+      ? (cache.screen ??= this.backend.getScreenSize())
+      : this.backend.getScreenSize();
+  }
+
+  private invalidateGeometry(): void {
+    this.geometryEpoch += 1;
+    const cache = this.geometry.getStore();
+    if (cache) {
+      delete cache.windows;
+      delete cache.screen;
+    }
+  }
+
   private async readWindows(): Promise<readonly ComputerWindow[]> {
-    const windows = await this.backend.listWindows();
+    const cache = this.currentGeometry();
+    const windows = await (cache?.active
+      ? (cache.windows ??= this.backend.listWindows())
+      : this.backend.listWindows());
     this.lastKnownWindowIds = windowIdSet(windows);
     return windows;
   }
@@ -570,7 +610,7 @@ export class ComputerManager {
         windowId: window.id,
       };
     }
-    const screenSize = await this.backend.getScreenSize();
+    const screenSize = await this.readScreenSize();
     return {
       screenshot: await this.backend.captureScreenshot({
         kind: "region",
@@ -793,7 +833,7 @@ export class ComputerManager {
     this.engageBackend();
     const [availability, screenSize] = await Promise.all([
       this.backend.availability(),
-      this.backend.getScreenSize(),
+      this.readScreenSize(),
     ]);
     return { computerId: this.computerId, screenSize, availability };
   }
@@ -814,7 +854,7 @@ export class ComputerManager {
 
   async getThreadState(threadId: string): Promise<ThreadComputerState> {
     const state = this.threadRuntime(threadId);
-    return (await this.publish(threadId, false)) ?? this.threadSnapshot(threadId, state);
+    return (await this.publish(threadId)) ?? this.threadSnapshot(threadId, state);
   }
 
   async click(
@@ -937,6 +977,7 @@ export class ComputerManager {
       // the keyboard pointed at a window this call just declined to move.
       assertDesktopOperationActive();
       await this.backend.focusWindow?.(windowId);
+      this.invalidateGeometry();
       return this.actionResult(
         threadId,
         "computer_activate_window",
@@ -1306,6 +1347,15 @@ export class ComputerManager {
    * be compared. Byte equality answers first and for free: pixels that did not
    * change did not move, which is what the end of a page looks like.
    */
+  private measurementBytes(screenshot: ComputerScreenshot): Uint8Array {
+    let bytes = this.screenshotBytes.get(screenshot);
+    if (!bytes) {
+      bytes = Buffer.from(screenshot.bytesBase64, "base64");
+      this.screenshotBytes.set(screenshot, bytes);
+    }
+    return bytes;
+  }
+
   private async measureTravel(
     before: ComputerScreenshot,
     after: ComputerScreenshot,
@@ -1317,8 +1367,8 @@ export class ComputerManager {
     const scale = before.scale;
     if (scale === undefined || scale !== after.scale || scale <= 0) return undefined;
     const traveled = await this.measureScrollTravel(
-      Buffer.from(before.bytesBase64, "base64"),
-      Buffer.from(after.bytesBase64, "base64"),
+      this.measurementBytes(before),
+      this.measurementBytes(after),
     );
     return traveled === undefined ? undefined : traveled / scale;
   }
@@ -1456,28 +1506,38 @@ export class ComputerManager {
     action: () => Promise<A>,
     signal?: AbortSignal,
   ): Promise<A> {
-    return this.operations.run(async () => {
-      const owner = agentThreadId(threadId);
-      if (owner === undefined) return await action();
-      const depth = (this.agentCallsInFlight.get(owner) ?? 0) + 1;
-      this.agentCallsInFlight.set(owner, depth);
-      if (depth === 1) await this.publish(owner, true).catch(() => undefined);
-      try {
-        return await action();
-      } finally {
-        const remaining = Math.max(0, (this.agentCallsInFlight.get(owner) ?? 1) - 1);
-        if (remaining === 0) {
-          this.agentCallsInFlight.delete(owner);
-          if (this.lease?.threadId === owner && this.lease.releaseRequested) {
-            await withoutDesktopCancellation(() => this.releaseDesktopControl(owner));
-          } else {
-            await this.publish(owner, true).catch(() => undefined);
-          }
+    return this.operations.run(() => this.trackAgentActivity(threadId, action), signal);
+  }
+
+  withAgentReadActivity<A>(
+    threadId: string,
+    action: () => Promise<A>,
+    signal?: AbortSignal,
+  ): Promise<A> {
+    return this.operations.read(() => this.trackAgentActivity(threadId, action), signal);
+  }
+
+  private async trackAgentActivity<A>(threadId: string, action: () => Promise<A>): Promise<A> {
+    const owner = agentThreadId(threadId);
+    if (owner === undefined) return await action();
+    const depth = (this.agentCallsInFlight.get(owner) ?? 0) + 1;
+    this.agentCallsInFlight.set(owner, depth);
+    if (depth === 1) this.publishCached(owner);
+    try {
+      return await action();
+    } finally {
+      const remaining = Math.max(0, (this.agentCallsInFlight.get(owner) ?? 1) - 1);
+      if (remaining === 0) {
+        this.agentCallsInFlight.delete(owner);
+        if (this.lease?.threadId === owner && this.lease.releaseRequested) {
+          await withoutDesktopCancellation(() => this.releaseDesktopControl(owner));
         } else {
-          this.agentCallsInFlight.set(owner, remaining);
+          this.publishCached(owner);
         }
+      } else {
+        this.agentCallsInFlight.set(owner, remaining);
       }
-    }, signal);
+    }
   }
 
   /**
@@ -1511,7 +1571,12 @@ export class ComputerManager {
     return this.operations.run(async () => {
       await this.claimDesktopControl(threadId);
       assertDesktopOperationActive();
-      return action();
+      const cache = { active: true, epoch: this.geometryEpoch };
+      try {
+        return await this.geometry.run(cache, action);
+      } finally {
+        cache.active = false;
+      }
     });
   }
 
@@ -1577,7 +1642,14 @@ export class ComputerManager {
     const trimmed = label?.trim();
     if (trimmed) {
       if (this.threadLabels.get(owner) === trimmed) return;
+      this.threadLabels.delete(owner);
       this.threadLabels.set(owner, trimmed);
+      for (const id of this.threadLabels.keys()) {
+        if (this.threadLabels.size <= 256) break;
+        if (id === owner || id === this.lease?.threadId || this.agentCallsInFlight.has(id))
+          continue;
+        this.threadLabels.delete(id);
+      }
     } else {
       if (!this.threadLabels.delete(owner)) return;
     }
@@ -1630,7 +1702,7 @@ export class ComputerManager {
       message,
       "The computer backend reported an error without a message.",
     );
-    await this.publish(threadId, true).catch(() => undefined);
+    await this.publish(threadId).catch(() => undefined);
   }
 
   subscribeFrames(sink: FrameSink): () => void {
@@ -1782,7 +1854,7 @@ export class ComputerManager {
 
   private async resolveCoordinatePoint(target: ComputerTarget): Promise<ComputerPoint> {
     try {
-      return resolveComputerPoint(target, await this.backend.getScreenSize());
+      return resolveComputerPoint(target, await this.readScreenSize());
     } catch (error) {
       if (!(error instanceof ComputerTargetError) || error.code !== "computer_target_offscreen") {
         throw error;
@@ -1864,6 +1936,7 @@ export class ComputerManager {
     await this.revealTarget(target);
     assertDesktopOperationActive();
     await this.backend.focusWindow?.(windowId);
+    this.invalidateGeometry();
   }
 
   /** Restack without changing keyboard aim, including on a hover. */
@@ -1872,6 +1945,7 @@ export class ComputerManager {
     if (windowId === undefined) return;
     assertDesktopOperationActive();
     const raiseFailure = await this.raiseTargetWindow(windowId);
+    this.invalidateGeometry();
     if (raiseFailure !== undefined && target?.point) {
       const covering = target.covering ?? (await this.coveringWindowsAt(target.point, windowId));
       if (covering.length > 0) {
@@ -1936,6 +2010,8 @@ export class ComputerManager {
         throw error;
       }
       throw refusedInjectionError(action, windowId, point);
+    } finally {
+      this.invalidateGeometry();
     }
   }
 
@@ -1987,6 +2063,7 @@ export class ComputerManager {
     result: ComputerBackendActionResult | void,
     windowId?: string,
   ): ComputerActionResult {
+    this.invalidateGeometry();
     const merged = computerBackendActionResult(this.computerId, action, {
       ...(point ? { point } : {}),
       ...(windowId !== undefined ? { windowId } : {}),
@@ -2000,7 +2077,7 @@ export class ComputerManager {
     const state = attributed ? this.threads.get(attributed) : undefined;
     if (attributed && state && merged.point) {
       state.cursor = merged.point;
-      this.publish(attributed, true).catch(() => undefined);
+      this.publishCached(attributed);
     }
     return merged;
   }
@@ -2057,48 +2134,40 @@ export class ComputerManager {
    * is how duplicate versions leaked to the pane. Chaining makes each publish
    * see its predecessor's state.
    */
+  private publishCached(threadId: string): ThreadComputerState | undefined {
+    const state = this.threads.get(threadId);
+    if (!state || this.disposed) return undefined;
+    state.version = ++this.nextStateVersion;
+    const snapshot = this.threadSnapshot(threadId, state);
+    this.emit({ type: "computer.thread-state", state: snapshot });
+    return snapshot;
+  }
+
   private async publish(
     threadId: string,
-    increment: boolean,
+    desktop?: Promise<Partial<ThreadComputerRuntimeState>>,
   ): Promise<ThreadComputerState | undefined> {
     const previous = this.publishChains.get(threadId) ?? Promise.resolve();
-    const next = previous.then(() => this.publishNow(threadId, increment));
-    this.publishChains.set(
-      threadId,
-      next.catch(() => undefined),
-    );
-    return await next;
+    const next = previous.then(() => this.publishNow(threadId, desktop));
+    const settled = next.catch(() => undefined);
+    this.publishChains.set(threadId, settled);
+    try {
+      return await next;
+    } finally {
+      if (this.publishChains.get(threadId) === settled) this.publishChains.delete(threadId);
+    }
   }
 
   private async publishNow(
     threadId: string,
-    increment: boolean,
+    desktop?: Promise<Partial<ThreadComputerRuntimeState>>,
   ): Promise<ThreadComputerState | undefined> {
     const state = this.threads.get(threadId);
     if (!state) return undefined;
-    if (increment) state.version += 1;
     try {
-      if (this.backendEngaged) {
-        const [availability, windows, screenSize] = await Promise.all([
-          this.backend.availability(),
-          this.readWindows(),
-          this.backend.getScreenSize(),
-        ]);
-        if (this.disposed || this.threads.get(threadId) !== state) return undefined;
-        state.availability = availability;
-        state.windows = windows;
-        state.screenSize = screenSize;
-      } else {
-        // Nothing has asked for the desktop yet, so nothing here may reach for
-        // it: the probe answers whether the feature could work, and the windows
-        // and screen size stay at whatever the last pass cached — empty and a
-        // placeholder on a backend that has never connected. A panel showing no
-        // windows before anyone opened it is right; provisioning a compositor
-        // plugin to fill that list in would not be.
-        const availability = await this.backend.probeAvailability();
-        if (this.disposed || this.threads.get(threadId) !== state) return undefined;
-        state.availability = availability;
-      }
+      const refreshed = await (desktop ?? this.readDesktopState());
+      if (this.disposed || this.threads.get(threadId) !== state) return undefined;
+      Object.assign(state, refreshed);
       state.lastError = null;
     } catch (error) {
       // Error text the backend does not control, so it meets the contract's
@@ -2109,15 +2178,33 @@ export class ComputerManager {
       );
     }
     if (this.disposed || this.threads.get(threadId) !== state) return undefined;
+    state.version = ++this.nextStateVersion;
     const snapshot = this.threadSnapshot(threadId, state);
     this.emit({ type: "computer.thread-state", state: snapshot });
     return snapshot;
   }
 
+  private async readDesktopState(): Promise<Partial<ThreadComputerRuntimeState>> {
+    if (!this.backendEngaged) return { availability: await this.backend.probeAvailability() };
+    const [availability, windows, screenSize] = await Promise.all([
+      this.backend.availability(),
+      this.readWindows(),
+      this.readScreenSize(),
+    ]);
+    return { availability, windows, screenSize };
+  }
+
   private async publishAllThreads(): Promise<void> {
     this.publishAllDepth += 1;
     try {
-      for (const threadId of this.threads.keys()) await this.publish(threadId, true);
+      if (this.threads.size > 0) {
+        const desktop = this.readDesktopState();
+        // Existing publication chains can delay the first consumer of a failed refresh.
+        void desktop.catch(() => undefined);
+        await Promise.all(
+          [...this.threads.keys()].map((threadId) => this.publish(threadId, desktop)),
+        );
+      }
     } finally {
       this.publishAllDepth -= 1;
       if (this.publishAllDepth === 0 && this.windowsPublishPending) {
@@ -2158,7 +2245,7 @@ export class ComputerManager {
   private republishAllThreads(): void {
     if (this.disposed) return;
     for (const [threadId, state] of this.threads) {
-      state.version += 1;
+      state.version = ++this.nextStateVersion;
       this.emit({ type: "computer.thread-state", state: this.threadSnapshot(threadId, state) });
     }
   }
@@ -2167,7 +2254,7 @@ export class ComputerManager {
     let state = this.threads.get(threadId);
     if (!state) {
       state = {
-        version: 0,
+        version: ++this.nextStateVersion,
         lastError: null,
         windows: [],
         screenSize: { width: 1, height: 1 },
@@ -2178,6 +2265,22 @@ export class ComputerManager {
         paneSurfaced: false,
       };
       this.threads.set(threadId, state);
+    } else {
+      this.threads.delete(threadId);
+      this.threads.set(threadId, state);
+    }
+    for (const [id, candidate] of this.threads) {
+      if (this.threads.size <= 256) break;
+      if (
+        id === threadId ||
+        id === this.lease?.threadId ||
+        this.agentCallsInFlight.has(id) ||
+        this.publishChains.has(id) ||
+        candidate.paneSurfaced
+      )
+        continue;
+      this.threads.delete(id);
+      this.threadLabels.delete(id);
     }
     return state;
   }
@@ -2250,7 +2353,7 @@ export class ComputerManager {
     this.errorRepublishTimer ??= setTimeout(() => {
       this.errorRepublishTimer = undefined;
       for (const threadId of this.threads.keys()) {
-        void this.publish(threadId, true).catch(() => undefined);
+        void this.publish(threadId).catch(() => undefined);
       }
     }, COMPUTER_ERROR_REPUBLISH_DEBOUNCE_MS);
     this.errorRepublishTimer.unref?.();
@@ -2277,8 +2380,10 @@ async function measureScrollTravelFromPng(
   before: Uint8Array,
   after: Uint8Array,
 ): Promise<number | undefined> {
-  const decodedBefore = await decodePngLuma(before);
-  const decodedAfter = await decodePngLuma(after);
+  const [decodedBefore, decodedAfter] = await Promise.all([
+    decodePngLuma(before),
+    decodePngLuma(after),
+  ]);
   if (!decodedBefore || !decodedAfter) return undefined;
   return estimateVerticalTravel(decodedBefore, decodedAfter);
 }
