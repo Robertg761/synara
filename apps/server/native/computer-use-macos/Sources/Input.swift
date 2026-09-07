@@ -814,12 +814,14 @@ final class InputController {
       guard let target else {
         throw RPCError(.notDelivered, "No input target is selected")
       }
+      try Windows.requireInputSpace(target.windowNumber, ownerPID: target.ownerPID)
       let isActive = SkyLight.frontmostPID() == target.ownerPID
       if mode == .foreground && !isActive {
         throw RPCError(.notDelivered, "Background input was not delivered; activating another application is forbidden")
       }
       if !Accessibility.keyboardWindowMatches(target) {
         if isActive { throw RPCError(.notDelivered, "Refusing to change the user's active window") }
+        try Windows.requireInputSpace(target.windowNumber, ownerPID: target.ownerPID)
         SkyLight.makeKeyWindow(pid: target.ownerPID, windowID: target.windowNumber)
         usleep(20_000)
       }
@@ -827,6 +829,7 @@ final class InputController {
         return Focus(cursor: cursor, controller: controller, needsRestore: false,
           targetBelievesItIsActive: true)
       }
+      try Windows.requireInputSpace(target.windowNumber, ownerPID: target.ownerPID)
       let outcome = SkyLight.activateWithoutRaise(
         pid: target.ownerPID, windowID: target.windowNumber)
       if outcome.needsRestore {
@@ -893,6 +896,7 @@ final class InputController {
     } else {
       target = Windows.topmost(at: point)
     }
+    if let target { try Windows.requireInputSpace(target.windowNumber, ownerPID: target.ownerPID) }
     // Resolve before moving so the overlay has the same window as the input.
     // The bounded glide waits for the picture to arrive before posting events.
     if glide { cursor.glide(to: point, window: target) }
@@ -1323,6 +1327,7 @@ final class InputController {
         "the window keyboard input was aimed at (\(aimed.windowNumber)) no longer exists; "
           + "click, focus, or raise a window again")
     }
+    try Windows.requireInputSpace(current.windowNumber, ownerPID: current.ownerPID)
     setKeyboardTarget(current)
     if SkyLight.frontmostPID() != current.ownerPID {
       try Accessibility.focusWindowForKeyboard(current)
@@ -1346,6 +1351,7 @@ final class InputController {
     if event.type == .keyDown { try assertKeyboardWindow(target) }
 
     if !releasing, let target {
+      try Windows.requireInputSpace(target.windowNumber, ownerPID: target.ownerPID)
       guard let current = Windows.window(withNumber: target.windowNumber),
         current.ownerPID == target.ownerPID else {
         throw RPCError(.targetMissing, "The input target closed or changed owner")

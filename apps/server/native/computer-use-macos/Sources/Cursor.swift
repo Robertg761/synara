@@ -50,7 +50,7 @@ final class AgentCursor {
   /// mostly empty: the arrow lives in the top-left corner and the badge to its
   /// lower-right, so the window is large enough for a long name and small enough
   /// never to cover much of what the agent is pointing at.
-  private static let windowSide: CGFloat = 126
+  private static let windowSide: CGFloat = 170
   /// Blank margin above and left of the tip, so the layer shadow has somewhere
   /// to fall. A window clips its content view, and a shadow drawn at the very
   /// edge would be sliced off on those two sides.
@@ -229,6 +229,8 @@ final class AgentCursor {
   private var badgeLayer: CALayer?
   private var badgeTextLayer: CATextLayer?
   private var badgeName = ""
+  private var badgeActivity = ""
+  private var badgeLabel: String { badgeActivity.isEmpty ? badgeName : badgeActivity }
   /// The backing scale the vectors were last rasterised for; 0 until installed.
   private var renderedScale: CGFloat = 0
 
@@ -425,7 +427,7 @@ final class AgentCursor {
     onMain {
       self.idleHide?.cancel()
       self.idleHide = nil
-      guard self.badgeName.isEmpty else { return }
+      guard self.badgeLabel.isEmpty else { return }
       let hide = DispatchWorkItem { [weak self] in self?.hide() }
       self.idleHide = hide
       DispatchQueue.main.asyncAfter(deadline: .now() + Self.idleHideDelay, execute: hide)
@@ -448,15 +450,17 @@ final class AgentCursor {
     }
   }
 
-  func setName(_ name: String) {
+  func setName(_ name: String, activity: String = "") {
     onMain {
-      guard self.badgeName != name else { return }
+      let activity = String(activity.prefix(32))
+      guard self.badgeName != name || self.badgeActivity != activity else { return }
       self.badgeName = name
+      self.badgeActivity = activity
       self.layoutBadge()
-      self.setBadgeVisible(!name.isEmpty)
+      self.setBadgeVisible(!self.badgeLabel.isEmpty)
       self.idleHide?.cancel()
       self.idleHide = nil
-      if name.isEmpty { self.hide() }
+      if self.badgeLabel.isEmpty { self.hide() }
     }
   }
 
@@ -757,7 +761,7 @@ final class AgentCursor {
   private func layoutBadge() {
     guard let badge = badgeLayer, let text = badgeTextLayer else { return }
     let font = NSFont.systemFont(ofSize: Self.badgeFontSize, weight: .semibold)
-    let measured = (badgeName as NSString).size(withAttributes: [.font: font]).width
+    let measured = (badgeLabel as NSString).size(withAttributes: [.font: font]).width
     let tip = Self.tipInWindow
     let originX = tip.x + Self.arrowWidth + 3
     let available = Self.windowSide - originX - Self.shadowInset
@@ -772,7 +776,7 @@ final class AgentCursor {
         x: originX, y: top - Self.badgeHeight, width: width, height: Self.badgeHeight)
       text.frame = badge.bounds.insetBy(
         dx: Self.badgePadding, dy: (Self.badgeHeight - lineHeight) / 2)
-      text.string = badgeName
+      text.string = badgeLabel
     }
   }
 

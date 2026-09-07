@@ -1251,6 +1251,21 @@ describe("agent gateway computer tools", () => {
     expect(backend.callsFor("scroll").map((entry) => entry.args)).toEqual([[null, 0, 150]]);
   });
 
+  it("limits large scrolls to overlapping views across screenshot scale changes", async () => {
+    const { backend, call } = await setup();
+    const first = resultJson(await call("computer_screenshot", { window_id: "fake-terminal" })) as {
+      screenshot: { region: { width: number; height: number }; width: number; height: number };
+    };
+    for (const distance of [1500, 700, -1400]) {
+      const result = resultJson(await call("computer_scroll", {
+        window_id: "fake-terminal", delta_x: 0, delta_y: distance,
+      })) as { scroll: { requested: { deltaY: number }; limitedTo: { deltaY: number } } };
+      expect(result.scroll.limitedTo.deltaY).toBe(Math.sign(distance) * first.screenshot.region.height / 2);
+      expect(Math.abs(result.scroll.requested.deltaY)).toBeGreaterThan(Math.abs(result.scroll.limitedTo.deltaY));
+      expect(Math.abs(backend.callsFor("scroll").at(-1)!.args[2] as number)).toBeLessThanOrEqual(first.screenshot.region.height / 2);
+    }
+  });
+
   it("reports scroll travel and spends no extra capture doing it", async () => {
     const { backend, call, see } = await setup();
     await see();

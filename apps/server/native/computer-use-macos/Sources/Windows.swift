@@ -181,6 +181,28 @@ enum Windows {
     snapshot(maxAgeNanoseconds: 0)
   }
 
+  /// Never select or inject into a window outside the user's current Space.
+  /// Use a fresh snapshot: the regular cache can survive a Space transition.
+  static func requireInputSpace(_ number: CGWindowID, ownerPID: pid_t? = nil) throws {
+    try InputCancellation.check()
+    // Query only this window. Full enumeration also sorts every window and
+    // resolves application metadata; doing that for each key event adds latency.
+    guard let entries = CGWindowListCopyWindowInfo(.optionIncludingWindow, number)
+      as? [[String: Any]],
+      let entry = entries.first(where: {
+        ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == number
+      }), let currentPID = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+      ownerPID == nil || currentPID == ownerPID else {
+      throw RPCError(.targetMissing, "The input target closed or changed owner")
+    }
+    guard (entry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true else {
+      throw RPCError(.inactiveSpace,
+        "Input paused: the target window is outside the current Space or minimized. "
+        + "Do not retry input, activate the app, or switch Spaces. Screenshots remain available; "
+        + "resume input only after the user returns the target to the current Space.")
+    }
+  }
+
   /// Check stacking, not keyboard focus. Include Synara here: it can hide the
   /// target even though it is deliberately absent from the agent's window list.
   static func isRevealed(_ window: DesktopWindow) -> Bool {

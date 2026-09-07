@@ -43,6 +43,8 @@ enum Lanes {
   /// The AX walk, alone.
   static let accessibility = DispatchQueue(
     label: "dev.synara.computer-helper.accessibility", qos: .userInitiated)
+  /// Cosmetic updates preserve arrival order without queuing behind input.
+  static let presentation = DispatchQueue(label: "dev.synara.computer-helper.presentation")
   /// The stdin reader.
   static let reader = DispatchQueue(
     label: "dev.synara.computer-helper.stdin", qos: .userInitiated)
@@ -67,10 +69,12 @@ enum Lanes {
     switch method {
     case "move", "click", "double-click", "triple-click", "right-click", "drag", "scroll",
       "type", "press-key", "hotkey", "set-value", "perform-action", "focus-window",
-      "raise-window", "clear-focus-window", "read-clipboard", "write-clipboard", "set-agent-cursor", "launch-app":
+      "raise-window", "clear-focus-window", "read-clipboard", "write-clipboard", "launch-app":
       // `launch-app` is an action with the same ordering expectation as the
       // rest: "open the app, then click in it" has to happen in that order.
       return input
+    case "set-agent-cursor":
+      return presentation
     case "describe-ui":
       return accessibility
     default:

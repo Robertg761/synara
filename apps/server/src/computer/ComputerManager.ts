@@ -1,3 +1,4 @@
+import { CursorActivity } from "./cursorActivity.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   ComputerId,
@@ -306,6 +307,7 @@ export class ComputerManager {
     return this.backend.capabilities();
   }
   private readonly operations = new DesktopOperationQueue();
+  readonly cursorActivity: CursorActivity;
   /**
    * The window ids the last window read saw, kept so a post-action read can be
    * diffed against it without paying for a second one.
@@ -328,6 +330,7 @@ export class ComputerManager {
 
   constructor(options: ComputerManagerOptions) {
     this.backend = options.backend;
+    this.cursorActivity = new CursorActivity((text) => this.backend.setCursorActivity?.(text));
     this.computerId = options.backend.computerId;
     this.now = options.now ?? Date.now;
     this.leaseIdleMs = options.leaseIdleMs ?? COMPUTER_LEASE_IDLE_MS;
@@ -1632,6 +1635,7 @@ export class ComputerManager {
    * loss, and must never turn into a refused action.
    */
   private async announceDrivingAgent(threadId: string | null): Promise<void> {
+    this.cursorActivity.setOwner(threadId);
     if (!this.backend.setDrivingAgent) return;
     const label = threadId === null ? null : (this.threadLabels.get(threadId) ?? null);
     await this.backend.setDrivingAgent(label).catch(() => undefined);
@@ -1774,6 +1778,7 @@ export class ComputerManager {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.cursorActivity.dispose();
     await this.operations.close();
     if (this.windowsPublishTimer !== undefined) clearTimeout(this.windowsPublishTimer);
     this.windowsPublishTimer = undefined;

@@ -902,6 +902,8 @@ export const ComputerActionResult = Schema.Struct({
     Schema.Struct({
       requested: Schema.Struct({ deltaX: Schema.Finite, deltaY: Schema.Finite }),
       injected: Schema.Struct({ deltaX: Schema.Finite, deltaY: Schema.Finite }),
+      /** Requested distance limited to preserve overlap between observations. */
+      limitedTo: Schema.optional(Schema.Struct({ deltaX: Schema.Finite, deltaY: Schema.Finite })),
       traveledY: Schema.optional(Schema.Finite),
       gearing: Schema.optional(Schema.Finite),
     }),

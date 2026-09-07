@@ -45,6 +45,13 @@ Geometry.startObservingScreenChanges()
 let cursor = AgentCursor()
 cursor.install()
 let input = InputController(cursor: cursor)
+let spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+  forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+) { _ in
+  InputCancellation.cancelActions()
+  Windows.invalidate()
+  cursor.hide()
+}
 
 // MARK: - Dispatch
 
@@ -292,8 +299,8 @@ func handle(method: String, params: Params) throws -> Any {
     guard let focusTarget = Windows.window(withNumber: focusId) else {
       throw RPCError(.targetMissing, "no window has id \(focusId)")
     }
-    input.setKeyboardTarget(focusTarget)
     try Accessibility.focusWindowForKeyboard(focusTarget)
+    input.setKeyboardTarget(focusTarget)
     return ["ok": true]
 
   case "raise-window":
@@ -321,7 +328,7 @@ func handle(method: String, params: Params) throws -> Any {
     return ["ok": true]
 
   case "set-agent-cursor":
-    cursor.setName(params.optionalString("name") ?? "")
+    cursor.setName(params.optionalString("name") ?? "", activity: params.optionalString("activity") ?? "")
     return ["ok": true]
 
   default:
@@ -333,6 +340,7 @@ func handle(method: String, params: Params) throws -> Any {
 
 func showSemanticTarget(_ params: Params) throws {
   try input.requireInputPermission()
+  try Windows.requireInputSpace(try windowId(from: params))
   // One RPC both shows the target and performs the semantic action. No hover
   // event is injected, since it could open a menu and invalidate the AX path.
   guard params.raw["x"] != nil || params.raw["y"] != nil else { return }
@@ -347,8 +355,8 @@ func aimKeyboard(from params: Params) throws {
   guard let window = Windows.window(withNumber: id) else {
     throw RPCError(.targetMissing, "no window has id \(id)")
   }
-  input.setKeyboardTarget(window)
   try Accessibility.focusWindowForKeyboard(window)
+  input.setKeyboardTarget(window)
 }
 
 
@@ -576,7 +584,7 @@ func handleLine(_ line: Data) {
     InputCancellation.cancel(params.raw["id"])
     return
   }
-  let cancellation = InputCancellation.register(id)
+  let cancellation = InputCancellation.register(id, isAction: Lanes.isAction(method))
   // Parsing happens on the reader thread; the work itself goes to the lane that
   // owns this method so a capture never queues behind a click, or vice versa.
   Lanes.queue(for: method).async {

@@ -96,6 +96,10 @@ enum Accessibility {
     var menuApps = Set<pid_t>()
     for window in windows {
       if remaining <= 0 || Date() >= deadline { truncated = true; break }
+      if !window.onScreen {
+        failedWindows.append(String(window.windowNumber))
+        continue
+      }
       let application: Application
       if let existing = applications[window.ownerPID] {
         application = existing
@@ -147,8 +151,10 @@ enum Accessibility {
 
   /// Resolve `windowId` + `nodePath` to a live element and set its value.
   static func setValue(windowId: CGWindowID, path: [Int], value: String, accessibilityRoot: String = "window") throws {
+    try Windows.requireInputSpace(windowId)
     let element = try resolve(windowId: windowId, path: path, accessibilityRoot: accessibilityRoot)
     try InputCancellation.check()
+    try Windows.requireInputSpace(windowId)
     let status = AXUIElementSetAttributeValue(
       element, kAXValueAttribute as CFString, value as CFTypeRef)
     guard status == .success else {
@@ -158,9 +164,11 @@ enum Accessibility {
 
   /// Resolve `windowId` + `nodePath` to a live element and perform an action.
   static func performAction(windowId: CGWindowID, path: [Int], action: String, accessibilityRoot: String = "window") throws {
+    try Windows.requireInputSpace(windowId)
     let element = try resolve(windowId: windowId, path: path, accessibilityRoot: accessibilityRoot)
     let axAction = mapAction(action)
     try InputCancellation.check()
+    try Windows.requireInputSpace(windowId)
     let status = AXUIElementPerformAction(element, axAction as CFString)
     guard status == .success else {
       throw RPCError(
@@ -211,6 +219,7 @@ enum Accessibility {
   /// app's focused element is a text control (or lives inside a web area) and
   /// the app is not a terminal.
   static func insertText(_ text: String, into window: DesktopWindow) -> TextInsertion {
+    guard (try? Windows.requireInputSpace(window.windowNumber, ownerPID: window.ownerPID)) != nil else { return .refused("target left current Space") }
     guard isTrusted() else { return .notApplicable }
     if let bundle = NSRunningApplication(processIdentifier: window.ownerPID)?.bundleIdentifier,
       terminalBundleIDs.contains(bundle)
@@ -231,9 +240,14 @@ enum Accessibility {
     let valueBefore = stringAttribute(focused, kAXValueAttribute)
     let role = stringAttribute(focused, kAXRoleAttribute) ?? ""
     let inWebArea = hasAncestor(focused, role: "AXWebArea")
-    guard textRoles.contains(role), !inWebArea else { return .notApplicable }
+    // Browser address bars expose writable AX text but that write may update
+    // only the accessibility mirror, leaving Enter pointed at the old URL.
+    // Keep atomic insertion for native multiline editors; use real keystrokes
+    // for single-line controls, including browser chrome.
+    guard role == "AXTextArea", !inWebArea else { return .notApplicable }
     guard isSettable(focused, kAXSelectedTextAttribute) else { return .notApplicable }
     guard (try? InputCancellation.check()) != nil else { return .refused("cancelled") }
+    guard (try? Windows.requireInputSpace(window.windowNumber, ownerPID: window.ownerPID)) != nil else { return .refused("target left current Space") }
     let status = AXUIElementSetAttributeValue(
       focused, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
     guard status == .success else {
@@ -454,22 +468,9 @@ enum Accessibility {
     if SkyLight.frontmostPID() == window.ownerPID && !keyboardWindowMatches(window) {
       throw RPCError(.notDelivered, "Refusing to change the user's active window")
     }
-    guard isTrusted() else { return }
-    let application = Application(
-      pid: window.ownerPID, requestAccessibility: false, messagingTimeout: windowMessagingTimeout)
-    guard let axWindow = application.match(window) else { return }
-    var raw: CFTypeRef?
-    if AXUIElementCopyAttributeValue(
-      application.element, kAXFocusedWindowAttribute as CFString, &raw) == .success,
-      let value = raw, CFGetTypeID(value) == AXUIElementGetTypeID(),
-      CFEqual(value, axWindow)
-    {
-      return
-    }
-    AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    AXUIElementSetAttributeValue(application.element, kAXFocusedWindowAttribute as CFString, axWindow)
-    SkyLight.makeKeyWindow(pid: window.ownerPID, windowID: window.windowNumber)
-    usleep(20_000)
+    try Windows.requireInputSpace(window.windowNumber, ownerPID: window.ownerPID)
+    // AXFocused/AXFocusedWindow writes can switch macOS Spaces even without an
+    // application activation notification. Focus.begin handles guarded key records.
   }
 
   /// Which of `candidates` the owning application says are actually minimized.

@@ -62,3 +62,25 @@ bun run --cwd apps/server test src/computer/MacComputerBackend.test.ts src/compu
 ```
 
 The performance changes were developed on Linux, where AppKit, ScreenCaptureKit, CryptoKit and the native Swift compiler were unavailable. Passing TypeScript tests does not establish native compilation or delivery timing. Run the native build and opt-in suites above on macOS before claiming those checks passed. Still requests continue capturing and hashing pixels at the normal cadence, usually twice a second; unchanged frames skip PNG encoding, base64 and stdio transport. This does not imply zero idle capture CPU. Use a static desktop to measure idle still encoding, a multi-display desktop to measure capture concurrency, and native plus Chromium text fields to check insertion fallback. The physical-key fallback retains its original pacing and per-event focus checks.
+
+## Space-change cancellation
+
+This test uses no desktop input. It checks cancellation of running and queued actions,
+continued perception, and acceptance of new requests after the transition.
+
+```sh
+helper_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/synara-space-tests.XXXXXX")
+swiftc apps/server/native/computer-use-macos/Sources/JSONRPC.swift \
+  apps/server/native/computer-use-macos/Sources/Cancellation.swift \
+  apps/server/native/computer-use-macos/Tests/InputCancellationTests.swift \
+  -o "$helper_test_dir/cancellation"
+"$helper_test_dir/cancellation"
+```
+
+Live Space testing must monitor both `didActivateApplicationNotification` and
+`activeSpaceDidChangeNotification`. App activation alone misses Space switches.
+Never switch the user's Space to reproduce a bug. Off-Space native input must
+return helper error -32015 without focus writes or event injection; screenshots
+remain available. A Space change during a gesture cancels further input, but
+release events still clean up held keys/buttons. Do not automatically replay a
+partially completed gesture.

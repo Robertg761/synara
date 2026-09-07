@@ -6,6 +6,7 @@
 // which is the same wire `@synara/shared/jsonrpc-stdio` speaks on the Node side.
 
 import Foundation
+import CoreGraphics
 
 /// JSON-RPC error codes: the standard range plus helper-specific ones.
 enum RPCErrorCode: Int {
@@ -22,6 +23,7 @@ enum RPCErrorCode: Int {
   case targetMissing = -32001
   /// Input this process accepted but could not deliver to the target.
   case notDelivered = -32002
+  case inactiveSpace = -32015
 }
 
 struct RPCError: Error {

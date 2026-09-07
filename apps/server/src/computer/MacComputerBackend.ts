@@ -461,6 +461,7 @@ export class MacComputerBackend implements ComputerBackend {
   private binaryPromise: Promise<string> | undefined;
   private disposed = false;
   private drivingAgent: string | null = null;
+  private cursorActivity: string | null = null;
   /** Capture availability follows both the preflight and actual OS capture results. */
   private captureGranted = false;
   private captureVerified = false;
@@ -1294,12 +1295,20 @@ export class MacComputerBackend implements ComputerBackend {
     await this.call(MAC_HELPER_METHODS.raiseWindow, { windowId });
   }
 
+  async setCursorActivity(text: string | null): Promise<void> {
+    this.cursorActivity = text;
+    if (!this.helper?.running) return;
+    await this.helper.request(MAC_HELPER_METHODS.setAgentCursor, {
+      name: this.drivingAgent ?? "", activity: text ?? "",
+    }).catch(() => undefined);
+  }
+
   async setDrivingAgent(name: string | null): Promise<void> {
     this.drivingAgent = name?.trim() ? name.trim() : null;
     if (!this.helper?.running) return;
     // Best effort: the agent cursor's name badge is presentation, so a failure
     // here must never fail the action that changed the holder.
-    await this.call(MAC_HELPER_METHODS.setAgentCursor, { name: this.drivingAgent ?? "" }).catch(
+    await this.call(MAC_HELPER_METHODS.setAgentCursor, { name: this.drivingAgent ?? "", activity: this.cursorActivity ?? "" }).catch(
       () => undefined,
     );
   }
@@ -2041,9 +2050,9 @@ export class MacComputerBackend implements ComputerBackend {
     }
     // Push the cached badge name onto the fresh session so a reconnect brings
     // the agent cursor back naming the same thread.
-    if (this.drivingAgent) {
+    if (this.drivingAgent || this.cursorActivity) {
       await helper
-        .request(MAC_HELPER_METHODS.setAgentCursor, { name: this.drivingAgent })
+        .request(MAC_HELPER_METHODS.setAgentCursor, { name: this.drivingAgent ?? "", activity: this.cursorActivity ?? "" })
         .catch(() => undefined);
     }
     this.publishHealth();

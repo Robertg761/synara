@@ -375,6 +375,8 @@ export interface ComputerBackend {
    * action that changed the holder.
    */
   setDrivingAgent?(name: string | null): Promise<void>;
+  /** Cosmetic activity badge; must not activate or move any window. */
+  setCursorActivity?(text: string | null): Promise<void>;
   launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult>;
   /**
    * `windowId` is the window the caller resolved this point to, when it named

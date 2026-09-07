@@ -1,3 +1,4 @@
+import { cursorToolActivity } from "../computer/cursorActivity.ts";
 import {
   assertDesktopOperationActive,
   desktopOperationSignal,
@@ -916,7 +917,7 @@ export function makeAgentGatewayComputerTools(
             async () => {
               await Effect.runPromise(context.assertCallerTurnActive(), { signal: abortSignal });
               abortSignal.throwIfAborted();
-              return run(args, context);
+              return manager.cursorActivity.during(context.callerThreadId, cursorToolActivity(name), () => run(args, context));
             },
             abortSignal,
           );
@@ -1494,7 +1495,7 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_scroll",
       "Scroll",
-      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in pixels of the same screenshot the coordinates are in, so a scroll needs a screenshot even when it names no coordinates at all — roughly 80 pixels per notch of a physical wheel in a full-resolution window capture. To page through content, scroll by about half the window's height as it appears in the screenshot so each observation overlaps the last; larger steps skip content. Some applications gear scrolling up and travel several times the distance requested; browsers commonly do. The result reports what the content actually did in scroll.traveledY, in desktop pixels with the same sign as delta_y, and scrolls are corrected automatically using it: the first large scroll into a window is delivered as a small probe plus a pre-corrected remainder, so ask for the distance you actually want — even the first scroll lands close, and later ones land closer. A traveledY of 0 means the content did not move at all, which usually means the page is already at its edge — a wheel cannot scroll past the top or bottom. If you are scrolling to hunt for a control and accessibility is available, call computer_get_state once: its elements list names the labeled controls on screen, and one of those may already be targetable by label. ${POINTER_COORDINATE_HINT}`,
+      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in pixels of the same screenshot the coordinates are in, so a scroll needs a screenshot even when it names no coordinates at all — roughly 80 pixels per notch of a physical wheel in a full-resolution window capture. Each call is limited to half the captured width/height so successive observations overlap; scroll.limitedTo reports a shortened request in desktop pixels. Read the returned image before scrolling again. Do not blindly repeat a pixel count: attached action images may use a different scale. Some applications gear scrolling up and travel several times the distance requested; browsers commonly do. The result reports what the content actually did in scroll.traveledY, in desktop pixels with the same sign as delta_y, and scrolls are corrected automatically using it: the first large scroll into a window is delivered as a small probe plus a pre-corrected remainder, so ask for the distance you actually want — even the first scroll lands close, and later ones land closer. A traveledY of 0 means the content did not move at all, which usually means the page is already at its edge — a wheel cannot scroll past the top or bottom. If you are scrolling to hunt for a control and accessibility is available, call computer_get_state once: its elements list names the labeled controls on screen, and one of those may already be targetable by label. ${POINTER_COORDINATE_HINT}`,
       {
         type: "object",
         properties: {
@@ -1529,23 +1530,40 @@ export function makeAgentGatewayComputerTools(
           readDelta(args, "delta_x"),
           readDelta(args, "delta_y"),
         );
+        // Keep adjacent observations overlapping even when the model repeats
+        // a pixel count after the screenshot changes scale.
+        const limited = {
+          deltaX: Math.sign(delta.deltaX) * Math.min(Math.abs(delta.deltaX), frame.region.width / 2),
+          deltaY: Math.sign(delta.deltaY) * Math.min(Math.abs(delta.deltaY), frame.region.height / 2),
+        };
         const modifiers = readModifiers(args);
-        return manager.scrollCalibrated(
+        const outcome = await manager.scrollCalibrated(
           threadId,
           hasTargetFields(target) ? target : null,
-          delta.deltaX,
-          delta.deltaY,
+          limited.deltaX,
+          limited.deltaY,
           {
             observe: readBooleanArg(args, "include_screenshot") !== false,
             ...(modifiers.length > 0 ? { modifiers } : {}),
           },
         );
+        if (outcome.result.scroll &&
+          (limited.deltaX !== delta.deltaX || limited.deltaY !== delta.deltaY)) {
+          return {
+            ...outcome,
+            result: {
+              ...outcome.result,
+              scroll: { ...outcome.result.scroll, requested: delta, limitedTo: limited },
+            },
+          };
+        }
+        return outcome;
       },
     ),
     observedActionEntry(
       "computer_type_text",
       "Type text",
-      `Type text into the focused desktop control, as if typed on the keyboard. It inserts at the caret and replaces nothing: to overwrite a field's contents, select them first — computer_triple_click on the field, or the application's own select-all shortcut through computer_hotkey — or use computer_set_value, which writes the whole value atomically. Type the whole string in one call — a name, an email address, a URL — and do not split it into pieces; splitting only multiplies the chance of a partial result. ${KEYBOARD_TARGET_HINT} ${DELIVERY_HINT}`,
+      `Type text into the focused desktop control, as if typed on the keyboard. It inserts at the caret and replaces nothing: to overwrite a field's contents, select them first — computer_triple_click on the field, or the application's own select-all shortcut through computer_hotkey — or use computer_set_value, which writes the whole value atomically. For browser navigation: hotkey meta+l (ctrl+l outside macOS), type the URL without a newline, then press_key enter with wait_for_label for a known destination control. Never guess address-bar coordinates or repeat Enter on an unchanged page. Type the whole string in one call — a name, an email address, a URL — and do not split it into pieces; splitting only multiplies the chance of a partial result. ${KEYBOARD_TARGET_HINT} ${DELIVERY_HINT}`,
       {
         type: "object",
         properties: {

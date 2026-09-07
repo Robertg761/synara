@@ -1007,6 +1007,36 @@ describe("MacComputerBackend", () => {
     expect((error as ComputerBackendError).rejectedOperation).toBe("press-key");
   });
 
+  it("restores cursor activity on helper startup and updates it without input calls", async () => {
+    const helper = new FakeMacHelper();
+    const backend = makeBackend(helper);
+    await backend.setDrivingAgent("Luna");
+    await backend.setCursorActivity("Thinking");
+    expect(helper.startCount).toBe(0);
+    await backend.availability();
+    expect(helper.callsFor("set-agent-cursor").at(-1)).toEqual({ name: "Luna", activity: "Thinking" });
+    await backend.setCursorActivity("Waiting for you");
+    expect(helper.callsFor("set-agent-cursor").at(-1)).toEqual({ name: "Luna", activity: "Waiting for you" });
+    expect(helper.callsFor("focus-window")).toEqual([]);
+    expect(helper.callsFor("raise-window")).toEqual([]);
+    await backend.dispose();
+  });
+
+  it("preserves a Space pause without suggesting a retry or a permission prompt", async () => {
+    const message = "Input paused: the target window is outside the current Space. Do not retry input.";
+    const helper = new FakeMacHelper({
+      "press-key": new MacComputerHelperError("helper_-32015", message),
+    });
+    const backend = makeBackend(helper);
+    const error = await backend.pressKey("enter").catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(ComputerBackendError);
+    expect(error.message).toBe(message);
+    expect(error.rejectedOperation).toBeUndefined();
+    expect(error.setupRequired).toBe(false);
+    expect(helper.callsFor("press-key")).toHaveLength(1);
+    await backend.dispose();
+  });
+
   it("turns a missing target into the window-not-found answer the manager already speaks", async () => {
     const helper = new FakeMacHelper({
       capture: new MacComputerHelperError("helper_-32001", "window 5 is minimized"),
