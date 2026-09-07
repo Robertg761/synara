@@ -1,0 +1,29 @@
+{
+  "name": "@synara/session-sync",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/main.ts",
+    "start": "bun run src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --maxWorkers=1 --no-file-parallelism"
+  },
+  "dependencies": {
+    "@synara/contracts": "workspace:*",
+    "@synara/shared": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@synara/contracts": "workspace:*",
+    "@synara/shared": "workspace:*",
+    "@types/bun": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "engines": {
+    "node": "^22.19 || ^23.11 || >=24.10"
+  }
+}
