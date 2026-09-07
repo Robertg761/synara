@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The XML theme only governs the launch window, before the first composed frame exists. Its whole
+  job is to paint the same background Compose is about to paint, so launching the app does not
+  flash a mismatched colour.
+
+  System bar colours are deliberately absent: MainActivity calls enableEdgeToEdge(), which makes
+  the bars transparent and is the only supported way to control them on API 35+, where the
+  statusBarColor/navigationBarColor attributes this theme used to set are ignored outright.
+-->
+<resources>
+    <style name="Theme.Synara" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <!-- Let the window draw behind the bars from the very first frame. -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

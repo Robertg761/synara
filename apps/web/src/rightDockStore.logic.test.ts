@@ -9,12 +9,24 @@ import {
   findMissingSidechatPaneIds,
   isRightDockPaneKind,
   openPaneInState,
+  resolveDockVisibility,
+  resolveVisibleDockPane,
   resolveVisibleDockSidechatThreadIds,
   sanitizeRightDockStateByThreadId,
   sanitizeRightDockThreadState,
   setDockOpenInState,
   updatePaneInState,
+  type DockVisibility,
 } from "./rightDockStore.logic";
+
+/** Desktop chat route: the dock component is mounted, the store picks the visible pane. */
+const DESKTOP_DOCK: DockVisibility = { dockRendered: true, phonePaneId: null };
+/** Nothing dock-shaped on screen (editor view, or a phone chat with no `?pane=`). */
+const NO_DOCK: DockVisibility = { dockRendered: false, phonePaneId: null };
+/** Phone chat route with `?pane=<id>` pushed full screen. */
+function phoneDock(paneId: string): DockVisibility {
+  return { dockRendered: false, phonePaneId: paneId };
+}
 
 describe("RIGHT_DOCK_PANE_KINDS (single source of truth)", () => {
   it("lists every supported kind", () => {
@@ -227,7 +239,7 @@ describe("resolveVisibleDockSidechatThreadIds", () => {
   it("exposes the embedded sidechat thread of an open host dock", () => {
     expect(
       resolveVisibleDockSidechatThreadIds({
-        dockRendered: true,
+        visibility: DESKTOP_DOCK,
         dockStateByThreadId: { [hostThreadId]: dockWithSidechat(true) },
         hostThreadIds: [hostThreadId],
       }),
@@ -237,21 +249,21 @@ describe("resolveVisibleDockSidechatThreadIds", () => {
   it("ignores hidden docks, inactive sidechat panes, other hosts, and non-sidechat panes", () => {
     expect(
       resolveVisibleDockSidechatThreadIds({
-        dockRendered: false,
+        visibility: NO_DOCK,
         dockStateByThreadId: { [hostThreadId]: dockWithSidechat(true) },
         hostThreadIds: [hostThreadId],
       }),
     ).toEqual([]);
     expect(
       resolveVisibleDockSidechatThreadIds({
-        dockRendered: true,
+        visibility: DESKTOP_DOCK,
         dockStateByThreadId: { [hostThreadId]: dockWithSidechat(false) },
         hostThreadIds: [hostThreadId],
       }),
     ).toEqual([]);
     expect(
       resolveVisibleDockSidechatThreadIds({
-        dockRendered: true,
+        visibility: DESKTOP_DOCK,
         dockStateByThreadId: { [hostThreadId]: dockWithSidechat(true) },
         hostThreadIds: [ThreadId.makeUnsafe("other-host")],
       }),
@@ -262,7 +274,7 @@ describe("resolveVisibleDockSidechatThreadIds", () => {
     });
     expect(
       resolveVisibleDockSidechatThreadIds({
-        dockRendered: true,
+        visibility: DESKTOP_DOCK,
         dockStateByThreadId: { [hostThreadId]: explorerOnly },
         hostThreadIds: [hostThreadId],
       }),
@@ -273,7 +285,7 @@ describe("resolveVisibleDockSidechatThreadIds", () => {
     });
     expect(
       resolveVisibleDockSidechatThreadIds({
-        dockRendered: true,
+        visibility: DESKTOP_DOCK,
         dockStateByThreadId: { [hostThreadId]: inactiveSidechat },
         hostThreadIds: [hostThreadId],
       }),
@@ -288,7 +300,7 @@ describe("resolveVisibleDockSidechatThreadIds", () => {
     });
     expect(
       resolveVisibleDockSidechatThreadIds({
-        dockRendered: true,
+        visibility: DESKTOP_DOCK,
         dockStateByThreadId: { [hostThreadId]: selfEmbedding },
         hostThreadIds: [hostThreadId],
       }),
@@ -297,7 +309,7 @@ describe("resolveVisibleDockSidechatThreadIds", () => {
     const otherHostThreadId = ThreadId.makeUnsafe("other-host");
     expect(
       resolveVisibleDockSidechatThreadIds({
-        dockRendered: true,
+        visibility: DESKTOP_DOCK,
         dockStateByThreadId: {
           [hostThreadId]: dockWithSidechat(true),
           [otherHostThreadId]: dockWithSidechat(true),
@@ -305,6 +317,149 @@ describe("resolveVisibleDockSidechatThreadIds", () => {
         hostThreadIds: [hostThreadId, otherHostThreadId],
       }),
     ).toEqual([sidechatThreadId]);
+  });
+
+  it("leases the phone pane screen's sidechat, whatever the store's active pane says", () => {
+    // The pushed screen renders off the URL, so the lease must not wait for the
+    // store to catch up (collapsed dock, no active pane).
+    const collapsed = dockWithSidechat(false);
+    expect(
+      resolveVisibleDockSidechatThreadIds({
+        visibility: phoneDock("side-pane"),
+        dockStateByThreadId: { [hostThreadId]: collapsed },
+        hostThreadIds: [hostThreadId],
+      }),
+    ).toEqual([sidechatThreadId]);
+  });
+
+  it("leases nothing on phone unless the URL pane is that sidechat", () => {
+    const withExplorerActive = openPaneInState(dockWithSidechat(true), {
+      paneId: "explorer-pane",
+      kind: "explorer",
+    });
+    // Another pane is pushed: the sidechat is not on screen, so it stays out of
+    // the live-stream budget rather than every sidechat pane being leased.
+    expect(
+      resolveVisibleDockSidechatThreadIds({
+        visibility: phoneDock("explorer-pane"),
+        dockStateByThreadId: { [hostThreadId]: withExplorerActive },
+        hostThreadIds: [hostThreadId],
+      }),
+    ).toEqual([]);
+    // Stale/unknown pane id in the URL.
+    expect(
+      resolveVisibleDockSidechatThreadIds({
+        visibility: phoneDock("missing-pane"),
+        dockStateByThreadId: { [hostThreadId]: withExplorerActive },
+        hostThreadIds: [hostThreadId],
+      }),
+    ).toEqual([]);
+    // Phone chat with no pane pushed at all.
+    expect(
+      resolveVisibleDockSidechatThreadIds({
+        visibility: NO_DOCK,
+        dockStateByThreadId: { [hostThreadId]: dockWithSidechat(true) },
+        hostThreadIds: [hostThreadId],
+      }),
+    ).toEqual([]);
+    // A phone pane id only ever resolves against its own host thread.
+    expect(
+      resolveVisibleDockSidechatThreadIds({
+        visibility: phoneDock("side-pane"),
+        dockStateByThreadId: { [hostThreadId]: dockWithSidechat(true) },
+        hostThreadIds: [ThreadId.makeUnsafe("other-host")],
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe("resolveDockVisibility", () => {
+  it("mounts the dock on desktop chat routes", () => {
+    expect(
+      resolveDockVisibility({
+        layoutMode: "desktop",
+        view: undefined,
+        urlPaneId: null,
+      }),
+    ).toEqual({ dockRendered: true, phonePaneId: null });
+    // A stray pane param never means anything on desktop.
+    expect(
+      resolveDockVisibility({
+        layoutMode: "desktop",
+        view: undefined,
+        urlPaneId: "side-pane",
+      }),
+    ).toEqual({ dockRendered: true, phonePaneId: null });
+  });
+
+  it("hides everything dock-shaped in the editor view", () => {
+    expect(
+      resolveDockVisibility({
+        layoutMode: "desktop",
+        view: "editor",
+        urlPaneId: "side-pane",
+      }),
+    ).toEqual({ dockRendered: false, phonePaneId: null });
+    expect(
+      resolveDockVisibility({
+        layoutMode: "phone",
+        view: "editor",
+        urlPaneId: "side-pane",
+      }),
+    ).toEqual({ dockRendered: false, phonePaneId: null });
+  });
+
+  it("routes phone visibility through the URL pane instead of the dock", () => {
+    expect(
+      resolveDockVisibility({
+        layoutMode: "phone",
+        view: undefined,
+        urlPaneId: "side-pane",
+      }),
+    ).toEqual({ dockRendered: false, phonePaneId: "side-pane" });
+    expect(
+      resolveDockVisibility({
+        layoutMode: "phone",
+        view: undefined,
+        urlPaneId: null,
+      }),
+    ).toEqual({ dockRendered: false, phonePaneId: null });
+    expect(
+      resolveDockVisibility({
+        layoutMode: "phone",
+        view: undefined,
+        urlPaneId: undefined,
+      }),
+    ).toEqual({ dockRendered: false, phonePaneId: null });
+  });
+});
+
+describe("resolveVisibleDockPane", () => {
+  const sidechatThreadId = ThreadId.makeUnsafe("sidechat-thread");
+  const twoPaneDock = openPaneInState(
+    openPaneInState(createDefaultRightDockState(), {
+      paneId: "side-pane",
+      kind: "sidechat",
+      threadId: sidechatThreadId,
+    }),
+    { paneId: "explorer-pane", kind: "explorer" },
+  );
+
+  it("follows the store on desktop", () => {
+    expect(resolveVisibleDockPane(DESKTOP_DOCK, twoPaneDock)?.id).toBe("explorer-pane");
+    expect(resolveVisibleDockPane(DESKTOP_DOCK, setDockOpenInState(twoPaneDock, false))).toBeNull();
+    expect(resolveVisibleDockPane(NO_DOCK, twoPaneDock)).toBeNull();
+    expect(resolveVisibleDockPane(DESKTOP_DOCK, null)).toBeNull();
+    expect(resolveVisibleDockPane(DESKTOP_DOCK, undefined)).toBeNull();
+  });
+
+  it("follows the URL on phone", () => {
+    expect(resolveVisibleDockPane(phoneDock("side-pane"), twoPaneDock)?.id).toBe("side-pane");
+    expect(
+      resolveVisibleDockPane(phoneDock("side-pane"), setDockOpenInState(twoPaneDock, false))?.id,
+    ).toBe("side-pane");
+    expect(resolveVisibleDockPane(phoneDock("missing-pane"), twoPaneDock)).toBeNull();
+    expect(resolveVisibleDockPane(phoneDock("side-pane"), null)).toBeNull();
   });
 });
 

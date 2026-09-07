@@ -1,0 +1,51 @@
+name: android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/android/**"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "apps/android/**"
+      - ".github/workflows/android.yml"
+
+jobs:
+  build:
+    name: Assemble & unit-test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # No Gradle wrapper is committed yet; setup-gradle pins the version instead so builds stay
+      # reproducible. Once a wrapper lands, switch to `gradle/actions/setup-gradle` with
+      # cache-read-only and invoke ./gradlew.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Unit tests
+        run: gradle :app:testDebugUnitTest --stacktrace
+
+      - name: Assemble debug
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Assemble release (shrunk)
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: apps/android/app/build/test-results/
+          if-no-files-found: ignore

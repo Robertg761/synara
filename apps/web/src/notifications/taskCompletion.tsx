@@ -9,10 +9,12 @@ import { useMemo, useEffect, useRef, useState } from "react";
 import { toastManager } from "../components/ui/toast";
 import { resolveVisibleToastThreadIds } from "../components/ui/toastRouteVisibility";
 import { useAppSettings } from "../appSettings";
-import { isElectron } from "../env";
+import { appRuntime } from "../env";
 import { useDiffRouteSearch } from "../hooks/useDiffRouteSearch";
+import { useLayoutMode } from "../lib/layoutMode";
 import { selectSplitView, useSplitViewStore } from "../splitViewStore";
 import { selectRightDockState, useRightDockStore } from "../rightDockStore";
+import { resolveDockVisibility } from "../rightDockStore.logic";
 import { useStore } from "../store";
 import { createAllThreadsSelector } from "../storeSelectors";
 import { useTerminalStateStore } from "../terminalStateStore";
@@ -28,35 +30,36 @@ import {
   collectInputNeededThreadCandidates,
   collectTerminalAttentionCandidates,
   isNotificationRuntimeFreshTimestamp,
+  resolveBrowserNotificationPermissionState,
+  resolveNotificationSettingsSupportText,
   shouldAttemptSystemTaskNotification,
   shouldShowThreadNotificationToast,
+  type BrowserNotificationPermissionState,
 } from "./taskCompletion.logic";
 
-export type BrowserNotificationPermissionState =
-  | NotificationPermission
-  | "unsupported"
-  | "insecure";
+export type { BrowserNotificationPermissionState };
 
-function isBrowserNotificationSupported(): boolean {
-  return typeof window !== "undefined" && "Notification" in window;
-}
-
-// Browsers require secure contexts and a user gesture before asking for permission.
+// Browsers require secure contexts and a user gesture before asking for permission,
+// and the mobile shell has no Web Notification UI at all — see
+// resolveBrowserNotificationPermissionState.
 export function readBrowserNotificationPermissionState(): BrowserNotificationPermissionState {
   if (typeof window === "undefined") {
     return "unsupported";
   }
-  if (!isBrowserNotificationSupported()) {
-    return "unsupported";
-  }
-  if (!window.isSecureContext) {
-    return "insecure";
-  }
-  return Notification.permission;
+  const hasNotificationApi = "Notification" in window;
+  return resolveBrowserNotificationPermissionState({
+    runtime: appRuntime,
+    hasNotificationApi,
+    isSecureContext: window.isSecureContext,
+    // Only meaningful when the API exists; ignored by the resolver otherwise.
+    permission: hasNotificationApi ? Notification.permission : "denied",
+  });
 }
 
 export async function requestBrowserNotificationPermission(): Promise<BrowserNotificationPermissionState> {
   const current = readBrowserNotificationPermissionState();
+  // The mobile shell resolves to "unsupported", so Notification.requestPermission()
+  // is never reached there — it would hang or auto-deny inside the WebView.
   if (current === "unsupported" || current === "insecure" || current === "denied") {
     return current;
   }
@@ -109,6 +112,9 @@ async function showSystemThreadNotification(
     });
   }
 
+  // Web fallback for plain browser tabs only: the mobile shell reports
+  // "unsupported" and therefore never displays a Notification the WebView
+  // would swallow. Its alerts come from the app's background watch.
   if (readBrowserNotificationPermissionState() !== "granted") {
     return false;
   }
@@ -164,6 +170,7 @@ export function TaskCompletionNotifications() {
   const rightDockState = useRightDockStore(
     useMemo(() => selectRightDockState(activeThreadId), [activeThreadId]),
   );
+  const layoutMode = useLayoutMode();
   const [allThreadsSelector] = useState(() => createAllThreadsSelector());
   const threads = useStore(allThreadsSelector);
   const threadsHydrated = useStore((store) => store.threadsHydrated);
@@ -171,7 +178,11 @@ export function TaskCompletionNotifications() {
   const visibleThreadIds = resolveVisibleToastThreadIds({
     activeThreadId,
     splitView,
-    rightDockRendered: routeSearch.view !== "editor",
+    dockVisibility: resolveDockVisibility({
+      layoutMode,
+      view: routeSearch.view,
+      urlPaneId: routeSearch.pane ?? null,
+    }),
     rightDockState,
   });
   const previousThreadsRef = useRef<readonly Thread[]>([]);
@@ -340,19 +351,5 @@ export function TaskCompletionNotifications() {
 export function buildNotificationSettingsSupportText(
   permissionState: BrowserNotificationPermissionState,
 ): string {
-  if (isElectron) {
-    return "Desktop app notifications use your operating system notification center.";
-  }
-  switch (permissionState) {
-    case "granted":
-      return "Browser notifications are enabled for this app.";
-    case "denied":
-      return "Browser notifications are blocked. Re-enable them in your browser site settings.";
-    case "insecure":
-      return "Browser notifications need a secure context. Localhost works; plain HTTP does not.";
-    case "unsupported":
-      return "This browser does not support desktop notifications.";
-    case "default":
-      return "Allow browser notifications to get alerts when chats or terminal agents finish or need input in the background.";
-  }
+  return resolveNotificationSettingsSupportText(appRuntime, permissionState);
 }

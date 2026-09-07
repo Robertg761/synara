@@ -139,6 +139,16 @@ const TEXT_VIEWPORT_MATRIX = [
   { name: "mobile", width: 430, height: 932 },
   { name: "narrow", width: 320, height: 700 },
 ] as const satisfies readonly ViewportSpec[];
+/**
+ * Second desktop width, used for same-instance resize checks. It stays above the 768px phone
+ * breakpoint on purpose: below it `/_chat` swaps the desktop tree for `PhoneAppShell`, so a
+ * resize across that line remounts the chat instead of reflowing it.
+ */
+const DESKTOP_NARROW_VIEWPORT: ViewportSpec = {
+  ...DEFAULT_VIEWPORT,
+  name: "desktop-narrow",
+  width: 800,
+};
 const ATTACHMENT_VIEWPORT_MATRIX = [
   DEFAULT_VIEWPORT,
   { name: "mobile", width: 430, height: 932 },
@@ -2368,11 +2378,49 @@ describe("ChatView transcript geometry (full app)", () => {
     },
   );
 
-  it("[geometry:linux] tracks wrapping parity while resizing an existing ChatView across the viewport matrix", async () => {
+  // Fresh mount per width, not one instance resized through the matrix: three of the four
+  // matrix widths sit below the 768px phone breakpoint, where `/_chat` renders `PhoneAppShell`
+  // instead of the desktop sidebar tree and the whole chat tree remounts (the accepted M3
+  // tradeoff — see `ChatRouteLayout`). A matrix walk therefore measures freshly mounted trees
+  // whatever this test does, so it mounts each width honestly and claims only what it can
+  // observe: wrapping parity *at* every width, and that the widths really do differ.
+  // The same-instance resize claim lives in the desktop-only test below.
+  it("[geometry:linux] keeps wrapping parity at every viewport in the matrix", async () => {
     const userText = "x".repeat(3_200);
     const targetMessageId = "msg-user-target-resize" as MessageId;
+    const snapshot = createSnapshotForTargetUser({
+      targetMessageId,
+      targetText: userText,
+    });
+
+    const measurements: UserRowMeasurement[] = [];
+
+    for (const viewport of TEXT_VIEWPORT_MATRIX) {
+      measurements.push(await measureUserRowAtViewport({ viewport, snapshot, targetMessageId }));
+    }
+
+    expect(
+      new Set(measurements.map((measurement) => Math.round(measurement.timelineWidthMeasuredPx)))
+        .size,
+    ).toBeGreaterThanOrEqual(3);
+
+    const byMeasuredWidth = measurements.toSorted(
+      (left, right) => left.timelineWidthMeasuredPx - right.timelineWidthMeasuredPx,
+    );
+    const narrowest = byMeasuredWidth[0]!;
+    const widest = byMeasuredWidth.at(-1)!;
+    expect(narrowest.timelineWidthMeasuredPx).toBeLessThan(widest.timelineWidthMeasuredPx);
+    // Both widths exceed the 12-line limit, so the collapsed row stays the same height.
+    expect(
+      Math.abs(narrowest.measuredRowHeightPx - widest.measuredRowHeightPx),
+    ).toBeLessThanOrEqual(8);
+  });
+
+  it("[geometry:linux] tracks wrapping parity while resizing an existing ChatView between desktop widths", async () => {
+    const userText = "x".repeat(3_200);
+    const targetMessageId = "msg-user-target-desktop-resize" as MessageId;
     const mounted = await mountChatView({
-      viewport: TEXT_VIEWPORT_MATRIX[0],
+      viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotForTargetUser({
         targetMessageId,
         targetText: userText,
@@ -2380,29 +2428,21 @@ describe("ChatView transcript geometry (full app)", () => {
     });
 
     try {
-      const measurements: UserRowMeasurement[] = [];
-
-      for (const viewport of TEXT_VIEWPORT_MATRIX) {
+      // Both widths stay above the 768px phone breakpoint, so this is the one place that
+      // still observes a single live ChatView reflowing rather than a remounted one.
+      const measure = async (viewport: ViewportSpec) => {
         await mounted.setViewport(viewport);
-        const measurement = await mounted.measureUserRow(targetMessageId);
-        measurements.push(measurement);
-      }
+        return mounted.measureUserRow(targetMessageId);
+      };
 
-      expect(
-        new Set(measurements.map((measurement) => Math.round(measurement.timelineWidthMeasuredPx)))
-          .size,
-      ).toBeGreaterThanOrEqual(3);
+      const wide = await measure(DEFAULT_VIEWPORT);
+      const narrow = await measure(DESKTOP_NARROW_VIEWPORT);
 
-      const byMeasuredWidth = measurements.toSorted(
-        (left, right) => left.timelineWidthMeasuredPx - right.timelineWidthMeasuredPx,
-      );
-      const narrowest = byMeasuredWidth[0]!;
-      const widest = byMeasuredWidth.at(-1)!;
-      expect(narrowest.timelineWidthMeasuredPx).toBeLessThan(widest.timelineWidthMeasuredPx);
+      expect(narrow.timelineWidthMeasuredPx).toBeLessThan(wide.timelineWidthMeasuredPx);
       // Both widths exceed the 12-line limit, so the collapsed row stays the same height.
-      expect(
-        Math.abs(narrowest.measuredRowHeightPx - widest.measuredRowHeightPx),
-      ).toBeLessThanOrEqual(8);
+      expect(Math.abs(narrow.measuredRowHeightPx - wide.measuredRowHeightPx)).toBeLessThanOrEqual(
+        8,
+      );
     } finally {
       await mounted.cleanup();
     }
@@ -2506,12 +2546,22 @@ describe("ChatView transcript geometry (full app)", () => {
     });
 
     try {
-      const sendButton = await waitForSendButton();
-      const sendArrow = await waitForElement(
-        () => sendButton.querySelector<HTMLElement>("[data-slot='central-icon']"),
-        "Unable to find composer send arrow.",
-      );
-      const expectOpticalAlignment = () => {
+      // Every step re-queries the send button and its arrow instead of caching nodes:
+      // crossing the 768px layout breakpoint swaps the whole `/_chat` tree for the phone
+      // shell (see `ChatRouteLayout`), which detaches any node captured beforehand — a
+      // detached node measures as a 0x0 rect and would fail the alignment assertions for
+      // a reason that has nothing to do with alignment.
+      const querySendButton = () =>
+        document.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
+      const expectSendButtonDisabled = async (disabled: boolean) => {
+        await vi.waitFor(() => expect(querySendButton()?.disabled).toBe(disabled));
+      };
+      const expectOpticalAlignment = async () => {
+        const sendButton = await waitForSendButton();
+        const sendArrow = await waitForElement(
+          () => sendButton.querySelector<HTMLElement>("[data-slot='central-icon']"),
+          "Unable to find composer send arrow.",
+        );
         const buttonRect = sendButton.getBoundingClientRect();
         const arrowRect = sendArrow.getBoundingClientRect();
         const buttonCenterX = buttonRect.x + buttonRect.width / 2;
@@ -2529,23 +2579,26 @@ describe("ChatView transcript geometry (full app)", () => {
         expect(getComputedStyle(sendArrow).mask).toContain("/central-icons-reversed/arrow-up.svg");
       };
 
-      expect(sendButton.disabled).toBe(true);
-      expectOpticalAlignment();
+      await expectSendButtonDisabled(true);
+      await expectOpticalAlignment();
 
       useComposerDraftStore.getState().setPrompt(THREAD_ID, "Optical alignment check");
-      await vi.waitFor(() => expect(sendButton.disabled).toBe(false));
-      expectOpticalAlignment();
+      await expectSendButtonDisabled(false);
+      await expectOpticalAlignment();
 
       document.documentElement.classList.add("dark");
       await waitForLayout();
-      expectOpticalAlignment();
+      await expectOpticalAlignment();
 
+      // Crosses 768px: the route tree remounts as the phone shell here (accepted M3
+      // tradeoff), so everything below this line works off freshly queried nodes.
       await mounted.setViewport(TEXT_VIEWPORT_MATRIX[2]);
-      expectOpticalAlignment();
+      await expectSendButtonDisabled(false);
+      await expectOpticalAlignment();
 
       useComposerDraftStore.getState().setPrompt(THREAD_ID, "");
-      await vi.waitFor(() => expect(sendButton.disabled).toBe(true));
-      expectOpticalAlignment();
+      await expectSendButtonDisabled(true);
+      await expectOpticalAlignment();
     } finally {
       document.documentElement.classList.remove("dark");
       await mounted.cleanup();

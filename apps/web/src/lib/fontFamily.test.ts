@@ -25,7 +25,13 @@ describe("normalizeMonospaceFontFamilyCssValue", () => {
 
   it("keeps existing generic mono fallbacks intact", () => {
     expect(normalizeMonospaceFontFamilyCssValue('"Geist Mono", ui-monospace')).toBe(
-      '"Geist Mono", ui-monospace',
+      '"Geist Mono Variable", "Geist Mono", ui-monospace',
+    );
+  });
+
+  it("prepends the bundled variable alias for self-hosted families", () => {
+    expect(normalizeFontFamilyCssValue("Geist, Inter")).toBe(
+      '"Geist Variable", Geist, "Inter Variable", Inter',
     );
   });
 

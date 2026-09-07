@@ -1,6 +1,7 @@
 import { AuthSessionId, type AuthClientMetadata, type AuthClientSession } from "@synara/contracts";
 import * as Crypto from "node:crypto";
 import {
+  Cause,
   Clock,
   DateTime,
   Deferred,
@@ -17,7 +18,11 @@ import {
 } from "effect";
 
 import { AuthSessionRepositoryLive } from "../../persistence/Layers/AuthSessions";
-import { AuthSessionRepository } from "../../persistence/Services/AuthSessions";
+import {
+  AuthSessionRepository,
+  type AuthSessionRecord,
+  type AuthSessionRenewalPolicy,
+} from "../../persistence/Services/AuthSessions";
 import { ServerConfig } from "../../config";
 import { ServerSecretStore } from "../Services/ServerSecretStore";
 import {
@@ -39,7 +44,31 @@ import {
 
 const SIGNING_SECRET_NAME = "server-signing-key";
 const DEFAULT_SESSION_TTL = Duration.days(30);
+/**
+ * Minimum spacing between expiry rewrites. Sessions slide forward on active use, but a
+ * device that talks to the server constantly must not rewrite its row on every request,
+ * so the expiry is only pushed out once the previous extension is this old.
+ */
+const SESSION_RENEWAL_THROTTLE = Duration.days(1);
+/**
+ * Hard ceiling on how far renewal may push a session past the instant it was issued. Sliding
+ * expiry alone would make an actively used credential immortal, so a session can slide for at
+ * most this long and then expires for good and the device re-pairs.
+ */
+const SESSION_ABSOLUTE_LIFETIME = Duration.days(365);
+const DEFAULT_SESSION_TTL_MILLIS = Duration.toMillis(DEFAULT_SESSION_TTL);
+const SESSION_ABSOLUTE_LIFETIME_MILLIS = Duration.toMillis(SESSION_ABSOLUTE_LIFETIME);
+const SESSION_RENEWAL_THRESHOLD_MILLIS =
+  DEFAULT_SESSION_TTL_MILLIS - Duration.toMillis(SESSION_RENEWAL_THROTTLE);
 const DEFAULT_WEBSOCKET_TOKEN_TTL = Duration.minutes(5);
+/**
+ * How long a minted media credential stays usable. Long enough that a page of images, a PDF
+ * viewer and a download all resolve against the URL the render built, short enough that a
+ * credential leaked through a URL (a screenshot, a referrer, a proxy access log) stops working
+ * within minutes. Unlike a websocket ticket it is deliberately replayable for its lifetime —
+ * an `<img>` retry, an HTTP range request and a reload must all be able to reuse the same URL.
+ */
+const DEFAULT_MEDIA_TOKEN_TTL = Duration.minutes(15);
 export const MAX_AUTHENTICATED_CONNECTIONS_PER_SESSION = 8;
 export const MAX_OUTSTANDING_WEBSOCKET_TICKETS_PER_SESSION = 16;
 const CAPACITY_RETRY_AFTER_SECONDS = 1;
@@ -52,6 +81,15 @@ const SessionClaims = Schema.Struct({
   role: Schema.Literals(["owner", "client"]),
   method: Schema.Literals(["browser-session-cookie", "bearer-session-token"]),
   iat: Schema.Number,
+  /**
+   * The credential's absolute ceiling, not its current expiry. A sliding session's row moves
+   * forward on use, so `exp` is stamped with `iat + SESSION_ABSOLUTE_LIFETIME` — the furthest
+   * renewal could ever push it — and a fixed session stamps its one and only expiry. That
+   * makes `exp` a cheap backstop that can never contradict `auth_sessions.expires_at`, which
+   * remains the expiry authority. Tokens minted before this rule carry the 30-day initial TTL
+   * instead, so those sessions stop verifying at their original 30-day mark and the device
+   * re-authenticates once: the pre-sliding behaviour, and the safe direction to err in.
+   */
   exp: Schema.Number,
 });
 type SessionClaims = typeof SessionClaims.Type;
@@ -66,8 +104,25 @@ const WebSocketClaims = Schema.Struct({
 });
 type WebSocketClaims = typeof WebSocketClaims.Type;
 
+/**
+ * A read-only capability for the media GET routes, scoped by construction. `kind` and `scope`
+ * are literals, so this payload cannot decode as a session or websocket credential and neither
+ * of those can decode as this one — the three token families share a signing key but can never
+ * be substituted for one another, whatever channel they arrive on.
+ */
+const MediaClaims = Schema.Struct({
+  v: Schema.Literal(1),
+  kind: Schema.Literal("media"),
+  scope: Schema.Literal("media-read"),
+  sid: AuthSessionId,
+  iat: Schema.Number,
+  exp: Schema.Number,
+});
+type MediaClaims = typeof MediaClaims.Type;
+
 const decodeSessionClaims = Schema.decodeUnknownEffect(Schema.fromJsonString(SessionClaims));
 const decodeWebSocketClaims = Schema.decodeUnknownEffect(Schema.fromJsonString(WebSocketClaims));
+const decodeMediaClaims = Schema.decodeUnknownEffect(Schema.fromJsonString(MediaClaims));
 
 function createDefaultClientMetadata(): AuthClientMetadata {
   return { deviceType: "unknown" };
@@ -163,6 +218,69 @@ export const makeSessionCredentialService = Effect.gen(function* () {
         }),
       );
     });
+
+  /**
+   * Slides an already-verified session's expiry forward so an actively used device never
+   * has to re-pair. Throttled by {@link SESSION_RENEWAL_THROTTLE}, monotonic in the
+   * repository, and strictly best-effort: a failed renewal is logged and swallowed,
+   * because a credential that verified must never be rejected over a bookkeeping write.
+   *
+   * The renewal policy lives here, in full:
+   * - Only rows persisted as `sliding` renew. Renewability is decided once, at issuance, and
+   *   stored on the row; it is never re-derived from the row's lifetime, so changing
+   *   {@link DEFAULT_SESSION_TTL} cannot silently stop already-issued sessions from sliding.
+   *   A `fixed` row is a deliberate hard-expiry contract — a short-lived credential must
+   *   never be promoted to the default TTL.
+   * - Renewal targets `now + DEFAULT_SESSION_TTL`, clamped to
+   *   `issuedAt + SESSION_ABSOLUTE_LIFETIME`. A continuously used session therefore slides
+   *   for up to a year from issue and then hard-expires, forcing the device to re-pair.
+   *
+   * Resolves to the expiry callers should observe — the extended one when the row moved,
+   * the row's existing one otherwise.
+   */
+  const renewSessionExpiry = (row: AuthSessionRecord, nowMillis: number) =>
+    Effect.gen(function* () {
+      if (row.renewalPolicy !== "sliding") return row.expiresAt;
+      const currentExpiresAtMillis = DateTime.toEpochMillis(row.expiresAt);
+      if (currentExpiresAtMillis >= nowMillis + SESSION_RENEWAL_THRESHOLD_MILLIS) {
+        return row.expiresAt;
+      }
+      const expiresAtMillis = Math.min(
+        nowMillis + DEFAULT_SESSION_TTL_MILLIS,
+        DateTime.toEpochMillis(row.issuedAt) + SESSION_ABSOLUTE_LIFETIME_MILLIS,
+      );
+      // At the absolute cap the target stops moving, so skip the write the repository's
+      // monotonic guard would reject anyway rather than pay a round trip on every request.
+      if (expiresAtMillis <= currentExpiresAtMillis) return row.expiresAt;
+      const expiresAt = DateTime.makeUnsafe(expiresAtMillis);
+      const extended = yield* authSessions.extendExpiry({ sessionId: row.sessionId, expiresAt });
+      if (!extended) return row.expiresAt;
+      const activeConnections = yield* Ref.get(activeConnectionsRef);
+      yield* emitUpsert(
+        toAuthClientSession({
+          sessionId: row.sessionId,
+          subject: row.subject,
+          role: row.role,
+          method: row.method,
+          client: toClientMetadata(row.client),
+          issuedAt: row.issuedAt,
+          expiresAt,
+          lastConnectedAt: row.lastConnectedAt,
+          connected: activeConnections.has(row.sessionId),
+        }),
+      );
+      return expiresAt;
+    }).pipe(
+      Effect.catchCause((cause) => {
+        // Interruption is not a renewal failure: swallowing it would report a successful
+        // verification from a fiber that is already being torn down.
+        if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause);
+        return Effect.logError("Failed to renew authenticated session expiry", {
+          sessionId: row.sessionId,
+          cause,
+        }).pipe(Effect.as(row.expiresAt));
+      }),
+    );
 
   const acquireConnection = (sessionId: AuthSessionId, interrupt: Effect.Effect<void>) =>
     activeConnectionsSemaphore
@@ -313,6 +431,12 @@ export const makeSessionCredentialService = Effect.gen(function* () {
     Effect.gen(function* () {
       const sessionId = AuthSessionId.makeUnsafe(Crypto.randomUUID());
       const issuedAt = yield* DateTime.now;
+      const issuedAtMillis = DateTime.toEpochMillis(issuedAt);
+      // An explicitly requested TTL is a hard-expiry contract: only the default-TTL sessions
+      // this service mints for real devices are allowed to slide. The decision is made once,
+      // here, and persisted on the row — never re-derived from the row's lifetime later.
+      const renewalPolicy: AuthSessionRenewalPolicy =
+        input?.ttl === undefined ? "sliding" : "fixed";
       const expiresAt = DateTime.addDuration(issuedAt, input?.ttl ?? DEFAULT_SESSION_TTL);
       const client = input?.client ?? createDefaultClientMetadata();
       const claims: SessionClaims = {
@@ -322,8 +446,11 @@ export const makeSessionCredentialService = Effect.gen(function* () {
         sub: input?.subject ?? "browser",
         role: input?.role ?? "client",
         method: input?.method ?? "browser-session-cookie",
-        iat: DateTime.toEpochMillis(issuedAt),
-        exp: DateTime.toEpochMillis(expiresAt),
+        iat: issuedAtMillis,
+        exp:
+          renewalPolicy === "sliding"
+            ? issuedAtMillis + SESSION_ABSOLUTE_LIFETIME_MILLIS
+            : DateTime.toEpochMillis(expiresAt),
       };
       const encodedPayload = base64UrlEncode(JSON.stringify(claims));
       const signature = signPayload(encodedPayload, signingSecret);
@@ -341,6 +468,7 @@ export const makeSessionCredentialService = Effect.gen(function* () {
           os: client.os ?? null,
           browser: client.browser ?? null,
         },
+        renewalPolicy,
         issuedAt,
         expiresAt,
       });
@@ -387,6 +515,10 @@ export const makeSessionCredentialService = Effect.gen(function* () {
         ),
       );
       const now = yield* Clock.currentTimeMillis;
+      // Cheap, row-free backstop. `claims.exp` is the credential's absolute ceiling (see the
+      // `SessionClaims.exp` note), so it can never contradict a sliding row: the row's expiry
+      // below is still the authority, but any path that reaches a signed token without loading
+      // its row cannot be talked into honouring one that is past its ceiling.
       if (claims.exp <= now) return yield* toSessionCredentialError("Session token expired.");
       const row = yield* authSessions.getById({ sessionId: claims.sid });
       if (Option.isNone(row)) return yield* toSessionCredentialError("Unknown session token.");
@@ -395,12 +527,13 @@ export const makeSessionCredentialService = Effect.gen(function* () {
       }
       if (row.value.revokedAt !== null)
         return yield* toSessionCredentialError("Session token revoked.");
+      const expiresAt = yield* renewSessionExpiry(row.value, now);
       return {
         sessionId: claims.sid,
         token,
         method: claims.method,
         client: toClientMetadata(row.value.client),
-        expiresAt: DateTime.makeUnsafe(claims.exp),
+        expiresAt,
         subject: claims.sub,
         role: claims.role,
       } satisfies VerifiedSession;
@@ -505,7 +638,11 @@ export const makeSessionCredentialService = Effect.gen(function* () {
           toSessionCredentialError("Invalid websocket token payload.", cause),
         ),
       );
-      return yield* activeConnectionsSemaphore.withPermit(
+      // The permit spans delete-ticket-then-load-row, which is the ordering single-use
+      // consumption requires: the ticket is burned before anything can observe the session,
+      // so concurrent dials cannot both pass. Loading the row is the one database read that
+      // ticket consumption pays inside the permit.
+      const sessionRow = yield* activeConnectionsSemaphore.withPermit(
         Effect.gen(function* () {
           const now = yield* Clock.currentTimeMillis;
           const currentTickets = pruneOutstandingWebSocketTickets(
@@ -534,22 +671,125 @@ export const makeSessionCredentialService = Effect.gen(function* () {
           if (row.value.revokedAt !== null) {
             return yield* toSessionCredentialError("Websocket session revoked.");
           }
-          return {
-            sessionId: row.value.sessionId,
-            token,
-            method: row.value.method,
-            client: toClientMetadata(row.value.client),
-            expiresAt: row.value.expiresAt,
-            subject: row.value.subject,
-            role: row.value.role,
-          } satisfies VerifiedSession;
+          return row.value;
         }),
       );
+      // Deliberately does not renew. Every ticket is minted by `POST /api/auth/ws-token`
+      // moments before the socket dials, and that mint authenticates through `verify`, which
+      // renews — so renewing here again is redundant. Desktop and browser upgrades
+      // authenticate with a cookie or bearer through `verify` directly.
+      return {
+        sessionId: sessionRow.sessionId,
+        token,
+        method: sessionRow.method,
+        client: toClientMetadata(sessionRow.client),
+        expiresAt: sessionRow.expiresAt,
+        subject: sessionRow.subject,
+        role: sessionRow.role,
+      } satisfies VerifiedSession;
     }).pipe(
       Effect.mapError((cause) =>
         cause instanceof SessionCredentialError
           ? cause
           : toSessionCredentialError("Failed to verify websocket token.", cause),
+      ),
+    );
+
+  /**
+   * Stateless mint: signature + claims are the whole credential, so nothing is written and a
+   * restart neither invalidates outstanding media URLs nor grows an in-memory ledger with one
+   * entry per image on screen. The expiry is clamped to the session's own so a media token can
+   * never outlive the session it was minted from, and the row is read here (rather than trusted
+   * from the caller's already-authenticated session) so a session revoked between authenticating
+   * the mint request and issuing cannot hand out a fresh capability.
+   */
+  const issueMediaToken: SessionCredentialServiceShape["issueMediaToken"] = (sessionId, input) =>
+    Effect.gen(function* () {
+      const row = yield* authSessions.getById({ sessionId });
+      const issuedAt = yield* DateTime.now;
+      const issuedAtMillis = DateTime.toEpochMillis(issuedAt);
+      if (Option.isNone(row)) return yield* toSessionCredentialError("Unknown media session.");
+      if (row.value.revokedAt !== null)
+        return yield* toSessionCredentialError("Media session revoked.");
+      const sessionExpiresAtMillis = DateTime.toEpochMillis(row.value.expiresAt);
+      if (sessionExpiresAtMillis <= issuedAtMillis) {
+        return yield* toSessionCredentialError("Media session expired.");
+      }
+
+      const requestedExpiresAt = DateTime.addDuration(
+        issuedAt,
+        input?.ttl ?? DEFAULT_MEDIA_TOKEN_TTL,
+      );
+      const expiresAtMillis = Math.min(
+        DateTime.toEpochMillis(requestedExpiresAt),
+        sessionExpiresAtMillis,
+      );
+      const claims: MediaClaims = {
+        v: 1,
+        kind: "media",
+        scope: "media-read",
+        sid: sessionId,
+        iat: issuedAtMillis,
+        exp: expiresAtMillis,
+      };
+      const encodedPayload = base64UrlEncode(JSON.stringify(claims));
+      const signature = signPayload(encodedPayload, signingSecret);
+      return {
+        token: `${encodedPayload}.${signature}`,
+        expiresAt: DateTime.makeUnsafe(expiresAtMillis),
+      };
+    }).pipe(
+      Effect.mapError((cause) =>
+        cause instanceof SessionCredentialError
+          ? cause
+          : toSessionCredentialError("Failed to issue media token.", cause),
+      ),
+    );
+
+  /**
+   * Verification is signature → claims → expiry → the referenced session row still being live.
+   * The row read is what makes a stateless credential revocable: signing out or revoking the
+   * device kills every media URL it ever built on the next request, without a ledger.
+   *
+   * Deliberately does not renew the session: a media GET is a passive asset fetch (a cached page
+   * can fire dozens), and the mint that produced this token already authenticated through
+   * `verify`, which renews.
+   */
+  const verifyMediaToken: SessionCredentialServiceShape["verifyMediaToken"] = (token) =>
+    Effect.gen(function* () {
+      const [encodedPayload, signature] = token.split(".");
+      if (!encodedPayload || !signature)
+        return yield* toSessionCredentialError("Malformed media token.");
+      const expectedSignature = signPayload(encodedPayload, signingSecret);
+      if (!timingSafeEqualBase64Url(signature, expectedSignature)) {
+        return yield* toSessionCredentialError("Invalid media token signature.");
+      }
+      const claims = yield* decodeMediaClaims(base64UrlDecodeUtf8(encodedPayload)).pipe(
+        Effect.mapError((cause) => toSessionCredentialError("Invalid media token payload.", cause)),
+      );
+      const now = yield* Clock.currentTimeMillis;
+      if (claims.exp <= now) return yield* toSessionCredentialError("Media token expired.");
+      const row = yield* authSessions.getById({ sessionId: claims.sid });
+      if (Option.isNone(row)) return yield* toSessionCredentialError("Unknown media session.");
+      if (DateTime.toEpochMillis(row.value.expiresAt) <= now) {
+        return yield* toSessionCredentialError("Media session expired.");
+      }
+      if (row.value.revokedAt !== null)
+        return yield* toSessionCredentialError("Media session revoked.");
+      return {
+        sessionId: row.value.sessionId,
+        token,
+        method: row.value.method,
+        client: toClientMetadata(row.value.client),
+        expiresAt: row.value.expiresAt,
+        subject: row.value.subject,
+        role: row.value.role,
+      } satisfies VerifiedSession;
+    }).pipe(
+      Effect.mapError((cause) =>
+        cause instanceof SessionCredentialError
+          ? cause
+          : toSessionCredentialError("Failed to verify media token.", cause),
       ),
     );
 
@@ -641,6 +881,9 @@ export const makeSessionCredentialService = Effect.gen(function* () {
       ({ lease, connectionFiber }) =>
         Effect.gen(function* () {
           const now = yield* Clock.currentTimeMillis;
+          // Deliberately pinned to the lease's expiry rather than the (slidable) row: a
+          // long-lived socket is still cut at its lease expiry and simply reconnects,
+          // which re-verifies and picks up the renewed expiry.
           const expiresIn = Math.max(0, DateTime.toEpochMillis(lease.expiresAt) - now);
           const expiryFiber = yield* Effect.forkChild(
             Effect.sleep(Duration.millis(expiresIn)).pipe(
@@ -662,6 +905,8 @@ export const makeSessionCredentialService = Effect.gen(function* () {
     verify,
     issueWebSocketToken,
     verifyWebSocketToken,
+    issueMediaToken,
+    verifyMediaToken,
     listActive,
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub);

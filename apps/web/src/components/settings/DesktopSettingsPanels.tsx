@@ -17,7 +17,7 @@ import { createLatestAppSnapRequestGuard } from "~/appSnap.logic";
 import { playAppSnapCaptureSound } from "~/lib/appSnapSound";
 import { CentralIcon } from "~/lib/central-icons";
 import { cn } from "~/lib/utils";
-import { isElectron } from "~/env";
+import { isMobileShell, isNativeShell } from "~/env";
 import {
   buildNotificationSettingsSupportText,
   readBrowserNotificationPermissionState,
@@ -49,6 +49,25 @@ function appSnapStatusText(state: DesktopAppSnapState | null): string {
 }
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
+
+// One setting, two vocabularies: on desktop and in browsers this row is about OS/browser
+// notifications the web app posts itself; on the mobile shell notifications come from the
+// native background watch, so "desktop" would be wrong everywhere it appears.
+const SYSTEM_NOTIFICATIONS_COPY = isMobileShell
+  ? {
+      title: "Notifications",
+      description:
+        "Notify you when a chat or managed terminal agent finishes or needs input while the app is in the background.",
+      resetLabel: "notifications",
+      ariaLabel: "Activity notifications",
+    }
+  : {
+      title: "Desktop notifications",
+      description:
+        "Show an OS notification when a chat or managed terminal agent finishes or needs input while the app is in the background.",
+      resetLabel: "desktop notifications",
+      ariaLabel: "Desktop activity notifications",
+    };
 
 const APPSNAP_PERMISSION_LABELS: Record<DesktopAppSnapPermission, string> = {
   granted: "Granted",
@@ -100,7 +119,10 @@ export function NotificationsSettingsPanel({
       return;
     }
 
-    if (isElectron) {
+    // Native shells post notifications themselves — the desktop app through the
+    // OS notification center, the mobile app through its background watch — so
+    // there is no browser permission to ask for.
+    if (isNativeShell) {
       updateSettings({ enableSystemTaskCompletionNotifications: true });
       return;
     }
@@ -191,14 +213,14 @@ export function NotificationsSettingsPanel({
         />
 
         <SettingsRow
-          title="Desktop notifications"
-          description="Show an OS notification when a chat or managed terminal agent finishes or needs input while the app is in the background."
+          title={SYSTEM_NOTIFICATIONS_COPY.title}
+          description={SYSTEM_NOTIFICATIONS_COPY.description}
           status={buildNotificationSettingsSupportText(browserNotificationPermission)}
           resetAction={
             settings.enableSystemTaskCompletionNotifications !==
             defaults.enableSystemTaskCompletionNotifications ? (
               <SettingResetButton
-                label="desktop notifications"
+                label={SYSTEM_NOTIFICATIONS_COPY.resetLabel}
                 onClick={() =>
                   updateSettings({
                     enableSystemTaskCompletionNotifications:
@@ -210,15 +232,19 @@ export function NotificationsSettingsPanel({
           }
           control={
             <div className="flex w-full items-center gap-2 sm:w-auto sm:justify-end">
-              <Button size="xs" variant="outline" onClick={() => void sendTestNotification()}>
-                Test
-              </Button>
+              {/* The mobile WebView has nothing to test: the Web Notification UI is absent and
+                  the native background watch posts notifications outside the web app. */}
+              {isMobileShell ? null : (
+                <Button size="xs" variant="outline" onClick={() => void sendTestNotification()}>
+                  Test
+                </Button>
+              )}
               <Switch
                 checked={settings.enableSystemTaskCompletionNotifications}
                 onCheckedChange={(checked) => {
                   void setSystemNotificationsEnabled(Boolean(checked));
                 }}
-                aria-label="Desktop activity notifications"
+                aria-label={SYSTEM_NOTIFICATIONS_COPY.ariaLabel}
               />
             </div>
           }

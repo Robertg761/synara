@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The mark: three round-capped strokes with alternating alignment, reading as a transcript rather
+  than as a menu. The offsets echo the app's own message layout — assistant turns run to the left
+  edge, the user's turn sits right.
+
+  Sizing is set against the circular mask (72dp diameter, so radius 36 from the 54,54 centre), not
+  just the 66dp safe zone: staying inside the safe zone only guarantees the art is not clipped, and
+  a mark drawn out to that limit fills its keyline edge to edge and reads as a solid blob at
+  launcher size. The furthest cap here lands ~26 from centre, about 70% of the mask radius, which
+  is the proportion the rest of the system's icons sit at. Stroke spacing (16 apart, 9 wide) keeps
+  a clear 7dp gap so the strokes stay separate when scaled down to a home-screen grid.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M38,38 L66,38"
+        android:strokeColor="#FCFCFC"
+        android:strokeWidth="9"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M46,54 L70,54"
+        android:strokeColor="#FCFCFC"
+        android:strokeAlpha="0.5"
+        android:strokeWidth="9"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M38,70 L58,70"
+        android:strokeColor="#FCFCFC"
+        android:strokeWidth="9"
+        android:strokeLineCap="round" />
+</vector>
