@@ -3946,11 +3946,15 @@ async function applyRemoteAccessConfig(
       try {
         await stopBackendAndWaitForExit();
       } catch (error) {
-        // The old process is wedged; force-stop so the rebind cannot race it.
+        // The old process is wedged even after the graceful path escalated to
+        // SIGKILL; drop it from the tracked slot so the rebind cannot race it.
         writeDesktopLogHeader(
           `remote access graceful stop failed message=${formatErrorMessage(error)}`,
         );
-        stopBackend();
+        const wedged = takeBackendProcessForShutdown();
+        if (wedged && wedged.exitCode === null && wedged.signalCode === null) {
+          wedged.kill("SIGKILL");
+        }
       }
       await restartBackendAfterCrash("remote access configuration change", "lifecycle");
       try {
