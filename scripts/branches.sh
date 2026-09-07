@@ -12,10 +12,13 @@ set -euo pipefail
 # Topic branches, in merge order. Add a branch here the day you create it.
 TOPICS=(
   computer-use-linux
-  codex/computer-use-macos
   android-app
   fork-tooling
 )
+# codex/computer-use-macos (PR #1010) is not merged yet. It carries slices 1-3 of the Linux
+# stack plus the macOS backend, and its core edits collide with slices 4-6 in ~15 files
+# (contracts, ComputerService, ComputerPanel, settings). Add it back once the two stacks are
+# reconciled on a common base; until then a Linux canary loses nothing by leaving it out.
 
 BASE="${SYNARA_BASE:-upstream/main}"
 INTEGRATION="${SYNARA_INTEGRATION:-canary}"

@@ -10,13 +10,18 @@ the branches have distinct jobs.
 | `canary`                   | Every topic merged onto `upstream/main`. Runs as Canary.     | **No.** It is regenerated.                   |
 | `computer-use-linux`       | Linux computer use. → PR #780, sliced as #820–#824           | Yes                                          |
 | `computer-use-linux-1..5`  | PR-only slices of `computer-use-linux`. Rebase, never merge. | Only by rebasing the stack                   |
-| `codex/computer-use-macos` | macOS computer use. → PR #1010                               | Yes                                          |
+| `codex/computer-use-macos` | macOS computer use. → PR #1010. Not in the rebuild yet.      | Yes                                          |
 | `android-app`              | The Android app and remote access.                           | Yes                                          |
 | `fork-tooling`             | Session-sync app, this script and document, turbo env fix.   | Yes                                          |
 
-`claude/computer-use-macos-s1vpp0` is an older all-in-one macOS line that diverged
-from `codex/computer-use-macos` on 2026-09-06. It is not part of the rebuild until the
-two are reconciled.
+`codex/computer-use-macos` stays out of `TOPICS` for now: it carries slices 1–3 of the
+Linux stack plus the macOS backend, and its computer-use core edits collide with slices
+4–6 in about 15 files. A Linux canary loses nothing by leaving it out. Add it back once
+both stacks sit on a common base.
+
+`claude/computer-use-macos-s1vpp0` is an older all-in-one macOS line that diverged from
+`codex/computer-use-macos` on 2026-09-06. It is not part of the rebuild either, until the
+two macOS lines are reconciled.
 
 Two backup tags keep history nobody should need: `backup/canary-2026-09-07` is the last
 hand-merged Canary, and `pr-media` pins the screenshots PR #823 embeds by commit hash.
