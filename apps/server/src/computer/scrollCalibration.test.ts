@@ -217,6 +217,16 @@ function paethReference(left: number, up: number, upLeft: number): number {
 }
 
 describe("estimateVerticalTravel", () => {
+  it("refuses repeating rows with multiple equally plausible offsets", () => {
+    const width = 120;
+    const height = 400;
+    const frame = (offset: number): LumaImage => ({
+      width, height,
+      luma: Uint8Array.from({ length: width * height }, (_, index) =>
+        (Math.floor(index / width) + offset) % 40 < 5 ? 20 : 240),
+    });
+    expect(estimateVerticalTravel(frame(0), frame(17))).toBeUndefined();
+  });
   const width = 64;
   const height = 400;
   const page = noise(width, height + 300, 20_260_822);

@@ -378,6 +378,20 @@ final class AgentCursor {
   /// degrades to `move`, because waiting there would deadlock against the
   /// display link.
   func glide(to global: CGPoint, window: DesktopWindow?, whileMoving: () -> Void = {}) {
+    // An off-screen target has no visible cursor journey to synchronize with.
+    // Keep the overlay animation, but never park input waiting for its display
+    // link (which may itself be throttled while the target is covered).
+    if let window, !window.onScreen || Windows.list().contains(where: {
+      $0.onScreen && $0.stackingIndex < window.stackingIndex
+        && $0.bounds.contains(window.bounds)
+    }) {
+      onMain {
+        self.targetWindow = window
+        self.retarget(to: global)
+      }
+      whileMoving()
+      return
+    }
     guard !Thread.isMainThread else {
       targetWindow = window
       retarget(to: global)

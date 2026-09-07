@@ -58,20 +58,17 @@ describe.skipIf(!enabled)("macOS input into owned fixture windows", () => {
     }
   });
 
-  it("reveals a covered window without changing the agent's keyboard target", async () => {
-    const a = windows.get("A")!,
-      b = windows.get("B")!;
+  it("refuses to raise a covered window without changing keyboard aim or stacking", async () => {
+    const a = windows.get("A")!, b = windows.get("B")!;
     await helper.request("focus-window", { windowId: b.id });
-    await helper.request("raise-window", { windowId: a.id });
-    const state = (await helper.request("list-windows")) as {
-      focusedWindowId: string;
-      windows: Array<{ id: string; occludedBy?: string[] }>;
+    const before = await helper.request("list-windows") as {
+      focusedWindowId: string; windows: Array<{ id: string }>;
     };
-    expect(state.focusedWindowId).toBe(b.id);
-    expect(state.windows.findIndex((w) => w.id === a.id)).toBeLessThan(
-      state.windows.findIndex((w) => w.id === b.id),
-    );
-    expect(state.windows.find((w) => w.id === a.id)?.occludedBy ?? []).not.toContain(b.id);
+    await expect(helper.request("raise-window", { windowId: a.id })).rejects.toThrow();
+    const after = await helper.request("list-windows") as typeof before;
+    expect(after.focusedWindowId).toBe(b.id);
+    const owned = (state: typeof before) => state.windows.filter(w => w.id === a.id || w.id === b.id).map(w => w.id);
+    expect(owned(after)).toEqual(owned(before));
   });
 
   it("sends real hover events without changing keyboard aim", async () => {
@@ -247,6 +244,21 @@ describe.skipIf(!enabled)("macOS input into owned fixture windows", () => {
       await expect
         .poll(() => otherEvents.some((event) => event.ready === true), { timeout: 5_000 })
         .toBe(true);
+      const activePID = async () => {
+        const state = await helper.request("list-windows") as { windows: Array<{ active?: boolean; pid: number }> };
+        return state.windows.find(window => window.active)?.pid;
+      };
+      other.stdin.write("activate\n");
+      await expect.poll(activePID).toBe(other.pid);
+      const beforeRefusal = events.length;
+      await expect(helper.request("type", {
+        text: "must not be delivered", windowId: windows.get("A")!.id, deliveryMode: "foreground",
+      })).rejects.toThrow(/activating another application is forbidden/);
+      expect(await activePID()).toBe(other.pid);
+      expect(events.slice(beforeRefusal).filter(event => event.event === "key")).toEqual([]);
+      // Explicit fixture commands simulate the user choosing the target first.
+      fixture.stdin.write("focusA\nactivate\n");
+      await expect.poll(activePID).toBe(fixture.pid);
       const start = events.length;
       const controller = new AbortController();
       const typing = helper.request(

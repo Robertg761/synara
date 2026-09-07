@@ -120,14 +120,9 @@ enum Capture {
     guard let target = Windows.window(withNumber: number) else {
       throw RPCError(.targetMissing, "no window has id \(number)")
     }
-    // A minimized or otherwise off-screen window has no composited pixels. Both
-    // links of the chain answer anyway — with the desktop behind it, or with a
-    // stale cached frame — and the reported region is then a rect the image
-    // does not cover, so every coordinate the agent reads off it maps to the
-    // wrong place. There is no honest image to return, so this refuses.
-    guard target.onScreen else {
-      throw RPCError(.targetMissing, "window \(number) is not on screen")
-    }
+    // WindowServer marks fully covered and other-Space windows off-screen too.
+    // SCK's desktop-independent window capture can still return their surface;
+    // try it before deciding the explicitly requested window is unavailable.
     // A window whose bounds miss every display is the same trapping-conversion
     // hazard as a region, and equally has nothing to show.
     guard (try? Geometry.clampRectToWorkspace(target.bounds)) != nil else {
@@ -139,6 +134,9 @@ enum Capture {
           pngBase64: capture.png.base64EncodedString(), region: capture.frame,
           source: .screenCaptureKit)
       }
+    }
+    guard target.onScreen else {
+      throw RPCError(.targetMissing, "window \(number) has no available background capture")
     }
     // `screencapture -l` composites the window's whole *surface*, which is not
     // the rect `CGWindowList` reports: measured against a Terminal window the
@@ -491,7 +489,7 @@ enum Capture {
 
     let signature = desktopSignature()
     let done = DispatchSemaphore(value: 0)
-    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) {
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) {
       content, error in
       if let content {
         contentLock.lock()

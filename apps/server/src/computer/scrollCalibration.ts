@@ -199,7 +199,7 @@ export interface VerticalTravelOptions {
 
 /** Columns and rows sampled, as a fraction of the capture. */
 const PROFILE_COLUMN_BAND = 0.5;
-const PROFILE_ROW_BAND = 0.6;
+const PROFILE_ROW_BAND = 0.8;
 /** Fewer overlapping rows than this cannot distinguish a match from a coincidence. */
 const MIN_PROFILE_OVERLAP_ROWS = 32;
 /** Below this much row-to-row variation there is no content to correlate. */
@@ -252,21 +252,35 @@ export function estimateVerticalTravel(
 
   const maxShift = Math.max(0, Math.floor(options.maxShift ?? Math.floor(rowCount * 0.9)));
   const scores: number[] = [];
+  const alignments: { shift: number; score: number }[] = [];
+  // A tiny surviving strip can match one repeated card while disagreeing with
+  // the rest of the page. Require substantial overlap, not just 32 rows.
+  const minimumOverlap = Math.max(MIN_PROFILE_OVERLAP_ROWS, Math.ceil(rowCount * 0.4));
   let best: { shift: number; score: number } | undefined;
   for (let shift = -maxShift; shift <= maxShift; shift += 1) {
     const from = Math.max(0, -shift);
     const to = Math.min(rowCount, rowCount - shift);
-    if (to - from < MIN_PROFILE_OVERLAP_ROWS) continue;
+    if (to - from < minimumOverlap) continue;
     let total = 0;
     for (let index = from; index < to; index += 1) {
       total += Math.abs(afterProfile[index]! - beforeProfile[index + shift]!);
     }
     const score = total / (to - from);
     scores.push(score);
+    alignments.push({ shift, score });
     if (!best || score < best.score) best = { shift, score };
   }
   if (!best || scores.length === 0) return undefined;
   if (best.score > MAX_WINNING_SCORE) return undefined;
+  const winner = best;
+  // Repeating cards/rows can match at several different offsets. Beating the
+  // median is not enough: a false alias otherwise teaches an inflated gearing
+  // and makes every subsequent scroll too short. Ignore neighbouring pixels
+  // (resampling spreads a real minimum), but require a distinct minimum.
+  if (alignments.some((candidate) =>
+    Math.abs(candidate.shift - winner.shift) > 3 &&
+    candidate.score <= winner.score + 0.5
+  )) return undefined;
   const median = scores.toSorted((first, second) => first - second)[scores.length >> 1]!;
   if (!(best.score < median * MAX_WINNING_SCORE_RATIO)) return undefined;
   return best.shift;

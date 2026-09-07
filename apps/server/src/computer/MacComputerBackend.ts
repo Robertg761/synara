@@ -434,6 +434,7 @@ export interface MacComputerBackendOptions {
  * desktop at construction time, so it is safe to build at boot on every host.
  */
 export class MacComputerBackend implements ComputerBackend {
+  readonly inputDoesNotRequireReveal = true;
   readonly computerId: ComputerId;
 
   private readonly platform: string;

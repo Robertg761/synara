@@ -77,9 +77,10 @@ enum Accessibility {
       // A window WindowServer is not compositing — minimized, or on another
       // Space — has no useful geometry for the agent to act on, and walking it
       // costs the same as a visible one.
-      guard window.onScreen else { return false }
-      guard let windowIds else { return true }
-      return windowIds.contains(window.windowNumber)
+      // Explicit window targeting includes covered/other-Space windows. A full
+      // desktop walk still visits only on-screen windows to bound its cost.
+      if let windowIds { return windowIds.contains(window.windowNumber) }
+      return window.onScreen
     }
 
     // Reuse each app's window list. Only an explicitly targeted app opts into
@@ -440,22 +441,6 @@ enum Accessibility {
     return false
   }
 
-  /// Select the exact window for the foreground keyboard fallback. Routine
-  /// targeting reveals it separately, then uses focusWindowForKeyboard below.
-  static func focusKeyboardWindowVisibly(_ window: DesktopWindow) throws {
-    let application = Application(pid: window.ownerPID, requestAccessibility: false, messagingTimeout: windowMessagingTimeout)
-    guard let target = application.match(window) else { throw RPCError(.targetMissing, "The target window closed") }
-    try InputCancellation.check()
-    AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
-    AXUIElementSetAttributeValue(target, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    for _ in 0..<10 {
-      if keyboardWindowMatches(window) { return }
-      try InputCancellation.check()
-      usleep(20_000)
-    }
-    throw RPCError(.notDelivered, "The application could not select the requested window")
-  }
-
   static func keyboardWindowMatches(_ window: DesktopWindow) -> Bool {
     let application = AXUIElementCreateApplication(window.ownerPID)
     AXUIElementSetMessagingTimeout(application, windowMessagingTimeout)
@@ -465,7 +450,10 @@ enum Accessibility {
     return CFEqual(focused, ownWindow)
   }
 
-  static func focusWindowForKeyboard(_ window: DesktopWindow) {
+  static func focusWindowForKeyboard(_ window: DesktopWindow) throws {
+    if SkyLight.frontmostPID() == window.ownerPID && !keyboardWindowMatches(window) {
+      throw RPCError(.notDelivered, "Refusing to change the user's active window")
+    }
     guard isTrusted() else { return }
     let application = Application(
       pid: window.ownerPID, requestAccessibility: false, messagingTimeout: windowMessagingTimeout)

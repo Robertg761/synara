@@ -647,10 +647,11 @@ export class ComputerManager {
     windowIdHint?: string,
     actionPoint?: ComputerPoint,
     threadId?: string,
+    settle = true,
   ): Promise<ComputerActionObservation | undefined> {
     if (!this.backendCapabilities.capture) return undefined;
     this.engageBackend();
-    if (this.actionSettleMs > 0) {
+    if (settle && this.actionSettleMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.actionSettleMs));
     }
     if (windowIdHint !== undefined) {
@@ -771,11 +772,18 @@ export class ComputerManager {
     } catch {
       return undefined;
     }
+    const owner = windows.find((window) => window.id === excludeWindowId);
+    // A new notification/menu in the person's application is not an outcome
+    // of our action. Never replace the target's image with an unrelated app.
+    if (!owner) return undefined;
     return windows
       .filter(
         (window) =>
           !baseline.has(window.id) &&
           window.id !== excludeWindowId &&
+          (owner.pid !== undefined
+            ? window.pid === owner.pid
+            : owner.appName !== undefined && window.appName === owner.appName) &&
           window.bounds !== undefined &&
           window.visible &&
           !window.minimized,
@@ -1941,6 +1949,7 @@ export class ComputerManager {
 
   /** Restack without changing keyboard aim, including on a hover. */
   private async revealTarget(target: PreparedTarget | undefined): Promise<void> {
+    if (this.backend.inputDoesNotRequireReveal) return;
     const windowId = target?.windowId;
     if (windowId === undefined) return;
     assertDesktopOperationActive();
@@ -2471,8 +2480,8 @@ function occludedTargetError(
     message:
       `Window ${JSON.stringify(windowId)} is covered at (${point.x}, ${point.y}) by ${blockers}, ` +
       `and this desktop could not raise it: ${reason}. The input would go to the covering window. ` +
-      "Aim at a part of the target window that nothing covers, or move the covering window out of " +
-      "the way first; or drop window_id to act on whatever is topmost at that point.",
+      "Take a fresh screenshot of the intended window or report the obstruction. Keep window_id; " +
+      "do not hide, activate, or rearrange the user's windows to bypass this refusal.",
   });
 }
 
@@ -2497,7 +2506,7 @@ function refusedInjectionError(
       `(${point.x}, ${point.y}), so no input was sent. The window is not accepting input at that ` +
       "point: a window's bounds include invisible resize and shadow margins, and the window may " +
       "also have closed since it was listed. Aim nearer the middle of the control, target it by " +
-      "label instead of a coordinate, or drop window_id to act on whatever is topmost there.",
+      "label instead of a coordinate. Keep the intended window_id; do not redirect input to another app.",
   });
 }
 

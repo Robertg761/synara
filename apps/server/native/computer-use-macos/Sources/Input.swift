@@ -18,39 +18,11 @@
 // posting. The agent's visible cursor is the overlay in Cursor.swift, moved in
 // lockstep with these posts.
 //
-// Three rules the gesture layer enforces on top of that:
-//
-//   * **One target per gesture.** The window is resolved once, at the point the
-//     gesture starts, and every event of that gesture is stamped with it. That
-//     is how macOS routes a real drag (the window that took the mouse-down owns
-//     every dragged event and the up), and it means a click cannot deliver its
-//     down and its up to two different windows if something restacks in the
-//     middle of it.
-//   * **A background target is made to believe it is active *and* key, then put
-//     back.** AppKit hit-tests mouse events against the tracking state a window
-//     last saw and only routes keys to an app it thinks is active, so every
-//     gesture at a window whose app is not frontmost is wrapped in the focus
-//     records from SkyLight.swift — the activate/deactivate pair *and* the
-//     key-window pair — primed with a `mouseMoved`, and followed by the inverse
-//     pair (or, if the click genuinely raised the app, by re-activating the
-//     human's previous app). The key-window half is what makes this work on
-//     Chromium and Electron: with the activate record alone a background web
-//     page receives no `mousedown` at all, and with both it behaves like any
-//     other window. WindowServer's z-order and the current Space are never
-//     changed by any of it.
-//   * **Nothing stays held.** A mouse button or modifier that is logically down
-//     is tracked, and the unwind path posts the matching up on SIGTERM/SIGINT or
-//     when stdin closes. The classic failure is an agent dying between a
-//     modifier-down and its up, latching the modifier so every subsequent human
-//     keystroke becomes a shortcut.
-//
-// Typing is a ladder, invisible rungs first: an accessibility `AXSelectedText`
-// insert into the focused text element, which lands in a background AppKit view
-// and can be read back; then pid-routed keystrokes, which now reach a background
-// web view too; and, only when the caller asks for `deliveryMode: "foreground"`
-// or an application has already been caught dropping both, a brief real
-// activation of the target that is undone afterwards. The result names the rung
-// that ran.
+// Every gesture keeps one window target and releases held buttons/modifiers on
+// cancellation. Background input sends synthetic activation only to its target;
+// the user's application is never deactivated. Unconfirmed clicks are reported,
+// never replayed. Foreground keycodes require an already-active target and never
+// activate another app as a delivery fallback.
 
 import AppKit
 import ApplicationServices
@@ -74,8 +46,8 @@ private let kSyntheticClickFidelityFlag: UInt64 = 0x2000_0000
 enum DeliveryMode: String {
   /// The default: never change which application is frontmost.
   case background
-  /// Genuinely bring the target forward for the duration of the action and put
-  /// the previous application back afterwards. Opt-in, because it is visible.
+  /// Physical keycodes, only if the user already has the target active.
+  /// This never grants permission to activate another application.
   case foreground
 
   init(param: String?) throws {
@@ -90,19 +62,9 @@ enum DeliveryMode: String {
   }
 }
 
-/// What a gesture still owes the human's application, replayable from the exit
-/// path.
-///
-/// The two rungs owe different debts, and a struct that could only express the
-/// record pair meant the foreground rung recorded nothing at all: a SIGTERM
-/// arriving while the agent typed into a genuinely activated app left that app
-/// frontmost over the human's editor, which is the exact disruption the design
-/// forbids.
-enum PendingFocusRestore {
-  /// A focus record pair was posted; undo it with the inverse pair.
-  case recordPair(previousPID: pid_t, previousWindowID: CGWindowID, targetPID: pid_t)
-  /// The target was genuinely activated; give the human's app back.
-  case activation(previousPID: pid_t, targetPID: pid_t)
+/// Synthetic activation belongs only to the agent's target, never the user's app.
+struct PendingFocusRestore {
+  let targetPID: pid_t
 }
 
 /// How well an action's effect could actually be observed.
@@ -251,27 +213,20 @@ final class InputController {
   ) throws -> PointerOutcome {
     try requireInputPermission()
     let target = try aim(at: point, named: window, glide: false)
-    // Same ladder the keyboard uses, and it now starts on the invisible rung for
-    // every surface including web content: the focus prelude makes the target
-    // window key as well as its app active, which is what a background Chromium
-    // page needs before it will hit-test a pid-posted mouseDown at all. The
-    // foreground rung is left only for an app already caught dropping one.
-    // The previous application is restored by `focus.end()` either way.
-    let mode: DeliveryMode = Focus.routesBackgroundInput(target) ? .background : .foreground
+    // Make only the target believe it is active; never activate another app.
+    let mode: DeliveryMode = .background
     let types = Self.eventTypes(for: button)
     let group = Self.newClickGroup()
     // What every mouse event of this gesture carries in its flags. Empty for a
     // plain click, and `formUnion` with the empty set changes nothing, so an
     // unmodified click is byte-for-byte the event stream it always was.
     let modifierFlags = Self.combinedFlags(modifiers)
-    // Observed before the gesture so the background path can be checked. Only
-    // meaningful on the invisible rung: the foreground rung is already the
-    // fallback, so there is nothing to learn from it.
+    // Observe delivery once; an unchanged control is not permission to replay.
     var watch: DeliveryWatch?
     cursor.glide(to: point, window: target) {
       if mode == .background { watch = DeliveryWatch(target: target, point: point) }
     }
-    var focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: mode)
+    let focus = try Focus.begin(for: target, cursor: cursor, controller: self, mode: mode)
     defer { focus.end() }
     // A throw between the down and the up would otherwise leave the target in a
     // phantom drag until the process exits — a rubber-band selection or a
@@ -308,29 +263,8 @@ final class InputController {
     }
     try postGesture()
 
-    // Did the invisible rung actually reach the app? An unchanged target is
-    // only evidence of failure when the click should have changed something,
-    // which `DeliveryWatch` decides; otherwise this is a no-op and the app
-    // keeps its optimistic route.
-    //
-    // `focus.end()` settles before it returns, which the retry depends on: the
-    // `Focus.begin` below reads the frontmost pid to decide what it must do, and
-    // reading it while the target was still front produced a focus with no
-    // previous app — a retry that never brought the target forward and never
-    // restored anything. The `defer` above re-reads `focus` at scope exit, so
-    // the replacement is the one that gets ended.
-    var verified = watch?.observe() ?? .unverifiable
-    if let watch, let target, verified == .unconfirmed {
-      Self.rememberForegroundOnly(target, kind: .pointer)
-      focus.end()
-      focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: .foreground)
-      try postGesture()
-      // The escalated replay is judged on the same expectation the first
-      // attempt armed: the failed attempt did not move focus, so the element
-      // the click was aimed at is still the one that should gain it.
-      verified = watch.renewedObservation()
-      return PointerOutcome(mode: .foreground, verified: verified)
-    }
+    // An uncertain click must never be replayed: it may already have acted.
+    let verified = watch?.observe() ?? .unverifiable
     return PointerOutcome(mode: mode, verified: verified)
   }
 
@@ -342,9 +276,7 @@ final class InputController {
     try click(at: point, button: .right, window: window, modifiers: modifiers)
   }
 
-  /// Returns the rung that actually ran, which is not always the one asked for:
-  /// a background drag into an app known to drop them is promoted, and the
-  /// caller's report must name what happened rather than what it requested.
+  /// Keep the requested delivery mode; background drags never escalate.
   @discardableResult
   func drag(
     from: CGPoint, to: CGPoint, durationMs: Int, mode: DeliveryMode, window: CGWindowID? = nil
@@ -363,11 +295,8 @@ final class InputController {
     // and the up — which is how macOS routes a real drag.
     let target = try aim(at: from, named: window)
     let group = Self.newClickGroup()
-    // A caller that did not ask for foreground still gets it when this app is
-    // known to drop background gestures, the same rule `click` applies.
-    let resolvedMode: DeliveryMode =
-      mode == .foreground || !Focus.routesBackgroundInput(target) ? .foreground : .background
-    let focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: resolvedMode)
+    let resolvedMode = mode
+    let focus = try Focus.begin(for: target, cursor: cursor, controller: self, mode: resolvedMode)
     defer { focus.end() }
     defer { releaseHeldButton() }
     try prime(at: from, target: target, group: group)
@@ -427,8 +356,8 @@ final class InputController {
     // the target is what "scroll this window" means.
     let aimPoint = point ?? target.map { CGPoint(x: $0.bounds.midX, y: $0.bounds.midY) }
     if point == nil, let aimPoint { cursor.glide(to: aimPoint, window: target) }
-    let mode: DeliveryMode = Focus.routesBackgroundInput(target) ? .background : .foreground
-    let focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: mode)
+    let mode: DeliveryMode = .background
+    let focus = try Focus.begin(for: target, cursor: cursor, controller: self, mode: mode)
     defer { focus.end() }
     // Scroll deltas are in pixels; a positive dy scrolls toward the content end,
     // matching the wire convention. Line units are negated the way a wheel is.
@@ -480,13 +409,9 @@ final class InputController {
   func typeText(_ text: String, mode: DeliveryMode) throws -> TypeOutcome {
     try requireInputPermission()
     let target = try resolveKeyboardTarget()
-    // Whether the invisible rungs are worth attempting at all. Only an
-    // application already caught dropping background input answers yes: a web
-    // view no longer does, because rung 2 reaches one now. Rung 1 still declines
-    // web content on its own terms — an accessibility write into a page cannot
-    // be read back — and falls through to rung 2 rather than to the visible one.
-    let skipInvisibleRungs = Self.needsForegroundKeyboard(target)
-    if mode == .foreground || skipInvisibleRungs || !Accessibility.keyboardWindowMatches(target) {
+    // A failed verification must not poison later calls by selecting the
+    // forbidden foreground route. Every background request stays background.
+    if mode == .foreground {
       // An explicitly requested foreground rung takes exactly the path rung 3
       // takes. Posting pid-routed Unicode here instead — which it used to — put
       // this rung's one reason to exist on the wrong side of the activation:
@@ -523,7 +448,7 @@ final class InputController {
     // synthetic active state — `Focus` reports whether it did.
     var routed = false
     do {
-      let focus = Focus.begin(for: target, cursor: cursor, controller: self)
+      let focus = try Focus.begin(for: target, cursor: cursor, controller: self)
       defer { focus.end() }
       if focus.targetBelievesItIsActive {
         try postText(text, to: target)
@@ -542,20 +467,15 @@ final class InputController {
       if verification != .unconfirmed {
         return TypeOutcome(path: "keystrokes", verified: verification)
       }
-      // Readable, and it did not change: this application really does drop keys
-      // posted to its pid, so remember it and stop paying for these rungs.
-      Self.rememberForegroundOnly(target, kind: .keyboard)
+      // A delayed accessibility mirror is not proof this application can never
+      // accept background input. Report uncertainty without changing its route.
     }
 
-    // Rung 3: foreground keycodes, still addressed to the target process. Reached only when rung 2 was posted,
-    // was readable, and demonstrably changed nothing — an application that
-    // really does drop keys addressed at its pid. Chromium is no longer such an
-    // application: with the window made key by the focus prelude a background
-    // page receives the keydown and its field gains the text, so this rung is
-    // now a genuine last resort rather than the web's default path. Unlike a
-    // mouse event, a key event on the foreground route has no pointer component, so
-    // this cannot move the human's cursor; it only needs the target frontmost,
-    // which `withForeground` arranges and then undoes.
+    // Do not replay an unconfirmed background insertion through another route.
+    if mode == .background {
+      return TypeOutcome(path: "keystrokes", verified: .unconfirmed)
+    }
+    // Physical keycodes are allowed only when the target is already active.
     var path = "foreground-keys"
     try withForeground(target) { path = try self.postForegroundText(text) }
     return TypeOutcome(
@@ -844,14 +764,7 @@ final class InputController {
     try? deliver(event, to: button.target, localPoint: localPoint(button.point, in: button.target))
   }
 
-  /// Undoes a focus record pair that a gesture posted but never got to reverse.
-  ///
-  /// `Focus.end()` runs from a `defer` on the input lane; `shutdown()` calls
-  /// `exit()` from the signal source or the stdin reader, so a SIGTERM landing
-  /// inside a background gesture terminates the process first. The human's app
-  /// would then stay AppKit-deactivated — visually frontmost with no caret and
-  /// no key routing — which is precisely the disruption this design exists to
-  /// avoid, and it fired on every server restart that landed mid-gesture.
+  /// Unwind target-only synthetic activation when input is interrupted.
   private func restorePendingFocus() {
     guard let pending = takePendingFocusRestore() else { return }
     performFocusRestore(pending)
@@ -872,19 +785,9 @@ final class InputController {
     return pending
   }
 
-  /// Hand the human's application back what a gesture took from it. The one
-  /// implementation of the restore, shared by `Focus.end()` and the exit path so
-  /// the two cannot drift apart — the record pair is the invisible rung's debt,
-  /// a real activation is the visible rung's.
+  /// Shared by normal completion and cancellation; neither activates an app.
   fileprivate func performFocusRestore(_ pending: PendingFocusRestore) {
-    switch pending {
-    case .recordPair(let previousPID, let previousWindowID, let targetPID):
-      _ = SkyLight.restoreActivation(
-        to: previousPID, windowID: previousWindowID, from: targetPID)
-    case .activation(let previousPID, let targetPID):
-      guard SkyLight.frontmostPID() == targetPID else { return }
-      NSRunningApplication(processIdentifier: previousPID)?.activate(options: [])
-    }
+    _ = SkyLight.restoreActivation(from: pending.targetPID)
   }
 
   /// Records, or clears, the focus pair a gesture still owes the human.
@@ -896,217 +799,71 @@ final class InputController {
 
   // MARK: - Focus prelude and postlude
 
-  /// One gesture's activation bookkeeping: what was front before, what was done
-  /// to the target, and how to put both back.
+  /// Synthetic input state belongs to the target process only. Never deactivate
+  /// the user's application or restore it through a real foreground activation.
   private struct Focus {
-    private let target: DesktopWindow?
-    private let previousPID: pid_t?
-    /// The human's window that `begin` deactivated. Kept rather than re-derived
-    /// at `end()`: the list is a fresh `CGWindowList` snapshot by then, and the
-    /// gesture itself may have restacked it, so re-deriving could hand the
-    /// record pair a window the human's app no longer fronts.
-    private let previousWindowID: CGWindowID
-    private let activatedWithoutRaise: Bool
-    private let broughtForward: Bool
-    /// The overlay is re-pinned after every activation change, which can
-    /// reorder it.
     private let cursor: AgentCursor
-    /// Set so `unwind()` can replay the restore if the process dies mid-gesture.
     private unowned let controller: InputController
-    /// Whether the target's app will route input as if it were active. When it
-    /// will not, AppKit hit-tests the window as a background one, so the
-    /// invisible rung cannot work and the caller should climb the ladder.
+    private let needsRestore: Bool
     let targetBelievesItIsActive: Bool
 
-    /// Whether a background gesture at `target` can be expected to route.
-    ///
-    /// Cheap and decided before any event exists: an app that is already
-    /// frontmost routes normally. Anything else consults what has been learned
-    /// about that application — see `requiresForegroundDelivery`. Nothing is
-    /// posted and no accessibility round trip is made, so it is free to ask on
-    /// every gesture.
-    static func routesBackgroundInput(_ target: DesktopWindow?) -> Bool {
-      guard let target else { return true }
-      let ownPID = ProcessInfo.processInfo.processIdentifier
-      guard let front = SkyLight.frontmostPID(), front != ownPID else { return true }
-      // Already frontmost: its own routing is live, nothing to arrange.
-      if front == target.ownerPID { return true }
-      // Without the record pair there is nothing that can make a background app
-      // believe it is active, so the invisible rung would post into a window
-      // AppKit still hit-tests as background. Asked before any event exists, and
-      // it posts nothing.
-      guard SkyLight.canActivateWithoutRaise(pid: target.ownerPID, windowID: target.windowNumber)
-      else { return false }
-      // Web content used to be excluded here, on the measurement that a
-      // pid-posted click into a background Chromium page produced no
-      // `mousedown`. That measurement was right and the conclusion was wrong:
-      // what the page was missing was key-window status, not a real activation.
-      // With `makeKeyWindow` now part of the focus prelude the same click lands
-      // in a background page, so web content takes the invisible rung like
-      // everything else and the AX round trip that used to decide this is gone.
-      //
-      // Every target starts optimistic and is judged after the fact: an app
-      // caught dropping a background gesture is remembered for this window and
-      // skips to the visible rung until that short-lived fallback expires. This is the net that catches surfaces the
-      // web-content rule cannot see, such as a canvas or game view.
-      return !InputController.requiresForegroundDelivery(target, kind: .pointer)
-    }
-
-    /// Make `target`'s app route input as if active. In `.background` mode that
-    /// is the focus record pair, which changes nothing on screen; in
-    /// `.foreground` mode the app is really brought forward. Either way `end()`
-    /// restores the human's previous app. A target whose app is already front
-    /// needs nothing and gets nothing.
     static func begin(
       for target: DesktopWindow?, cursor: AgentCursor, controller: InputController,
       mode: DeliveryMode = .background
-    ) -> Focus {
-      if let target, !Accessibility.keyboardWindowMatches(target) {
+    ) throws -> Focus {
+      guard let target else {
+        throw RPCError(.notDelivered, "No input target is selected")
+      }
+      let isActive = SkyLight.frontmostPID() == target.ownerPID
+      if mode == .foreground && !isActive {
+        throw RPCError(.notDelivered, "Background input was not delivered; activating another application is forbidden")
+      }
+      if !Accessibility.keyboardWindowMatches(target) {
+        if isActive { throw RPCError(.notDelivered, "Refusing to change the user's active window") }
         SkyLight.makeKeyWindow(pid: target.ownerPID, windowID: target.windowNumber)
         usleep(20_000)
       }
-      let ownPID = ProcessInfo.processInfo.processIdentifier
-      let front = SkyLight.frontmostPID()
-      let previous = front.flatMap { $0 == ownPID ? nil : $0 }
-      guard let target, let previous, previous != target.ownerPID else {
-        // Nothing to arrange — but "nothing to arrange" is not the same as
-        // "the target is active", and reporting the latter unconditionally is
-        // how `withForeground` came to post foreground keys with nothing
-        // verified frontmost: with no target at all, or with no previous app,
-        // this branch used to claim success and the agent's text went into
-        // whatever the human was looking at. The flag is an observation now.
-        let believesItIsActive = target.map { front == $0.ownerPID } ?? false
-        return Focus(
-          target: target, previousPID: nil, previousWindowID: 0, activatedWithoutRaise: false,
-          broughtForward: false, cursor: cursor, controller: controller,
-          targetBelievesItIsActive: believesItIsActive)
+      if isActive {
+        return Focus(cursor: cursor, controller: controller, needsRestore: false,
+          targetBelievesItIsActive: true)
       }
-      if mode == .foreground {
-        // A genuine activation, not the kCPSNoWindows variant. This rung's whole
-        // point is that the target really is frontmost the way it would be if a
-        // person had clicked it; the SPI's no-windows option leaves the window
-        // stacked behind, which a Chromium web view treats as still background.
-        // The cursor is untouched either way — activation is not pointer input.
-        //
-        // Recorded before the activation is asked for, not after: from the
-        // instant the target comes forward the human's app is owed its place
-        // back, and a SIGTERM in between would otherwise leave the target
-        // sitting on top of whatever the human was looking at.
-        controller.setPendingFocusRestore(.activation(previousPID: previous, targetPID: target.ownerPID))
-        let forward =
-          NSRunningApplication(processIdentifier: target.ownerPID)?.activate(options: [])
-          ?? SkyLight.setFrontProcess(pid: target.ownerPID, windowID: target.windowNumber)
-        // Wait for the activation to actually take, rather than assuming a fixed
-        // interval covers it.
-        var settled = false
-        for _ in 0..<40 {
-          if SkyLight.frontmostPID() == target.ownerPID {
-            settled = true
-            break
-          }
-          usleep(10_000)
-        }
-        if !settled {
-          logDiagnostic("foreground rung: target did not become frontmost within 400ms")
-        }
-        cursor.repin()
-        // `forward` is only the synchronous return of an asynchronous request,
-        // and `NSRunningApplication.activate` reports false for an activation
-        // that then happens anyway. What this rung promises its callers is that
-        // the target really is frontmost — foreground keys go wherever that is
-        // — so the settled observation alone is the answer.
-        return Focus(
-          target: target, previousPID: previous, previousWindowID: 0,
-          activatedWithoutRaise: false, broughtForward: forward, cursor: cursor,
-          controller: controller, targetBelievesItIsActive: settled)
-      }
-      let previousWindowID =
-        Windows.list().first { $0.ownerPID == previous && $0.onScreen }?.windowNumber ?? 0
       let outcome = SkyLight.activateWithoutRaise(
-        pid: target.ownerPID, windowID: target.windowNumber, previousWindowID: previousWindowID)
+        pid: target.ownerPID, windowID: target.windowNumber)
       if outcome.needsRestore {
-        // Recorded as soon as the deactivate lands: a SIGTERM arriving during
-        // the settle below must still find the debt, because by then the
-        // human's app has already been told it is inactive.
-        controller.setPendingFocusRestore(
-          .recordPair(
-            previousPID: previous, previousWindowID: previousWindowID,
-            targetPID: target.ownerPID))
-        // AppKit updates its active/key-window routing asynchronously, and the
-        // state change can disturb the overlay's ordering.
+        controller.setPendingFocusRestore(PendingFocusRestore(targetPID: target.ownerPID))
         usleep(50_000)
         cursor.repin()
       }
-      return Focus(
-        target: target, previousPID: previous, previousWindowID: previousWindowID,
-        activatedWithoutRaise: outcome.needsRestore, broughtForward: false, cursor: cursor,
-        controller: controller, targetBelievesItIsActive: outcome.activated)
+      guard outcome.activated else {
+        throw RPCError(.notDelivered, "Target did not accept background input; application activation is forbidden")
+      }
+      return Focus(cursor: cursor, controller: controller, needsRestore: outcome.needsRestore,
+        targetBelievesItIsActive: outcome.activated)
     }
 
-    /// Put the human's application back, and only then forget that it was owed.
-    ///
-    /// The order matters more than it looks: clearing the debt first and
-    /// restoring afterwards — which this used to do — left a window in which a
-    /// SIGTERM found nothing owed and exited with the target still holding
-    /// focus. The debt is instead re-recorded as this gesture has actually left
-    /// it (a background gesture that ended up raising its target owes an
-    /// activation, not the inverse pair `begin` recorded), paid through the same
-    /// single implementation the exit path uses, and cleared last.
     func end() {
-      guard let target, let previousPID else { return }
+      guard needsRestore else { return }
       usleep(50_000)
-      let frontNow = SkyLight.frontmostPID()
-      let owed: PendingFocusRestore?
-      if frontNow == target.ownerPID {
-        // The target really is front now — either because this was the
-        // foreground rung or because the gesture itself raised it (a first
-        // click in some apps does). Give the human their app back.
-        owed = .activation(previousPID: previousPID, targetPID: target.ownerPID)
-      } else if activatedWithoutRaise {
-        // Nothing moved on screen; undo the belief we planted so the human's app
-        // stops thinking it was deactivated and the target stops thinking it is
-        // active.
-        owed = .recordPair(
-          previousPID: previousPID, previousWindowID: previousWindowID, targetPID: target.ownerPID)
-      } else {
-        owed = nil
-      }
-      controller.setPendingFocusRestore(owed)
-      // Claimed rather than merely read: `unwind()` pays the same debt from the
-      // signal source, and whichever of the two takes it is the one that pays.
-      guard owed != nil, let claimed = controller.takePendingFocusRestore() else { return }
-      controller.performFocusRestore(claimed)
-      if case .activation = claimed {
-        // Activation is asynchronous, and the next gesture on this serial lane
-        // reads the frontmost pid to decide its own rung. Returning before the
-        // human's app is actually front made that read see the target still in
-        // front, which built a `Focus` with no previous app at all — so the
-        // retry neither brought the target forward nor restored anything.
-        for _ in 0..<40 {
-          if SkyLight.frontmostPID() == previousPID { break }
-          usleep(10_000)
-        }
+      if let pending = controller.takePendingFocusRestore() {
+        controller.performFocusRestore(pending)
       }
       cursor.repin()
-      Windows.invalidate()
     }
   }
 
-  /// The foreground rung for keyboard actions: bring the target forward, act,
-  /// restore the previous application.
-  ///
-  /// Delivery remains PID-addressed. Activation and key-window guards ensure
-  /// that the requested window is ready; each key also checks for a human app
-  /// switch. `end()` restores focus only while our target still owns it.
+  /// Foreground keycodes are permitted only while the user already has this
+  /// application active. This path never activates or raises an application.
   private func withForeground(_ target: DesktopWindow?, _ body: () throws -> Void) throws {
-    let focus = Focus.begin(for: target, cursor: cursor, controller: self, mode: .foreground)
+    let focus = try Focus.begin(for: target, cursor: cursor, controller: self, mode: .foreground)
     defer { focus.end() }
     guard focus.targetBelievesItIsActive else {
       throw RPCError(
         .notDelivered, "target did not become frontmost; refusing to type into whatever is")
     }
-    if let target { try Accessibility.focusKeyboardWindowVisibly(target) }
-    foregroundKeyboardPID = target?.ownerPID
+    guard let target, Accessibility.keyboardWindowMatches(target) else {
+      throw RPCError(.notDelivered, "The requested keyboard window is not selected")
+    }
+    foregroundKeyboardPID = target.ownerPID
     defer { foregroundKeyboardPID = nil }
     try body()
   }
@@ -1302,29 +1059,6 @@ final class InputController {
     case .rightMouseDragged: return .rightMouseDragged
     default: return nil
     }
-  }
-
-  private static var deliveryHistory = InputDeliveryHistory()
-
-  fileprivate static func requiresForegroundDelivery(
-    _ target: DesktopWindow, kind: InputDeliveryHistory.Kind
-  ) -> Bool {
-    deliveryHistory.requiresForeground(
-      pid: target.ownerPID, windowID: target.windowNumber, kind: kind)
-  }
-
-  /// Pointer fallback does not imply that this window drops keyboard events.
-  private static func needsForegroundKeyboard(_ target: DesktopWindow?) -> Bool {
-    guard let target else { return false }
-    return requiresForegroundDelivery(target, kind: .keyboard)
-  }
-
-  fileprivate static func rememberForegroundOnly(
-    _ target: DesktopWindow, kind: InputDeliveryHistory.Kind
-  ) {
-    deliveryHistory.recordFailure(
-      pid: target.ownerPID, windowID: target.windowNumber, kind: kind)
-    logDiagnostic("window \(target.windowNumber) requires foreground \(kind) input; background delivery will be retried after the fallback expires")
   }
 
   private static let eventNumberLock = NSLock()
@@ -1526,21 +1260,13 @@ final class InputController {
     let throughForeground: (CGKeyCode, Bool, CGEventFlags) throws -> Void = { code, down, flags in
       try self.postForegroundKey(code, down: down, flags: flags, units: nil)
     }
-    if mode == .foreground || Self.needsForegroundKeyboard(target) {
+    if mode == .foreground {
       try withForeground(target) { try body(throughForeground) }
       return KeyOutcome(path: "foreground", verified: verification())
     }
-    let focus = Focus.begin(for: target, cursor: cursor, controller: self)
-    // The same rule the typing ladder follows: a target that will not take the
-    // synthetic active state hit-tests as background and drops the chord
-    // silently, so it is worth the visible rung rather than reporting a shortcut
-    // that never ran. Reported as what happened, not as what was asked for.
-    if !focus.targetBelievesItIsActive || !Accessibility.keyboardWindowMatches(target) {
-      focus.end()
-      try withForeground(target) { try body(throughForeground) }
-      return KeyOutcome(path: "foreground", verified: verification())
-    }
+    let focus = try Focus.begin(for: target, cursor: cursor, controller: self)
     defer { focus.end() }
+    try assertKeyboardWindow(target)
     try body(throughPid)
     return KeyOutcome(path: "keystrokes", verified: verification())
   }
@@ -1599,7 +1325,7 @@ final class InputController {
     }
     setKeyboardTarget(current)
     if SkyLight.frontmostPID() != current.ownerPID {
-      Accessibility.focusWindowForKeyboard(current)
+      try Accessibility.focusWindowForKeyboard(current)
     }
     return current
   }
@@ -1621,8 +1347,8 @@ final class InputController {
 
     if !releasing, let target {
       guard let current = Windows.window(withNumber: target.windowNumber),
-        current.ownerPID == target.ownerPID, current.onScreen else {
-        throw RPCError(.targetMissing, "The input target closed or is no longer on screen")
+        current.ownerPID == target.ownerPID else {
+        throw RPCError(.targetMissing, "The input target closed or changed owner")
       }
     }
     // There is no frontmost fallback for either kind of event. An unstamped

@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   COMPUTER_TEXT_MAX_LENGTH,
@@ -134,26 +134,62 @@ function windowIdDescription(byName: ToolsByName, tool: string): string {
 }
 
 describe("agent gateway computer tools", () => {
-  it("describes window_id as a raise on a backend that raises", async () => {
+  it("documents non-disruptive targeting and recovery", async () => {
     const { byName } = await setup();
     const notes = computerToolInstructions();
-    expect(notes).toContain("raise and focus a specific window");
-    expect(windowIdDescription(byName, "computer_press_key")).toContain("The window is raised");
-    expect(windowIdDescription(byName, "computer_click")).toContain("the window is raised");
+    expect(notes).toContain("never raises or activates");
+    expect(notes).toContain("Never hide, minimize, activate, or rearrange");
+    expect(windowIdDescription(byName, "computer_press_key")).toContain("without activating");
+    expect(windowIdDescription(byName, "computer_click")).toContain("macOS does not raise");
+    expect(byName.get("computer_activate_window")?.definition.description).toContain(
+      "macOS refuses changes",
+    );
   });
 
-  it("describes the same visible workflow for macOS and Linux", async () => {
-    const { byName } = await setup(
-      Object.assign(new FakeComputerBackend(), { agentDialect: "macos" as const }),
-    );
-    const notes = computerToolInstructions();
-    expect(notes).toContain("user can watch your work");
-    expect(notes).not.toContain("without bringing it to the front");
-    expect(windowIdDescription(byName, "computer_click")).toContain("the window is raised");
-    expect(windowIdDescription(byName, "computer_type_text")).toContain("The window is raised");
-    expect(byName.get("computer_activate_window")?.definition.description).toContain(
-      "already reveals its window",
-    );
+  it("keeps screenshot clicks and scrolls aimed at a covered window without raising it", async () => {
+    const backend = Object.assign(new FakeComputerBackend(), { inputDoesNotRequireReveal: true });
+    const click = vi.spyOn(backend, "click");
+    const scroll = vi.spyOn(backend, "scroll");
+    const { call } = await setup(backend);
+    const shot = await call("computer_screenshot", { window_id: "fake-calculator" });
+    const { screenshot } = resultJson(shot) as { screenshot: { screenshotId: string } };
+    const windows = await backend.listWindows();
+    backend.emitWindowsChanged(windows.map((window) => ({
+      ...window,
+      stackingIndex: window.id === "fake-calculator" ? 1 : 0,
+      ...(window.id === "fake-calculator" ? { occludedBy: ["fake-browser"] } : {
+        bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      }),
+    })));
+    const clicked = await call("computer_click", {
+      x: 50, y: 50, screenshot_id: screenshot.screenshotId, include_screenshot: false,
+    });
+    expect(clicked.isError).not.toBe(true);
+    expect(click.mock.calls.at(-1)?.[1]).toBe("fake-calculator");
+    const scrolled = await call("computer_scroll", {
+      x: 50, y: 50, delta_y: 100, delta_x: 0,
+      screenshot_id: screenshot.screenshotId, include_screenshot: false,
+    });
+    expect(scrolled.isError).not.toBe(true);
+    expect(scroll.mock.calls.at(-1)?.[3]).toBe("fake-calculator");
+    const centered = await call("computer_scroll", {
+      delta_y: 100, delta_x: 0, screenshot_id: screenshot.screenshotId, include_screenshot: false,
+    });
+    expect(centered.isError).not.toBe(true);
+    expect(scroll.mock.calls.at(-1)?.[3]).toBe("fake-calculator");
+    expect(backend.callsFor("raiseWindow")).toHaveLength(0);
+  });
+
+  it("refuses an old window screenshot after its window closes instead of targeting another app", async () => {
+    const { backend, call } = await setup();
+    const shot = await call("computer_screenshot", { window_id: "fake-calculator" });
+    const { screenshot } = resultJson(shot) as { screenshot: { screenshotId: string } };
+    backend.emitWindowsChanged((await backend.listWindows()).filter(w => w.id !== "fake-calculator"));
+    const clicked = await call("computer_click", {
+      x: 50, y: 50, screenshot_id: screenshot.screenshotId, include_screenshot: false,
+    });
+    expect(clicked.isError).toBe(true);
+    expect(backend.callsFor("click")).toHaveLength(0);
   });
 
   it("spells out all three delivery verdicts once, in the shared notes", async () => {
@@ -421,7 +457,7 @@ describe("agent gateway computer tools", () => {
     // to be described on the shared property rather than in one tool.
     for (const name of ["computer_click", "computer_double_click", "computer_drag"]) {
       const schema = JSON.stringify(byName.get(name)?.definition.inputSchema ?? {});
-      expect(schema).toContain("raised and input is routed to it");
+      expect(schema).toContain("input is routed to that window");
     }
   });
 
@@ -881,7 +917,7 @@ describe("agent gateway computer tools", () => {
     expect(notes).toContain("not that the action failed");
     // Each action still says a screenshot is attached, and points at the rest.
     const description = byName.get("computer_click")?.definition.description ?? "";
-    expect(description).toContain("screenshot taken after the action settled");
+    expect(description).toContain("screenshot taken shortly after the action");
     expect(description).toContain("The screenshot on every action");
   });
 
@@ -912,7 +948,7 @@ describe("agent gateway computer tools", () => {
       "computer_perform_action",
     ]) {
       const tool = byName.get(name);
-      expect(tool?.definition.description).toContain("screenshot taken after the action settled");
+      expect(tool?.definition.description).toContain("screenshot taken shortly after the action");
       expect(JSON.stringify(tool?.definition.inputSchema)).toContain("include_screenshot");
     }
     // Launching resolves seconds later and clipboard writes change no pixels,
@@ -1360,6 +1396,35 @@ describe("agent gateway computer tools", () => {
     expect(resultJson(negative)).toMatchObject({ waitedMs: 0 });
   });
 
+  it("waits for a live label and returns its window screenshot in the same call", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_wait", {
+      duration_ms: 5_000, label: "Display", window_id: "fake-calculator",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(resultJson(result)).toMatchObject({ status: "ready", screenshot: { windowId: "fake-calculator" } });
+    expect(backend.callsFor("getState")).toHaveLength(1);
+    expect(backend.callsFor("click")).toHaveLength(0);
+    expect(backend.callsFor("raiseWindow")).toHaveLength(0);
+    const invalid = await call("computer_wait", { duration_ms: 0, label: "Display" });
+    expect(invalid.isError).toBe(true);
+  });
+
+  it("can wait for the next label on an action without replaying input", async () => {
+    const { backend, call } = await setup();
+    const result = await call("computer_click", {
+      label: "Display", window_id: "fake-calculator", wait_for_label: "Display",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(resultJson(result)).toMatchObject({ readiness: { status: "ready" } });
+    expect(backend.callsFor("click")).toHaveLength(1);
+    const invalid = await call("computer_click", {
+      label: "Display", wait_for_label: "",
+    });
+    expect(invalid.isError).toBe(true);
+    expect(backend.callsFor("click")).toHaveLength(1);
+  });
+
   it("holds modifiers across a click and a scroll, and refuses a name it cannot press", async () => {
     // Not expressible with computer_hotkey, which releases its keys before the
     // gesture happens — so shift-click and ctrl-scroll had no spelling at all.
@@ -1451,6 +1516,22 @@ describe("agent gateway computer tools", () => {
       screenshotUnchanged: true,
       note: expect.stringContaining("does not prove the action missed"),
     });
+  });
+
+  it("does not substitute a new window from another process for the target screenshot", async () => {
+    const backend = new FakeComputerBackend();
+    const before = (await backend.listWindows()).map((window) => ({ ...window, pid: 10 }));
+    backend.emitWindowsChanged(before);
+    const { call } = await setup(backend);
+    backend.pressKey = async () => {
+      backend.emitWindowsChanged([
+        ...before,
+        { ...before[0]!, id: "unrelated-popup", pid: 20, stackingIndex: 0 },
+      ]);
+      return {};
+    };
+    const result = await call("computer_press_key", { key: "enter", window_id: "fake-terminal" });
+    expect(resultJson(result)).toMatchObject({ screenshot: { windowId: "fake-terminal" } });
   });
 
   it("scopes the elements digest by window and by label, and counts what it drops", async () => {

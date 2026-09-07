@@ -8,29 +8,9 @@
 // a dyld crash at launch. `report()` says which entry points resolved so the
 // backend and `--probe` can show it.
 //
-// The one non-obvious routine is `activateWithoutRaise`. AppKit only routes
-// keyboard events, and hit-tests mouse events against live tracking state, in
-// an application it believes is *active*; WindowServer only makes an app active
-// by bringing its windows forward and (on a multi-Space setup) switching Spaces,
-// which is exactly the disruption this helper exists to avoid. The two can be
-// split: posting a pair of process-level event records — a "deactivate" to the
-// app that is currently front, an "activate" to the target — flips the target's
-// AppKit-active state while WindowServer's z-order and Space stay untouched.
-// This is yabai's `window_manager_focus_window_without_raise` recipe and the
-// mechanism the open-source cua-driver validated against its toolkit matrix;
-// it is also what Codex's `SyntheticAppFocusEnforcer` amounts to (see
-// docs/computer-use-macos-reference.md §2.3). The gesture layer undoes it
-// afterwards so the human's app is left as it was found.
-//
-// Process-active is only half of it, and the missing half is what used to make
-// Chromium look impossible to reach in the background. An app can be active and
-// still have no *key window*, and a Chromium window that is not key drops a
-// pid-posted mouseDown on the floor — measured on this machine: the page saw no
-// `mousedown` at all. `makeKeyWindow` is the second record pair yabai posts
-// (`window_manager_make_key_window`), and sending it straight after the activate
-// is the difference between a background click into a web view landing and
-// vanishing. Native AppKit windows never needed it, which is why the gap looked
-// like a Chromium-only prohibition rather than a missing step.
+// Background input sends synthetic active/key-window state only to its target.
+// Never send deactivation or activation records to the user's application, and
+// never fall back to making another process foreground when a symbol is absent.
 
 import AppKit
 import CoreGraphics
@@ -175,16 +155,9 @@ enum SkyLight {
 
   /// The outcome of a focus prelude.
   ///
-  /// `activated` and `needsRestore` are deliberately separate. The pair is two
-  /// posts to two different processes, and the failure that matters is the one
-  /// in between: if the deactivate landed and the activate did not — the target
-  /// quit, its window died — the human's app is left holding an unmatched
-  /// deactivate. Collapsing both into one boolean meant the caller skipped the
-  /// restore in exactly the case that needed it most.
+  /// Whether target-only synthetic activation was accepted and needs unwinding.
   struct FocusOutcome {
-    /// The target's app now believes it is active.
     let activated: Bool
-    /// A deactivate was posted to the human's app and is owed a matching restore.
     let needsRestore: Bool
   }
 
@@ -206,27 +179,15 @@ enum SkyLight {
   /// this returns, since the pid-targeted post that follows is what actually
   /// delivers the event — but it must honour `needsRestore`.
   static func activateWithoutRaise(
-    pid: pid_t, windowID: CGWindowID, previousWindowID: CGWindowID
+    pid: pid_t, windowID: CGWindowID
   ) -> FocusOutcome {
     guard let previous = frontProcess(), let target = process(owning: windowID, pid: pid),
       previous != target
     else { return FocusOutcome(activated: false, needsRestore: false) }
-    // The window id in a record names the window the *receiving* process is
-    // being told about, so the deactivate carries the human app's own window,
-    // not the target's. yabai's `window_manager_focus_window_without_raise`
-    // does the same, and the asymmetry is why `restoreActivation` passes 0.
-    let outcome = postPair(
-      deactivateTo: (previous, previousWindowID),
-      activateTo: (target, windowID),
-      activateWhenDeactivateFails: false)
-    if !outcome.deactivated {
-      logDiagnostic("focus prelude: deactivate record was refused by the front process")
-      return FocusOutcome(activated: false, needsRestore: false)
-    }
-    if !outcome.activated {
-      logDiagnostic("focus prelude: activate record was refused by the target process")
-    }
-    let activated = outcome.activated
+    // Only the target receives synthetic activation. Deactivating the user's
+    // app, even without restacking, interrupts its keyboard and active state.
+    let activated = post(record(kind: .activate, windowID: windowID), to: target)
+    guard activated else { return FocusOutcome(activated: false, needsRestore: false) }
     // Active is not the same as key, and Chromium needs both. Posted
     // unconditionally rather than only when the activate reported success: the
     // return above is WindowServer accepting the record, not the app having
@@ -284,80 +245,15 @@ enum SkyLight {
     _ = post(bytes, to: psn)
   }
 
-  /// The inverse of `activateWithoutRaise`: hand AppKit-active state back to
-  /// the app that had it. `windowID` is a window of the app being restored (0
-  /// when none is known).
-  ///
-  /// Deliberately *not* symmetric: no `makeKeyWindow` is posted at the human's
-  /// application. It does not need one — measured both ways, a TextEdit and a
-  /// Helium window that were frontmost before a background gesture still
-  /// receive physical keystrokes after it — and every record posted into the
-  /// human's app is a record that could disturb it. The asymmetry is the safe
-  /// direction: the agent's target is made key on purpose, the human's window
-  /// keeps whatever it already had.
-  static func restoreActivation(to previousPID: pid_t, windowID: CGWindowID, from targetPID: pid_t)
+  /// Undo only the target's synthetic active state. The user's app is untouched.
+  static func restoreActivation(from targetPID: pid_t)
     -> Bool
   {
-    guard let previous = process(owning: windowID, pid: previousPID) else { return false }
-    // The target may be gone by now — a click that quit it, a crash, an app the
-    // agent closed — and that is exactly when the restore matters most: the
-    // human's application is sitting there holding an unmatched deactivate, with
-    // no caret and no key routing, and it will keep holding it until something
-    // activates it. Requiring the *target's* process serial to resolve before
-    // posting anything meant a dead target took the human's focus with it. There
-    // is nothing to deactivate in that case, so only the activate half is posted.
-    guard let target = process(owning: 0, pid: targetPID), previous != target else {
-      return post(record(kind: .activate, windowID: windowID), to: previous)
-    }
-    // The same pair, with the same settle. Posting the two back to back — which
-    // this used to do — let the activate overtake the resign-active the
-    // deactivate started, which is exactly the race the prelude sleeps to avoid;
-    // the human's application was the one paying for it.
-    //
-    // `activateWhenDeactivateFails` is the one asymmetry: the prelude bails if
-    // it cannot deactivate the human's app, because there is then nothing owed,
-    // while the restore must hand the app back whatever else happened.
-    let outcome = postPair(
-      deactivateTo: (target, 0),
-      activateTo: (previous, windowID),
-      activateWhenDeactivateFails: true)
-    return outcome.deactivated && outcome.activated
-  }
-
-  /// The deactivate/activate pair, with the settle the recipe requires between
-  /// them. One definition, used by the prelude and by the restore.
-  private static func postPair(
-    deactivateTo: (process: ProcessSerial, windowID: CGWindowID),
-    activateTo: (process: ProcessSerial, windowID: CGWindowID),
-    activateWhenDeactivateFails: Bool
-  ) -> (deactivated: Bool, activated: Bool) {
-    let deactivated = post(
-      record(kind: .deactivate, windowID: deactivateTo.windowID), to: deactivateTo.process)
-    guard deactivated || activateWhenDeactivateFails else { return (false, false) }
-    // Without this the activate can overtake the resign-active the deactivate
-    // started, and the receiving app ends up believing the wrong one won.
-    usleep(focusRecordSettleMicroseconds)
-    let activated = post(
-      record(kind: .activate, windowID: activateTo.windowID), to: activateTo.process)
-    return (deactivated, activated)
-  }
-
-  /// How long WindowServer needs between the two halves of a focus pair.
-  private static let focusRecordSettleMicroseconds: useconds_t = 40_000
-
-  /// The explicit foreground rung: genuinely make `pid` the front process, with
-  /// only `windowID` ordered forward. This *does* move the human's active app —
-  /// callers restore the previous one when the gesture is done.
-  static func setFrontProcess(pid: pid_t, windowID: CGWindowID) -> Bool {
-    guard let setFront = symbols.setFrontProcessWithOptions,
-      var target = process(owning: windowID, pid: pid)
-    else {
-      return NSRunningApplication(processIdentifier: pid)?.activate(options: []) ?? false
-    }
-    let status = withUnsafePointer(to: &target) {
-      setFront(UnsafeRawPointer($0), windowID, setFrontNoWindows)
-    }
-    return status == 0
+    // The user's app was never deactivated. Only unwind the target's synthetic
+    // state, and leave it alone if the user has since made it active themselves.
+    guard frontmostPID() != targetPID else { return true }
+    guard let target = process(owning: 0, pid: targetPID) else { return true }
+    return post(record(kind: .deactivate, windowID: 0), to: target)
   }
 
   private enum RecordKind: UInt8 {

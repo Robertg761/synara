@@ -230,6 +230,8 @@ export type ComputerAgentDialect = "linux" | "macos";
 
 /** Provider-side contract shared by real display backends and the CI fake. */
 export interface ComputerBackend {
+  /** Window-addressed input works without changing the user's window stacking. */
+  readonly inputDoesNotRequireReveal?: boolean;
   /**
    * The vocabulary this desktop speaks, for the tool descriptions that differ
    * by family. Absent means `"linux"`: the evdev + AT-SPI pair every backend

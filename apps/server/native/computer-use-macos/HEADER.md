@@ -32,7 +32,7 @@ Replies correlate by `id` and may arrive out of order. A success has `result`; a
 | `move`, `click`, `double-click`, `triple-click`, `right-click`, `drag`, `scroll` | Pointer input addressed to a target window                                 |
 | `type`, `press-key`, `hotkey`                                                    | Keyboard input addressed to the target process                             |
 | `set-value`, `perform-action`                                                    | Accessibility value updates and semantic actions                           |
-| `focus-window`, `clear-focus-window`, `raise-window`                             | Keyboard aim, clearing aim and explicit foreground activation              |
+| `focus-window`, `clear-focus-window`, `raise-window`                             | Keyboard aim, clearing aim and checking that a window is revealed              |
 | `read-clipboard`, `write-clipboard`                                              | Clipboard access                                                           |
 | `set-agent-cursor`                                                               | Agent cursor overlay                                                       |
 | `cancel-request`                                                                 | Cancel an action by `params.id` (notification, no reply)                   |
@@ -50,10 +50,10 @@ Input and clipboard operations run on one serial queue. Perception runs concurre
 - Window stacking comes from the on-screen WindowServer snapshot; the all-window snapshot only supplements it with minimized/off-Space windows.
 - Target windows must belong to the requested process. Synara-owned windows and the helper overlay are excluded from targeting.
 - Pointer coordinates use desktop points. Captures report their actual pixel extent and the mapping back to desktop coordinates; stale or incompatible frame metadata is refused.
-- Input is addressed to a process and window. Targeted actions first reveal the window, matching the Linux desktop workflow. Raising normally preserves application focus; apps that refuse it may require activation. The target stays visible between actions. Keyboard delivery checks the intended key window, and hover does not change keyboard aim.
+- Input is addressed to a process and window. Routine actions never raise windows or activate another application. Synthetic active/key-window records go only to the target; the user's app is not deactivated. Unconfirmed clicks are not replayed. Foreground keycodes require the target to already be active.
 - The agent cursor stays above its target between model calls while a thread owns control. Other windows cover it according to their stacking order; minimizing the target hides it, and restoring the target restores it. Releasing ownership hides it and stops visibility checks.
 - Semantic value writes and actions move the agent overlay to the control within the same RPC. They do not inject a hover event that could change the accessibility tree.
-- Some applications require foreground activation. The helper reports that delivery path and stops if the user switches to another application during foreground typing. Background delivery cannot be guaranteed for every application.
+- Background delivery is not supported by every application. A refused background route does not authorize activation, window rearrangement, or input into a different app.
 - SkyLight symbols are resolved at runtime. Missing symbols become explicit capability failures. They are private macOS interfaces, so each supported OS release needs compatibility testing.
 - Captures use ScreenCaptureKit where available, with a bounded, cached shareable-content lookup. The `screencapture` fallback checks image geometry. Multi-display composition handles negative origins, differing scales and gaps; host windows are masked from desktop captures.
 - Accessibility traversal has node, depth and time budgets. Truncation and semantic action support are reported rather than inferred.

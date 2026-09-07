@@ -293,7 +293,7 @@ func handle(method: String, params: Params) throws -> Any {
       throw RPCError(.targetMissing, "no window has id \(focusId)")
     }
     input.setKeyboardTarget(focusTarget)
-    Accessibility.focusWindowForKeyboard(focusTarget)
+    try Accessibility.focusWindowForKeyboard(focusTarget)
     return ["ok": true]
 
   case "raise-window":
@@ -348,7 +348,7 @@ func aimKeyboard(from params: Params) throws {
     throw RPCError(.targetMissing, "no window has id \(id)")
   }
   input.setKeyboardTarget(window)
-  Accessibility.focusWindowForKeyboard(window)
+  try Accessibility.focusWindowForKeyboard(window)
 }
 
 
@@ -486,7 +486,7 @@ func launchApp(app: String, arguments: [String]) throws -> [String: Any] {
   process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
   // `-a` opens by application name or path; anything after `--args` is passed to
   // the launched app. `open` returns as soon as the launch is handed off.
-  var args = ["-a", app]
+  var args = ["-g", "-a", app]
   if !arguments.isEmpty {
     args.append("--args")
     args.append(contentsOf: arguments)
@@ -514,12 +514,11 @@ func launchApp(app: String, arguments: [String]) throws -> [String: Any] {
   guard process.terminationStatus == 0 else {
     throw RPCError(.targetMissing, "no application named \(app) could be opened")
   }
-  return ["resolvedCommand": "open -a \(app)"]
+  return ["resolvedCommand": "open -g -a \(app)"]
 }
 
-/// Reveal the target and leave it visible, as the Linux compositor does.
-/// AXRaise usually suffices without transferring the person's keyboard focus.
-/// Applications that refuse background restacking need visible activation.
+/// Compatibility endpoint: an already revealed window needs no action. Never
+/// raise another window, since even AXRaise may activate its application.
 func raiseWindow(windowId: CGWindowID) throws {
   try input.requireInputPermission()
   guard let window = Windows.window(withNumber: windowId) else {
@@ -532,26 +531,10 @@ func raiseWindow(windowId: CGWindowID) throws {
     Windows.invalidate()
     return
   }
-  try InputCancellation.check()
-  _ = Accessibility.raise(window)
-  if try waitForRevealedWindow(window, timeoutMs: 100) { return }
-  // The target must stay in view between actions; restoring the preceding app
-  // here would hide the result immediately and make the desktop flash.
-  try InputCancellation.check()
-  _ = NSRunningApplication(processIdentifier: window.ownerPID)?.activate(options: [])
-  _ = Accessibility.raise(window)
-  if try waitForRevealedWindow(window, timeoutMs: 500) { return }
-  throw RPCError(.notDelivered, "window \(windowId) could not be brought into view")
-}
-
-/// AX restacking is asynchronous; observe visual order before sending input.
-func waitForRevealedWindow(_ window: DesktopWindow, timeoutMs: Int) throws -> Bool {
-  for _ in 0..<(timeoutMs / 10) {
-    try InputCancellation.check()
-    if Windows.isRevealed(window) { Windows.invalidate(); return true }
-    usleep(10_000)
-  }
-  return false
+  // Raising another app can activate it even through AXRaise. Refuse rather
+  // than move the user's windows; input recovery must not take over the desktop.
+  if Windows.isRevealed(window) { return }
+  throw RPCError(.notDelivered, "window \(windowId) is covered; refusing to raise or activate it")
 }
 
 // MARK: - Shutdown

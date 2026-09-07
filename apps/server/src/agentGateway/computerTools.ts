@@ -25,6 +25,7 @@ import {
 } from "@synara/contracts";
 
 import { actionableElements, ComputerTargetError } from "../computer/uiTreeTargeting.ts";
+import { waitForControl } from "../computer/waitForControl.ts";
 import {
   COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
@@ -220,7 +221,7 @@ const SHARED_CLIPBOARD_NOTE =
   "The desktop has a single clipboard shared with the human user, not a private one for the agent.";
 
 const POINTER_COORDINATE_NOTE =
-  "x/y are pixel coordinates in a screenshot you received — by default the most recent one this conversation was given, otherwise the one named by screenshot_id — measured from that image's top-left corner. Never convert screenshot pixels into desktop coordinates yourself; the server does that. Point at what you can see: if you have not looked at the desktop yet, or a window has moved or resized since your last screenshot, take a new screenshot first.";
+  "x/y are pixel coordinates in a screenshot you received — by default the most recent one this conversation was given, otherwise the one named by screenshot_id — measured from that image's top-left corner. A window screenshot keeps input scoped to that window even if another app covers it. Never hide, minimize, activate, or rearrange the user's other windows to recover from an input error, including through shell commands or AppleScript. If input is refused, report the obstruction instead of changing targets. Never convert screenshot pixels into desktop coordinates yourself; the server does that. Point at what you can see: if you have not looked at the desktop yet, or a window has moved or resized since your last screenshot, take a new screenshot first.";
 
 /** The short form each pointer tool carries in place of the paragraph above. */
 const POINTER_COORDINATE_HINT =
@@ -244,11 +245,11 @@ const SEMANTIC_TARGETING_NOTE =
  * agent that cannot read a label in it must know the answer is one
  * `computer_screenshot` away rather than that the label is unreadable.
  */
-const ACTION_SCREENSHOT_NOTE = `Every mutating computer tool returns a screenshot taken after the action settled, zoomed to the window the action affected — the window it named, or the window under its coordinates — falling back to the whole workspace when neither identifies one, capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side so a typical application window comes back at full resolution. It becomes the screenshot your next x/y are measured in: read the next state from it and aim your next action at its pixels instead of making a separate screenshot call, and call computer_screenshot only when this one is too small to read the detail you need. Pass include_screenshot: false on an action whose picture you will not read — an action in the middle of a chain in one response — and never on the last one, because skipping it and then calling computer_screenshot costs the extra round trip the attached screenshot exists to avoid. When the new capture and its coordinate mapping are identical to the latest screenshot delivered to this conversation, the result reports screenshotUnchanged instead of repeating the image: keep reading the previous one, which remains the screenshot your coordinates refer to. Unchanged means the pixels did not move, not that the action failed — the screen may not have settled yet, and Synara has already checked whether the action opened a new window and photographed that instead if it did — so use computer_wait or a fresh computer_get_state before concluding it missed, and do not blind-retry the same action more than once. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
+const ACTION_SCREENSHOT_NOTE = `Every mutating computer tool returns a screenshot taken shortly after the action, zoomed to the window the action affected — the window it named, or the window under its coordinates — falling back to the whole workspace when neither identifies one, capped at ${COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION} pixels on its longest side so a typical application window comes back at full resolution. It becomes the screenshot your next x/y are measured in: read the next state from it and aim your next action at its pixels instead of making a separate screenshot call, and request another observation only when detail is unreadable or the expected page/content has not appeared. Pass include_screenshot: false on an action whose picture you will not read — an action in the middle of a chain in one response — and never on the last one, because skipping it and then calling computer_screenshot costs the extra round trip the attached screenshot exists to avoid. When the new capture and its coordinate mapping are identical to the latest screenshot delivered to this conversation, the result reports screenshotUnchanged instead of repeating the image: keep reading the previous one, which remains the screenshot your coordinates refer to. Unchanged means the pixels did not move, not that the action failed — the screen may not have settled yet, and Synara has already checked whether the action opened a new window and photographed that instead if it did — so use computer_wait with label and window_id for a known next control, or a fresh screenshot if accessibility is unavailable. Never blind-retry an action. After loading, scrolling, or rearranging controls, discard earlier coordinates; prefer a live label target, which is resolved again immediately before input. When the action closed its own target window, the result reports targetWindowClosed instead of a screenshot — the picture of a different window would not show your action's outcome.`;
 
 /** The short form the action tools carry. */
 const ACTION_SCREENSHOT_HINT =
-  'The result carries a screenshot taken after the action settled, zoomed to the window it affected; read your next coordinates from it. See "The screenshot on every action" in this server\'s instructions.';
+  'The result carries a screenshot taken shortly after the action, zoomed to the window it affected; read your next coordinates from it. See "The screenshot on every action" in this server\'s instructions.';
 
 const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
   include_screenshot: {
@@ -259,7 +260,7 @@ const INCLUDE_ACTION_SCREENSHOT_PROPERTY = {
 } as const;
 
 const KEYBOARD_TARGET_NOTE =
-  "Pass window_id to raise and focus a specific window so the user can watch your work. Otherwise keys go to the last aimed window. A click, drag, scroll, or explicit keyboard window_id aims the keyboard; computer_move_cursor only reveals the window and moves the agent cursor. With no target or a closed target, input is refused: aim first instead of retrying unchanged.";
+  "Pass window_id to aim input at a specific window. On macOS this never raises or activates it. Otherwise keys go to the last aimed window. A click, drag, scroll, or explicit keyboard window_id aims the keyboard; computer_move_cursor only moves the agent cursor. With no target or a closed target, input is refused: aim first instead of retrying unchanged.";
 
 /** The short form the keyboard tools carry. */
 const KEYBOARD_TARGET_HINT =
@@ -289,7 +290,7 @@ function keyboardTargetProperty(): Record<string, unknown> {
     window_id: {
       type: "string",
       description:
-        "Window id to aim keyboard input at. The window is raised and focused. Defaults to the last aimed window.",
+        "Window id to aim keyboard input at. Selects the agent keyboard target without activating another macOS app. Defaults to the last aimed window.",
     },
   };
 }
@@ -317,6 +318,10 @@ function withActionScreenshotSchema(schema: Record<string, unknown>): Record<str
     properties: {
       ...(schema.properties as Record<string, unknown>),
       ...INCLUDE_ACTION_SCREENSHOT_PROPERTY,
+      wait_for_label: {
+        type: "string",
+        description: "Wait up to 2s for this label in the affected window before capturing.",
+      },
     },
   };
 }
@@ -352,7 +357,7 @@ function targetProperties(): Record<string, unknown> {
     window_id: {
       type: "string",
       description:
-        "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: the window is raised and input is routed to it even if another window overlaps, and the click is refused if the coordinate is outside the window. For computer_scroll it is also a target on its own, scrolling the window itself.",
+        "Optional window id from computer_list_windows. With a label it picks which window the label is resolved in. With x/y it scopes the coordinate to that window: input is routed to that window even if another window overlaps; macOS does not raise or activate it, and the click is refused if the coordinate is outside the window. For computer_scroll it is also a target on its own, scrolling the window itself.",
     },
   };
 }
@@ -829,7 +834,13 @@ export function makeAgentGatewayComputerTools(
     const { screenshotId, ...rest } = target;
     if (typeof target.x !== "number" || typeof target.y !== "number") return rest;
     const frame = frames.resolve(threadId, screenshotId);
-    return { ...rest, ...screenshotPointToDesktop(frame, target.x, target.y) };
+    return {
+      ...rest,
+      ...(rest.windowId === undefined && frame.windowId !== undefined
+        ? { windowId: frame.windowId }
+        : {}),
+      ...screenshotPointToDesktop(frame, target.x, target.y),
+    };
   };
 
   const readTarget = (args: Record<string, unknown>, context: ToolContext): ComputerTarget =>
@@ -1000,7 +1011,7 @@ export function makeAgentGatewayComputerTools(
    */
   const withObservation = (
     context: ToolContext,
-    result: ComputerActionResult,
+    result: Record<string, unknown>,
     capture: ComputerActionObservation | undefined,
   ): unknown => {
     if (!capture) return result;
@@ -1042,15 +1053,30 @@ export function makeAgentGatewayComputerTools(
     context: ToolContext,
   ): Promise<unknown> => {
     if (readBooleanArg(args, "include_screenshot") === false) return result;
+    const label = readVerbatimStringArg(args, "wait_for_label");
+    const readiness = label === undefined ? undefined : result.windowId === undefined
+      ? { status: "unavailable", waitedMs: 0 }
+      : await waitForControl(
+        () => manager.getState({ includeTree: true, windowId: result.windowId }),
+        { label, windowId: result.windowId },
+        2_000,
+        desktopOperationSignal(),
+      ).catch((error: unknown) => {
+        // Input already happened. A failed observation must not imply it is
+        // safe to send that input again; cancellation still stops the turn.
+        assertDesktopOperationActive();
+        return { status: "unavailable", note: errorText(error) };
+      });
     // The clamped point when the display server moved the pointer, because the
     // window under where the action actually landed is the one it affected.
     return withObservation(
       context,
-      result,
+      readiness === undefined ? result : { ...result, readiness },
       await manager.captureActionScreenshot(
         result.windowId,
         result.clampedTo ?? result.point,
         context.callerThreadId,
+        readiness === undefined,
       ),
     );
   };
@@ -1081,10 +1107,18 @@ export function makeAgentGatewayComputerTools(
       `${description} ${ACTION_SCREENSHOT_HINT}`,
       withActionScreenshotSchema(inputSchema),
       async (args, context) => {
+        if (args.wait_for_label !== undefined) {
+          if (!readStringArg(args, "wait_for_label")?.trim()) {
+            throw new Error("wait_for_label must be a nonempty label.");
+          }
+          if (readBooleanArg(args, "include_screenshot") === false) {
+            throw new Error("wait_for_label requires the action screenshot.");
+          }
+        }
         const outcome = await run(args, context);
-        return "result" in outcome
+        return "result" in outcome && args.wait_for_label === undefined
           ? withObservation(context, outcome.result, outcome.observation)
-          : observeAfterAction(args, outcome, context);
+          : observeAfterAction(args, "result" in outcome ? outcome.result : outcome, context);
       },
       annotations,
     );
@@ -1132,7 +1166,7 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_list_windows",
-        description: `List visible desktop windows and their bounds without touching the pointer. Windows come back topmost-first: stackingIndex is 0 for the topmost window and grows downward, and occludedBy names the overlapping windows stacked above each one. A plain x/y click lands on whatever is topmost at that point, so when the window you want is occluded, pass its id as window_id alongside x/y to scope the click to it. When present, active reports which window the desktop considers activated. That is diagnostic, not a prerequisite: input aimed with window_id brings the target into view automatically, so a separate activation call is unnecessary before each action.${windowListCompletenessNote(dialect)}`,
+        description: `List visible desktop windows and their bounds without touching the pointer. Windows come back topmost-first: stackingIndex is 0 for the topmost window and grows downward, and occludedBy names the overlapping windows stacked above each one. A plain x/y click lands on whatever is topmost at that point, so when the window you want is occluded, pass its id as window_id alongside x/y to scope the click to it. When present, active reports which window the desktop considers activated. That is diagnostic, not a prerequisite: input aimed with window_id preserves its target. On macOS it leaves window stacking and user focus alone; never activate or hide another app to recover.${windowListCompletenessNote(dialect)}`,
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         annotations: { title: "List computer windows", ...READ_ONLY_TOOL_ANNOTATIONS },
       },
@@ -1143,7 +1177,7 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_get_state",
-        description: `Read the current desktop state, and call this before acting: the result lists every labeled actionable control (buttons, text fields, checkboxes...) as "elements", and targeting those by label is far more reliable than estimating pixel coordinates from a screenshot. Each element carries role, label, windowId, and an editable control's current value. It returns no screenshot unless you ask for one, so it does not on its own give you a frame to point x/y into — the pointer tools need one. With include_screenshot it adds the entire desktop workspace across every monitor, scaled down; ${SCREENSHOT_FRAME_NOTE} Window bounds and cursor positions in the JSON are desktop coordinates, useful for telling windows apart but not for aiming: aim by label, or with screenshot pixels. Use computer_screenshot when workspace detail is too small to read. include_text adds a full accessibility-text rendering of the tree on top of the elements list; request it or a screenshot only when needed because both increase payload size. On a busy desktop the elements list is capped: when it reports elementsTruncated it also reports elementsOmitted, the number of matching controls it could not fit, and window_id or label_contains narrows the list rather than leaving you to guess which prefix you were shown.`,
+        description: `Read the current desktop state, and call this before acting: the result lists every labeled actionable control (buttons, text fields, checkboxes...) as "elements", and targeting those by label is far more reliable than estimating pixel coordinates from a screenshot. Each element carries role, label, windowId, and an editable control's current value. It returns no screenshot unless you ask for one, so it does not on its own give you a frame to point x/y into — the pointer tools need one. With include_screenshot it adds the entire desktop workspace across every monitor, scaled down; ${SCREENSHOT_FRAME_NOTE} Window bounds and cursor positions in the JSON are desktop coordinates, useful for telling windows apart but not for aiming: aim by label, or with screenshot pixels. Use computer_screenshot when workspace detail is too small to read. include_text adds a full accessibility-text rendering of the tree on top of the elements list; request it or a screenshot only when needed because both increase payload size. If accessibility.unavailableWindowIds includes your window, use scoped screenshots; repeated tree reads will not restore missing accessibility. Do not activate, move, or hide windows to obtain it. On a busy desktop the elements list is capped: when it reports elementsTruncated it also reports elementsOmitted, the number of matching controls it could not fit, and window_id or label_contains narrows the list rather than leaving you to guess which prefix you were shown.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -1297,7 +1331,7 @@ export function makeAgentGatewayComputerTools(
       requiresActiveTurn: true,
       definition: {
         name: "computer_wait",
-        description: `Pause before looking at the desktop again, when something on screen needs time you cannot shorten: a window opening, a menu animating, a page painting, a save completing. Use it when an action's screenshot came back unchanged or half-drawn, instead of concluding the action missed or repeating it. It touches nothing — no pointer, no keys, no focus — and returns no screenshot, so follow it with computer_screenshot or computer_get_state. Waiting is capped at ${COMPUTER_WAIT_MAX_MS} ms per call and a longer request is clamped to it; for something genuinely slow, wait and look, then wait and look again, rather than trying to sleep through it in one call.`,
+        description: `Wait for delayed content without sending input or changing focus. Prefer label plus window_id when you know the next control: duration_ms is then a maximum, and the tool returns as soon as that unique control appears, with a screenshot by default. Target it by label afterward so a layout change cannot leave stale coordinates. An unavailable accessibility tree returns immediately; use the screenshot and do not repeat semantic waits until the environment changes. Without label this is a fixed pause with no screenshot. Never repeat the preceding action merely because a page is still loading. Waiting is capped at ${COMPUTER_WAIT_MAX_MS} ms; one accessibility read may finish after the deadline.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -1307,14 +1341,39 @@ export function makeAgentGatewayComputerTools(
               maximum: COMPUTER_WAIT_MAX_MS,
               description: `How long to wait, in milliseconds. Clamped to ${COMPUTER_WAIT_MAX_MS}.`,
             },
+            label: { type: "string", description: "The next control's label to wait for. Requires window_id." },
+            role: { type: "string", description: "Optional role to distinguish controls with the same label." },
+            window_id: { type: "string", description: "Window to observe without raising or activating it." },
+            ...INCLUDE_ACTION_SCREENSHOT_PROPERTY,
           },
           required: ["duration_ms"],
           additionalProperties: false,
         },
         annotations: { title: "Wait", ...READ_ONLY_TOOL_ANNOTATIONS },
       },
-      handler: handle("computer_wait", async (args) => {
+      handler: handle("computer_wait", async (args, context) => {
         const durationMs = readWaitDurationMs(args);
+        if (args.label !== undefined) {
+          const target = readTarget(args, context);
+          if (!target.windowId || !target.label?.trim()) {
+            throw new Error("A conditional wait requires a nonempty label and window_id.");
+          }
+          const readiness = await waitForControl(
+            () => manager.getState({ includeTree: true, windowId: target.windowId }),
+            target,
+            durationMs,
+            desktopOperationSignal(),
+          );
+          const result = { computerId: manager.computerId, ...readiness };
+          if (readBooleanArg(args, "include_screenshot") === false || readiness.status === "closed") {
+            return result;
+          }
+          const screenshot = await manager.captureScreenshot({
+            kind: "window", windowId: target.windowId,
+            maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+          });
+          return deliverScreenshot(context.callerThreadId, result, screenshot, target.windowId);
+        }
         if (durationMs > 0)
           await waitForComputer(durationMs, undefined, { signal: desktopOperationSignal() });
         return { computerId: manager.computerId, waitedMs: durationMs };
@@ -1435,7 +1494,7 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_scroll",
       "Scroll",
-      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in pixels of the same screenshot the coordinates are in, so a scroll needs a screenshot even when it names no coordinates at all — roughly 80 pixels per notch of a physical wheel in a full-resolution window capture. To page through content, scroll by about half the window's height as it appears in the screenshot so each observation overlaps the last; larger steps skip content. Some applications gear scrolling up and travel several times the distance requested; browsers commonly do. The result reports what the content actually did in scroll.traveledY, in desktop pixels with the same sign as delta_y, and scrolls are corrected automatically using it: the first large scroll into a window is delivered as a small probe plus a pre-corrected remainder, so ask for the distance you actually want — even the first scroll lands close, and later ones land closer. A traveledY of 0 means the content did not move at all, which usually means the page is already at its edge — a wheel cannot scroll past the top or bottom. If you are scrolling to hunt for a control, stop and call computer_get_state instead: its elements list names the labeled controls on screen, and one of those may already be targetable by label. ${POINTER_COORDINATE_HINT}`,
+      `Scroll at an optional target. The target is resolved before the gesture and is never guessed. Scroll distance is measured in pixels of the same screenshot the coordinates are in, so a scroll needs a screenshot even when it names no coordinates at all — roughly 80 pixels per notch of a physical wheel in a full-resolution window capture. To page through content, scroll by about half the window's height as it appears in the screenshot so each observation overlaps the last; larger steps skip content. Some applications gear scrolling up and travel several times the distance requested; browsers commonly do. The result reports what the content actually did in scroll.traveledY, in desktop pixels with the same sign as delta_y, and scrolls are corrected automatically using it: the first large scroll into a window is delivered as a small probe plus a pre-corrected remainder, so ask for the distance you actually want — even the first scroll lands close, and later ones land closer. A traveledY of 0 means the content did not move at all, which usually means the page is already at its edge — a wheel cannot scroll past the top or bottom. If you are scrolling to hunt for a control and accessibility is available, call computer_get_state once: its elements list names the labeled controls on screen, and one of those may already be targetable by label. ${POINTER_COORDINATE_HINT}`,
       {
         type: "object",
         properties: {
@@ -1458,11 +1517,15 @@ export function makeAgentGatewayComputerTools(
       async (args, context) => {
         const threadId = context.callerThreadId;
         const raw = readScreenshotTarget(args);
-        const target = resolveTarget(raw, threadId);
+        const frame = frames.resolve(threadId, raw.screenshotId);
+        const resolved = resolveTarget(raw, threadId);
+        const target = !hasTargetFields(resolved) && frame.windowId !== undefined
+          ? { ...resolved, windowId: frame.windowId }
+          : resolved;
         // The distance is in the same picture's pixels as the point, so a
         // scroll needs a frame even when it names no point at all.
         const delta = screenshotDeltaToDesktop(
-          frames.resolve(threadId, raw.screenshotId),
+          frame,
           readDelta(args, "delta_x"),
           readDelta(args, "delta_y"),
         );
@@ -1557,7 +1620,7 @@ export function makeAgentGatewayComputerTools(
     actionEntry(
       "computer_activate_window",
       "Activate window",
-      "Bring a window into view and aim the agent keyboard at it. Targeted input already reveals its window automatically; use this tool when the user asks to see a window without sending input. A desktop that cannot raise the window refuses. It returns no screenshot; observe with computer_screenshot or computer_get_state when needed.",
+      "Bring a window into view and aim the agent keyboard at it. macOS refuses changes to window stacking or application focus; use this tool when the user asks to see a window without sending input. A desktop that cannot raise the window refuses. It returns no screenshot; observe with computer_screenshot or computer_get_state when needed.",
       {
         type: "object",
         properties: {
