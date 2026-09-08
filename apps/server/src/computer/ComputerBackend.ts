@@ -9,6 +9,7 @@ import {
   type ComputerHealth,
   type ComputerId,
   type ComputerInputModifier,
+  type ComputerInputPause,
   type ComputerLaunchAppResult,
   type ComputerPermission,
   type ComputerPoint,
@@ -174,6 +175,7 @@ export class ComputerBackendError extends Error {
    * card raised for a window that merely moved would be noise.
    */
   readonly setupRequired: boolean;
+  readonly inputPause: ComputerInputPause | undefined;
 
   constructor(
     message: string,
@@ -183,6 +185,7 @@ export class ComputerBackendError extends Error {
       readonly cause?: unknown;
       readonly rejectedOperation?: string;
       readonly setupRequired?: boolean;
+      readonly inputPause?: ComputerInputPause;
     } = {},
   ) {
     super(message, options);
@@ -191,6 +194,7 @@ export class ComputerBackendError extends Error {
     this.dormant = options.dormant ?? false;
     this.rejectedOperation = options.rejectedOperation;
     this.setupRequired = options.setupRequired ?? false;
+    this.inputPause = options.inputPause;
   }
 }
 
@@ -378,6 +382,8 @@ export interface ComputerBackend {
   /** Cosmetic activity badge; must not activate or move any window. */
   setCursorActivity?(text: string | null): Promise<void>;
   launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult>;
+  /** Readiness only: never raises, focuses, or injects input into the target. */
+  checkInputReady?(windowId: string): Promise<void>;
   /**
    * `windowId` is the window the caller resolved this point to, when it named
    * one. A backend that injects at a screen coordinate ignores it — whatever is

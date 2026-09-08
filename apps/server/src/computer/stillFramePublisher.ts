@@ -86,6 +86,7 @@ export class StillFramePublisher {
   private readonly dedupe = new StillFrameDedupe();
 
   private listener: ComputerFrameListener | undefined;
+  private attachmentGeneration = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
   private inFlight = false;
   private nextSequence = 1;
@@ -101,24 +102,17 @@ export class StillFramePublisher {
   }
 
   async attach(listener: ComputerFrameListener): Promise<void> {
+    const generation = ++this.attachmentGeneration;
+    this.listener = undefined;
     this.clearTimer();
-    await this.options.prepare?.();
-    // An overlapping attach (a second pane joining mid-attach) cleared the first
-    // interval above, but the await let the FIRST attach resume here and install
-    // its own interval — which nothing would ever clear again, because `timer`
-    // names the second one. Cleared once more so exactly the newest attach's
-    // interval survives.
-    this.clearTimer();
-    this.listener = listener;
-    // A re-attached pane has seen nothing, so the memory of what the previous
-    // one saw must not suppress its first frame.
     this.dedupe.reset();
+    await this.options.prepare?.();
+    // A detach or newer attach supersedes this preparation, even when callers
+    // reuse the same callback or preparations finish out of order.
+    if (this.attachmentGeneration !== generation) return;
+    this.listener = listener;
     await this.publish({ force: true });
-    // A newer attach took over while the first frame was in flight; it already
-    // owns the interval, and installing a second one here would orphan it — the
-    // leak the two `clearTimer` calls above only cover when the attaches settle
-    // in the order they started.
-    if (this.listener !== listener) return;
+    if (this.attachmentGeneration !== generation) return;
     this.timer = setInterval(() => {
       void this.publish();
     }, this.options.intervalMs);
@@ -126,6 +120,7 @@ export class StillFramePublisher {
   }
 
   async detach(): Promise<void> {
+    this.attachmentGeneration += 1;
     this.listener = undefined;
     this.clearTimer();
     this.dedupe.reset();
@@ -140,6 +135,7 @@ export class StillFramePublisher {
 
   async publish(options: { readonly force?: boolean } = {}): Promise<void> {
     const listener = this.listener;
+    const generation = this.attachmentGeneration;
     if (!listener || !this.options.isCaptureAvailable()) return;
     if (this.inFlight) {
       // A keyframe asked for while a still is already in flight used to be
@@ -161,7 +157,7 @@ export class StillFramePublisher {
     try {
       const bytes = await this.options.capture(force);
       if (bytes === undefined) return;
-      if (this.listener !== listener) return;
+      if (this.attachmentGeneration !== generation) return;
       // An idle desktop encodes the same bytes every tick; republishing them
       // spends about a megabyte of socket to convey nothing.
       if (!this.dedupe.shouldPublish(bytes, force)) return;
@@ -181,7 +177,11 @@ export class StillFramePublisher {
       // A transient capture failure must not tear down a subscribed stream, and
       // a bounded number of retries must not become an unbounded one: past the
       // budget the force is dropped and the timer cadence takes over.
-      if (force && this.forceRetries < MAX_FORCE_RETRIES) {
+      if (
+        this.attachmentGeneration === generation &&
+        force &&
+        this.forceRetries < MAX_FORCE_RETRIES
+      ) {
         this.forceRetries += 1;
         this.dedupe.deferForce();
       }
@@ -189,7 +189,8 @@ export class StillFramePublisher {
       this.inFlight = false;
       // A forced request that arrived mid-flight is served now rather than
       // waiting for the next timer tick.
-      if (this.dedupe.forcePending && this.listener === listener) {
+      // A replacement attachment can be waiting on this capture slot too.
+      if (this.dedupe.forcePending && this.listener) {
         void this.publish();
       }
     }

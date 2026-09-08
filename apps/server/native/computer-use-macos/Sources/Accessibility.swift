@@ -150,9 +150,10 @@ enum Accessibility {
   }
 
   /// Resolve `windowId` + `nodePath` to a live element and set its value.
-  static func setValue(windowId: CGWindowID, path: [Int], value: String, accessibilityRoot: String = "window") throws {
+  static func setValue(windowId: CGWindowID, path: [Int], value: String, accessibilityRoot: String = "window", expectedRole: String? = nil, expectedLabel: String? = nil) throws -> Verification {
     try Windows.requireInputSpace(windowId)
     let element = try resolve(windowId: windowId, path: path, accessibilityRoot: accessibilityRoot)
+    try validateIdentity(element, role: expectedRole, label: expectedLabel)
     try InputCancellation.check()
     try Windows.requireInputSpace(windowId)
     let status = AXUIElementSetAttributeValue(
@@ -160,12 +161,19 @@ enum Accessibility {
     guard status == .success else {
       throw RPCError(.notDelivered, "the control refused a value write (AX error \(status.rawValue))")
     }
+    // A successful AX write is not proof that the application accepted the
+    // value. Read this same element, never the field that happens to be focused.
+    // Web renderers can expose an AX mirror without updating their form state.
+    guard let actual = stringAttribute(element, kAXValueAttribute) else { return .unverifiable }
+    if actual != value { return .unconfirmed }
+    return valueContext(element) == .native ? .confirmed : .unverifiable
   }
 
   /// Resolve `windowId` + `nodePath` to a live element and perform an action.
-  static func performAction(windowId: CGWindowID, path: [Int], action: String, accessibilityRoot: String = "window") throws {
+  static func performAction(windowId: CGWindowID, path: [Int], action: String, accessibilityRoot: String = "window", expectedRole: String? = nil, expectedLabel: String? = nil) throws {
     try Windows.requireInputSpace(windowId)
     let element = try resolve(windowId: windowId, path: path, accessibilityRoot: accessibilityRoot)
+    try validateIdentity(element, role: expectedRole, label: expectedLabel)
     let axAction = mapAction(action)
     try InputCancellation.check()
     try Windows.requireInputSpace(windowId)
@@ -239,7 +247,7 @@ enum Accessibility {
     AXUIElementSetMessagingTimeout(focused, windowMessagingTimeout)
     let valueBefore = stringAttribute(focused, kAXValueAttribute)
     let role = stringAttribute(focused, kAXRoleAttribute) ?? ""
-    let inWebArea = hasAncestor(focused, role: "AXWebArea")
+    let inWebArea = valueContext(focused) == .web
     // Browser address bars expose writable AX text but that write may update
     // only the accessibility mirror, leaving Enter pointed at the old URL.
     // Keep atomic insertion for native multiline editors; use real keystrokes
@@ -440,19 +448,25 @@ enum Accessibility {
     return signature(of: focused)
   }
 
-  private static func hasAncestor(_ element: AXUIElement, role: String) -> Bool {
+  private enum ValueContext { case native, web, unknown }
+
+  /// Exhausting the bounded walk or losing AX access cannot prove a field is
+  /// native. In particular, deeply nested web fields must not become confirmed.
+  private static func valueContext(_ element: AXUIElement) -> ValueContext {
     var current = element
     for _ in 0..<12 {
       var raw: CFTypeRef?
       guard
         AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &raw) == .success,
         let value = raw, CFGetTypeID(value) == AXUIElementGetTypeID()
-      else { return false }
+      else { return .unknown }
       // swiftlint:disable:next force_cast
       current = value as! AXUIElement
-      if stringAttribute(current, kAXRoleAttribute) == role { return true }
+      guard let role = stringAttribute(current, kAXRoleAttribute) else { return .unknown }
+      if role == "AXWebArea" { return .web }
+      if role == "AXWindow" || role == "AXApplication" { return .native }
     }
-    return false
+    return .unknown
   }
 
   static func keyboardWindowMatches(_ window: DesktopWindow) -> Bool {
@@ -602,14 +616,18 @@ enum Accessibility {
     // not something the agent can act on, and those subtrees are where the node
     // count explodes. A zero-size node is a layout container, not a position, so
     // it is still descended.
-    if depth > 0, frame.width > 0, frame.height > 0, !frame.intersects(windowBounds) {
+    let offscreen = depth > 0 && frame.width > 0 && frame.height > 0 && !frame.intersects(windowBounds)
+    // Keep a shallow address for known fields so AXScrollToVisible can reveal
+    // them. Do not walk off-screen subtrees or spend the visible-node budget on
+    // their layout containers.
+    if offscreen && !valueBearingRoles.contains(snapshot.role) {
       return nil
     }
     budget.remaining -= 1
     budget.used += 1
 
     var children: [[String: Any]] = []
-    if depth < maxDepth {
+    if !offscreen && depth < maxDepth {
       for (index, child) in snapshot.children.enumerated() {
         // The cap cut this window's tree short exactly when a child still
         // existed and there was no budget left to emit it.
@@ -631,7 +649,7 @@ enum Accessibility {
           children.append(childNode)
         }
       }
-    } else if !snapshot.children.isEmpty {
+    } else if !offscreen && !snapshot.children.isEmpty {
       budget.truncated = true
     }
 
@@ -645,7 +663,7 @@ enum Accessibility {
         "x": Double(frame.midX),
         "y": Double(frame.midY),
       ],
-      "onScreen": true,
+      "onScreen": !offscreen,
       "windowId": String(windowId),
       "editable": valueBearingRoles.contains(snapshot.role)
         && isSettable(element, kAXValueAttribute),
@@ -698,6 +716,21 @@ enum Accessibility {
   }
 
   // MARK: - Internals
+
+  /// A child-index path can resolve to a different control after a rerender.
+  /// Refuse before delivery when its observed identity no longer matches.
+  private static func validateIdentity(_ element: AXUIElement, role: String?, label: String?) throws {
+    AXUIElementSetMessagingTimeout(element, windowMessagingTimeout)
+    if let role, stringAttribute(element, kAXRoleAttribute) != role {
+      throw RPCError(.targetChanged, "The target control changed. Read the window state again.")
+    }
+    if let label {
+      let actual = stringAttribute(element, kAXTitleAttribute) ?? stringAttribute(element, kAXDescriptionAttribute)
+      guard actual == label else {
+        throw RPCError(.targetChanged, "The target label changed. Read the window state again.")
+      }
+    }
+  }
 
   private static func mapAction(_ action: String) -> String {
     switch action {

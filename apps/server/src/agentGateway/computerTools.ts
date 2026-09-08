@@ -31,6 +31,7 @@ import {
   COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
   DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   MAX_COMPUTER_CLIPBOARD_BYTES,
+  ComputerBackendError,
   type ComputerAgentDialect,
   type ComputerCaptureRequest,
 } from "../computer/ComputerBackend.ts";
@@ -199,6 +200,11 @@ export function computerToolInstructions(): string {
     "",
     "### When a computer tool refuses",
     REFUSAL_NOTE,
+    "A computer_input_paused refusal means input is suspended, while screenshots still work. Stop sending mutations, including activation or launch attempts. Tell the user which window needs attention and what remains. After the user returns it, call computer_get_state scoped to that window to check readiness before continuing. Resume from the current form contents; do not replay completed fields.",
+    "",
+    "### Form progress and handback",
+    "When submission is forbidden, do not use Enter to finish a form dropdown: it can submit the form if the popup has closed. Prefer clicking the visible option. If using typeahead or arrows, leave the control with Tab or Escape and verify its value. A dropdown value write may be a no-op even when the accessibility API accepts it.",
+    "Read the form before filling it and collect missing choices together when they determine later fields. Use computer_set_value for addressable fields and respect character limits. A successful delivery is not proof of the intended field's contents: check meaningful section boundaries and the final required values using the returned observations, without adding a screenshot after every keystroke. Read new state after revealing conditional fields. Never blindly repeat typing, paste, or checkbox toggles. At handback, distinguish verified values, attempted but unverified values, and missing fields, and preserve the user's submission boundary.",
   ].join("\n");
 }
 
@@ -917,7 +923,11 @@ export function makeAgentGatewayComputerTools(
             async () => {
               await Effect.runPromise(context.assertCallerTurnActive(), { signal: abortSignal });
               abortSignal.throwIfAborted();
-              return manager.cursorActivity.during(context.callerThreadId, cursorToolActivity(name), () => run(args, context));
+              return manager.cursorActivity.during(
+                context.callerThreadId,
+                cursorToolActivity(name),
+                () => run(args, context),
+              );
             },
             abortSignal,
           );
@@ -951,11 +961,18 @@ export function makeAgentGatewayComputerTools(
         Effect.flatMap(({ result, signal }) => withSetupCard(name, context, signal, result)),
         Effect.catch((error) => {
           const failure =
-            error instanceof ComputerTargetError
-              ? targetErrorResult(error)
-              : error instanceof ComputerLeaseError
-                ? leaseErrorResult(error)
-                : mcpToolResultError(errorText(error));
+            error instanceof ComputerBackendError && error.inputPause
+              ? {
+                  ...mcpToolResultJson({
+                    error: { code: "computer_input_paused", ...error.inputPause, retryable: false },
+                  }),
+                  isError: true,
+                }
+              : error instanceof ComputerTargetError
+                ? targetErrorResult(error)
+                : error instanceof ComputerLeaseError
+                  ? leaseErrorResult(error)
+                  : mcpToolResultError(errorText(error));
           // A missing OS grant is the only failure a user has to act on, so it
           // is the only one that raises a card. Everything else — a target that
           // moved, an undelivered keystroke, arguments the desktop refused — is
@@ -1055,19 +1072,23 @@ export function makeAgentGatewayComputerTools(
   ): Promise<unknown> => {
     if (readBooleanArg(args, "include_screenshot") === false) return result;
     const label = readVerbatimStringArg(args, "wait_for_label");
-    const readiness = label === undefined ? undefined : result.windowId === undefined
-      ? { status: "unavailable", waitedMs: 0 }
-      : await waitForControl(
-        () => manager.getState({ includeTree: true, windowId: result.windowId }),
-        { label, windowId: result.windowId },
-        2_000,
-        desktopOperationSignal(),
-      ).catch((error: unknown) => {
-        // Input already happened. A failed observation must not imply it is
-        // safe to send that input again; cancellation still stops the turn.
-        assertDesktopOperationActive();
-        return { status: "unavailable", note: errorText(error) };
-      });
+    const windowId = result.windowId;
+    const readiness =
+      label === undefined
+        ? undefined
+        : windowId === undefined
+          ? { status: "unavailable", waitedMs: 0 }
+          : await waitForControl(
+              () => manager.getState({ includeTree: true, windowId }),
+              { label, windowId },
+              2_000,
+              desktopOperationSignal(),
+            ).catch((error: unknown) => {
+              // Input already happened. A failed observation must not imply it is
+              // safe to send that input again; cancellation still stops the turn.
+              assertDesktopOperationActive();
+              return { status: "unavailable", note: errorText(error) };
+            });
     // The clamped point when the display server moved the pointer, because the
     // window under where the action actually landed is the one it affected.
     return withObservation(
@@ -1342,9 +1363,18 @@ export function makeAgentGatewayComputerTools(
               maximum: COMPUTER_WAIT_MAX_MS,
               description: `How long to wait, in milliseconds. Clamped to ${COMPUTER_WAIT_MAX_MS}.`,
             },
-            label: { type: "string", description: "The next control's label to wait for. Requires window_id." },
-            role: { type: "string", description: "Optional role to distinguish controls with the same label." },
-            window_id: { type: "string", description: "Window to observe without raising or activating it." },
+            label: {
+              type: "string",
+              description: "The next control's label to wait for. Requires window_id.",
+            },
+            role: {
+              type: "string",
+              description: "Optional role to distinguish controls with the same label.",
+            },
+            window_id: {
+              type: "string",
+              description: "Window to observe without raising or activating it.",
+            },
             ...INCLUDE_ACTION_SCREENSHOT_PROPERTY,
           },
           required: ["duration_ms"],
@@ -1359,18 +1389,23 @@ export function makeAgentGatewayComputerTools(
           if (!target.windowId || !target.label?.trim()) {
             throw new Error("A conditional wait requires a nonempty label and window_id.");
           }
+          const windowId = target.windowId;
           const readiness = await waitForControl(
-            () => manager.getState({ includeTree: true, windowId: target.windowId }),
+            () => manager.getState({ includeTree: true, windowId }),
             target,
             durationMs,
             desktopOperationSignal(),
           );
           const result = { computerId: manager.computerId, ...readiness };
-          if (readBooleanArg(args, "include_screenshot") === false || readiness.status === "closed") {
+          if (
+            readBooleanArg(args, "include_screenshot") === false ||
+            readiness.status === "closed"
+          ) {
             return result;
           }
           const screenshot = await manager.captureScreenshot({
-            kind: "window", windowId: target.windowId,
+            kind: "window",
+            windowId: target.windowId,
             maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
           });
           return deliverScreenshot(context.callerThreadId, result, screenshot, target.windowId);
@@ -1406,11 +1441,15 @@ export function makeAgentGatewayComputerTools(
     actionEntry(
       "computer_launch_app",
       "Launch computer app",
-      `Launch an application. ${launchAppNote(dialect)} The window appears a second or two later, so this returns no screenshot: follow it with computer_list_windows or computer_get_state once the application has had time to open, and use computer_wait if it has not appeared yet.`,
+      `Launch an application. ${launchAppNote(dialect)} Waits briefly for one matching window and returns its id without a screenshot. A null window is not a launch failure: use computer_list_windows or computer_get_state instead of launching again.`,
       {
         type: "object",
         properties: {
           app: { type: "string", description: launchAppArgumentNote(dialect) },
+          wait_for_window: {
+            type: "boolean",
+            description: "Wait up to 2s for a window. Defaults to true.",
+          },
           arguments: {
             type: "array",
             items: { type: "string" },
@@ -1426,6 +1465,7 @@ export function makeAgentGatewayComputerTools(
           context.callerThreadId,
           readStringArg(args, "app", { required: true })!,
           readStringArrayArg(args, "arguments") ?? [],
+          readBooleanArg(args, "wait_for_window") === false ? 0 : 2_000,
         ),
     ),
     clickEntry(
@@ -1520,9 +1560,10 @@ export function makeAgentGatewayComputerTools(
         const raw = readScreenshotTarget(args);
         const frame = frames.resolve(threadId, raw.screenshotId);
         const resolved = resolveTarget(raw, threadId);
-        const target = !hasTargetFields(resolved) && frame.windowId !== undefined
-          ? { ...resolved, windowId: frame.windowId }
-          : resolved;
+        const target =
+          !hasTargetFields(resolved) && frame.windowId !== undefined
+            ? { ...resolved, windowId: frame.windowId }
+            : resolved;
         // The distance is in the same picture's pixels as the point, so a
         // scroll needs a frame even when it names no point at all.
         const delta = screenshotDeltaToDesktop(
@@ -1533,8 +1574,10 @@ export function makeAgentGatewayComputerTools(
         // Keep adjacent observations overlapping even when the model repeats
         // a pixel count after the screenshot changes scale.
         const limited = {
-          deltaX: Math.sign(delta.deltaX) * Math.min(Math.abs(delta.deltaX), frame.region.width / 2),
-          deltaY: Math.sign(delta.deltaY) * Math.min(Math.abs(delta.deltaY), frame.region.height / 2),
+          deltaX:
+            Math.sign(delta.deltaX) * Math.min(Math.abs(delta.deltaX), frame.region.width / 2),
+          deltaY:
+            Math.sign(delta.deltaY) * Math.min(Math.abs(delta.deltaY), frame.region.height / 2),
         };
         const modifiers = readModifiers(args);
         const outcome = await manager.scrollCalibrated(
@@ -1547,8 +1590,10 @@ export function makeAgentGatewayComputerTools(
             ...(modifiers.length > 0 ? { modifiers } : {}),
           },
         );
-        if (outcome.result.scroll &&
-          (limited.deltaX !== delta.deltaX || limited.deltaY !== delta.deltaY)) {
+        if (
+          outcome.result.scroll &&
+          (limited.deltaX !== delta.deltaX || limited.deltaY !== delta.deltaY)
+        ) {
           return {
             ...outcome,
             result: {
@@ -1661,7 +1706,7 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_set_value",
       "Set computer value",
-      "Set the value of a uniquely labelled accessible control after a fresh snapshot. The label comes from computer_get_state's elements list; this writes atomically instead of typing keystrokes, so prefer it over click-then-type for any field that appears there. It replaces the control's whole value rather than inserting at the caret.",
+      "Replace the whole value of a unique accessible field from computer_get_state, using fresh target lookup. Prefer this over click-then-type. The result reports delivery.verified; inspect an unconfirmed write before continuing.",
       {
         type: "object",
         properties: {
@@ -1681,7 +1726,7 @@ export function makeAgentGatewayComputerTools(
     observedActionEntry(
       "computer_perform_action",
       "Perform computer action",
-      `Perform a named semantic action on a uniquely labelled accessible control, through the accessibility layer rather than by clicking. ${performActionNote(dialect)}`,
+      `Perform a semantic action on a unique accessible control. AXScrollToVisible reveals a known off-screen field; read fresh state afterward. ${performActionNote(dialect)}`,
       {
         type: "object",
         properties: {

@@ -103,6 +103,7 @@ const HELPER_TARGET_MISSING_CODE = "helper_-32001";
  * control did not react" and "the keystroke never left this process".
  */
 const HELPER_NOT_DELIVERED_CODE = "helper_-32002";
+const HELPER_INACTIVE_SPACE_CODE = "helper_-32015";
 /** JSON-RPC `invalidParams` — an argument this helper build cannot act on. */
 const HELPER_INVALID_PARAMS_CODE = "helper_-32602";
 
@@ -971,10 +972,16 @@ export class MacComputerBackend implements ComputerBackend {
     };
   }
 
-  async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
+  captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
+    return this.withActionCapture(() => this.captureActionScreenshot(request));
+  }
+
+  private async withActionCapture(
+    capture: () => Promise<ComputerScreenshot>,
+  ): Promise<ComputerScreenshot> {
     this.actionCapturesInFlight += 1;
     try {
-      return await this.captureActionScreenshot(request);
+      return await capture();
     } finally {
       this.actionCapturesInFlight -= 1;
     }
@@ -1050,6 +1057,10 @@ export class MacComputerBackend implements ComputerBackend {
       ...(resolvedCommand ? { resolvedCommand } : {}),
       window: null,
     };
+  }
+
+  async checkInputReady(windowId: string): Promise<void> {
+    await this.call(MAC_HELPER_METHODS.checkInputReady, { windowId });
   }
 
   async click(
@@ -1223,8 +1234,9 @@ export class MacComputerBackend implements ComputerBackend {
     value: string,
   ): Promise<ComputerBackendActionResult> {
     const address = this.writeAddress(target);
+    let payload: unknown;
     if (address) {
-      await this.call(MAC_HELPER_METHODS.setValue, {
+      payload = await this.call(MAC_HELPER_METHODS.setValue, {
         ...address,
         ...this.globalPoint(target.point),
         value,
@@ -1236,6 +1248,7 @@ export class MacComputerBackend implements ComputerBackend {
       );
     }
     return {
+      ...MacComputerBackend.deliveryReport(payload),
       point: target.point,
       ...(target.node.windowId ? { windowId: target.node.windowId } : {}),
       textLength: value.length,
@@ -1298,9 +1311,12 @@ export class MacComputerBackend implements ComputerBackend {
   async setCursorActivity(text: string | null): Promise<void> {
     this.cursorActivity = text;
     if (!this.helper?.running) return;
-    await this.helper.request(MAC_HELPER_METHODS.setAgentCursor, {
-      name: this.drivingAgent ?? "", activity: text ?? "",
-    }).catch(() => undefined);
+    await this.helper
+      .request(MAC_HELPER_METHODS.setAgentCursor, {
+        name: this.drivingAgent ?? "",
+        activity: text ?? "",
+      })
+      .catch(() => undefined);
   }
 
   async setDrivingAgent(name: string | null): Promise<void> {
@@ -1308,9 +1324,10 @@ export class MacComputerBackend implements ComputerBackend {
     if (!this.helper?.running) return;
     // Best effort: the agent cursor's name badge is presentation, so a failure
     // here must never fail the action that changed the holder.
-    await this.call(MAC_HELPER_METHODS.setAgentCursor, { name: this.drivingAgent ?? "", activity: this.cursorActivity ?? "" }).catch(
-      () => undefined,
-    );
+    await this.call(MAC_HELPER_METHODS.setAgentCursor, {
+      name: this.drivingAgent ?? "",
+      activity: this.cursorActivity ?? "",
+    }).catch(() => undefined);
   }
 
   onEvent(listener: ComputerBackendEventListener): () => void {
@@ -1368,6 +1385,8 @@ export class MacComputerBackend implements ComputerBackend {
         readonly windowId: string;
         readonly nodePath: readonly number[];
         readonly accessibilityRoot?: "window" | "menu-bar" | "menu-bar-extra";
+        readonly expectedRole: string;
+        readonly expectedLabel?: string;
       }
     | undefined {
     const windowId = target.node.windowId;
@@ -1376,6 +1395,10 @@ export class MacComputerBackend implements ComputerBackend {
     return {
       windowId,
       nodePath,
+      expectedRole: target.node.role,
+      ...(!target.node.truncated && target.node.label && target.node.label.length < 1_024
+        ? { expectedLabel: target.node.label }
+        : {}),
       ...(target.node.accessibilityRoot
         ? { accessibilityRoot: target.node.accessibilityRoot }
         : {}),
@@ -1429,14 +1452,18 @@ export class MacComputerBackend implements ComputerBackend {
     return x !== undefined && y !== undefined ? { x: x - origin.x, y: y - origin.y } : null;
   }
 
-  private async captureWorkspaceScreenshot(origin: ComputerPoint): Promise<ComputerScreenshot> {
-    const global = await this.workspaceRect();
-    const captured = await this.callCapture({
-      kind: "region",
-      region: global,
-      maxDimension: this.captureMaxDimension,
+  private captureWorkspaceScreenshot(origin: ComputerPoint): Promise<ComputerScreenshot> {
+    // State observations deserve the same capture priority as explicit shots.
+    // Release it when pixels finish, independently of the concurrent AX walk.
+    return this.withActionCapture(async () => {
+      const global = await this.workspaceRect();
+      const captured = await this.callCapture({
+        kind: "region",
+        region: global,
+        maxDimension: this.captureMaxDimension,
+      });
+      return this.screenshot(captured, shiftRect(captured.region ?? global, -origin.x, -origin.y));
     });
-    return this.screenshot(captured, shiftRect(captured.region ?? global, -origin.x, -origin.y));
   }
 
   /**
@@ -1868,6 +1895,16 @@ export class MacComputerBackend implements ComputerBackend {
       }
       if (error instanceof ComputerBackendError) throw error;
       const message = error instanceof Error ? error.message : String(error);
+      if (code === HELPER_INACTIVE_SPACE_CODE) {
+        const windowId = typeof params.windowId === "string" ? params.windowId : undefined;
+        throw new ComputerBackendError(message, {
+          cause: error,
+          inputPause: {
+            ...(windowId ? { windowId } : {}),
+            message: clampComputerMessage(message, "The target window is unavailable for input."),
+          },
+        });
+      }
       if (code === HELPER_PERMISSION_DENIED_CODE) {
         // The one failure the agent cannot recover from by trying something
         // else: macOS is withholding Screen Recording or Accessibility from
@@ -2052,7 +2089,10 @@ export class MacComputerBackend implements ComputerBackend {
     // the agent cursor back naming the same thread.
     if (this.drivingAgent || this.cursorActivity) {
       await helper
-        .request(MAC_HELPER_METHODS.setAgentCursor, { name: this.drivingAgent ?? "", activity: this.cursorActivity ?? "" })
+        .request(MAC_HELPER_METHODS.setAgentCursor, {
+          name: this.drivingAgent ?? "",
+          activity: this.cursorActivity ?? "",
+        })
         .catch(() => undefined);
     }
     this.publishHealth();

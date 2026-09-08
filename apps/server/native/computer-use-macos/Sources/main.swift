@@ -171,6 +171,10 @@ func handle(method: String, params: Params) throws -> Any {
   case "launch-app":
     return try launchApp(app: try params.string("app"), arguments: params.stringArray("arguments"))
 
+  case "check-input-ready":
+    try Windows.requireInputSpace(try windowId(from: params))
+    return ["ready": true]
+
   case "move":
     let point = try point(from: params)
     try input.move(to: point, window: try optionalWindowId(from: params))
@@ -274,16 +278,18 @@ func handle(method: String, params: Params) throws -> Any {
   case "set-value":
     let windowId = try windowId(from: params)
     try showSemanticTarget(params)
-    try Accessibility.setValue(
-      windowId: windowId, path: intArray(params, "nodePath"), value: try params.text("value"), accessibilityRoot: params.optionalString("accessibilityRoot") ?? "window")
-    return ["ok": true]
+    let verified = try Accessibility.setValue(
+      windowId: windowId, path: intArray(params, "nodePath"), value: try params.text("value"), accessibilityRoot: params.optionalString("accessibilityRoot") ?? "window",
+      expectedRole: params.optionalString("expectedRole"), expectedLabel: params.optionalString("expectedLabel"))
+    return ["ok": true, "path": "accessibility", "verified": verified.rawValue, "windowId": String(windowId)]
 
   case "perform-action":
     let windowId = try windowId(from: params)
-    try showSemanticTarget(params)
+    if params.optionalString("action") != "AXScrollToVisible" { try showSemanticTarget(params) }
     let activeBefore = SkyLight.frontmostPID()
     try Accessibility.performAction(
-      windowId: windowId, path: intArray(params, "nodePath"), action: try params.string("action"), accessibilityRoot: params.optionalString("accessibilityRoot") ?? "window")
+      windowId: windowId, path: intArray(params, "nodePath"), action: try params.string("action"), accessibilityRoot: params.optionalString("accessibilityRoot") ?? "window",
+      expectedRole: params.optionalString("expectedRole"), expectedLabel: params.optionalString("expectedLabel"))
     return ["ok": true, "windowId": String(windowId),
       "path": activeBefore == SkyLight.frontmostPID() ? "accessibility" : "foreground-accessibility",
       "verified": "unverifiable"]

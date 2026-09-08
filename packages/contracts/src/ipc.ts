@@ -173,6 +173,8 @@ import type {
   ComputerActionResult,
   ComputerEvent,
   ComputerGetStatusInput,
+  ComputerGetStateInput,
+  ComputerState,
   ComputerInputClickInput,
   ComputerInputKeyInput,
   ComputerInputScrollInput,
@@ -965,6 +967,8 @@ export interface NativeApi {
   computer: {
     /** Thread-independent backend status for surfaces outside any conversation. */
     getStatus: (input: ComputerGetStatusInput) => Promise<ComputerStatusResult>;
+    /** Read-only observation used to check a paused window before resuming. */
+    getState: (input: ComputerGetStateInput) => Promise<ComputerState>;
     provision: (input: ComputerProvisionInput) => Promise<ComputerProvisionResult>;
     getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
     /** User input from the computer dock pane; needs no agent turn in flight. */

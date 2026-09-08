@@ -154,26 +154,40 @@ describe("agent gateway computer tools", () => {
     const shot = await call("computer_screenshot", { window_id: "fake-calculator" });
     const { screenshot } = resultJson(shot) as { screenshot: { screenshotId: string } };
     const windows = await backend.listWindows();
-    backend.emitWindowsChanged(windows.map((window) => ({
-      ...window,
-      stackingIndex: window.id === "fake-calculator" ? 1 : 0,
-      ...(window.id === "fake-calculator" ? { occludedBy: ["fake-browser"] } : {
-        bounds: { x: 0, y: 0, width: 1920, height: 1080 },
-      }),
-    })));
+    backend.emitWindowsChanged(
+      windows.map((window) => ({
+        ...window,
+        stackingIndex: window.id === "fake-calculator" ? 1 : 0,
+        ...(window.id === "fake-calculator"
+          ? { occludedBy: ["fake-browser"] }
+          : {
+              bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+            }),
+      })),
+    );
     const clicked = await call("computer_click", {
-      x: 50, y: 50, screenshot_id: screenshot.screenshotId, include_screenshot: false,
+      x: 50,
+      y: 50,
+      screenshot_id: screenshot.screenshotId,
+      include_screenshot: false,
     });
     expect(clicked.isError).not.toBe(true);
     expect(click.mock.calls.at(-1)?.[1]).toBe("fake-calculator");
     const scrolled = await call("computer_scroll", {
-      x: 50, y: 50, delta_y: 100, delta_x: 0,
-      screenshot_id: screenshot.screenshotId, include_screenshot: false,
+      x: 50,
+      y: 50,
+      delta_y: 100,
+      delta_x: 0,
+      screenshot_id: screenshot.screenshotId,
+      include_screenshot: false,
     });
     expect(scrolled.isError).not.toBe(true);
     expect(scroll.mock.calls.at(-1)?.[3]).toBe("fake-calculator");
     const centered = await call("computer_scroll", {
-      delta_y: 100, delta_x: 0, screenshot_id: screenshot.screenshotId, include_screenshot: false,
+      delta_y: 100,
+      delta_x: 0,
+      screenshot_id: screenshot.screenshotId,
+      include_screenshot: false,
     });
     expect(centered.isError).not.toBe(true);
     expect(scroll.mock.calls.at(-1)?.[3]).toBe("fake-calculator");
@@ -184,9 +198,14 @@ describe("agent gateway computer tools", () => {
     const { backend, call } = await setup();
     const shot = await call("computer_screenshot", { window_id: "fake-calculator" });
     const { screenshot } = resultJson(shot) as { screenshot: { screenshotId: string } };
-    backend.emitWindowsChanged((await backend.listWindows()).filter(w => w.id !== "fake-calculator"));
+    backend.emitWindowsChanged(
+      (await backend.listWindows()).filter((w) => w.id !== "fake-calculator"),
+    );
     const clicked = await call("computer_click", {
-      x: 50, y: 50, screenshot_id: screenshot.screenshotId, include_screenshot: false,
+      x: 50,
+      y: 50,
+      screenshot_id: screenshot.screenshotId,
+      include_screenshot: false,
     });
     expect(clicked.isError).toBe(true);
     expect(backend.callsFor("click")).toHaveLength(0);
@@ -1257,12 +1276,22 @@ describe("agent gateway computer tools", () => {
       screenshot: { region: { width: number; height: number }; width: number; height: number };
     };
     for (const distance of [1500, 700, -1400]) {
-      const result = resultJson(await call("computer_scroll", {
-        window_id: "fake-terminal", delta_x: 0, delta_y: distance,
-      })) as { scroll: { requested: { deltaY: number }; limitedTo: { deltaY: number } } };
-      expect(result.scroll.limitedTo.deltaY).toBe(Math.sign(distance) * first.screenshot.region.height / 2);
-      expect(Math.abs(result.scroll.requested.deltaY)).toBeGreaterThan(Math.abs(result.scroll.limitedTo.deltaY));
-      expect(Math.abs(backend.callsFor("scroll").at(-1)!.args[2] as number)).toBeLessThanOrEqual(first.screenshot.region.height / 2);
+      const result = resultJson(
+        await call("computer_scroll", {
+          window_id: "fake-terminal",
+          delta_x: 0,
+          delta_y: distance,
+        }),
+      ) as { scroll: { requested: { deltaY: number }; limitedTo: { deltaY: number } } };
+      expect(result.scroll.limitedTo.deltaY).toBe(
+        (Math.sign(distance) * first.screenshot.region.height) / 2,
+      );
+      expect(Math.abs(result.scroll.requested.deltaY)).toBeGreaterThan(
+        Math.abs(result.scroll.limitedTo.deltaY),
+      );
+      expect(Math.abs(backend.callsFor("scroll").at(-1)!.args[2] as number)).toBeLessThanOrEqual(
+        first.screenshot.region.height / 2,
+      );
     }
   });
 
@@ -1414,10 +1443,15 @@ describe("agent gateway computer tools", () => {
   it("waits for a live label and returns its window screenshot in the same call", async () => {
     const { backend, call } = await setup();
     const result = await call("computer_wait", {
-      duration_ms: 5_000, label: "Display", window_id: "fake-calculator",
+      duration_ms: 5_000,
+      label: "Display",
+      window_id: "fake-calculator",
     });
     expect(result.isError).not.toBe(true);
-    expect(resultJson(result)).toMatchObject({ status: "ready", screenshot: { windowId: "fake-calculator" } });
+    expect(resultJson(result)).toMatchObject({
+      status: "ready",
+      screenshot: { windowId: "fake-calculator" },
+    });
     expect(backend.callsFor("getState")).toHaveLength(1);
     expect(backend.callsFor("click")).toHaveLength(0);
     expect(backend.callsFor("raiseWindow")).toHaveLength(0);
@@ -1428,13 +1462,16 @@ describe("agent gateway computer tools", () => {
   it("can wait for the next label on an action without replaying input", async () => {
     const { backend, call } = await setup();
     const result = await call("computer_click", {
-      label: "Display", window_id: "fake-calculator", wait_for_label: "Display",
+      label: "Display",
+      window_id: "fake-calculator",
+      wait_for_label: "Display",
     });
     expect(result.isError).not.toBe(true);
     expect(resultJson(result)).toMatchObject({ readiness: { status: "ready" } });
     expect(backend.callsFor("click")).toHaveLength(1);
     const invalid = await call("computer_click", {
-      label: "Display", wait_for_label: "",
+      label: "Display",
+      wait_for_label: "",
     });
     expect(invalid.isError).toBe(true);
     expect(backend.callsFor("click")).toHaveLength(1);
@@ -1716,6 +1753,18 @@ describe("agent gateway computer setup prompts", () => {
     );
     expect(result.isError).toBe(true);
     expect(setupPrompts).toEqual(["computer_list_windows"]);
+  });
+
+  it("returns a structured pause without asking for OS permissions", async () => {
+    const pause = { windowId: "test-window", message: "Return to this desktop." };
+    const { result, setupPrompts } = await readFailingWith(
+      new ComputerBackendError(pause.message, { inputPause: pause }),
+    );
+    expect(result.isError).toBe(true);
+    expect(resultJson(result)).toEqual({
+      error: { code: "computer_input_paused", ...pause, retryable: false },
+    });
+    expect(setupPrompts).toEqual([]);
   });
 
   it("prompts for setup when the permission failure arrived wrapped", async () => {

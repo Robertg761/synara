@@ -858,6 +858,7 @@ export function createWsNativeApi(): NativeApi {
     },
     computer: {
       getStatus: (input) => transport.request(COMPUTER_WS_METHODS.getStatus, input),
+      getState: (input) => transport.request(COMPUTER_WS_METHODS.getState, input),
       provision: (input) =>
         transport.request(COMPUTER_WS_METHODS.provision, input, { timeoutMs: null }),
       getThreadState: (input) => transport.request(COMPUTER_WS_METHODS.getThreadState, input),

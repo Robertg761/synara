@@ -45,6 +45,7 @@ export const MAC_HELPER_METHODS = {
   listWindows: "list-windows",
   screenSize: "screen-size",
   describeUi: "describe-ui",
+  checkInputReady: "check-input-ready",
   capture: "capture",
   launchApp: "launch-app",
   move: "move",

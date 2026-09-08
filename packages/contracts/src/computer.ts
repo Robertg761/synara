@@ -525,7 +525,14 @@ export const ComputerScreenshot = Schema.Struct({
 });
 export type ComputerScreenshot = typeof ComputerScreenshot.Type;
 
+export const ComputerInputPause = Schema.Struct({
+  windowId: Schema.optional(ComputerWindowId),
+  message: Schema.String.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH)),
+});
+export type ComputerInputPause = typeof ComputerInputPause.Type;
+
 export const ComputerState = Schema.Struct({
+  inputPause: Schema.optional(ComputerInputPause),
   accessibility: Schema.optional(
     Schema.Struct({
       status: Schema.Literals(["complete", "partial", "unavailable"]),
@@ -561,6 +568,8 @@ export const ThreadComputerState = Schema.Struct({
   screenSize: ComputerScreenSize,
   cursor: Schema.optional(ComputerPoint),
   agentActive: Schema.Boolean,
+  activity: Schema.optional(Schema.String.check(Schema.isMaxLength(128))),
+  inputPause: Schema.optional(ComputerInputPause),
   /** Current desktop owner; used by the global Stop control between tool calls. */
   controlOwnerThreadId: Schema.optional(ThreadId),
   controlOwnerLabel: Schema.optional(

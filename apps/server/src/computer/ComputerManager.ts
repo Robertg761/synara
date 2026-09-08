@@ -1,4 +1,5 @@
 import { CursorActivity } from "./cursorActivity.ts";
+import { waitForWindow } from "./waitForWindow.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   ComputerId,
@@ -32,6 +33,7 @@ import { FrameTransport, type FrameSink } from "@synara/shared/frameTransport";
 import {
   DesktopOperationQueue,
   assertDesktopOperationActive,
+  desktopOperationSignal,
   withoutDesktopCancellation,
 } from "./DesktopOperationQueue.ts";
 import {
@@ -134,6 +136,7 @@ export type ComputerEventListener = (event: ComputerEvent) => void;
 interface ThreadComputerRuntimeState {
   version: number;
   lastError: string | null;
+  inputPause?: NonNullable<ThreadComputerState["inputPause"]>;
   windows: readonly ComputerWindow[];
   screenSize: ComputerScreenSize;
   availability: ComputerAvailability;
@@ -308,6 +311,7 @@ export class ComputerManager {
   }
   private readonly operations = new DesktopOperationQueue();
   readonly cursorActivity: CursorActivity;
+  private activity: string | null = null;
   /**
    * The window ids the last window read saw, kept so a post-action read can be
    * diffed against it without paying for a second one.
@@ -330,7 +334,11 @@ export class ComputerManager {
 
   constructor(options: ComputerManagerOptions) {
     this.backend = options.backend;
-    this.cursorActivity = new CursorActivity((text) => this.backend.setCursorActivity?.(text));
+    this.cursorActivity = new CursorActivity((text) => {
+      this.activity = text;
+      for (const threadId of this.threads.keys()) this.publishCached(threadId);
+      return this.backend.setCursorActivity?.(text);
+    });
     this.computerId = options.backend.computerId;
     this.now = options.now ?? Date.now;
     this.leaseIdleMs = options.leaseIdleMs ?? COMPUTER_LEASE_IDLE_MS;
@@ -578,7 +586,21 @@ export class ComputerManager {
       }),
       this.backend.availability(),
     ]);
-    const withAvailability = { ...state, availability: this.correctedAvailability(availability) };
+    // A fresh, scoped observation is the recovery boundary. Merely capturing
+    // pixels or waiting does not establish that input is possible again.
+    if (options.windowId) await this.refreshInputPause(options.windowId, state.windows);
+    const inputPause =
+      (this.lease ? this.threads.get(this.lease.threadId)?.inputPause : undefined) ??
+      (options.windowId
+        ? [...this.threads.values()].find(
+            (thread) => thread.inputPause?.windowId === options.windowId,
+          )?.inputPause
+        : undefined);
+    const withAvailability = {
+      ...state,
+      availability: this.correctedAvailability(availability),
+      ...(inputPause ? { inputPause } : {}),
+    };
     if (options.includeText !== true || !withAvailability.root) return withAvailability;
     return { ...withAvailability, text: describeComputerUiTree(withAvailability.root) };
   }
@@ -854,11 +876,29 @@ export class ComputerManager {
     threadId: string | undefined,
     app: string,
     args: readonly string[] = [],
+    waitForWindowMs = 0,
   ): Promise<ComputerLaunchAppResult> {
     return this.withDesktopControl(threadId, async () => {
       assertDesktopOperationActive();
       const result = await this.backend.launchApp(app, args);
       this.emitAction(threadId, "computer_launch_app");
+      if (!result.window && waitForWindowMs > 0) {
+        // Launch happened even if the observation fails. Never turn that into
+        // an error that suggests launching the application again.
+        const window = await waitForWindow(
+          async () => {
+            this.invalidateGeometry();
+            return this.readWindows();
+          },
+          app,
+          waitForWindowMs,
+          desktopOperationSignal(),
+        ).catch(() => {
+          assertDesktopOperationActive();
+          return null;
+        });
+        return { ...result, window };
+      }
       return result;
     });
   }
@@ -1488,15 +1528,21 @@ export class ComputerManager {
     action: string,
   ): Promise<ComputerActionResult> {
     return this.withDesktopControl(threadId, async () => {
-      const resolved = await this.resolveSemanticTarget(target);
-      await this.prepareResolvedTarget(semanticPointTarget(resolved));
+      const reveal = action === "AXScrollToVisible";
+      const resolved = await this.resolveSemanticTarget(target, reveal);
+      // Revealing a control must resolve its identity without first requiring
+      // its activation point to be visible. The native action still checks Space.
+      if (!reveal) await this.prepareResolvedTarget(semanticPointTarget(resolved));
       assertDesktopOperationActive();
       const result = await this.backend.performAction(resolved, action);
+      // Revealing changes geometry; the old activation point is no longer an
+      // honest cursor position or target for a following action.
+      const { point: _oldPoint, clampedTo: _oldClamp, ...revealed } = result ?? {};
       return this.actionResult(
         threadId,
         "computer_perform_action",
-        resolved.point,
-        result,
+        reveal ? undefined : resolved.point,
+        reveal ? revealed : result,
         resolved.node.windowId ?? undefined,
       );
     });
@@ -1582,13 +1628,54 @@ export class ComputerManager {
     return this.operations.run(async () => {
       await this.claimDesktopControl(threadId);
       assertDesktopOperationActive();
+      const state = owner ? this.threads.get(owner) : undefined;
+      if (state?.inputPause) {
+        throw new ComputerBackendError(state.inputPause.message, { inputPause: state.inputPause });
+      }
       const cache = { active: true, epoch: this.geometryEpoch };
       try {
         return await this.geometry.run(cache, action);
+      } catch (error) {
+        if (owner && error instanceof ComputerBackendError && error.inputPause) {
+          this.threadRuntime(owner).inputPause = error.inputPause;
+          this.publishCached(owner);
+        }
+        throw error;
       } finally {
         cache.active = false;
       }
     });
+  }
+
+  private async refreshInputPause(
+    windowId: string,
+    windows: readonly ComputerWindow[],
+  ): Promise<void> {
+    if (!this.backend.checkInputReady) return;
+    const paused = [...this.threads.entries()].filter(
+      ([, state]) =>
+        state.inputPause &&
+        (!state.inputPause.windowId ||
+          state.inputPause.windowId === windowId ||
+          !windows.some((window) => window.id === state.inputPause?.windowId)),
+    );
+    if (paused.length === 0) return;
+    const snapshots = paused.map(([threadId, state]) => ({
+      threadId,
+      state,
+      pause: state.inputPause,
+    }));
+    try {
+      await this.backend.checkInputReady(windowId);
+    } catch {
+      return; // Read-only perception remains available while input is paused.
+    }
+    for (const { threadId, state, pause } of snapshots) {
+      if (state.inputPause !== pause) continue;
+      delete state.inputPause;
+      state.lastError = null;
+      this.publishCached(threadId);
+    }
   }
 
   private async claimDesktopControl(threadId: string | undefined): Promise<void> {
@@ -2037,7 +2124,10 @@ export class ComputerManager {
     return windowsCoveringPoint(windows, windowId, point);
   }
 
-  private async resolveSemanticTarget(target: ComputerTarget): Promise<ComputerResolvedTarget> {
+  private async resolveSemanticTarget(
+    target: ComputerTarget,
+    allowOffscreen = false,
+  ): Promise<ComputerResolvedTarget> {
     // Without a label or role the query matches every control in scope, and
     // the ambiguity refusal that follows would dump the whole tree at the
     // caller. Refuse up front, before paying for the accessibility walk, with
@@ -2062,7 +2152,7 @@ export class ComputerManager {
         notFound: true,
       });
     }
-    return { target, ...resolveComputerSemanticTarget(state.root, target) };
+    return { target, ...resolveComputerSemanticTarget(state.root, target, { allowOffscreen }) };
   }
 
   /**
@@ -2308,6 +2398,8 @@ export class ComputerManager {
       screenSize: state.screenSize,
       ...(state.cursor ? { cursor: state.cursor } : {}),
       agentActive: (this.agentCallsInFlight.get(threadId) ?? 0) > 0,
+      ...(this.activity && this.lease?.threadId === threadId ? { activity: this.activity } : {}),
+      ...(state.inputPause ? { inputPause: state.inputPause } : {}),
       controlledByOtherThread: this.lease !== null && this.lease.threadId !== threadId,
       ...(this.lease
         ? {

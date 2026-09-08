@@ -165,6 +165,10 @@ describe("resolving a labelled desktop target", () => {
     const error = thrown(() => resolveComputerSemanticTarget(desktop, { label: "Hidden" }));
     expect(error.code).toBe("computer_target_offscreen");
     expect(error.candidates).toHaveLength(1);
+    expect(
+      resolveComputerSemanticTarget(desktop, { label: "Hidden" }, { allowOffscreen: true }).node
+        .label,
+    ).toBe("Hidden");
   });
 });
 

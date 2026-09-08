@@ -9,6 +9,7 @@ import type { DockPaneRuntimeMode } from "~/lib/dockPaneActivation";
 import { CursorClickIcon, LoaderCircleIcon, MonitorIcon, StopIcon, XIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
 import { ensureNativeApi } from "~/nativeApi";
+import { ComputerInputPauseNotice } from "./computer/ComputerInputPauseNotice";
 
 import {
   selectThreadComputerAction,
@@ -396,6 +397,13 @@ export default function ComputerPanel(props: {
 
   return (
     <DiffPanelShell mode={props.mode} header={header}>
+      {threadState?.inputPause ? (
+        <ComputerInputPauseNotice
+          key={threadState.inputPause.windowId ?? "unknown"}
+          pause={threadState.inputPause}
+          windows={threadState.windows}
+        />
+      ) : null}
       <div
         ref={viewportRef}
         className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden bg-black/90"

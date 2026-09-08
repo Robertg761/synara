@@ -15,7 +15,11 @@ interface Harness {
 
 function makePublisher(
   capture: (force: boolean) => Promise<Uint8Array | undefined>,
-  options: { readonly captureAvailable?: () => boolean; readonly intervalMs?: number } = {},
+  options: {
+    readonly captureAvailable?: () => boolean;
+    readonly intervalMs?: number;
+    readonly prepare?: () => Promise<void>;
+  } = {},
 ): Harness {
   const frames: ComputerStreamFrame[] = [];
   const observed: ComputerStreamFrame[] = [];
@@ -32,12 +36,111 @@ function makePublisher(
       emit: (frame) => observed.push(frame),
       now: () => 0,
       intervalMs: options.intervalMs ?? 100,
+      ...(options.prepare ? { prepare: options.prepare } : {}),
     }),
   };
   return harness;
 }
 
 describe("StillFramePublisher", () => {
+  it("does not start capturing when detached during preparation", async () => {
+    vi.useFakeTimers();
+    const preparation = Promise.withResolvers<void>();
+    const harness = makePublisher(async () => FRAME_A, { prepare: () => preparation.promise });
+    try {
+      const attaching = harness.publisher.attach((frame) => harness.frames.push(frame));
+      await harness.publisher.detach();
+      preparation.resolve();
+      await attaching;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(harness.publisher.attached).toBe(false);
+      expect(harness.captures).toBe(0);
+      expect(harness.observed).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await harness.publisher.detach();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the newest listener when preparations finish out of order", async () => {
+    vi.useFakeTimers();
+    const first = Promise.withResolvers<void>();
+    const second = Promise.withResolvers<void>();
+    const prepare = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const harness = makePublisher(async () => FRAME_A, { prepare });
+    const firstListener = vi.fn();
+    const secondListener = vi.fn();
+    try {
+      const firstAttach = harness.publisher.attach(firstListener);
+      const secondAttach = harness.publisher.attach(secondListener);
+      second.resolve();
+      await secondAttach;
+      first.resolve();
+      await firstAttach;
+      await harness.publisher.requestKeyframe();
+      expect(firstListener).not.toHaveBeenCalled();
+      expect(secondListener).toHaveBeenCalledTimes(2);
+      expect(harness.captures).toBe(2);
+      expect(vi.getTimerCount()).toBe(1);
+    } finally {
+      await harness.publisher.detach();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps one timer when overlapping attaches reuse the same listener", async () => {
+    vi.useFakeTimers();
+    const harness = makePublisher(async () => FRAME_A);
+    const listener = vi.fn();
+    try {
+      await Promise.all([harness.publisher.attach(listener), harness.publisher.attach(listener)]);
+      expect(vi.getTimerCount()).toBe(1);
+      await harness.publisher.detach();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await harness.publisher.detach();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])(
+    "immediately serves a replacement listener after an old capture settles (failure: %s)",
+    async (fails) => {
+      vi.useFakeTimers();
+      const capture = Promise.withResolvers<Uint8Array>();
+      let firstCapture = true;
+      const harness = makePublisher(() => {
+        if (firstCapture) {
+          firstCapture = false;
+          return capture.promise;
+        }
+        return Promise.resolve(FRAME_B);
+      });
+      // Reusing the callback must still identify this as a new attachment.
+      const listener = vi.fn();
+      try {
+        const firstAttach = harness.publisher.attach(listener);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(harness.captures).toBe(1);
+        await harness.publisher.detach();
+        await harness.publisher.attach(listener);
+        if (fails) capture.reject(new Error("old capture failed"));
+        else capture.resolve(FRAME_A);
+        await firstAttach;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(harness.captures).toBe(2);
+        expect(listener).toHaveBeenCalledTimes(1);
+        expect(listener.mock.calls[0]?.[0].data).toEqual(FRAME_B);
+        expect(harness.observed.map((frame) => frame.data)).toEqual([FRAME_B]);
+        expect(vi.getTimerCount()).toBe(1);
+      } finally {
+        await harness.publisher.detach();
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("publishes the first frame, dedupes identical ones, and republishes on a keyframe", async () => {
     let bytes = FRAME_A;
     const harness = makePublisher(async () => bytes);

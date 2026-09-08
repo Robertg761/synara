@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { ComputerWindow, ThreadComputerState } from "@synara/contracts";
+import type { ComputerUiNode, ComputerWindow, ThreadComputerState } from "@synara/contracts";
 import { decodeComputerFrame } from "@synara/shared/computerFrame";
 
 import {
@@ -60,6 +60,93 @@ function coveredCalculatorWindows(): readonly ComputerWindow[] {
 }
 
 describe("ComputerManager and FakeComputerBackend", () => {
+  it.each([false, true])(
+    "reveals a known off-screen field without permitting an off-screen write or click (void result: %s)",
+    async (voidResult) => {
+      const field: ComputerUiNode = {
+        role: "AXTextField",
+        label: "Notes",
+        value: "old",
+        description: null,
+        frame: { x: 30, y: 2000, width: 100, height: 20 },
+        activationPoint: { x: 80, y: 2010 },
+        onScreen: false,
+        windowId: "fake-calculator",
+        nodePath: [0],
+        children: [],
+      };
+      const backend = new FakeComputerBackend({
+        root: { ...field, label: "Desktop", onScreen: true, children: [field] },
+      });
+      if (voidResult) {
+        const performAction = backend.performAction.bind(backend);
+        Object.assign(backend, {
+          performAction: async (...args: Parameters<typeof performAction>) => {
+            await performAction(...args);
+          },
+        });
+      }
+      const manager = new ComputerManager({ backend });
+      await expect(manager.setValue("thread-a", { label: "Notes" }, "new")).rejects.toHaveProperty(
+        "code",
+        "computer_target_offscreen",
+      );
+      await expect(
+        manager.performAction("thread-a", { label: "Notes" }, "AXPress"),
+      ).rejects.toHaveProperty("code", "computer_target_offscreen");
+      const result = await manager.performAction(
+        "thread-a",
+        { label: "Notes" },
+        "AXScrollToVisible",
+      );
+      expect(result).toMatchObject({
+        action: "computer_perform_action",
+        windowId: "fake-calculator",
+      });
+      expect(result.point).toBeUndefined();
+      expect(backend.calls.filter((call) => call.method === "performAction")).toHaveLength(1);
+      await manager.dispose();
+    },
+  );
+
+  it("holds refused input until a scoped observation establishes readiness", async () => {
+    class PausedBackend extends FakeComputerBackend {
+      ready = false;
+      attempts = 0;
+      checks = 0;
+      override async typeText(text: string) {
+        this.attempts += 1;
+        if (!this.ready)
+          throw new ComputerBackendError("Return to the target window.", {
+            inputPause: { windowId: "fake-calculator", message: "Return to the target window." },
+          });
+        return super.typeText(text);
+      }
+      async checkInputReady() {
+        this.checks += 1;
+        if (!this.ready) throw new Error("still unavailable");
+      }
+    }
+    const backend = new PausedBackend();
+    const manager = new ComputerManager({ backend });
+    await expect(manager.typeText("thread-a", "hello")).rejects.toHaveProperty("inputPause");
+    await expect(manager.typeText("thread-a", "hello")).rejects.toHaveProperty("inputPause");
+    expect(backend.attempts).toBe(1);
+    expect((await manager.getThreadState("thread-a")).inputPause?.windowId).toBe("fake-calculator");
+    await manager.releaseDesktopControl("thread-a");
+    expect((await manager.getState({ windowId: "fake-calculator" })).inputPause).toBeDefined();
+    expect(backend.checks).toBe(1);
+    expect((await manager.getThreadState("thread-a")).inputPause).toBeDefined();
+    backend.ready = true;
+    await manager.getState({ windowId: "different-window" });
+    expect(backend.checks).toBe(1);
+    await manager.getState({ windowId: "fake-calculator" });
+    expect((await manager.getThreadState("thread-a")).inputPause).toBeUndefined();
+    await manager.typeText("thread-a", "hello");
+    expect(backend.attempts).toBe(2);
+    await manager.dispose();
+  });
+
   it("publishes thread snapshots, activity transitions, and backend window events", async () => {
     const backend = new FakeComputerBackend({ now: () => "2026-08-15T00:00:00.000Z" });
     const manager = new ComputerManager({ backend });

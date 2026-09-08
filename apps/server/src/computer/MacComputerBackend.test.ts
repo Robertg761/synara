@@ -827,6 +827,8 @@ describe("MacComputerBackend", () => {
     expect(helper.callsFor("set-value")[0]).toEqual({
       windowId: "5",
       nodePath: [1, 3],
+      expectedRole: "text-field",
+      expectedLabel: "Field",
       x: 60,
       y: 20,
       value: "hello",
@@ -844,6 +846,22 @@ describe("MacComputerBackend", () => {
     expect(helper.callsFor("click")).toHaveLength(0);
     expect(helper.callsFor("type")).toHaveLength(0);
   });
+
+  it.each(["confirmed", "unconfirmed", "unverifiable"])(
+    "preserves %s field readback without retrying the write",
+    async (verified) => {
+      const helper = new FakeMacHelper({
+        "set-value": { ok: true, path: "accessibility", verified },
+      });
+      const backend = makeBackend(helper);
+      expect(
+        await backend.setValue(resolvedTarget({ windowId: "5", nodePath: [1] }), "new value"),
+      ).toMatchObject({ deliveryPath: "accessibility", verified });
+      expect(helper.callsFor("set-value")).toHaveLength(1);
+      expect(helper.callsFor("type")).toHaveLength(0);
+      await backend.dispose();
+    },
+  );
 
   it("passes typed text, keys, and hotkeys straight to the helper", async () => {
     const helper = new FakeMacHelper();
@@ -1002,6 +1020,7 @@ describe("MacComputerBackend", () => {
     const backend = makeBackend(helper);
     const error = await backend.pressKey("enter").catch((value: unknown) => value);
     expect(error).toBeInstanceOf(ComputerBackendError);
+    if (!(error instanceof ComputerBackendError)) throw new Error("Expected a backend error");
     // `ComputerManager.injectScoped` keys off this to say "refused, nothing
     // injected" rather than leaving the caller to assume the control is broken.
     expect((error as ComputerBackendError).rejectedOperation).toBe("press-key");
@@ -1014,22 +1033,30 @@ describe("MacComputerBackend", () => {
     await backend.setCursorActivity("Thinking");
     expect(helper.startCount).toBe(0);
     await backend.availability();
-    expect(helper.callsFor("set-agent-cursor").at(-1)).toEqual({ name: "Luna", activity: "Thinking" });
+    expect(helper.callsFor("set-agent-cursor").at(-1)).toEqual({
+      name: "Luna",
+      activity: "Thinking",
+    });
     await backend.setCursorActivity("Waiting for you");
-    expect(helper.callsFor("set-agent-cursor").at(-1)).toEqual({ name: "Luna", activity: "Waiting for you" });
+    expect(helper.callsFor("set-agent-cursor").at(-1)).toEqual({
+      name: "Luna",
+      activity: "Waiting for you",
+    });
     expect(helper.callsFor("focus-window")).toEqual([]);
     expect(helper.callsFor("raise-window")).toEqual([]);
     await backend.dispose();
   });
 
   it("preserves a Space pause without suggesting a retry or a permission prompt", async () => {
-    const message = "Input paused: the target window is outside the current Space. Do not retry input.";
+    const message =
+      "Input paused: the target window is outside the current Space. Do not retry input.";
     const helper = new FakeMacHelper({
       "press-key": new MacComputerHelperError("helper_-32015", message),
     });
     const backend = makeBackend(helper);
     const error = await backend.pressKey("enter").catch((value: unknown) => value);
     expect(error).toBeInstanceOf(ComputerBackendError);
+    if (!(error instanceof ComputerBackendError)) throw new Error("Expected a backend error");
     expect(error.message).toBe(message);
     expect(error.rejectedOperation).toBeUndefined();
     expect(error.setupRequired).toBe(false);
@@ -1299,6 +1326,67 @@ describe("MacComputerBackend", () => {
       expect(helper.callsFor("capture")).toHaveLength(4);
     } finally {
       await backend.detachStream();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])(
+    "defers routine stills during a state screenshot and resumes after settlement (failure: %s)",
+    async (fails) => {
+      vi.useFakeTimers();
+      const capture = Promise.withResolvers<unknown>();
+      const region = { x: -1440, y: -200, width: 2880, height: 1100 };
+      const helper = new FakeMacHelper({
+        "list-windows": windowsResponse(region),
+        capture: (params: Record<string, unknown>) =>
+          params.deduplicate ? { base64: PNG_1X1 } : capture.promise,
+      });
+      const backend = makeBackend(helper, { stillIntervalMs: 100 });
+      try {
+        await backend.attachStream(() => {});
+        const pending = backend.getState({ includeScreenshot: true });
+        await vi.advanceTimersByTimeAsync(300);
+        expect(helper.callsFor("capture")).toHaveLength(2);
+        // A blank pane must still be able to request a full picture.
+        await backend.requestKeyframe();
+        expect(helper.callsFor("capture")).toHaveLength(3);
+        if (fails) capture.reject(new Error("capture unavailable"));
+        else capture.resolve({ base64: PNG_1X1, region });
+        const state = await pending;
+        if (fails) expect(state.screenshot).toBeUndefined();
+        else {
+          expect(state.screenshot?.bytesBase64).toBe(PNG_1X1);
+          expect(state.screenshot?.region).toEqual({ ...region, x: 0, y: 0 });
+        }
+        await vi.advanceTimersByTimeAsync(100);
+        expect(helper.callsFor("capture")).toHaveLength(4);
+      } finally {
+        capture.resolve({ base64: PNG_1X1, region });
+        await backend.dispose();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("keeps stills running while only the state accessibility walk remains pending", async () => {
+    vi.useFakeTimers();
+    const tree = Promise.withResolvers<unknown>();
+    const helper = new FakeMacHelper({
+      "list-windows": windowsResponse({ x: 0, y: 0, width: 1440, height: 900 }),
+      "describe-ui": () => tree.promise,
+      capture: { base64: PNG_1X1 },
+    });
+    const backend = makeBackend(helper, { stillIntervalMs: 100 });
+    try {
+      await backend.attachStream(() => {});
+      const pending = backend.getState({ includeScreenshot: true, includeTree: true });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(helper.callsFor("capture")).toHaveLength(5);
+      tree.resolve({});
+      expect((await pending).screenshot?.bytesBase64).toBe(PNG_1X1);
+    } finally {
+      tree.resolve({});
+      await backend.dispose();
       vi.useRealTimers();
     }
   });

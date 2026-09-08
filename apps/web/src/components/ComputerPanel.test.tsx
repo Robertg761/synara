@@ -99,6 +99,31 @@ afterEach(() => {
 });
 
 describe("ComputerPanel", () => {
+  it("shows the current activity and keeps Stop available during a pause", () => {
+    const active = { agentActive: true, activity: "Thinking" };
+    expect(render(threadState(active))).toContain("Thinking");
+    const markup = render(
+      threadState({
+        ...active,
+        inputPause: { windowId: "7", message: "Return to the window." },
+        windows: [
+          {
+            id: "7",
+            title: "Draft",
+            appName: "Helium",
+            focused: false,
+            minimized: true,
+            visible: false,
+          },
+        ],
+      }),
+    );
+    expect(markup).toContain("Input paused — return to Helium");
+    expect(markup).toContain("Check again");
+    expect(markup).toContain("Stop the agent controlling this computer");
+    expect(markup).not.toContain(">Thinking<");
+  });
+
   it("names the desktop the canvas is a picture of", () => {
     // The single most important fact about the surface: whether the agent is
     // driving a sandbox or the machine the user is sitting at.

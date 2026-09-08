@@ -109,13 +109,14 @@ export function resolveComputerPoint(
 export function resolveComputerSemanticTarget(
   root: ComputerUiNode,
   target: ComputerTarget,
+  options: { readonly allowOffscreen?: boolean } = {},
 ): ComputerTargetMatch {
   const match = resolveUiTreeTarget({
     pool: flattenUiTree(root, childrenOf).filter((node) => matchesWindow(node, target.windowId)),
     query: { label: target.label, role: target.role },
     spec: computerTargetSpec(target),
   });
-  if (!match.onScreen) {
+  if (!match.onScreen && !options.allowOffscreen) {
     throw new ComputerTargetError({
       code: "computer_target_offscreen",
       message: `Computer target ${describeTarget(target)} is off-screen; refusing to guess a click.`,

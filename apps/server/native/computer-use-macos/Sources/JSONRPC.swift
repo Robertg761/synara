@@ -24,6 +24,7 @@ enum RPCErrorCode: Int {
   /// Input this process accepted but could not deliver to the target.
   case notDelivered = -32002
   case inactiveSpace = -32015
+  case targetChanged = -32016
 }
 
 struct RPCError: Error {
