@@ -108,6 +108,15 @@ class BrowserGuestHostTest {
                 awaitPage()
                 assertEquals("true", evaluate("typeof Capacitor === 'undefined' && typeof SynaraShell === 'undefined' && typeof Android === 'undefined'"))
                 assertEquals("\"Clicked\"", evaluate("document.querySelector('#count').click(); document.querySelector('#count').textContent"))
+                // DOM evaluation can finish before WebView has submitted its painted state.
+                // Wait for that specific renderer state instead of sleeping or retrying pixels.
+                val painted = CountDownLatch(1)
+                scenario.onActivity {
+                    guest().postVisualStateCallback(1L, object : WebView.VisualStateCallback() {
+                        override fun onComplete(requestId: Long) { painted.countDown() }
+                    })
+                }
+                assertTrue("Guest did not produce a visual state", painted.await(10, TimeUnit.SECONDS))
                 val shot = command("captureScreenshot", JSObject().put("tabId", initialTab))
                 val bytes = Base64.decode(shot.getString("base64")!!, Base64.DEFAULT)
                 val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
