@@ -49,6 +49,7 @@ jobs:
           src/mobileNotifications.test.ts src/wsNativeApi.test.ts
           src/wsTransport.test.ts
           src/mobileBrowser.test.ts
+          src/lib/browserCapabilities.test.ts src/components/chat/ChatHeader.test.tsx
           src/shellBridge.test.ts src/shellSession.test.ts
           src/mobileDownloads.test.ts src/lib/browserDownload.test.ts
           src/lib/mobileBackStack.test.ts src/shellSessionExit.test.ts
@@ -62,6 +63,7 @@ jobs:
           src/components/phone/PhoneHomeScreen.phone.browser.tsx
           src/components/phone/PhonePaneScreen.phone.browser.tsx
           src/components/chat/composerPhoneChrome.browser.tsx
+          src/components/chat/ChatHeader.browserPane.phone.browser.tsx
           src/components/onboarding/FeatureTourStep.browser.tsx
           src/components/settings/DesktopSettingsPanels.browser.tsx
           src/components/settings/PhoneSettingsNavigation.browser.tsx
