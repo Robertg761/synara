@@ -2831,6 +2831,16 @@ diffs-container {
   max-width: min(11.25rem, 92vw);
 }
 
+/* Touch rows need their own space so adjacent menu choices never share a hit target. */
+@media (pointer: coarse) {
+  .composer-picker-menu--small,
+  .composer-picker-menu-wide--small,
+  .composer-picker-menu--normal,
+  .composer-picker-menu-wide--normal {
+    --picker-option-touch-min-h: 2.75rem;
+  }
+}
+
 /* Size-aware option rows inside composer picker shells. */
 .composer-picker-menu--small [data-slot="menu-item"],
 .composer-picker-menu--small [data-slot="menu-radio-item"],
@@ -2852,7 +2862,7 @@ diffs-container {
 .composer-picker-menu-wide--normal [data-slot="menu-checkbox-item"],
 .composer-picker-menu-wide--normal [data-slot="menu-sub-trigger"],
 .composer-picker-menu-wide--normal [data-slot="select-item"] {
-  min-height: var(--picker-option-min-h);
+  min-height: max(var(--picker-option-min-h), var(--picker-option-touch-min-h, 0px));
   padding-inline: var(--picker-option-px);
   padding-block: var(--picker-option-py);
   gap: var(--picker-option-gap);

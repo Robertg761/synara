@@ -47,6 +47,22 @@ afterEach(() => {
 });
 
 describe("phone composer chrome", () => {
+  it("keeps picker density while reserving separate touch rows", () => {
+    const host = document.createElement("div");
+    host.innerHTML = `
+      <div class="composer-picker-menu--normal"><div data-slot="menu-item">Normal</div></div>
+      <div class="composer-picker-menu--small"><div data-slot="menu-item">Small</div></div>
+      <div class="composer-picker-menu--normal runtime-mode-menu"><div data-slot="menu-radio-item">Permission</div></div>
+    `;
+    document.body.append(host);
+    hosts.push(host);
+    const touchMinimum = matchMedia("(pointer: coarse)").matches ? 44 : 0;
+    const rows = host.querySelectorAll<HTMLElement>("[data-slot]");
+    expect(Number.parseFloat(getComputedStyle(rows[0]!).minHeight)).toBe(Math.max(26, touchMinimum));
+    expect(Number.parseFloat(getComputedStyle(rows[1]!).minHeight)).toBe(Math.max(24, touchMinimum));
+    expect(Number.parseFloat(getComputedStyle(rows[2]!).minHeight)).toBe(44);
+  });
+
   it("caps the command menu at 40dvh on phone layouts", () => {
     document.documentElement.dataset.layout = "phone";
     const { menuBody } = mountFixture();
