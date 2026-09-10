@@ -3,8 +3,8 @@
 //          Owns step navigation and the per-run results the final summary reads.
 // Layer: Web UI overlay (mounted once from the root route)
 //
-// The popup is a fixed 800×540 frame for every step so the window never resizes as the
-// user moves through the tour; hero steps (welcome, done) center their content in it.
+// The popup uses an 800×540 frame, capped by the shared dialog viewport limit.
+// Steps scroll within it on short screens; hero steps center their content.
 
 import { PROVIDER_DESCRIPTORS } from "@synara/shared/providerMetadata";
 import { useEffect, useState } from "react";
@@ -215,7 +215,7 @@ export function OnboardingDialog(props: {
   };
   return (
     <Dialog open={props.open} onOpenChange={handleOpenChange}>
-      <DialogPopup showCloseButton className="h-[540px] max-h-full max-w-[800px]">
+      <DialogPopup showCloseButton className="h-[540px] max-w-[800px]">
         {/* Remount per open so a replay from Settings starts at the first step. */}
         {props.open ? (
           <OnboardingFlow
