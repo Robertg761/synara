@@ -80,3 +80,5 @@ This migration removes the duplicate app and establishes shared feature ownershi
 - Before distribution, verify pairing with a real HTTPS server, attachments, approvals, terminal input, long streaming transcripts, network changes, process death, keyboard/rotation, TalkBack, and signed upgrades on physical devices.
 
 Extend the shared browser tests for desktop and phone when features change. Extend native instrumentation tests when device integration changes.
+
+Use [the Android acceptance checklist](VERIFICATION.md) to track device coverage separately from shared-code coverage.
