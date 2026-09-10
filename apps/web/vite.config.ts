@@ -187,8 +187,13 @@ function precompressPlugin(): Plugin {
   };
 }
 
-export default defineConfig(({ mode }) => ({
+export default defineConfig({
   plugins: [
+    {
+      name: "synara-android-webview-target",
+      config: (_config, { mode }) =>
+        mode === "android" ? { build: { target: ANDROID_WEB_BUILD_TARGET } } : undefined,
+    },
     tanstackRouter({
       target: "react",
       autoCodeSplitting: true,
@@ -234,7 +239,6 @@ export default defineConfig(({ mode }) => ({
     },
   },
   build: {
-    target: mode === "android" ? ANDROID_WEB_BUILD_TARGET : undefined,
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: buildSourcemap,
@@ -248,4 +252,4 @@ export default defineConfig(({ mode }) => ({
       },
     },
   },
-}));
+});
