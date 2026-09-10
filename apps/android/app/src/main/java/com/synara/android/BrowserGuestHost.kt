@@ -47,7 +47,13 @@ internal class BrowserGuestHost(
         var open: Boolean = false,
         var version: Long = 0,
     )
-    private val workspaces = linkedMapOf<String, Workspace>()
+    private val workspaces = BrowserWorkspaceCache<Workspace>(16, 32, { it.tabs.size }) { workspace ->
+        if (owner === workspace) { owner = null; bounds = null }
+        workspace.tabs.clear()
+        workspace.active = null
+        workspace.open = false
+        changed(workspace)
+    }
     private var guest: WebView? = null
     private var owner: Workspace? = null
     private var current: Tab? = null
@@ -63,10 +69,26 @@ internal class BrowserGuestHost(
         }
         val id = input.optString("threadId")
         require(id.isNotBlank() && id.length <= 256) { "A browser thread is required." }
-        val workspace = workspaces[id] ?: run {
-            require(workspaces.size < 16) { "Close an unused browser workspace first." }
-            Workspace(id).also { workspaces[id] = it }
+        require(operation in setOf(
+            "open", "close", "hide", "getState", "setPanelBounds", "navigate", "newTab",
+            "selectTab", "closeTab", "reload", "goBack", "goForward", "captureScreenshot",
+        )) { "Unsupported browser operation." }
+        when (operation) {
+            "open" -> requireUrl(input.optString("initialUrl", "about:blank"))
+            "navigate" -> requireUrl(input.optString("url"))
+            "newTab" -> requireUrl(input.optString("url", "about:blank"))
         }
+        val existing = workspaces[id]
+        if (existing == null) {
+            when (operation) {
+                "getState", "close" -> return snapshot(Workspace(id))
+                "hide", "setPanelBounds" -> return JSObject()
+                "open", "navigate", "newTab" -> Unit
+                else -> throw IllegalArgumentException("The browser tab is no longer available.")
+            }
+        }
+        val workspace = existing ?: workspaces.getOrCreate(id, displayedWorkspaceIds()) { Workspace(id) }
+        if (operation !in setOf("getState", "hide", "setPanelBounds")) workspaces.touch(id)
         fun selected(): Tab = workspace.tabs.find { it.id == input.optString("tabId", workspace.active ?: "") }
             ?: throw IllegalArgumentException("The browser tab is no longer available.")
         when (operation) {
@@ -163,8 +185,11 @@ internal class BrowserGuestHost(
         require(BrowserUrlPolicy.allows(url)) { "Use an HTTPS page address. Local app pages cannot open here." }
     }
 
+    private fun displayedWorkspaceIds(): Set<String> =
+        if (guest != null) setOfNotNull(owner?.id) else emptySet()
+
     private fun addTab(workspace: Workspace, url: String, activate: Boolean) {
-        require(workspaces.values.sumOf { it.tabs.size } < 32) { "Close an unused browser tab first." }
+        workspaces.reserveTab(displayedWorkspaceIds() + workspace.id)
         val tab = Tab(url = url)
         workspace.tabs.add(tab)
         if (activate || workspace.active == null) workspace.active = tab.id

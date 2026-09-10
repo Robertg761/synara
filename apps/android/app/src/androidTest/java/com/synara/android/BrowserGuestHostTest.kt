@@ -20,6 +20,34 @@ import java.util.concurrent.TimeUnit
 /** Pass -e browserFixtureUrl with an HTTPS fixture trusted by the test device. */
 @RunWith(AndroidJUnit4::class)
 class BrowserGuestHostTest {
+    @Test fun queriesAndUnknownActionsDoNotConsumeWorkspaceCapacity() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                val host = BrowserGuestHost(activity, activity.bridge.webView) {}
+                fun input(id: String) = JSObject().put("threadId", id)
+                try {
+                    repeat(40) { index ->
+                        val state = host.execute("getState", input("query-$index"))
+                        assertFalse(state.getBoolean("open"))
+                        assertEquals(0, state.getJSONArray("tabs").length())
+                        assertThrows(IllegalArgumentException::class.java) {
+                            host.execute("unknown", input("invalid-$index"))
+                        }
+                    }
+                    repeat(17) { index ->
+                        assertTrue(host.execute("open", input("browser-$index")).getBoolean("open"))
+                        host.execute("hide", input("browser-$index"))
+                    }
+                    assertFalse(host.execute("getState", input("browser-0")).getBoolean("open"))
+                    assertTrue(host.execute("getState", input("browser-1")).getBoolean("open"))
+                    assertTrue(host.execute("getState", input("browser-16")).getBoolean("open"))
+                } finally {
+                    host.destroy()
+                }
+            }
+        }
+    }
+
     @Test fun isolatedHttpsGuestNavigatesCapturesAndRestoresTabs() {
         val url = InstrumentationRegistry.getArguments().getString("browserFixtureUrl")
         assumeTrue("HTTPS fixture argument required", !url.isNullOrBlank())
