@@ -331,23 +331,33 @@ export async function negotiateOverHttp(
   // never runs and the transport wedges; the legacy socket path got that
   // backstop for free from the browser's WS handshake timeout. The caller's
   // lifetime signal is composed in so disposal aborts the request too.
-  const deadline = AbortSignal.timeout(NEGOTIATE_HTTP_TIMEOUT_MS);
-  const signal = lifetimeSignal ? AbortSignal.any([lifetimeSignal, deadline]) : deadline;
-  let response: Response;
+  const abortScope = makeRequestAbortScope({
+    timeoutMs: NEGOTIATE_HTTP_TIMEOUT_MS,
+    ...(lifetimeSignal ? { signal: lifetimeSignal } : {}),
+  });
   try {
-    response = await fetch(makeNegotiateHttpUrl(explicitUrl), { cache: "no-store", signal });
-  } catch {
-    return null;
+    let response: Response;
+    try {
+      response = await fetch(makeNegotiateHttpUrl(explicitUrl), {
+        cache: "no-store",
+        signal: abortScope.signal,
+      });
+    } catch {
+      return null;
+    }
+    const body: unknown = await response.json().catch(() => null);
+    if (response.status === 426) {
+      const issue = Schema.decodeUnknownOption(WsCompatibilityError)(body);
+      if (Option.isSome(issue)) throw issue.value;
+      throw new Error("WebSocket negotiation was refused with an unreadable 426 response.");
+    }
+    if (!response.ok) return null;
+    const result = Schema.decodeUnknownOption(WsBootstrapNegotiateResult)(body);
+    return Option.isSome(result) ? result.value : null;
+  } finally {
+    // Keep both cancellation sources alive until the response body has settled.
+    abortScope.cleanup();
   }
-  const body: unknown = await response.json().catch(() => null);
-  if (response.status === 426) {
-    const issue = Schema.decodeUnknownOption(WsCompatibilityError)(body);
-    if (Option.isSome(issue)) throw issue.value;
-    throw new Error("WebSocket negotiation was refused with an unreadable 426 response.");
-  }
-  if (!response.ok) return null;
-  const result = Schema.decodeUnknownOption(WsBootstrapNegotiateResult)(body);
-  return Option.isSome(result) ? result.value : null;
 }
 
 /**

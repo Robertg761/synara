@@ -1617,6 +1617,55 @@ describe("WsTransport", () => {
     await expect(negotiateOverHttp("ws://localhost:3020")).resolves.toBeNull();
   });
 
+  describe("HTTP negotiation on older WebViews", () => {
+    beforeEach(() => {
+      vi.stubGlobal("AbortSignal", new Proxy(AbortSignal, {
+        get(target, property, receiver) {
+          return property === "any" ? undefined : Reflect.get(target, property, receiver);
+        },
+      }));
+    });
+
+    it("negotiates without AbortSignal.any and releases its deadline and lifetime listener", async () => {
+      vi.useFakeTimers();
+      try {
+        const lifetime = new AbortController();
+        const removeListener = vi.spyOn(lifetime.signal, "removeEventListener");
+        vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(200, NEGOTIATION_RESULT)));
+        await expect(negotiateOverHttp("ws://localhost:3020", lifetime.signal)).resolves.toEqual(NEGOTIATION_RESULT);
+        expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each(["deadline", "lifetime"] as const)("keeps %s cancellation active while reading the body", async (cancellation) => {
+      vi.useFakeTimers();
+      try {
+        const lifetime = new AbortController();
+        let bodyStarted = false;
+        vi.stubGlobal("fetch", vi.fn(async (_input: unknown, init?: { signal?: AbortSignal }) => ({
+          ok: true,
+          status: 200,
+          json: () => new Promise((_resolve, reject) => {
+            bodyStarted = true;
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+          }),
+        })));
+        const negotiation = negotiateOverHttp("ws://localhost:3020", lifetime.signal);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(bodyStarted).toBe(true);
+        if (cancellation === "deadline") await vi.advanceTimersByTimeAsync(5_000);
+        else lifetime.abort(new Error("transport disposed"));
+        await expect(negotiation).resolves.toBeNull();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it("falls back to bootstrap when the negotiate request never settles", async () => {
     // A connection that accepts and then stalls (WAN/tunnel black hole) must
     // not wedge the transport: browsers apply no default fetch timeout, so
