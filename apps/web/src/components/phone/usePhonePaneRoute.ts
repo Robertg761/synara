@@ -24,6 +24,8 @@ import {
   type PreviousStorePaneId,
 } from "./phonePaneRoute.logic";
 
+type PhonePaneInput = Omit<OpenPaneInput, "paneId"> & { paneId?: string };
+
 /**
  * A navigation this hook issued and is waiting to observe.
  *
@@ -218,7 +220,7 @@ export function usePhonePaneRouteSync(input: {
 
   // Explicit phone opens must push even when a persisted desktop dock already has
   // this pane active: that case produces no observable store transition.
-  return useCallback((pane: Omit<OpenPaneInput, "paneId">) => {
+  const requestPane = useCallback((pane: PhonePaneInput, toggle: boolean) => {
     if (!enabled) return;
     const store = useRightDockStore.getState();
     if (navigationRef.current) {
@@ -230,7 +232,7 @@ export function usePhonePaneRouteSync(input: {
     const visiblePane = store.dockStateByThreadId[threadId]?.panes.find(
       (entry) => entry.id === urlPaneId,
     );
-    if (visiblePane?.kind === pane.kind) {
+    if (toggle && visiblePane?.kind === pane.kind) {
       store.toggleSingletonPane(threadId, pane);
       return;
     }
@@ -249,4 +251,12 @@ export function usePhonePaneRouteSync(input: {
       if (navigationRef.current === issued) navigationRef.current = null;
     });
   }, [enabled, navigate, threadId, urlPaneId]);
+
+  const openPane = useCallback((pane: PhonePaneInput) => {
+    requestPane(pane, false);
+  }, [requestPane]);
+  const togglePane = useCallback((pane: PhonePaneInput) => {
+    requestPane(pane, true);
+  }, [requestPane]);
+  return { openPane, togglePane };
 }

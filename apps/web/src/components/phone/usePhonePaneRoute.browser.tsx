@@ -62,7 +62,7 @@ function PhonePaneRouteHarness() {
   const search = useRouterState({ select: (state) => state.location.search as ThreadRouteSearch });
   const urlPaneId = search.pane ?? null;
   const dockState = useRightDockStore(useMemo(() => selectRightDockState(THREAD_ID), []));
-  const togglePhonePane = usePhonePaneRouteSync({
+  const { openPane: openPhonePane, togglePane: togglePhonePane } = usePhonePaneRouteSync({
     enabled: !hasLegacyPanelRoute(search),
     threadId: THREAD_ID,
     urlPaneId,
@@ -76,6 +76,8 @@ function PhonePaneRouteHarness() {
     <>
       <button onClick={() => togglePhonePane({ kind: "browser" })}>Open browser</button>
       <button onClick={() => togglePhonePane({ kind: "diff" })}>Open diff</button>
+      <button onClick={() => openPhonePane({ kind: "browser" })}>Open browser link</button>
+      <button onClick={() => openPhonePane({ kind: "diff", diffFilePath: "changed.ts" })}>Open turn diff</button>
       <div data-testid="phone-pane-screen">{shownPaneId}</div>
     </>
   );
@@ -201,6 +203,28 @@ describe("usePhonePaneRouteSync", () => {
     expect(route.historyIndex()).toBe(2);
     route.history.back();
     await expect.poll(() => dockThreadState()?.panes.find((pane) => pane.id === route.paneParam())?.kind).toBe("browser");
+  });
+
+  it.each([
+    { kind: "browser", label: "Open browser link" },
+    { kind: "diff", label: "Open turn diff" },
+  ] as const)("opens a hidden $kind from content and keeps repeated opens visible", async ({ kind, label }) => {
+    seedDockState({ open: true, panes: [createPane(kind, kind)], activePaneId: kind });
+    const route = await mountRoute(THREAD_PATH);
+    await settle();
+    const button = Array.from(document.querySelectorAll("button")).find((entry) => entry.textContent === label)!;
+    button.click();
+    await expect.poll(() => route.paneParam()).toBe(kind);
+    await settle();
+    button.click();
+    await settle();
+    expect(route.paneParam()).toBe(kind);
+    expect(shownPaneId()).toBe(kind);
+    expect(dockThreadState()?.open).toBe(true);
+    expect(route.historyIndex()).toBe(1);
+    if (kind === "diff") expect(dockThreadState()?.panes[0]?.diffFilePath).toBe("changed.ts");
+    route.history.back();
+    await expect.poll(() => dockThreadState()?.open).toBe(false);
   });
 
   it("leaves a persisted open dock alone when the URL names no pane", async () => {

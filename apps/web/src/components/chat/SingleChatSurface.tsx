@@ -219,7 +219,7 @@ export function SingleChatSurface(props: {
   const dockState = useRightDockStore(
     useMemo(() => selectRightDockState(props.threadId), [props.threadId]),
   );
-  const openPane = useRightDockStore((store) => store.openPane);
+  const openStorePane = useRightDockStore((store) => store.openPane);
   const toggleSingletonPane = useRightDockStore((store) => store.toggleSingletonPane);
   const closePane = useRightDockStore((store) => store.closePane);
   const setActivePane = useRightDockStore((store) => store.setActivePane);
@@ -362,12 +362,19 @@ export function SingleChatSurface(props: {
   // longer resolves is dropped in place. The editor view has no dock (it is the other
   // `dockRendered: false` case), so it opts out.
   const phonePaneRouteEnabled = !dockVisibility.dockRendered && !editorViewActive;
-  const togglePhonePane = usePhonePaneRouteSync({
+  const { openPane: openPhonePane, togglePane: togglePhonePane } = usePhonePaneRouteSync({
     enabled: phonePaneRouteEnabled && !hasLegacyPanelRoute(props.search),
     threadId: props.threadId,
     urlPaneId: props.search.pane ?? null,
     dockState,
   });
+  const openPane = useCallback<typeof openStorePane>((threadId, pane) => {
+    if (phonePaneRouteEnabled && threadId === props.threadId) {
+      openPhonePane(pane);
+    } else {
+      openStorePane(threadId, pane);
+    }
+  }, [openPhonePane, openStorePane, phonePaneRouteEnabled, props.threadId]);
   const {
     activePaneRuntimeMode,
     requestActivePaneLive: requestActiveDockPaneLive,
