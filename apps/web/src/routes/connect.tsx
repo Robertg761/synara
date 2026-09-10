@@ -227,7 +227,7 @@ function ConnectRouteView() {
                 id={serverFieldId}
                 value={serverUrlInput}
                 onChange={(event) => handleServerUrlChange(event.target.value)}
-                placeholder="http://192.168.1.5:3773"
+                placeholder="https://synara.example.com"
                 inputMode="url"
                 autoComplete="off"
                 autoCapitalize="off"
