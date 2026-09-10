@@ -6,7 +6,7 @@
 import { PROVIDER_DISPLAY_NAMES, type ProviderKind } from "@synara/contracts";
 import { PROVIDER_DESCRIPTORS } from "@synara/shared/providerMetadata";
 import { sameAppSnapShortcut } from "@synara/shared/appSnapShortcut";
-import { createFileRoute, useSearch } from "@tanstack/react-router";
+import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -28,6 +28,7 @@ import {
 } from "../appSettings";
 import { APP_VERSION } from "../branding";
 import { AdvancedSettingsPanel } from "~/components/settings/AdvancedSettingsPanel";
+import { PhoneSettingsNavigation } from "~/components/settings/PhoneSettingsNavigation";
 import { AppIconPicker } from "~/components/settings/AppIconPicker";
 import {
   ArchivedSettingsPanel,
@@ -197,6 +198,7 @@ type BooleanSettingKey = {
 // ── Route screen ───────────────────────────────────────────────────────────
 
 function SettingsRouteView() {
+  const navigate = useNavigate();
   const routeSearch = useSearch({ strict: false }) as Record<string, unknown>;
   const activeSection = normalizeSettingsSection(routeSearch.section);
   const settingsTarget = typeof routeSearch.target === "string" ? routeSearch.target : null;
@@ -1265,7 +1267,7 @@ function SettingsRouteView() {
           caption buttons themselves are a separate fixed cluster (see root route). */}
         <div
           className={cn(
-            "drag-region absolute inset-x-0 top-0 z-10 flex items-center",
+            "drag-region absolute inset-x-0 top-0 z-10 hidden items-center md:flex",
             CHAT_SURFACE_HEADER_PADDING_X_CLASS,
             CHAT_SURFACE_HEADER_HEIGHT_CLASS,
             desktopTopBarTrafficLightGutterClassName,
@@ -1283,6 +1285,20 @@ function SettingsRouteView() {
                 activeSection === "profile" ? "max-w-3xl" : "max-w-2xl",
               )}
             >
+              <PhoneSettingsNavigation
+                activeSection={activeSection}
+                onBack={() => { void navigate({ to: "/" }); }}
+                onSelectSection={(section, options) => {
+                  void navigate({
+                    to: "/settings",
+                    search: (previous) => ({
+                      ...previous,
+                      section: section === "general" ? undefined : section,
+                      target: options?.target,
+                    }),
+                  });
+                }}
+              />
               {activeSection !== "profile" ? (
                 <div className="mb-8 flex items-start justify-between gap-4">
                   <div className="min-w-0">
