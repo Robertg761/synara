@@ -8,6 +8,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -29,6 +30,7 @@ import {
 import {
   buildCodexInitializeParams,
   buildCodexThreadOpenRequest,
+  shouldWarnCodexFreshStartWithoutResume,
   CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
   CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
   __codexCliVersionGateTesting,
@@ -79,6 +81,8 @@ describe("Codex Synara harness policy", () => {
       expect(instructions).toContain(SYNARA_HARNESS_POLICY_MARKER);
       expect(instructions.split(SYNARA_HARNESS_POLICY_MARKER)).toHaveLength(2);
       expect(instructions).toContain("Synara is the host and harness");
+      expect(instructions).toContain("Final responses must restate every needed scope");
+      expect(instructions).toContain("include all decision context");
       expect(instructions).toContain("one exact synara_create_threads plan");
       expect(instructions).toContain("tools.mcp__synara__browser_open");
       for (const name of BROWSER_TOOL_NAMES) {
@@ -593,7 +597,7 @@ describe("Codex app-server teardown", () => {
     expect(manager.hasSession(threadId)).toBe(false);
   });
 
-  it("releases the session lease once when the app-server exits spontaneously", () => {
+  it("releases the session lease once when the app-server exits spontaneously", async () => {
     class FakeCodexChild extends EventEmitter {
       readonly pid = 5252;
       exitCode: number | null = null;
@@ -603,7 +607,12 @@ describe("Codex app-server teardown", () => {
       readonly stderr = new PassThrough();
     }
     const child = new FakeCodexChild();
-    const manager = new CodexAppServerManager();
+    const teardownProcessTree = vi.fn(async () => ({
+      escalated: false,
+      signalErrors: [],
+      capturedBeforeRootExit: false,
+    }));
+    const manager = new CodexAppServerManager(undefined, { teardownProcessTree });
     const threadId = asThreadId("thread-codex-spontaneous-exit");
     const revokeSessionToken = vi.fn();
     const gatewaySessionLease = acquireAgentGatewaySessionLease(
@@ -647,11 +656,14 @@ describe("Codex app-server teardown", () => {
     internals.sessions.set(threadId, context);
     internals.attachProcessListeners(context);
 
+    child.exitCode = 1;
     child.emit("exit", 1, null);
     child.emit("exit", 1, null);
 
     expect(revokeSessionToken).toHaveBeenCalledOnce();
     expect(manager.hasSession(threadId)).toBe(false);
+    await vi.waitFor(() => expect(internals.sessions.has(threadId)).toBe(false));
+    expect(teardownProcessTree).toHaveBeenCalledOnce();
   });
 });
 
@@ -1192,18 +1204,39 @@ describe("buildCodexProcessEnv", () => {
     }
   });
 
-  it("repairs stale real files in Synara's Codex home overlay", async () => {
+  it("keeps Codex SQLite state out of Synara's Codex home overlay", async () => {
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "synara-codex-env-"));
     const runtimeHome = mkdtempSync(path.join(os.tmpdir(), "synara-runtime-home-"));
+    const lstatOrUndefined = (target: string) => {
+      try {
+        return lstatSync(target);
+      } catch {
+        return undefined;
+      }
+    };
     try {
-      const sourceMemoryPath = path.join(tempDir, "memories_1.sqlite");
       writeFileSync(path.join(tempDir, "config.toml"), 'model = "gpt-5.5"', "utf8");
-      writeFileSync(sourceMemoryPath, "fresh-source-db", "utf8");
+      writeFileSync(path.join(tempDir, "history.jsonl"), "", "utf8");
+      const sourceSqliteEntries = [
+        "state_5.sqlite",
+        "state_5.sqlite-wal",
+        "state_5.sqlite-shm",
+        "memories_1.sqlite",
+      ];
+      for (const entry of sourceSqliteEntries) {
+        writeFileSync(path.join(tempDir, entry), "source-db", "utf8");
+      }
 
       const overlayHome = path.join(runtimeHome, "codex-home-overlay");
-      const overlayMemoryPath = path.join(overlayHome, "memories_1.sqlite");
       mkdirSync(overlayHome, { recursive: true });
-      writeFileSync(overlayMemoryPath, "stale-overlay-db", "utf8");
+      // Links left behind by releases that mirrored SQLite state per file,
+      // including a WAL sidecar whose source Codex has since checkpointed away.
+      const legacyLinks = ["state_5.sqlite", "thread_history_1.sqlite-wal"];
+      for (const entry of legacyLinks) {
+        symlinkSync(path.join(tempDir, entry), path.join(overlayHome, entry), "file");
+      }
+      const staleOverlayDbPath = path.join(overlayHome, "memories_1.sqlite");
+      writeFileSync(staleOverlayDbPath, "stale-overlay-db", "utf8");
 
       const env = await buildCodexProcessEnv({
         env: { SYNARA_HOME: runtimeHome },
@@ -1212,8 +1245,17 @@ describe("buildCodexProcessEnv", () => {
       });
 
       expect(env.CODEX_HOME).toBe(overlayHome);
-      expect(lstatSync(overlayMemoryPath).isSymbolicLink()).toBe(true);
-      expect(readlinkSync(overlayMemoryPath)).toBe(sourceMemoryPath);
+      expect(env.CODEX_SQLITE_HOME).toBe(tempDir);
+      for (const entry of [...sourceSqliteEntries, ...legacyLinks]) {
+        if (entry === "memories_1.sqlite") continue;
+        expect(lstatOrUndefined(path.join(overlayHome, entry))).toBeUndefined();
+      }
+      // A regular database file in the overlay is not Synara's to destroy.
+      expect(lstatSync(staleOverlayDbPath).isSymbolicLink()).toBe(false);
+      expect(readFileSync(staleOverlayDbPath, "utf8")).toBe("stale-overlay-db");
+      const overlayHistoryPath = path.join(overlayHome, "history.jsonl");
+      expect(lstatSync(overlayHistoryPath).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(overlayHistoryPath)).toBe(path.join(tempDir, "history.jsonl"));
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
       rmSync(runtimeHome, { recursive: true, force: true });
@@ -1448,6 +1490,29 @@ describe("buildCodexThreadOpenRequest", () => {
   });
 });
 
+describe("shouldWarnCodexFreshStartWithoutResume", () => {
+  it("warns only when a previously bound thread is opened with thread/start", () => {
+    expect(
+      shouldWarnCodexFreshStartWithoutResume({
+        threadOpenMethod: "thread/start",
+        previouslyBound: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldWarnCodexFreshStartWithoutResume({
+        threadOpenMethod: "thread/start",
+        previouslyBound: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldWarnCodexFreshStartWithoutResume({
+        threadOpenMethod: "thread/resume",
+        previouslyBound: true,
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("formatCodexThreadResumeError", () => {
   it("explains how to resolve an active writer conflict", () => {
     const formatted = formatCodexThreadResumeError(
@@ -1531,6 +1596,43 @@ describe("resolveCodexModelForAccount", () => {
 });
 
 describe("startSession", () => {
+  it("emits session/started after any successful thread open", () => {
+    const manager = new CodexAppServerManager();
+    const methods: string[] = [];
+    manager.on("event", (event) => {
+      methods.push(event.method);
+    });
+    const context = {
+      session: {
+        provider: "codex" as const,
+        status: "connecting" as const,
+        threadId: asThreadId("thread-1"),
+        runtimeMode: "full-access" as const,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        resumeCursor: undefined as unknown,
+      },
+    };
+
+    for (const threadOpenMethod of ["thread/start", "thread/resume", "thread/fork"] as const) {
+      methods.length = 0;
+      (
+        manager as unknown as {
+          markSessionReadyAfterThreadOpen: (
+            context: unknown,
+            input: { threadOpenMethod: string; providerThreadId: string },
+          ) => void;
+        }
+      ).markSessionReadyAfterThreadOpen(context, {
+        threadOpenMethod,
+        providerThreadId: "native-thread-1",
+      });
+      expect(methods).toEqual(["session/threadOpenResolved", "session/ready", "session/started"]);
+      expect(context.session.status).toBe("ready");
+      expect(context.session.resumeCursor).toEqual({ threadId: "native-thread-1" });
+    }
+  });
+
   it("enables Codex experimental api capabilities during initialize", () => {
     expect(buildCodexInitializeParams()).toEqual({
       clientInfo: {

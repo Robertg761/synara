@@ -382,13 +382,25 @@ function buildContextWindowActivityPayload(
   const hasPercentUsage =
     typeof usage.usedPercent === "number" && Number.isFinite(usage.usedPercent);
   const hasKnownWindow = typeof usage.maxTokens === "number" && Number.isFinite(usage.maxTokens);
-  if (!hasTokenUsage && !hasPercentUsage && !hasKnownWindow) {
+  const hasProcessedTokens =
+    typeof usage.totalProcessedTokens === "number" &&
+    Number.isFinite(usage.totalProcessedTokens) &&
+    usage.totalProcessedTokens > 0;
+  if (!hasTokenUsage && !hasPercentUsage && !hasKnownWindow && !hasProcessedTokens) {
     return undefined;
   }
   // Stamp the emitting provider so token stats can attribute usage to the
   // provider that actually processed the turn, not the thread's persisted
   // model selection (which can drift, e.g. across future per-turn providers).
-  return toActivityPayload({ ...usage, provider: event.provider });
+  return toActivityPayload({
+    ...usage,
+    provider: event.provider,
+    ...(event.providerRefs?.providerThreadId
+      ? {
+          usageSessionId: `${event.providerRefs.providerThreadId}${event.lifecycleGeneration ? `:${event.lifecycleGeneration}` : ""}`,
+        }
+      : {}),
+  });
 }
 
 function asPositiveFiniteNumber(value: unknown): number | undefined {
@@ -396,6 +408,8 @@ function asPositiveFiniteNumber(value: unknown): number | undefined {
 }
 
 interface CompactModelUsage {
+  readonly cacheReadInputTokens?: number;
+  readonly cacheCreationInputTokens?: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly totalTokens: number;
@@ -426,7 +440,24 @@ function compactTurnModelUsage(
     if (totalTokens <= 0) {
       continue;
     }
-    compact[model] = { inputTokens, outputTokens, totalTokens };
+    // Preserve reported zeroes; missing cache counters must remain unknown.
+    const cacheReadInputTokens = usage.cacheReadInputTokens;
+    const cacheCreationInputTokens = usage.cacheCreationInputTokens;
+    compact[model] = {
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      ...(typeof cacheReadInputTokens === "number" &&
+      Number.isFinite(cacheReadInputTokens) &&
+      cacheReadInputTokens >= 0
+        ? { cacheReadInputTokens }
+        : {}),
+      ...(typeof cacheCreationInputTokens === "number" &&
+      Number.isFinite(cacheCreationInputTokens) &&
+      cacheCreationInputTokens >= 0
+        ? { cacheCreationInputTokens }
+        : {}),
+    };
   }
   return Object.keys(compact).length > 0 ? compact : undefined;
 }
@@ -657,6 +688,10 @@ export function projectProviderRuntimeActivities(
       // line ("Moved to background: <work>"), not as a runtime warning.
       const detailSubtype = asString(asObject(event.payload.detail)?.subtype);
       const isBackgroundMove = detailSubtype === "background_tasks_changed";
+      const isPiInfoNotification =
+        event.provider === "pi" &&
+        raw?.method === "extension/ui/notify" &&
+        asObject(event.payload.detail)?.type === "info";
       const message = truncateDetail(event.payload.message);
       return [
         {
@@ -664,14 +699,14 @@ export function projectProviderRuntimeActivities(
           createdAt: event.createdAt,
           tone: "info",
           kind: "runtime.warning",
-          summary: isBackgroundMove
-            ? "Moved to background"
-            : (event.provider === "opencode" || event.provider === "kilo") &&
-                (nativeType === "session.next.retried" || nativeType === "session.status")
-              ? event.provider === "opencode"
+          summary: isPiInfoNotification
+            ? "Pi extension"
+            : isBackgroundMove
+              ? "Moved to background"
+              : event.provider === "opencode" &&
+                  (nativeType === "session.next.retried" || nativeType === "session.status")
                 ? "OpenCode retrying"
-                : "Kilo retrying"
-              : "Runtime warning",
+                : "Runtime warning",
           // Keep the user-visible message even when raw detail is structured.
           payload: toActivityPayload({
             message,
@@ -1067,6 +1102,62 @@ export function projectProviderRuntimeActivities(
               ? { cumulativeCostUsd: event.payload.cumulativeCostUsd }
               : {}),
             ...(errorMessage ? { errorMessage } : {}),
+          }),
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
+    case "hook.started":
+    case "hook.progress":
+      // Hook lifecycle is operational evidence, not transcript content. The
+      // canonical runtime journal retains it for replay and diagnostics.
+      return [];
+
+    case "hook.completed": {
+      const status = event.payload.status;
+      // Successful hooks are routine, and cancelled hooks normally reflect an
+      // interrupted turn. Neither should add rows or transcript height churn.
+      if (
+        event.payload.outcome === "success" ||
+        (event.payload.outcome === "cancelled" && !status)
+      ) {
+        return [];
+      }
+      const hookLabel = event.payload.hookEvent ?? "Lifecycle";
+      const summary =
+        status === "blocked"
+          ? `${hookLabel} hook blocked an action`
+          : status === "stopped"
+            ? `${hookLabel} hook stopped execution`
+            : `${hookLabel} hook failed`;
+      const message = truncateDetail(
+        event.payload.statusMessage ??
+          event.payload.stderr ??
+          event.payload.output ??
+          event.payload.stdout ??
+          summary,
+        500,
+      );
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: status === "failed" || event.payload.outcome === "error" ? "error" : "info",
+          kind: "runtime.warning",
+          summary,
+          payload: toActivityPayload({
+            message,
+            detail: message,
+            hookId: event.payload.hookId,
+            ...(event.payload.hookName ? { hookName: event.payload.hookName } : {}),
+            ...(event.payload.hookEvent ? { hookEvent: event.payload.hookEvent } : {}),
+            outcome: event.payload.outcome,
+            ...(status ? { status } : {}),
+            ...(event.payload.durationMs !== undefined
+              ? { durationMs: event.payload.durationMs }
+              : {}),
           }),
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,

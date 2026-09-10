@@ -1,4 +1,4 @@
-import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 
@@ -37,7 +37,7 @@ import {
 import { prewarmChatGptVoiceTranscriptionConnection } from "@synara/shared/chatGptVoiceTranscription";
 import { getModelSelectionBooleanOptionValue, normalizeModelSlug } from "@synara/shared/model";
 import { decodeSubagentReceiverThreadIds } from "@synara/shared/subagents";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
+import { spawnProcess } from "@synara/shared/processRuntime";
 import { Effect, ServiceMap } from "effect";
 
 import {
@@ -56,7 +56,7 @@ import {
   AGENT_GATEWAY_TURN_AUTHORITY_RETIRED,
   type AgentGatewaySessionLease,
 } from "./agentGateway/sessionLease.ts";
-import { isNonFatalCodexErrorMessage } from "./codexErrorClassification.ts";
+import { CodexSessionStartError, isNonFatalCodexErrorMessage } from "./codexErrorClassification.ts";
 import { buildCodexProcessEnv } from "./codexProcessEnv.ts";
 import { assertCodexWorkingDirectoryExists } from "./codexWorkingDirectory.ts";
 import { executableIdentity, resolveExecutable } from "./executableLookup.ts";
@@ -179,7 +179,9 @@ interface CodexSessionContext {
     | undefined;
   nextRequestId: number;
   stopping: boolean;
+  transportError?: Error;
   stopPromise?: Promise<void>;
+  teardownCapturedBeforeExit?: boolean;
   discovery?: boolean;
 }
 
@@ -426,18 +428,13 @@ const CODEX_BROWSER_TOOL_ROUTING_INSTRUCTIONS = `
 
 ## Browser tool routing
 
-Prefer Synara's built-in browser for browser work. It may continue in the background without changing the user's active chat. In code mode, call its MCP methods directly inside \`functions.exec\` with the exact \`tools.mcp__synara__browser_*\` prefix (for example, \`await tools.mcp__synara__browser_open({ url })\` and \`await tools.mcp__synara__browser_snapshot({})\`). The available suffixes are ${BROWSER_TOOL_NAMES.map((name) => `\`${name.slice("browser_".length)}\``).join(", ")}.
+In code mode, call browser MCP methods directly inside \`functions.exec\` with the exact \`tools.mcp__synara__browser_*\` prefix (for example, \`await tools.mcp__synara__browser_open({ url })\` and \`await tools.mcp__synara__browser_snapshot({})\`). The available suffixes are ${BROWSER_TOOL_NAMES.map((name) => `\`${name.slice("browser_".length)}\``).join(", ")}.
 
 For element actions, keep the \`snapshotId\` returned by the fresh snapshot and use the exact shapes \`browser_type({ target: { ref, snapshotId }, text })\`, \`browser_click({ target: { ref, snapshotId } })\`, and \`browser_press({ keys: ["Enter"] })\`. Wait for observable changes with \`browser_wait({ conditions: [{ kind: "url", glob: "*expected*" }] })\` or another published condition. Never pass a bare \`ref\` without its \`snapshotId\`.
 
-Do not search or filter \`ALL_TOOLS\` to discover these methods. When several browser steps are deterministic, run their awaited MCP calls sequentially in one \`functions.exec\` invocation, inspect each result there, and stop as soon as the requested result is verified. Take a fresh semantic snapshot before element actions and after navigation or human interaction.
+Do not search or filter \`ALL_TOOLS\` to discover these methods. When several steps are deterministic, run their awaited MCP calls sequentially in one \`functions.exec\` invocation and inspect each result there.
 
-Use \`Computer Use\` only when at least one of these is true:
-- the user explicitly asks to use \`Computer Use\`
-- the task is outside the in-app browser (desktop apps, OS settings, system UI, other app windows)
-- the in-app browser cannot complete the task and a broader desktop fallback is required
-
-Do not choose \`Computer Use\` first for ordinary browser inspection, browser screenshots, or browser navigation when the in-app browser can handle the request.`;
+Use \`Computer Use\` only when the user explicitly asks for it, the task is outside the in-app browser (desktop apps, OS settings, other windows), or the in-app browser cannot complete the task.`;
 
 export const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS = `<collaboration_mode># Plan Mode (Conversational)
 
@@ -648,6 +645,13 @@ export function buildCodexThreadOpenRequest(input: {
   };
 }
 
+export function shouldWarnCodexFreshStartWithoutResume(input: {
+  readonly threadOpenMethod: string;
+  readonly previouslyBound: boolean;
+}): boolean {
+  return input.threadOpenMethod === "thread/start" && input.previouslyBound;
+}
+
 // turn/start uses sandboxPolicy objects, so keep this separate from thread/start.
 function mapCodexRuntimeModeToTurnOverrides(runtimeMode: RuntimeMode): {
   readonly approvalPolicy: CodexApprovalPolicy;
@@ -712,17 +716,11 @@ function spawnCodexAppServer(input: {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
 }): ChildProcessWithoutNullStreams {
-  const prepared = prepareWindowsSafeProcess(input.binaryPath, ["app-server"], {
-    cwd: input.cwd,
-    env: input.env,
-  });
-  return spawn(prepared.command, prepared.args, {
+  return spawnProcess(input.binaryPath, ["app-server"], {
+    requireExecutable: true,
     cwd: input.cwd,
     env: input.env,
     stdio: ["pipe", "pipe", "pipe"],
-    shell: prepared.shell,
-    windowsHide: prepared.windowsHide,
-    windowsVerbatimArguments: prepared.windowsVerbatimArguments,
   });
 }
 
@@ -953,6 +951,7 @@ function setRecentCacheEntry<K, V>(
 
 export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEvents> {
   private readonly sessions = new Map<ThreadId, CodexSessionContext>();
+  private readonly previouslyBoundThreadIds = new Set<ThreadId>();
   private readonly discoverySessions = new Map<string, CodexSessionContext>();
   private readonly discoverySessionStartups = new Map<string, Promise<CodexSessionContext>>();
   private readonly discoverySessionIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1035,6 +1034,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         extraRoots: [this.synaraSkillsDir],
       });
     } catch (error) {
+      if (!this.isContextRoutable(context)) throw error;
       // Older codex builds (< extra-roots support) keep working; Synara-only
       // skills simply stay invisible to codex on those versions.
       log.warn("skills/extraRoots/set unavailable", { error });
@@ -1046,12 +1046,14 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     const now = new Date().toISOString();
     let context: CodexSessionContext | undefined;
     let gatewaySessionLease: AgentGatewaySessionLease | undefined;
+    let previousSessionStopped = false;
 
     try {
       const existing = this.sessions.get(threadId);
       if (existing) {
         await this.stopSession(threadId);
       }
+      previousSessionStopped = true;
 
       const resolvedCwd = resolveScratchWorkspaceCwd(threadId, input.cwd);
 
@@ -1133,6 +1135,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           sparkEnabled: context.account.sparkEnabled,
         });
       } catch (error) {
+        if (!this.isContextRoutable(context)) throw error;
         log.warn("account/read failed", { error });
       }
 
@@ -1154,6 +1157,28 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         ...(resumeThreadId ? { resumeThreadId } : {}),
         sessionOverrides,
       });
+      const previouslyBound =
+        this.previouslyBoundThreadIds.has(threadId) || input.resumeCursor !== undefined;
+      if (
+        shouldWarnCodexFreshStartWithoutResume({
+          threadOpenMethod: threadOpenRequest.method,
+          previouslyBound,
+        })
+      ) {
+        this.emitLifecycleEvent(
+          context,
+          "session/threadStartWithoutResume",
+          "Starting a new Codex thread for a Synara thread that previously had a provider binding.",
+        );
+        await Effect.logWarning(
+          "codex app-server starting a fresh thread for a previously bound Synara thread",
+          {
+            threadId,
+            threadOpenMethod: "thread/start",
+            resumeThreadId: resumeThreadId ?? null,
+          },
+        ).pipe(this.runPromise);
+      }
       this.emitLifecycleEvent(
         context,
         "session/threadOpenRequested",
@@ -1241,15 +1266,10 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       }
       const providerThreadId = threadIdRaw;
 
-      this.updateSession(context, {
-        status: "ready",
-        resumeCursor: { threadId: providerThreadId },
+      this.markSessionReadyAfterThreadOpen(context, {
+        threadOpenMethod,
+        providerThreadId,
       });
-      this.emitLifecycleEvent(
-        context,
-        "session/threadOpenResolved",
-        `Codex ${threadOpenMethod} resolved.`,
-      );
       await Effect.logInfo("codex app-server thread open resolved", {
         threadId,
         threadOpenMethod,
@@ -1258,17 +1278,17 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         resolvedThreadId: providerThreadId,
         requestedRuntimeMode: input.runtimeMode,
       }).pipe(this.runPromise);
-      this.emitLifecycleEvent(context, "session/ready", `Connected to thread ${providerThreadId}`);
       return { ...context.session };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to start Codex session.";
+      const cause = context?.transportError ?? error;
+      const message = cause instanceof Error ? cause.message : "Failed to start Codex session.";
       if (context) {
         this.updateSession(context, {
           status: "error",
           lastError: message,
         });
         this.emitErrorEvent(context, "session/startFailed", message);
-        await this.stopSession(threadId);
+        await (context.stopPromise ?? this.stopSession(threadId));
       } else {
         gatewaySessionLease?.release();
         this.emitEvent({
@@ -1284,7 +1304,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           message,
         });
       }
-      throw new Error(message, { cause: error });
+      // A post-exit snapshot can miss reparented children even when cleanup
+      // succeeds. Only pre-exit capture can certify a safe startup rejection.
+      throw previousSessionStopped && (!context || context.teardownCapturedBeforeExit === true)
+        ? new CodexSessionStartError(message, { cause })
+        : new Error(message, { cause });
     }
   }
 
@@ -1933,16 +1957,10 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       const response = await this.sendRequest(context, "thread/fork", forkParams);
       const forkedProviderThreadId = this.readThreadIdFromResponse("thread/fork", response);
 
-      this.updateSession(context, {
-        status: "ready",
-        resumeCursor: { threadId: forkedProviderThreadId },
+      this.markSessionReadyAfterThreadOpen(context, {
+        threadOpenMethod: "thread/fork",
+        providerThreadId: forkedProviderThreadId,
       });
-      this.emitLifecycleEvent(context, "session/threadOpenResolved", "Codex thread/fork resolved.");
-      this.emitLifecycleEvent(
-        context,
-        "session/ready",
-        `Connected to thread ${forkedProviderThreadId}`,
-      );
 
       return {
         threadId,
@@ -2258,7 +2276,8 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
   private async teardownContextProcess(context: CodexSessionContext): Promise<void> {
     try {
-      await teardownChildProcessTree(context.child, this.teardownProcessTree);
+      const result = await teardownChildProcessTree(context.child, this.teardownProcessTree);
+      context.teardownCapturedBeforeExit = result.capturedBeforeRootExit === true;
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       throw new Error(
@@ -2947,30 +2966,19 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         return;
       }
 
-      context.detachStdout?.();
-      this.clearTaskCompleteFallback(context);
-      context.gatewaySessionLease?.release();
       const message = `codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`;
       const exitError = new Error(message);
       context.stdinWriter.close(exitError);
       this.rejectPendingRequests(context, exitError);
-      // The child is gone, so the responses cannot land; settling still clears
-      // the maps and emits the resolutions that close the pending UI cards.
-      void this.settlePendingHumanRequests(context, "session exited");
       this.updateSession(context, {
         status: "closed",
         activeTurnId: undefined,
         lastError: code === 0 ? context.session.lastError : message,
       });
       this.emitLifecycleEvent(context, "session/exited", message);
-      if (context.discovery) {
-        const discoveryKey = context.session.cwd ?? "";
-        if (discoveryKey) {
-          this.discoverySessions.delete(discoveryKey);
-        }
-      } else {
-        this.sessions.delete(context.session.threadId);
-      }
+      // Retire resources promptly while retaining the replacement barrier until
+      // teardown settles. Post-exit capture keeps startup failures uncertain.
+      this.stopFailedContext(context);
     });
   }
 
@@ -2982,14 +2990,22 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       error instanceof CodexAppServerTransportError
         ? error.message
         : `Codex app-server transport failed: ${error.message}`;
+    // Startup can report the original cause after cleanup. Pending requests
+    // keep stopSession's uncertain outcome: this error may belong to a different
+    // write, or a frame that reached the provider before the pipe closed.
+    context.transportError = error;
     this.updateSession(context, { status: "error", lastError: message });
     this.emitErrorEvent(context, "protocol/transportError", message);
 
+    this.stopFailedContext(context);
+  }
+
+  private stopFailedContext(context: CodexSessionContext): void {
     const stopping = context.discovery
       ? this.stopDiscoverySession(context.session.cwd ?? "")
       : this.stopSession(context.session.threadId);
     void stopping.catch((stopError) => {
-      log.error("failed to stop Codex session after transport error", {
+      log.error("failed to stop Codex session after process or transport failure", {
         threadId: context.session.threadId,
         error: stopError,
       });
@@ -3485,6 +3501,36 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       this.handleTransportFailure(context, cause);
       throw cause;
     });
+  }
+
+  private markSessionReadyAfterThreadOpen(
+    context: CodexSessionContext,
+    input: {
+      readonly threadOpenMethod: string;
+      readonly providerThreadId: string;
+    },
+  ): void {
+    this.updateSession(context, {
+      status: "ready",
+      resumeCursor: { threadId: input.providerThreadId },
+    });
+    this.previouslyBoundThreadIds.add(context.session.threadId);
+    this.emitLifecycleEvent(
+      context,
+      "session/threadOpenResolved",
+      `Codex ${input.threadOpenMethod} resolved.`,
+    );
+    this.emitLifecycleEvent(
+      context,
+      "session/ready",
+      `Connected to thread ${input.providerThreadId}`,
+    );
+    // Resume/fork do not notify session start; emit it so idle-stop re-arms.
+    this.emitLifecycleEvent(
+      context,
+      "session/started",
+      `Codex session ready for thread ${input.providerThreadId}`,
+    );
   }
 
   private emitLifecycleEvent(context: CodexSessionContext, method: string, message: string): void {
@@ -4082,21 +4128,14 @@ function runCodexVersionCommand(input: {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
 }): Promise<CodexVersionCommandResult> {
-  const prepared = prepareWindowsSafeProcess(input.binaryPath, ["--version"], {
-    cwd: input.cwd,
-    env: input.env,
-  });
-
   return new Promise<CodexVersionCommandResult>((resolve) => {
     let child: ChildProcess;
     try {
-      child = spawn(prepared.command, prepared.args, {
+      child = spawnProcess(input.binaryPath, ["--version"], {
+        requireExecutable: true,
         cwd: input.cwd,
         env: input.env,
         stdio: ["ignore", "pipe", "pipe"],
-        shell: prepared.shell,
-        windowsHide: prepared.windowsHide,
-        windowsVerbatimArguments: prepared.windowsVerbatimArguments,
       });
     } catch (error) {
       resolve({

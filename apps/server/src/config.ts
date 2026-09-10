@@ -112,6 +112,7 @@ export interface ServerConfigShape extends ServerDerivedPaths {
    * Seeded in memory only — never persisted.
    */
   readonly desktopBootstrapCredential?: string | undefined;
+  readonly migrationDivergenceConsent?: string | undefined;
   readonly autoBootstrapProjectFromCwd: boolean;
   readonly logProviderEvents: boolean;
   readonly logWebSocketEvents: boolean;
@@ -269,6 +270,7 @@ export class ServerConfig extends ServiceMap.Service<ServerConfig, ServerConfigS
           host: undefined,
           authToken: undefined,
           desktopShutdownToken: undefined,
+          migrationDivergenceConsent: undefined,
           staticDir: undefined,
           devUrl,
           publicUrl: undefined,

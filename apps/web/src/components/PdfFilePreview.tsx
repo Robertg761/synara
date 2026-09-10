@@ -33,9 +33,11 @@ export function PdfFilePreview(props: {
   filePath: string;
   cwd: string | null | undefined;
   previewGrant?: string | null | undefined;
+  cacheKey?: string | number | undefined;
   /** Pre-resolved target for the "Open in editor" control in the toolbar. */
   openInTarget: string | null;
   className?: string;
+  onReload?: (() => void) | undefined;
   onPreviewReady?: (() => void) | undefined;
   onPreviewError?: (() => void) | undefined;
 }) {
@@ -47,6 +49,7 @@ export function PdfFilePreview(props: {
     src: props.filePath,
     cwd: props.cwd ?? undefined,
     grant: props.previewGrant,
+    cacheKey: props.cacheKey,
   });
   const fileName = basenameOfPath(props.filePath);
   const doc = usePdfDocument(previewUrl);
@@ -100,6 +103,7 @@ export function PdfFilePreview(props: {
           onFitWidth={zoom.onFitWidth}
           onFitPage={zoom.onFitPage}
           openInTarget={props.openInTarget}
+          onReload={props.onReload}
         />
         <div ref={setScrollRoot} className="pdf-viewer-scroll min-h-0 flex-1 overflow-auto">
           {containerSize
@@ -129,6 +133,15 @@ export function PdfFilePreview(props: {
           <p className="text-[12px] text-muted-foreground">
             {doc.error ?? "Could not open this PDF."}
           </p>
+          {props.onReload ? (
+            <button
+              type="button"
+              className="rounded-md px-2 py-1 text-xs hover:bg-foreground/8"
+              onClick={props.onReload}
+            >
+              Reload file from disk
+            </button>
+          ) : null}
         </div>
       </div>
     );

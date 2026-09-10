@@ -441,12 +441,7 @@ function ChatRouteGlobalShortcuts() {
             });
             return;
           }
-          await handleNewThread(target.projectId, {
-            provider,
-            ...(target.inheritContext
-              ? resolveInheritedThreadContext({ activeThread, activeDraftThread })
-              : {}),
-          });
+          await handleNewThread(target.projectId, { provider });
         })();
         return;
       }
@@ -460,12 +455,7 @@ function ChatRouteGlobalShortcuts() {
       if (!target) return;
       event.preventDefault();
       event.stopPropagation();
-      void handleNewThread(
-        target.projectId,
-        target.inheritContext
-          ? resolveInheritedThreadContext({ activeThread, activeDraftThread })
-          : undefined,
-      );
+      void handleNewThread(target.projectId);
     };
 
     window.addEventListener("keydown", onWindowKeyDown, { capture: true });

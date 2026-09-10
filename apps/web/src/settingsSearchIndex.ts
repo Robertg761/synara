@@ -47,6 +47,13 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
       "Pick the default workspace mode for newly created draft threads. local worktree environment",
   },
   {
+    id: "general:welcome-tour",
+    section: "general",
+    title: "Welcome tour",
+    keywords:
+      "Replay the first-run setup: feature tour, provider selection, appearance, and first project. onboarding welcome wizard getting started setup",
+  },
+  {
     id: "general:project-order",
     section: "general",
     title: "Project order",
@@ -286,6 +293,13 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     section: "behavior",
     title: "Assistant output",
     keywords: "Show token-by-token output while a response is in progress. streaming",
+  },
+  {
+    id: "behavior:auto-open-simulator",
+    section: "behavior",
+    title: "Automatically open simulator",
+    keywords:
+      "Disable automatic iOS Simulator device pane opening. Use Simulator.app without the mirrored panel reopening. background launch",
   },
   {
     id: "behavior:diff-line-wrapping",

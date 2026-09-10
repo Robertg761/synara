@@ -46,6 +46,11 @@ import { useFeedbackDialogStore } from "../feedbackDialogStore";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { dispatchThreadGoal, dispatchThreadGoalPaused } from "../threadGoal";
 import {
+  buildDraftThreadRenameCreateInput,
+  dispatchThreadRename,
+  dispatchThreadTitleRegeneration,
+} from "../lib/threadRename";
+import {
   createOrJoinSidechat,
   createSidechatThread,
   sendSidechatPrompt,
@@ -69,9 +74,10 @@ export function useComposerSlashCommands(input: {
   activeThread: Thread | undefined;
   activeRootBranch: string | null;
   isServerThread: boolean;
+  isLocalDraftThread: boolean;
   supportsFastSlashCommand: boolean;
   canOfferCompactCommand: boolean;
-  canOfferSideCommand: boolean;
+  canExecuteSideCommand: boolean;
   sidechatTargetProviders: ReadonlyArray<ProviderKind>;
   canOfferExportCommand: boolean;
   supportsTextNativeReviewCommand: boolean;
@@ -121,9 +127,10 @@ export function useComposerSlashCommands(input: {
     activeThread,
     activeRootBranch,
     isServerThread,
+    isLocalDraftThread,
     supportsFastSlashCommand,
     canOfferCompactCommand,
-    canOfferSideCommand,
+    canExecuteSideCommand,
     sidechatTargetProviders,
     canOfferExportCommand,
     supportsTextNativeReviewCommand,
@@ -367,6 +374,76 @@ export function useComposerSlashCommands(input: {
       }
     },
     [activeThread?.goal, clearThreadGoal, editorActions, persistThreadGoal, setThreadGoalPaused],
+  );
+
+  const runRenameSlashCommand = useCallback(
+    async (args: string) => {
+      if (!activeThread) {
+        toastManager.add({
+          type: "warning",
+          title: "Rename is unavailable",
+          description: "Open a thread before renaming it.",
+        });
+        return;
+      }
+      if (args.length > 0) {
+        if (!isServerThread && !isLocalDraftThread) {
+          toastManager.add({ type: "warning", title: "Rename is unavailable" });
+          return;
+        }
+        const outcome = await dispatchThreadRename({
+          threadId: activeThread.id,
+          newTitle: args,
+          unchangedTitles: [],
+          createIfMissing: isLocalDraftThread
+            ? buildDraftThreadRenameCreateInput(activeThread)
+            : undefined,
+        });
+        if (outcome === "renamed") {
+          toastManager.add({ type: "success", title: "Thread renamed" });
+        } else if (outcome === "unavailable") {
+          toastManager.add({ type: "warning", title: "Rename is unavailable" });
+        } else {
+          toastManager.add({ type: "info", title: "Thread title is unchanged" });
+        }
+        return;
+      }
+
+      if (!isServerThread) {
+        toastManager.add({
+          type: "warning",
+          title: "Nothing to rename yet",
+          description: "Send a message before generating a thread title.",
+        });
+        return;
+      }
+
+      const outcome = await dispatchThreadTitleRegeneration(activeThread.id);
+      if (outcome.status === "renamed") {
+        toastManager.add({
+          type: "success",
+          title: "Thread renamed",
+          description: outcome.title,
+        });
+      } else if (outcome.status === "no-context") {
+        toastManager.add({
+          type: "warning",
+          title: "Nothing to rename yet",
+          description: "Send a message before generating a thread title.",
+        });
+      } else if (outcome.status === "stale") {
+        toastManager.add({
+          type: "info",
+          title: "Newer thread title kept",
+          description: "The generated title was discarded because the title changed.",
+        });
+      } else if (outcome.status === "unavailable") {
+        toastManager.add({ type: "warning", title: "Rename is unavailable" });
+      } else {
+        toastManager.add({ type: "info", title: "Thread title is unchanged" });
+      }
+    },
+    [activeThread, isLocalDraftThread, isServerThread],
   );
 
   const createForkThreadFromSlashCommand = useCallback(
@@ -837,6 +914,20 @@ export function useComposerSlashCommands(input: {
         await runGoalSlashCommand(slashInvocation.args);
         return true;
       }
+      if (slashInvocation.command === "rename") {
+        editorActions.clearComposerSlashDraft();
+        void runRenameSlashCommand(slashInvocation.args).catch((error) => {
+          toastManager.add({
+            type: "error",
+            title: "Could not rename thread",
+            description:
+              error instanceof Error
+                ? error.message
+                : "An error occurred while renaming the thread.",
+          });
+        });
+        return true;
+      }
       if (slashInvocation.command === "subagents") {
         editorActions.setComposerPromptValue(buildSubagentsPrompt(slashInvocation.args));
         return true;
@@ -922,7 +1013,9 @@ export function useComposerSlashCommands(input: {
         return true;
       }
       if (slashInvocation.command === "side") {
-        if (!canOfferSideCommand) {
+        // Execute allows `/side <provider> [prompt]` even though the menu offer still
+        // requires an otherwise-empty composer (the args are meaningful prompt text).
+        if (!canExecuteSideCommand) {
           toastManager.add({
             type: "warning",
             title: "Side is unavailable",
@@ -967,7 +1060,7 @@ export function useComposerSlashCommands(input: {
     },
     [
       availableBuiltInSlashCommands,
-      canOfferSideCommand,
+      canExecuteSideCommand,
       checkClaudeFastSlashCommandAvailability,
       compactProviderThread,
       createForkThreadFromSlashCommand,
@@ -986,6 +1079,7 @@ export function useComposerSlashCommands(input: {
       runExportSlashCommand,
       runFastSlashCommand,
       runGoalSlashCommand,
+      runRenameSlashCommand,
     ],
   );
 
@@ -996,7 +1090,12 @@ export function useComposerSlashCommands(input: {
         return;
       }
 
-      if (item.command === "model" || item.command === "goal" || item.command === "automation") {
+      if (
+        item.command === "model" ||
+        item.command === "goal" ||
+        item.command === "rename" ||
+        item.command === "automation"
+      ) {
         const replacement = `/${item.command} `;
         const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
           snapshot.value,

@@ -28,7 +28,6 @@ const RuntimeEventRawSource = Schema.Literals([
   "antigravity.cli.event",
   "acp.jsonrpc",
   "acp.cursor.extension",
-  "kilo.sdk.event",
   "opencode.sdk.event",
   "pi.sdk.event",
 ]);
@@ -318,6 +317,15 @@ const ThreadMetadataUpdatedPayload = Schema.Struct({
 export type ThreadMetadataUpdatedPayload = typeof ThreadMetadataUpdatedPayload.Type;
 
 export const ThreadTokenUsageSnapshot = Schema.Struct({
+  // Provider session totals, distinct from the latest request/context snapshot.
+  cumulativeUsage: Schema.optional(
+    Schema.Struct({
+      inputTokens: NonNegativeInt,
+      outputTokens: NonNegativeInt,
+      cachedInputTokens: Schema.optional(NonNegativeInt),
+      cacheCreationInputTokens: Schema.optional(NonNegativeInt),
+    }),
+  ),
   usedTokens: NonNegativeInt,
   usedPercent: Schema.optional(
     Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(100)),
@@ -621,6 +629,8 @@ const HookStartedPayload = Schema.Struct({
   hookId: TrimmedNonEmptyStringSchema,
   hookName: TrimmedNonEmptyStringSchema,
   hookEvent: TrimmedNonEmptyStringSchema,
+  statusMessage: Schema.optional(TrimmedNonEmptyStringSchema),
+  data: Schema.optional(Schema.Unknown),
 });
 export type HookStartedPayload = typeof HookStartedPayload.Type;
 
@@ -634,11 +644,17 @@ export type HookProgressPayload = typeof HookProgressPayload.Type;
 
 const HookCompletedPayload = Schema.Struct({
   hookId: TrimmedNonEmptyStringSchema,
+  hookName: Schema.optional(TrimmedNonEmptyStringSchema),
+  hookEvent: Schema.optional(TrimmedNonEmptyStringSchema),
   outcome: Schema.Literals(["success", "error", "cancelled"]),
+  status: Schema.optional(Schema.Literals(["completed", "failed", "blocked", "stopped"])),
+  statusMessage: Schema.optional(TrimmedNonEmptyStringSchema),
+  durationMs: Schema.optional(NonNegativeInt),
   output: Schema.optional(Schema.String),
   stdout: Schema.optional(Schema.String),
   stderr: Schema.optional(Schema.String),
   exitCode: Schema.optional(Schema.Int),
+  data: Schema.optional(Schema.Unknown),
 });
 export type HookCompletedPayload = typeof HookCompletedPayload.Type;
 

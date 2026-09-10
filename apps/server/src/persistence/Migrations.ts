@@ -112,7 +112,11 @@ import Migration0093 from "./Migrations/093_BackfillMaxIterationsDisabledReason.
 import Migration0094 from "./Migrations/094_ProjectionThreadsGoal.ts";
 import Migration0095 from "./Migrations/095_ProjectionThreadsGoalTiming.ts";
 import Migration0096 from "./Migrations/096_ProjectionThreadsGoalAchievements.ts";
-import Migration0097 from "./Migrations/097_AuthSessionRenewalPolicy.ts";
+import Migration0097 from "./Migrations/097_ProjectionThreadsSidechatLifecycle.ts";
+import Migration0098 from "./Migrations/098_MigrateKiloToOpenCode.ts";
+import Migration0099 from "./Migrations/099_InvalidateProjectionThreadsCursor.ts";
+import Migration0100 from "./Migrations/100_MessageTextChunks.ts";
+import Migration0101 from "./Migrations/101_AuthSessionRenewalPolicy.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -224,7 +228,11 @@ export const migrationEntries = [
   [94, "ProjectionThreadsGoal", Migration0094],
   [95, "ProjectionThreadsGoalTiming", Migration0095],
   [96, "ProjectionThreadsGoalAchievements", Migration0096],
-  [97, "AuthSessionRenewalPolicy", Migration0097],
+  [97, "ProjectionThreadsSidechatLifecycle", Migration0097],
+  [98, "MigrateKiloToOpenCode", Migration0098],
+  [99, "InvalidateProjectionThreadsCursor", Migration0099],
+  [100, "MessageTextChunks", Migration0100],
+  [101, "AuthSessionRenewalPolicy", Migration0101],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
@@ -255,6 +263,25 @@ const LATEST_MIGRATION_ID = Math.max(...migrationEntries.map(([id]) => id));
 const canonicalMigrationNamesById: ReadonlyMap<number, string> = new Map(
   migrationEntries.map(([id, name]) => [id, name] as const),
 );
+
+const IMPORTED_SCHEMA_RECONCILIATION_MIGRATION_ID = 32;
+
+export function planLegacyMigration32Rename(
+  recordedNamesById: ReadonlyMap<number, string>,
+): string | null {
+  const canonicalName = canonicalMigrationNamesById.get(
+    IMPORTED_SCHEMA_RECONCILIATION_MIGRATION_ID,
+  );
+  if (canonicalName === undefined) return null;
+
+  const hasCanonicalPrefix = migrationEntries
+    .filter(([id]) => id < IMPORTED_SCHEMA_RECONCILIATION_MIGRATION_ID)
+    .every(([id, name]) => recordedNamesById.get(id) === name);
+  const recordedName = recordedNamesById.get(IMPORTED_SCHEMA_RECONCILIATION_MIGRATION_ID);
+  return hasCanonicalPrefix && recordedName !== undefined && recordedName !== canonicalName
+    ? canonicalName
+    : null;
+}
 
 /**
  * First canonical entry whose name is not recorded at the same ID, considering
@@ -301,6 +328,14 @@ export interface MigrationLineageAlias {
 }
 
 export const MIGRATION_LINEAGE_ALIASES: readonly MigrationLineageAlias[] = [
+  {
+    // Android builds used 97 before upstream assigned it to sidechat lifecycle.
+    // Re-run that slot, then let the idempotent auth migration run at 101.
+    historicalId: 97,
+    historicalName: "AuthSessionRenewalPolicy",
+    currentId: 101,
+    historicalSlotRequiresRerun: true,
+  },
   {
     // Shipped in v0.5.5. Migration 54 is now `Effect.void` (see
     // `Migrations/054_ReservedDurableProviderCommandDelivery.ts`), so the slot
@@ -404,19 +439,12 @@ export const reconcileMigrationLineage = Effect.gen(function* () {
   const recordedNamesBeforeCanonicalization = new Map(
     recorded.map((row) => [row.migration_id, row.name]),
   );
-  const hasCanonicalPrefixThrough31 = migrationEntries
-    .filter(([id]) => id < 32)
-    .every(([id, name]) => recordedNamesBeforeCanonicalization.get(id) === name);
-  const migration32Name = recordedNamesBeforeCanonicalization.get(32);
-  if (
-    hasCanonicalPrefixThrough31 &&
-    migration32Name !== undefined &&
-    migration32Name !== "ReconcileImportedSchemaLineage"
-  ) {
+  const migration32Rename = planLegacyMigration32Rename(recordedNamesBeforeCanonicalization);
+  if (migration32Rename !== null) {
     yield* sql`
       UPDATE effect_sql_migrations
-      SET name = 'ReconcileImportedSchemaLineage'
-      WHERE migration_id = 32
+      SET name = ${migration32Rename}
+      WHERE migration_id = ${IMPORTED_SCHEMA_RECONCILIATION_MIGRATION_ID}
     `;
     recorded = yield* sql<{ readonly migration_id: number; readonly name: string }>`
       SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id ASC
