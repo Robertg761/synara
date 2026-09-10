@@ -124,7 +124,8 @@ describe("NotificationsSettingsPanel", () => {
       expect(harness.toastAdd).toHaveBeenCalledWith(
         expect.objectContaining({
           type: "warning",
-          title: "Desktop notifications unavailable",
+          title: "Notifications unavailable",
+          description: "Permission: denied",
         }),
       );
     });
