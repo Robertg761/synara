@@ -5,6 +5,7 @@
 
 import { useEffect, useSyncExternalStore } from "react";
 import { isElectron } from "../env";
+import { syncMobileTheme } from "../mobileTheme";
 import { isMacNavigatorPlatform } from "../lib/utils";
 import {
   DEFAULT_THEME_STATE,
@@ -176,6 +177,7 @@ function applyThemeState(state: ThemeState, suppressTransitions = false) {
   }
 
   syncDesktopTheme(state.mode);
+  syncMobileTheme(variant);
 
   if (suppressTransitions) {
     // Force a reflow so the no-transitions class takes effect before removal.
