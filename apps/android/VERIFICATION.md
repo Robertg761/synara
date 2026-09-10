@@ -6,7 +6,7 @@ Android uses the shared desktop renderer. That gives both apps the same feature 
 
 - Shared browser tests cover desktop and phone layouts with protocol fixtures.
 - Native instrumentation runs on a dedicated API 36 emulator. It must never use a personal device because the storage tests clear saved pairing.
-- Paired visual review uses an isolated HTTPS fixture server and a test CA installed only in the disposable emulator. The production app keeps normal certificate verification. Fixture conversations cannot validate real provider execution.
+- Paired visual review uses isolated HTTPS fixture and real Synara servers, with a test CA installed only in the disposable emulator. The production app keeps normal certificate verification. Fixture conversations cannot validate real provider execution.
 - Physical-device and signed-release checks remain separate from emulator checks.
 
 ## Coverage to retain
@@ -28,6 +28,15 @@ Android uses the shared desktop renderer. That gives both apps the same feature 
 | Release | Signing, upgrade, physical-device checks, TalkBack, background/process-death behavior |
 
 Record observed results separately from source review. A passing build or a fixture screenshot does not establish completion of every row.
+
+## Observed results, September 10, 2026
+
+- API 36 emulator paired to an isolated real Synara server over HTTPS/WSS, created a project in a disposable directory, and received a real Codex response to a no-tools prompt.
+- Native instrumentation verified encrypted storage compatibility, incoming-link consumption across recreation, guest browser isolation and navigation, visible viewport capture, notification delivery, and shared-file bytes and access boundaries.
+- API 26 with stock WebView 69 displayed the script-free update screen instead of failing silently. The shared transport also has a regression test for supported WebViews that lack `AbortSignal.any`.
+- Debug and unsigned release APKs built successfully with release shrinking. Native unit tests and Android lint passed.
+
+The message exchange above covers one provider round trip. Approvals, reconnect during a long response, and the remaining acceptance rows still need their own observed results.
 
 ## Known release gaps
 

@@ -47,6 +47,7 @@ jobs:
           bun run --cwd apps/web test
           src/mobilePairingIntent.test.ts src/mobileRuntime.test.ts
           src/mobileNotifications.test.ts src/wsNativeApi.test.ts
+          src/wsTransport.test.ts
           src/mobileBrowser.test.ts
           src/shellBridge.test.ts src/shellSession.test.ts
           src/mobileDownloads.test.ts src/lib/browserDownload.test.ts
@@ -61,6 +62,7 @@ jobs:
           src/components/phone/PhoneHomeScreen.phone.browser.tsx
           src/components/phone/PhonePaneScreen.phone.browser.tsx
           src/components/chat/composerPhoneChrome.browser.tsx
+          src/components/onboarding/FeatureTourStep.browser.tsx
           src/components/settings/DesktopSettingsPanels.browser.tsx
           src/lib/mobileOverlayBack.browser.tsx
           src/components/BrowserPanel.external.browser.tsx
