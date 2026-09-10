@@ -222,7 +222,7 @@ function ConnectRouteView() {
         <div className="flex flex-col gap-4 rounded-xl border border-border bg-card/60 p-4">
           <div className="flex flex-col gap-2">
             <Label htmlFor={serverFieldId}>Server URL</Label>
-            <InputGroup>
+            <InputGroup className="h-12">
               <InputGroupInput
                 id={serverFieldId}
                 value={serverUrlInput}
@@ -240,7 +240,7 @@ function ConnectRouteView() {
 
           <div className="flex flex-col gap-2">
             <Label htmlFor={pairingFieldId}>Pairing link or token</Label>
-            <InputGroup>
+            <InputGroup className="h-12">
               <InputGroupInput
                 id={pairingFieldId}
                 aria-describedby={pairingHintId}
