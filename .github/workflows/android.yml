@@ -58,6 +58,9 @@ jobs:
         run: >-
           bun run --cwd apps/web test:browser
           src/components/phone/PhoneAppShell.phone.browser.tsx
+          src/components/phone/PhoneHomeScreen.phone.browser.tsx
+          src/components/phone/PhonePaneScreen.phone.browser.tsx
+          src/components/chat/composerPhoneChrome.browser.tsx
           src/components/settings/DesktopSettingsPanels.browser.tsx
           src/lib/mobileOverlayBack.browser.tsx
           src/components/BrowserPanel.external.browser.tsx
