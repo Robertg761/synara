@@ -48,6 +48,8 @@ The installed APK passed browser button and legacy-link open/close checks, nativ
 
 The provider checks cover a message round trip and a file edit with diff review. Approvals, reconnect during a long response, and the remaining acceptance rows still need their own observed results.
 
+Version 0.2.1 addresses the physical-phone report of header controls overlapping the status bar. The native container now owns system-bar, cutout, and keyboard insets; Capacitor's WebView-version-dependent CSS inset handling is disabled. Embedded browser bounds use that same protected viewport. Debug and unsigned release builds, seven JVM tests, Android lint, and all 13 native instrumentation tests passed. The new regression checks inset ownership after viewport-cover detection, cutout and keyboard transitions, consumed child insets, and guest position. The first browser capture check ran before painting; the test now explicitly waits for WebView visual state and the complete suite passed. Portrait and keyboard screenshots were inspected on API 36 with WebView 133. A physical-phone retest and execution on WebView 140+ remain unverified. The workspace Bun formatting, lint, and typecheck commands were not run because authorization is still pending.
+
 ## Known release gaps
 
 - Reliable notifications while Android suspends or stops the app need server push.
