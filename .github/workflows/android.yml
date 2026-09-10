@@ -49,6 +49,7 @@ jobs:
           src/mobileNotifications.test.ts src/wsNativeApi.test.ts
           src/wsTransport.test.ts
           src/mobileBrowser.test.ts
+          src/mobileTheme.test.ts src/theme/theme.logic.test.ts
           src/lib/browserCapabilities.test.ts src/components/chat/ChatHeader.test.tsx
           src/components/phone/phonePaneRoute.logic.test.ts src/routes/-chatThreadRoute.logic.test.ts
           src/shellBridge.test.ts src/shellSession.test.ts
