@@ -267,6 +267,37 @@
   }
 }
 
+/* Phone header actions occupy separate 44px cells. Inline toolbars reserve their
+   width beside the label instead of overlapping a full-width disclosure button. */
+[data-sidebar-chrome="phone"] [data-sidebar-surface-header] button {
+  min-width: 2.75rem;
+  min-height: 2.75rem;
+}
+
+[data-sidebar-chrome="phone"] :has(> [data-sidebar-toolbar]) {
+  display: flex;
+  align-items: center;
+}
+
+[data-sidebar-chrome="phone"] :has(> [data-sidebar-toolbar]) > :first-child {
+  min-width: 0;
+  flex: 1;
+  padding-right: 0.5rem;
+}
+
+[data-sidebar-chrome="phone"] [data-sidebar-toolbar] {
+  position: static;
+  flex-shrink: 0;
+  gap: 0;
+  pointer-events: auto;
+  opacity: 1;
+}
+
+[data-sidebar-chrome="phone"] [data-sidebar-toolbar] .sidebar-icon-button {
+  width: 2.75rem;
+  height: 2.75rem;
+}
+
 /* One-shot entry for the sidebar's segment surface swap (Studio <-> Projects).
    Keyed remounts play this on the incoming surface so the switch reads
    as a movement instead of a hard cut. Enter-only by design: no exit or height
@@ -284,8 +315,8 @@
 }
 
 .sidebar-surface-enter {
-  animation: sidebar-surface-enter 160ms ease-out both;
-  will-change: opacity, transform;
+  /* Release the transform after entry so Android does not retain a stale scaled layer. */
+  animation: sidebar-surface-enter 160ms ease-out backwards;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -1393,8 +1393,8 @@ const PHONE_ROW_TOUCH_TARGET_CLASS_NAME =
 /**
  * Same 44px rule for the phone footer's icon triggers. `SidebarIconButton` is a fixed square
  * (`size-5` for the help menu), so min-height alone would leave a 20px tap target — the box is
- * grown instead. Scoped to the footer row on purpose: upsizing every `.sidebar-icon-button` in
- * the body would blow out the project/section header rows that pack several of them per line.
+ * grown instead. Section toolbars reserve separate cells through the phone rules in
+ * `index.css`; the footer can grow its triggers directly.
  */
 const PHONE_FOOTER_TOUCH_TARGET_CLASS_NAME = "[&_.sidebar-icon-button]:size-11";
 
@@ -1408,6 +1408,7 @@ function SidebarBody({ chrome, children }: { chrome: SidebarChrome; children: Re
   if (chrome === "phone") {
     return (
       <div
+        data-sidebar-chrome="phone"
         className={cn(
           "flex w-full min-w-0 flex-col gap-0 font-system-ui",
           PHONE_ROW_TOUCH_TARGET_CLASS_NAME,
@@ -6013,7 +6014,10 @@ export default function Sidebar(props: { chrome?: SidebarChrome }) {
           </SidebarGroup>
         ) : (
           <>
-            <div className="flex items-center gap-1 pt-0 pb-1 pr-2.5 pl-1.5">
+            <div
+              data-sidebar-surface-header
+              className="flex items-center gap-1 pt-0 pb-1 pr-2.5 pl-1.5"
+            >
               <SidebarSurfacePicker
                 views={["threads", ...(studioSectionVisible ? (["studio"] as const) : [])]}
                 activeView={isOnStudio ? "studio" : "threads"}

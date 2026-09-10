@@ -18,6 +18,7 @@ import {
 } from "@tanstack/react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "vitest-browser-react";
+import { page } from "vitest/browser";
 
 import { SidebarProvider } from "~/components/ui/sidebar";
 import { useSpacesUiStore } from "../../spacesUiStore";
@@ -111,7 +112,7 @@ async function renderPhoneHome(host: HTMLElement) {
   const rootRoute = createRootRoute({
     component: () => (
       <QueryClientProvider client={queryClient}>
-        <SidebarProvider>
+        <SidebarProvider className="min-w-0">
           <PhoneHomeScreen />
         </SidebarProvider>
       </QueryClientProvider>
@@ -210,6 +211,56 @@ describe("PhoneHomeScreen", () => {
       // `pb-[calc(env(safe-area-inset-bottom)+4.5rem)]`) stacks with it and strands the last
       // thread row ~72px above the bar, so the padding must stay the shell's job alone.
       expect(getComputedStyle(scroller as HTMLElement).paddingBottom).toBe("0px");
+    } finally {
+      await screen.unmount();
+    }
+  });
+
+  it("keeps phone header actions separate and tappable", async () => {
+    if (!host) throw new Error("missing host");
+    localStorage.setItem("synara:activity-onboarding:v1", "seen");
+    useStore.setState({
+      projects: [{ ...makeProject(), name: "A very long project name that must leave room for actions" }],
+    });
+    const screen = await renderPhoneHome(host);
+    try {
+      await vi.waitUntil(() => document.querySelector('[aria-label="Sort chats"]'));
+      await vi.waitFor(() => {
+        for (const surface of document.querySelectorAll(".sidebar-surface-enter")) {
+          expect(getComputedStyle(surface).transform).toBe("none");
+          expect(getComputedStyle(surface).willChange).toBe("auto");
+        }
+      });
+      for (const width of [390, 320]) {
+        await page.viewport(width, 844);
+        const controls = document.querySelectorAll<HTMLElement>(
+          '[data-sidebar-surface-header] button, [data-sidebar-toolbar] .sidebar-icon-button, [data-testid="phone-sidebar-footer"] button',
+        );
+        expect(controls.length).toBeGreaterThan(4);
+        for (const control of controls) {
+          const bounds = control.getBoundingClientRect();
+          expect(Math.round(bounds.width)).toBeGreaterThanOrEqual(TOUCH_TARGET_MIN_PX);
+          expect(Math.round(bounds.height)).toBeGreaterThanOrEqual(TOUCH_TARGET_MIN_PX);
+          expect(getComputedStyle(control).pointerEvents).toBe("auto");
+          const hit = document.elementFromPoint(
+            bounds.x + bounds.width / 2,
+            bounds.y + bounds.height / 2,
+          );
+          expect(
+            control.contains(hit),
+            control.getAttribute("aria-label") ?? "phone control",
+          ).toBe(true);
+        }
+        for (const toolbar of document.querySelectorAll("[data-sidebar-toolbar]")) {
+          const label = toolbar.parentElement?.firstElementChild;
+          expect(label?.getBoundingClientRect().right ?? Infinity).toBeLessThanOrEqual(
+            toolbar.getBoundingClientRect().left + 1,
+          );
+        }
+        expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
+      }
+      await screen.getByRole("button", { name: "Sort chats", exact: true }).click();
+      await expect.element(screen.getByRole("menu")).toBeVisible();
     } finally {
       await screen.unmount();
     }
