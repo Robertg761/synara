@@ -27,6 +27,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const requestMock = vi.fn<(...args: Array<unknown>) => Promise<unknown>>();
 const disposeMock = vi.fn();
+const downloadBlobMock = vi.fn();
 const showContextMenuFallbackMock =
   vi.fn<
     <T extends string>(
@@ -87,6 +88,8 @@ vi.mock("./contextMenuFallback", () => ({
   showContextMenuFallback: showContextMenuFallbackMock,
 }));
 
+vi.mock("./lib/browserDownload", () => ({ downloadBlob: downloadBlobMock }));
+
 let nextPushSequence = 1;
 
 function emitPush<C extends WsPushChannel>(channel: C, data: WsPushData<C>): void {
@@ -128,6 +131,7 @@ beforeEach(() => {
   vi.resetModules();
   requestMock.mockReset();
   disposeMock.mockReset();
+  downloadBlobMock.mockReset();
   showContextMenuFallbackMock.mockReset();
   subscribeMock.mockClear();
   channelListeners.clear();
@@ -142,6 +146,39 @@ afterEach(() => {
 });
 
 describe("wsNativeApi", () => {
+  it("routes exported files through the platform download helper", async () => {
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    const input = { defaultFilename: "plan.md", contents: "# Plan" };
+
+    await expect(createWsNativeApi().dialogs.saveFile(input)).resolves.toBeNull();
+
+    expect(downloadBlobMock).toHaveBeenCalledOnce();
+    const [blob, filename] = downloadBlobMock.mock.calls[0]!;
+    expect(filename).toBe("plan.md");
+    expect(blob.type).toBe("text/markdown;charset=utf-8");
+    expect(await blob.text()).toBe("# Plan");
+  });
+
+  it("preserves desktop save dialogs and their returned path", async () => {
+    const saveFile = vi.fn().mockResolvedValue("/tmp/plan.md");
+    Object.assign(getWindowForTest(), { desktopBridge: { saveFile } });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    const input = { defaultFilename: "plan.md", contents: "# Plan" };
+
+    await expect(createWsNativeApi().dialogs.saveFile(input)).resolves.toBe("/tmp/plan.md");
+    expect(saveFile).toHaveBeenCalledWith(input);
+    expect(downloadBlobMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates native export failures to the caller", async () => {
+    downloadBlobMock.mockRejectedValue(new Error("Sharing unavailable"));
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    await expect(
+      createWsNativeApi().dialogs.saveFile({ defaultFilename: "plan.md", contents: "# Plan" }),
+    ).rejects.toThrow("Sharing unavailable");
+  });
+
   it("delivers and caches valid server.welcome payloads", async () => {
     const { createWsNativeApi, onServerWelcome } = await import("./wsNativeApi");
 

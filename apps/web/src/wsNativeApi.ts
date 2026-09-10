@@ -58,6 +58,7 @@ import { requireHttpExternalUrl } from "./lib/externalUrl";
 import { WsTransport, type WsThreadStreamFailure } from "./wsTransport";
 import { emitWsCompatibilityIssue, emitWsTransportState } from "./wsTransportEvents";
 import { authenticatedServerFetch } from "./lib/authenticatedFetch";
+import { downloadBlob } from "./lib/browserDownload";
 
 export type { WsThreadStreamFailure } from "./wsTransport";
 
@@ -531,15 +532,7 @@ export function createWsNativeApi(): NativeApi {
           return window.desktopBridge.saveFile(input);
         }
         const blob = new Blob([input.contents], { type: "text/markdown;charset=utf-8" });
-        const url = URL.createObjectURL(blob);
-        try {
-          const anchor = document.createElement("a");
-          anchor.href = url;
-          anchor.download = input.defaultFilename;
-          anchor.click();
-        } finally {
-          URL.revokeObjectURL(url);
-        }
+        await downloadBlob(blob, input.defaultFilename);
         return null;
       },
       confirm: async (message) => {
