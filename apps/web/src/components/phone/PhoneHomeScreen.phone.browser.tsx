@@ -304,7 +304,7 @@ describe("PhoneHomeScreen", () => {
       await vi.waitFor(
         () => {
           expect(document.body.textContent).toContain("Send feedback");
-          expect(document.body.textContent).toContain("Keyboard shortcuts");
+          expect(document.body.textContent).toContain("Keybindings");
         },
         { timeout: 20_000, interval: 25 },
       );
