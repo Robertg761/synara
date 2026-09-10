@@ -17,6 +17,10 @@ Android packages the same React application as the desktop app. Desktop feature 
 
 Keep viewport layout separate from platform detection. A narrow desktop window uses phone layout; an Android tablet can use the wider layout. Native integrations must not reimplement server or feature behavior.
 
+## WebView support
+
+Android 8 or newer is supported with Android System WebView 111 or newer. The minimum follows the shared renderer's Chrome 111 build target and Tailwind 4 requirements. Capacitor checks this before loading the renderer and shows the bundled, script-free `webview-error.html` page when an update is required. The same page handles a failed main-frame load. Keep the Android build target and native minimum aligned through `webviewSupport.ts`.
+
 ## Build
 
 Install Bun 1.4.2, Node 24, Java 21, and an Android SDK with platform 36 and build tools 36.0.0. Set ANDROID_HOME and JAVA_HOME for your local toolchain.

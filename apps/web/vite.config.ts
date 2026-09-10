@@ -13,6 +13,7 @@ import babel from "@rolldown/plugin-babel";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import { defineConfig, type Plugin } from "vite";
 import pkg from "./package.json" with { type: "json" };
+import { ANDROID_WEB_BUILD_TARGET } from "../android/webviewSupport";
 
 const port = Number(process.env.PORT ?? 5733);
 const sourcemapEnv = process.env.SYNARA_WEB_SOURCEMAP?.trim().toLowerCase();
@@ -186,7 +187,7 @@ function precompressPlugin(): Plugin {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [
     tanstackRouter({
       target: "react",
@@ -233,6 +234,7 @@ export default defineConfig({
     },
   },
   build: {
+    target: mode === "android" ? ANDROID_WEB_BUILD_TARGET : undefined,
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: buildSourcemap,
@@ -246,4 +248,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));
