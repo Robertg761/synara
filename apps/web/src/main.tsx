@@ -8,10 +8,22 @@ import "./index.css";
 import { appHistory } from "./appNavigation";
 import { getRouter } from "./router";
 import { APP_DISPLAY_NAME } from "./branding";
-import { appRuntime, isElectron } from "./env";
+import { appRuntime, isElectron, isMobileShell } from "./env";
 import { isMacPlatform } from "./lib/utils";
 
 const router = getRouter(appHistory);
+// Desktop never loads the Android lifecycle or notification plugins.
+if (isMobileShell) {
+  let disposed = false;
+  let stop: (() => void) | undefined;
+  void import("./mobileRuntime").then(({ startMobileRuntime }) => {
+    if (!disposed) stop = startMobileRuntime(router);
+  }).catch(() => console.warn("Mobile device integration could not be loaded."));
+  if (import.meta.hot) import.meta.hot.dispose(() => {
+    disposed = true;
+    stop?.();
+  });
+}
 
 document.title = APP_DISPLAY_NAME;
 

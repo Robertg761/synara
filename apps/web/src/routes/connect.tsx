@@ -16,6 +16,7 @@ import { relaunchAppAtRoot } from "~/appRelaunch";
 import { APP_DISPLAY_NAME } from "~/branding";
 import { parseConnectRouteSearch, type ConnectRouteSearch } from "~/connectRouteSearch";
 import { isMobileShell } from "~/env";
+import { consumeMobilePairingIntent, subscribeMobilePairingIntent } from "~/mobilePairingIntent";
 import { Alert, AlertDescription } from "~/components/ui/alert";
 import { Button } from "~/components/ui/button";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "~/components/ui/input-group";
@@ -29,7 +30,7 @@ import { hydrateShellSession, isShellPaired, pairFromCredential } from "~/shellS
 
 /** Every user-facing failure string, in one place so the screen's voice stays consistent. */
 const MESSAGES = {
-  invalidServerUrl: "Enter a valid server URL, for example http://192.168.1.5:3773",
+  invalidServerUrl: "Enter a valid server URL, for example https://synara.example.com",
   missingCredential: "Paste a Synara pairing link or token.",
   credentialIsServerUrl:
     "That is a server address, not a pairing token. Paste the pairing link or its token here.",
@@ -89,6 +90,19 @@ function ConnectRouteView() {
     };
   }, []);
 
+  useEffect(() => {
+    const receive = () => {
+      const intent = consumeMobilePairingIntent();
+      if (!intent) return;
+      setServerUrlInput(intent.serverUrl);
+      setPairingInput(intent.credential);
+      setError(null);
+    };
+    const unsubscribe = subscribeMobilePairingIntent(receive);
+    receive();
+    return unsubscribe;
+  }, []);
+
   const normalizedServerUrl = normalizeServerBaseUrl(serverUrlInput);
   const insecure = normalizedServerUrl?.startsWith("http://") === true;
   const canSubmit = serverUrlInput.trim().length > 0 && pairingInput.trim().length > 0;
@@ -122,6 +136,10 @@ function ConnectRouteView() {
     const serverUrl = normalizeServerBaseUrl(serverUrlInput);
     if (serverUrl === null) {
       setError(MESSAGES.invalidServerUrl);
+      return;
+    }
+    if (!serverUrl.startsWith("https://")) {
+      setError("Android requires an HTTPS connection. Use your server's secure remote-access URL.");
       return;
     }
     const parsedPairing = parsePairingInput(pairingInput);
@@ -257,8 +275,9 @@ function ConnectRouteView() {
           {insecure ? (
             <Alert variant="warning" size="sm">
               <AlertDescription>
-                This connection is unencrypted. That is fine on your own network — use HTTPS to
-                reach Synara from outside it.
+                {isMobileShell
+                  ? "Android requires HTTPS. Use your server's secure remote-access URL."
+                  : "This connection is unencrypted. Use HTTPS when connecting outside your own network."}
               </AlertDescription>
             </Alert>
           ) : null}

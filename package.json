@@ -67,7 +67,9 @@
     "canary:stop": "node scripts/canary.ts stop",
     "canary:status": "node scripts/canary.ts status",
     "canary:rollback": "node scripts/canary.ts rollback",
-    "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules scripts/node_modules apps/*/dist apps/*/dist-electron packages/*/dist .turbo apps/*/.turbo packages/*/.turbo"
+    "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules scripts/node_modules apps/*/dist apps/*/dist-electron packages/*/dist .turbo apps/*/.turbo packages/*/.turbo",
+    "build:android": "bun run --cwd apps/android assemble:debug",
+    "dist:android": "bun run --cwd apps/android bundle:release"
   },
   "devDependencies": {
     "@effect/tsgo": "0.41.0",

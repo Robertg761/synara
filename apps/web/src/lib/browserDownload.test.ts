@@ -9,7 +9,12 @@ import { downloadServerFileAsBlob, downloadUrlAsBlob } from "./browserDownload";
 
 // The server-route download goes through `authenticatedServerFetch`; these stand in for the
 // runtime it asks about. The credential rules themselves are covered in authenticatedFetch.test.
-vi.mock("../env", () => ({ isMobileShell: true, isNativeShell: true, isElectron: false }));
+const runtime = vi.hoisted(() => ({ mobile: false }));
+const nativeDownload = vi.hoisted(() => ({ share: vi.fn().mockResolvedValue(undefined) }));
+vi.mock("../mobileDownloads", () => ({ shareMobileBlob: nativeDownload.share }));
+vi.mock("../env", () => ({
+  get isMobileShell() { return runtime.mobile; }, isNativeShell: true, isElectron: false,
+}));
 vi.mock("../shellAuthSession", () => ({
   acquireShellBearerToken: () => Promise.resolve("shell-bearer"),
   invalidateShellBearerToken: () => {},
@@ -20,6 +25,18 @@ vi.mock("./serverEndpoint", () => ({
 }));
 
 describe("browserDownload", () => {
+  it("uses the native share adapter and propagates export failures", async () => {
+    runtime.mobile = true;
+    globalThis.fetch = vi.fn(() => Promise.resolve(new Response("image")));
+    await downloadUrlAsBlob({ url: "https://box.example/image", filename: "image.png" });
+    expect(nativeDownload.share).toHaveBeenCalledWith(expect.any(Blob), "image.png");
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+    nativeDownload.share.mockRejectedValueOnce(new Error("export failed"));
+    await expect(downloadUrlAsBlob({
+      url: "https://box.example/image", filename: "image.png",
+    })).rejects.toThrow("export failed");
+  });
+
   const originalDocument = globalThis.document;
   const originalFetch = globalThis.fetch;
   const originalCreateObjectUrl = URL.createObjectURL;
@@ -34,6 +51,8 @@ describe("browserDownload", () => {
   };
 
   beforeEach(() => {
+    runtime.mobile = false;
+    nativeDownload.share.mockClear();
     click = vi.fn();
     appended = [];
     link = {

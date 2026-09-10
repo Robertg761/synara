@@ -5,14 +5,8 @@ pluginManagement {
         gradlePluginPortal()
     }
 }
-
-dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-    repositories {
-        google()
-        mavenCentral()
-    }
-}
-
 rootProject.name = "synara-android"
 include(":app")
+include(":capacitor-cordova-android-plugins")
+project(":capacitor-cordova-android-plugins").projectDir = file("capacitor-cordova-android-plugins")
+apply(from = "capacitor.settings.gradle")

@@ -882,7 +882,7 @@ export type BrowserNotificationPermissionState =
  * what keeps every caller off that path at once — the permission prompt, the
  * OS-notification web fallback, and the settings status line all key off this
  * value, so mobile gating lives here rather than at each call site. Mobile
- * notifications are delivered by the Synara app's background watch instead.
+ * notifications are delivered through the native notification adapter instead.
  */
 export function resolveBrowserNotificationPermissionState(input: {
   runtime: AppRuntime;
@@ -912,7 +912,7 @@ export function resolveNotificationSettingsSupportText(
     return "Desktop app notifications use your operating system notification center.";
   }
   if (runtime === "mobile") {
-    return "Mobile app notifications come from Synara's background watch once it is switched on, not from the browser.";
+    return "Android notifications work while Synara is connected. Alerts may stop when Android suspends the app; server push is not configured.";
   }
   switch (permissionState) {
     case "granted":

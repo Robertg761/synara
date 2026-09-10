@@ -4,9 +4,16 @@
 // Exports: downloadBlob, downloadUrlAsBlob, downloadServerFileAsBlob
 // Depends on: DOM anchor downloads, Fetch, and ./authenticatedFetch for server routes.
 
+import { isMobileShell } from "../env";
+
 import { authenticatedServerFetch } from "./authenticatedFetch";
 
-export function downloadBlob(blob: Blob, filename: string): void {
+export async function downloadBlob(blob: Blob, filename: string): Promise<void> {
+  if (isMobileShell) {
+    const { shareMobileBlob } = await import("../mobileDownloads");
+    await shareMobileBlob(blob, filename);
+    return;
+  }
   const url = URL.createObjectURL(blob);
   try {
     const link = document.createElement("a");
@@ -49,7 +56,7 @@ async function saveResponseAsDownload(response: Response, fallbackFilename: stri
     throw await downloadResponseError(response);
   }
   const filename = filenameFromContentDisposition(response.headers.get("Content-Disposition"));
-  downloadBlob(await response.blob(), filename ?? fallbackFilename);
+  await downloadBlob(await response.blob(), filename ?? fallbackFilename);
 }
 
 // Fetches a local artifact before saving it so server 404/auth errors cannot

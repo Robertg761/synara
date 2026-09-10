@@ -15,13 +15,12 @@ import { resolveServerWsBase, resolveWsHttpUrl } from "./serverEndpoint";
 async function pairShellWith(serverUrl: string): Promise<void> {
   const stored: MobileShellSession = { serverUrl, sessionToken: "shell-token" };
   const bridge = {
+    consumeLaunchUrl: () => Promise.resolve(null),
     session: {
       get: () => Promise.resolve(stored),
       set: () => Promise.resolve(),
       clear: () => Promise.resolve(),
     },
-    consumePendingThreadOpen: () => Promise.resolve(null),
-    addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
   } as unknown as MobileBridge;
   await hydrateShellSession(bridge);
 }

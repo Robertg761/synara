@@ -115,15 +115,19 @@ const PRECOMPRESS_MIN_BYTES = 1024;
 // the request path (apps/server/src/http.ts static route).
 function precompressPlugin(): Plugin {
   let resolvedOutDir = "dist";
+  let enabled = true;
   return {
     name: "synara-precompress",
     apply: "build",
     // Run after central-icon pruning so removed files don't get sidecars.
     enforce: "post",
     configResolved(config) {
+      // Android packages assets directly; AAPT treats .gz sidecars as duplicate files.
+      enabled = config.mode !== "android";
       resolvedOutDir = path.resolve(config.root, config.build.outDir);
     },
     async closeBundle() {
+      if (!enabled) return;
       const files = (await listFiles(resolvedOutDir)).filter((file) =>
         PRECOMPRESS_EXTENSIONS.has(path.extname(file)),
       );

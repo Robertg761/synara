@@ -17,7 +17,8 @@ import { createLatestAppSnapRequestGuard } from "~/appSnap.logic";
 import { playAppSnapCaptureSound } from "~/lib/appSnapSound";
 import { CentralIcon } from "~/lib/central-icons";
 import { cn } from "~/lib/utils";
-import { isMobileShell, isNativeShell } from "~/env";
+import { isMobileShell, isElectron } from "~/env";
+import { showMobileNotification } from "~/mobileNotifications";
 import {
   buildNotificationSettingsSupportText,
   readBrowserNotificationPermissionState,
@@ -50,9 +51,7 @@ function appSnapStatusText(state: DesktopAppSnapState | null): string {
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 
-// One setting, two vocabularies: on desktop and in browsers this row is about OS/browser
-// notifications the web app posts itself; on the mobile shell notifications come from the
-// native background watch, so "desktop" would be wrong everywhere it appears.
+// The same activity setting uses platform-appropriate notification labels.
 const SYSTEM_NOTIFICATIONS_COPY = isMobileShell
   ? {
       title: "Notifications",
@@ -110,7 +109,12 @@ export function NotificationsSettingsPanel({
     const timeoutId = window.setTimeout(() => {
       setBrowserNotificationPermission(readBrowserNotificationPermissionState());
     }, 0);
-    return () => window.clearTimeout(timeoutId);
+    const refresh = () => setBrowserNotificationPermission(readBrowserNotificationPermissionState());
+    window.addEventListener("synara:notification-permission", refresh);
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.removeEventListener("synara:notification-permission", refresh);
+    };
   }, []);
 
   async function setSystemNotificationsEnabled(nextEnabled: boolean) {
@@ -119,10 +123,8 @@ export function NotificationsSettingsPanel({
       return;
     }
 
-    // Native shells post notifications themselves — the desktop app through the
-    // OS notification center, the mobile app through its background watch — so
-    // there is no browser permission to ask for.
-    if (isNativeShell) {
+    // Android needs an OS permission prompt; Electron manages its own permission.
+    if (isElectron) {
       updateSettings({ enableSystemTaskCompletionNotifications: true });
       return;
     }
@@ -138,7 +140,7 @@ export function NotificationsSettingsPanel({
     updateSettings({ enableSystemTaskCompletionNotifications: false });
     toastManager.add({
       type: permission === "denied" ? "warning" : "error",
-      title: "Desktop notifications unavailable",
+      title: "Notifications unavailable",
       description: buildNotificationSettingsSupportText(permission),
     });
   }
@@ -164,12 +166,20 @@ export function NotificationsSettingsPanel({
     if (permission !== "granted") {
       toastManager.add({
         type: permission === "denied" ? "warning" : "error",
-        title: "Desktop notifications unavailable",
+        title: "Notifications unavailable",
         description: buildNotificationSettingsSupportText(permission),
       });
       return;
     }
 
+    if (isMobileShell) {
+      const shown = await showMobileNotification({ title, body });
+      toastManager.add({
+        type: shown ? "success" : "warning",
+        title: shown ? "Test notification sent" : "Notifications unavailable",
+      });
+      return;
+    }
     const notification = new Notification(title, { body, tag: "synara:test-notification" });
     notification.addEventListener("click", () => {
       window.focus();
@@ -232,13 +242,9 @@ export function NotificationsSettingsPanel({
           }
           control={
             <div className="flex w-full items-center gap-2 sm:w-auto sm:justify-end">
-              {/* The mobile WebView has nothing to test: the Web Notification UI is absent and
-                  the native background watch posts notifications outside the web app. */}
-              {isMobileShell ? null : (
-                <Button size="xs" variant="outline" onClick={() => void sendTestNotification()}>
-                  Test
-                </Button>
-              )}
+              <Button size="xs" variant="outline" onClick={() => void sendTestNotification()}>
+                Test
+              </Button>
               <Switch
                 checked={settings.enableSystemTaskCompletionNotifications}
                 onCheckedChange={(checked) => {

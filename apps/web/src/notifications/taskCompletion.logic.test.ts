@@ -1249,7 +1249,7 @@ describe("resolveNotificationSettingsSupportText", () => {
       "Desktop app notifications use your operating system notification center.",
     );
     expect(resolveNotificationSettingsSupportText("mobile", "unsupported")).toBe(
-      "Mobile app notifications come from Synara's background watch once it is switched on, not from the browser.",
+      "Android notifications work while Synara is connected. Alerts may stop when Android suspends the app; server push is not configured.",
     );
   });
 

@@ -9,7 +9,12 @@ import { useMemo, useEffect, useRef, useState } from "react";
 import { toastManager } from "../components/ui/toast";
 import { resolveVisibleToastThreadIds } from "../components/ui/toastRouteVisibility";
 import { useAppSettings } from "../appSettings";
-import { appRuntime } from "../env";
+import { appRuntime, isMobileShell } from "../env";
+import {
+  readMobileNotificationPermission,
+  requestMobileNotificationPermission,
+  showMobileNotification,
+} from "../mobileNotifications";
 import { useDiffRouteSearch } from "../hooks/useDiffRouteSearch";
 import { useLayoutMode } from "../lib/layoutMode";
 import { selectSplitView, useSplitViewStore } from "../splitViewStore";
@@ -39,13 +44,12 @@ import {
 
 export type { BrowserNotificationPermissionState };
 
-// Browsers require secure contexts and a user gesture before asking for permission,
-// and the mobile shell has no Web Notification UI at all — see
-// resolveBrowserNotificationPermissionState.
+// Native permission state comes from the OS; browser permission comes from the Web API.
 export function readBrowserNotificationPermissionState(): BrowserNotificationPermissionState {
   if (typeof window === "undefined") {
     return "unsupported";
   }
+  if (isMobileShell) return readMobileNotificationPermission();
   const hasNotificationApi = "Notification" in window;
   return resolveBrowserNotificationPermissionState({
     runtime: appRuntime,
@@ -57,9 +61,8 @@ export function readBrowserNotificationPermissionState(): BrowserNotificationPer
 }
 
 export async function requestBrowserNotificationPermission(): Promise<BrowserNotificationPermissionState> {
+  if (isMobileShell) return requestMobileNotificationPermission();
   const current = readBrowserNotificationPermissionState();
-  // The mobile shell resolves to "unsupported", so Notification.requestPermission()
-  // is never reached there — it would hang or auto-deny inside the WebView.
   if (current === "unsupported" || current === "insecure" || current === "denied") {
     return current;
   }
@@ -98,6 +101,7 @@ async function showSystemThreadNotification(
 ): Promise<boolean> {
   const { body, title } = copy;
 
+  if (isMobileShell) return showMobileNotification({ body, title, threadId });
   if (window.desktopBridge) {
     const supported = await window.desktopBridge.notifications.isSupported();
     if (!supported) {
@@ -112,9 +116,7 @@ async function showSystemThreadNotification(
     });
   }
 
-  // Web fallback for plain browser tabs only: the mobile shell reports
-  // "unsupported" and therefore never displays a Notification the WebView
-  // would swallow. Its alerts come from the app's background watch.
+  // Web Notification is only used in a browser; native shells use their own adapter.
   if (readBrowserNotificationPermissionState() !== "granted") {
     return false;
   }

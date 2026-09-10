@@ -7,3 +7,14 @@ local.properties
 .gradle/
 build/
 .cxx/
+
+node_modules/
+app/src/main/assets/public/
+app/src/main/assets/capacitor.config.json
+app/src/main/assets/capacitor.plugins.json
+capacitor-cordova-android-plugins/
+capacitor.settings.gradle
+app/capacitor.build.gradle
+*.jks
+*.keystore
+app/src/main/res/xml/config.xml

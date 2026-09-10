@@ -19,27 +19,22 @@ data class StoredSession(
 class SecureSessionStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
 
-    fun saveBaseUrl(baseUrl: String) {
-        preferences.edit().putString(KEY_BASE_URL, baseUrl).apply()
+    /** Encrypt first, then commit the URL and token together. A failed write rejects pairing. */
+    @Synchronized
+    fun saveSession(baseUrl: String, token: String) {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, encryptionKey())
+        val ciphertext = cipher.doFinal(token.toByteArray(StandardCharsets.UTF_8))
+        check(preferences.edit()
+            .putString(KEY_BASE_URL, baseUrl)
+            .putString(KEY_SESSION_TOKEN, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+            .putString(KEY_SESSION_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+            .commit()) { "Secure session persistence failed." }
     }
 
     fun readBaseUrl(): String? = preferences.getString(KEY_BASE_URL, null)
 
-    fun saveSessionToken(token: String) {
-        runCatching {
-            val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(Cipher.ENCRYPT_MODE, encryptionKey())
-            val ciphertext = cipher.doFinal(token.toByteArray(StandardCharsets.UTF_8))
-            preferences.edit()
-                .putString(KEY_SESSION_TOKEN, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-                .putString(KEY_SESSION_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-                .apply()
-        }.onFailure {
-            clearSessionToken()
-        }
-    }
-
-    fun readSessionToken(): String? = runCatching {
+    fun readSessionToken(): String? {
         val encodedCiphertext = preferences.getString(KEY_SESSION_TOKEN, null) ?: return null
         val encodedIv = preferences.getString(KEY_SESSION_IV, null) ?: return null
         val cipher = Cipher.getInstance(TRANSFORMATION)
@@ -48,28 +43,26 @@ class SecureSessionStore(context: Context) {
             encryptionKey(),
             GCMParameterSpec(TAG_LENGTH_BITS, Base64.decode(encodedIv, Base64.NO_WRAP)),
         )
-        String(
+        return String(
             cipher.doFinal(Base64.decode(encodedCiphertext, Base64.NO_WRAP)),
             StandardCharsets.UTF_8,
         ).takeIf { it.isNotBlank() }
-    }.getOrElse {
-        clearSessionToken()
-        null
     }
 
+    @Synchronized
     fun readSession(): StoredSession? {
         val baseUrl = readBaseUrl()?.takeIf { it.isNotBlank() } ?: return null
         val token = readSessionToken() ?: return null
         return StoredSession(baseUrl, token)
     }
 
-    fun clearSessionToken() {
-        preferences.edit().remove(KEY_SESSION_TOKEN).remove(KEY_SESSION_IV).apply()
-    }
-
+    @Synchronized
     fun clearAll() {
-        clearSessionToken()
-        preferences.edit().remove(KEY_BASE_URL).apply()
+        check(preferences.edit()
+            .remove(KEY_BASE_URL)
+            .remove(KEY_SESSION_TOKEN)
+            .remove(KEY_SESSION_IV)
+            .commit()) { "Secure session removal failed." }
     }
 
     private fun encryptionKey(): SecretKey {

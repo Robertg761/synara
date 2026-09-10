@@ -1,0 +1,27 @@
+{
+  "name": "@synara/android",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:web": "bun run --cwd ../web build --mode android --outDir ../android/build/web",
+    "sync": "cap sync android",
+    "assemble:debug": "bun run prepare:android && ./gradlew :app:assembleDebug",
+    "assemble:release": "bun run prepare:android && ./gradlew :app:assembleRelease",
+    "test:native": "./gradlew :app:testDebugUnitTest",
+    "prepare:android": "bun run build:web && bun run sync",
+    "bundle:release": "bun run prepare:android && ./gradlew :app:bundleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.5.0",
+    "@capacitor/core": "8.5.0",
+    "@capacitor/app": "^8.0.0",
+    "@capacitor/local-notifications": "^8.0.0",
+    "@capacitor/filesystem": "^8.0.0",
+    "@capacitor/share": "^8.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.5.0",
+    "typescript": "catalog:"
+  }
+}

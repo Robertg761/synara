@@ -38,9 +38,8 @@ function makeBridge(stored: MobileShellSession | null): {
   });
   return {
     bridge: {
+      consumeLaunchUrl: () => Promise.resolve(null),
       session: { get, set, clear },
-      consumePendingThreadOpen: () => Promise.resolve(null),
-      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
     },
     get,
     set,
@@ -130,9 +129,8 @@ describe("hydrateShellSession", () => {
       .mockRejectedValueOnce(new Error("keystore locked"))
       .mockResolvedValueOnce({ serverUrl: "http://localhost:3020", sessionToken: "t" });
     const bridge = {
+      consumeLaunchUrl: () => Promise.resolve(null),
       session: { get, set: vi.fn(), clear: vi.fn() },
-      consumePendingThreadOpen: () => Promise.resolve(null),
-      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
     } as unknown as MobileBridge;
 
     await expect(hydrateShellSession(bridge)).resolves.toBe("paired");
@@ -145,9 +143,8 @@ describe("hydrateShellSession", () => {
       .fn<() => Promise<MobileShellSession | null>>()
       .mockRejectedValue(new Error("keystore locked"));
     const bridge = {
+      consumeLaunchUrl: () => Promise.resolve(null),
       session: { get, set: vi.fn(), clear: vi.fn() },
-      consumePendingThreadOpen: () => Promise.resolve(null),
-      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
     } as unknown as MobileBridge;
 
     await expect(hydrateShellSession(bridge)).resolves.toBe("unavailable");
@@ -169,9 +166,8 @@ describe("hydrateShellSession", () => {
     });
     const get = vi.fn(() => pendingReadPromise);
     const bridge = {
+      consumeLaunchUrl: () => Promise.resolve(null),
       session: { get, set: vi.fn(() => Promise.resolve()), clear: vi.fn() },
-      consumePendingThreadOpen: () => Promise.resolve(null),
-      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
     } as unknown as MobileBridge;
 
     const hydrating = hydrateShellSession(bridge);
@@ -213,9 +209,8 @@ describe("pairFromCredential", () => {
   it("does not advance the pairing generation when the write fails", async () => {
     const set = vi.fn(() => Promise.reject(new Error("keystore write failed")));
     const bridge = {
+      consumeLaunchUrl: () => Promise.resolve(null),
       session: { get: vi.fn(() => Promise.resolve(null)), set, clear: vi.fn() },
-      consumePendingThreadOpen: () => Promise.resolve(null),
-      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
     } as unknown as MobileBridge;
 
     const initial = getShellPairingGeneration();
@@ -247,9 +242,8 @@ describe("pairFromCredential", () => {
     const get = vi.fn(() => Promise.resolve(stored));
     const set = vi.fn(() => Promise.reject(new Error("keystore write failed")));
     const bridge = {
+      consumeLaunchUrl: () => Promise.resolve(null),
       session: { get, set, clear: vi.fn() },
-      consumePendingThreadOpen: () => Promise.resolve(null),
-      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
     } as unknown as MobileBridge;
 
     await hydrateShellSession(bridge);
@@ -289,9 +283,8 @@ describe("clearShellSession", () => {
     );
     const clear = vi.fn(() => Promise.reject(new Error("keystore locked")));
     const bridge = {
+      consumeLaunchUrl: () => Promise.resolve(null),
       session: { get, set: vi.fn(), clear },
-      consumePendingThreadOpen: () => Promise.resolve(null),
-      addListener: () => Promise.resolve({ remove: () => Promise.resolve() }),
     } as unknown as MobileBridge;
 
     await hydrateShellSession(bridge);

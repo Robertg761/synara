@@ -1,97 +1,45 @@
-// FILE: shellBridge.ts
-// Purpose: The ONLY file in apps/web that knows Capacitor's runtime shape. Adapts the injected
-// `window.Capacitor.Plugins.SynaraShell` global to the MobileBridge contract so the rest of the
-// app depends on the contract and never on Capacitor.
-// Layer: Web shell integration
-// Depends on: ~/env (isMobileShell), @synara/contracts (MobileBridge)
-// Exports: getMobileBridge
+// The single adapter for Synara's native secure-storage plugin.
+import { registerPlugin } from "@capacitor/core";
+import type { MobileBridge, MobileShellSession } from "@synara/contracts";
 
-import type {
-  MobileBridge,
-  MobileShellEventMap,
-  MobileShellEventName,
-  MobileShellListenerHandle,
-  MobileShellSession,
-} from "@synara/contracts";
+import { isMobileShell } from "./env";
 
-import { isMobileShell } from "~/env";
-
-/**
- * Raw plugin surface as Capacitor exposes it: every method takes/returns a plain object and
- * values cross a bridge that can hand us anything. Kept structurally loose on purpose — the
- * adapter below is where it is narrowed to the contract.
- */
 interface SynaraShellPlugin {
-  getSession?: () => Promise<{ serverUrl?: unknown; sessionToken?: unknown } | null>;
-  setSession?: (options: MobileShellSession) => Promise<void>;
-  clearSession?: () => Promise<void>;
-  consumePendingThreadOpen?: () => Promise<{ threadId?: unknown } | null>;
-  addListener?: (
-    eventName: string,
-    listener: (event: unknown) => void,
-  ) => Promise<MobileShellListenerHandle>;
+  getSession: () => Promise<{ serverUrl?: unknown; sessionToken?: unknown }>;
+  setSession: (session: MobileShellSession) => Promise<void>;
+  clearSession: () => Promise<void>;
+  consumeLaunchUrl: (options: { expectedUrl?: string }) => Promise<{ url?: unknown }>;
 }
 
-interface CapacitorGlobal {
-  readonly Plugins?: { readonly SynaraShell?: SynaraShellPlugin };
-}
+const plugin = registerPlugin<SynaraShellPlugin>("SynaraShell");
 
-function readPlugin(): SynaraShellPlugin | null {
-  if (!isMobileShell) return null;
-  try {
-    return (window as { Capacitor?: CapacitorGlobal }).Capacitor?.Plugins?.SynaraShell ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function nonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function toSession(
-  raw: { serverUrl?: unknown; sessionToken?: unknown } | null,
-): MobileShellSession | null {
-  const serverUrl = nonEmptyString(raw?.serverUrl);
-  const sessionToken = nonEmptyString(raw?.sessionToken);
-  return serverUrl && sessionToken ? { serverUrl, sessionToken } : null;
-}
-
-const NOOP_LISTENER_HANDLE: MobileShellListenerHandle = {
-  remove: () => Promise.resolve(),
+const bridge: MobileBridge = {
+  consumeLaunchUrl: async (expectedUrl) => {
+    const result = await plugin.consumeLaunchUrl(expectedUrl ? { expectedUrl } : {});
+    return typeof result.url === "string" ? result.url : null;
+  },
+  session: {
+    get: async () => {
+      const stored = await plugin.getSession();
+      if (stored.serverUrl === undefined && stored.sessionToken === undefined) return null;
+      if (
+        typeof stored.serverUrl !== "string" || !stored.serverUrl.trim() ||
+        typeof stored.sessionToken !== "string" || !stored.sessionToken.trim()
+      ) {
+        throw new Error("The native shell returned an invalid saved connection.");
+      }
+      return { serverUrl: stored.serverUrl, sessionToken: stored.sessionToken };
+    },
+    set: (session) => plugin.setSession(session),
+    clear: () => plugin.clearSession(),
+  },
 };
 
-function adapt(plugin: SynaraShellPlugin): MobileBridge {
-  return {
-    session: {
-      get: async () => toSession((await plugin.getSession?.()) ?? null),
-      set: async (session) => {
-        await plugin.setSession?.(session);
-      },
-      clear: async () => {
-        await plugin.clearSession?.();
-      },
-    },
-    consumePendingThreadOpen: async () =>
-      nonEmptyString((await plugin.consumePendingThreadOpen?.())?.threadId),
-    addListener: async <E extends MobileShellEventName>(
-      eventName: E,
-      listener: (event: MobileShellEventMap[E]) => void,
-    ) => {
-      if (!plugin.addListener) return NOOP_LISTENER_HANDLE;
-      return plugin.addListener(eventName, (event) => {
-        listener((event ?? {}) as MobileShellEventMap[E]);
-      });
-    },
-  };
-}
-
-/**
- * The mobile shell bridge, or null in every other runtime (browser tab, Electron) and when the
- * shell is running a build that does not expose the plugin yet. Callers must treat null as
- * "no mobile shell" rather than as an error.
- */
 export function getMobileBridge(): MobileBridge | null {
-  const plugin = readPlugin();
-  return plugin ? adapt(plugin) : null;
+  return isMobileShell ? bridge : null;
+}
+// Consumed natively so even a renderer reload cannot replay an old pairing link.
+export async function consumeMobileLaunchUrl(expectedUrl?: string): Promise<string | null> {
+  if (!isMobileShell) return null;
+  return bridge.consumeLaunchUrl(expectedUrl);
 }

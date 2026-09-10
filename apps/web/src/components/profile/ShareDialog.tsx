@@ -128,14 +128,15 @@ export function ShareDialog({
     setBusy("save");
     setStatus(null);
     return renderNodeToPngBlob(node, CARD_EXPORT_SIZE)
-      .then((blob) => {
+      .then(async (blob) => {
         if (blob) {
-          downloadBlob(blob, `synara-stats-${stats.timezone.today}.png`);
-          setStatus("Saved PNG to your downloads.");
+          await downloadBlob(blob, `synara-stats-${stats.timezone.today}.png`);
+          setStatus("Image exported.");
         } else {
           setStatus("Could not render the image.");
         }
       })
+      .catch(() => { setStatus("Could not export the image."); })
       .finally(() => {
         setBusy(null);
       });

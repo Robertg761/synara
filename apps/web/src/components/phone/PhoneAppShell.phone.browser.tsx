@@ -380,7 +380,7 @@ describe("phone app shell", () => {
       // Positive assertion first: "no home screen, no tab bar" is also true of a shell that
       // rendered nothing at all, so require the chat surface itself to be on screen.
       await waitFor("[data-chat-composer-form='true']");
-      expect(query("[data-chat-scroll-container='true']")).not.toBeNull();
+      await waitFor("[data-chat-scroll-container='true']");
       await vi.waitFor(
         () => {
           expect(query('[data-testid="phone-home-screen"]')).toBeNull();
@@ -391,7 +391,7 @@ describe("phone app shell", () => {
       expectNoDesktopSidebarChrome();
       // The chat surface owns the only way back to Home on this screen (no tab bar here), so
       // there must be a back affordance in its header.
-      expect(query('[aria-label="Back to chats"]')).not.toBeNull();
+      await waitFor('[aria-label="Back to chats"]');
     } finally {
       await mounted.cleanup();
     }
