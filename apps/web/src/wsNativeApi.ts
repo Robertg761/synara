@@ -59,6 +59,8 @@ import { WsTransport, type WsThreadStreamFailure } from "./wsTransport";
 import { emitWsCompatibilityIssue, emitWsTransportState } from "./wsTransportEvents";
 import { authenticatedServerFetch } from "./lib/authenticatedFetch";
 import { downloadBlob } from "./lib/browserDownload";
+import { isMobileShell } from "./env";
+import { createMobileBrowserApi } from "./mobileBrowser";
 
 export type { WsThreadStreamFailure } from "./wsTransport";
 
@@ -889,7 +891,7 @@ export function createWsNativeApi(): NativeApi {
         transport.request(DEVICE_WS_METHODS.scrollToElement, input, { timeoutMs: null }),
       onEvent: deviceEventListeners.subscribe,
     },
-    browser: {
+    browser: isMobileShell ? createMobileBrowserApi() : {
       open: async (input) => {
         if (window.desktopBridge) {
           return window.desktopBridge.browser.open(input);

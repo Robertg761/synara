@@ -43,7 +43,9 @@ import {
   isBrowserCopyLinkChord,
 } from "@synara/shared/browserShortcuts";
 
-import { isElectron } from "~/env";
+import { isElectron, isMobileShell } from "~/env";
+import { registerBackDismissable } from "~/lib/mobileBackStack";
+import { dismissMobileOverlay } from "~/lib/mobileOverlayBack";
 import { CentralIcon } from "~/lib/central-icons";
 import { readNativeApi } from "~/nativeApi";
 import type { DockPaneRuntimeMode } from "~/lib/dockPaneActivation";
@@ -126,6 +128,9 @@ const NATIVE_BROWSER_OBSCURING_OVERLAY_SELECTOR = [
   "[data-slot='command-dialog-popup']",
   "[data-slot='command-dialog-viewport']",
   "[data-slot='toast-popup']",
+  "[role='menu']",
+  "[role='listbox']",
+  "[data-slot='popover-popup']",
   "[role='dialog'][aria-modal='true']",
 ].join(", ");
 
@@ -140,6 +145,7 @@ function BrowserActionMenuIcon({ icon: Icon }: { icon: LucideIcon }) {
 export function BrowserAnnotationButton(props: {
   controller: BrowserAnnotationsController;
   disabled: boolean;
+  unavailableReason?: string;
 }) {
   const label = props.controller.active ? "Cancel annotation" : "Annotate page";
   return (
@@ -156,7 +162,7 @@ export function BrowserAnnotationButton(props: {
             aria-pressed={props.controller.active}
             aria-busy={props.controller.starting || undefined}
             data-pressed={props.controller.active ? "" : undefined}
-            title={label}
+            title={props.unavailableReason ?? label}
             onClick={props.controller.toggle}
           />
         }
@@ -164,9 +170,9 @@ export function BrowserAnnotationButton(props: {
         <CentralIcon name="window-cursor" className="size-3.5" />
       </TooltipTrigger>
       <TooltipPopup side="bottom">
-        {props.controller.active
+        {props.unavailableReason ?? (props.controller.active
           ? "Cancel element selection (Esc)"
-          : "Select an element to annotate"}
+          : "Select an element to annotate")}
       </TooltipPopup>
     </Tooltip>
   );
@@ -578,6 +584,11 @@ export function BrowserPanel({
   const isFloatingMode = mode === "floating";
   const api = readNativeApi();
   const isLiveRuntime = runtimeMode === "live";
+  const browserCapabilities = api?.browser.capabilities;
+  const hasEmbeddedPreview = browserCapabilities?.embeddedPreview ?? isElectron;
+  const canCaptureScreenshot = browserCapabilities?.captureScreenshot ?? isElectron;
+  const canCopyScreenshot = browserCapabilities?.copyScreenshot ?? isElectron;
+  const canAnnotate = browserCapabilities?.annotations ?? isElectron;
   const threadBrowserState = useBrowserStateStore(selectThreadBrowserState(threadId));
   const recentHistory = useBrowserStateStore(selectThreadBrowserHistory(threadId));
   const upsertThreadState = useBrowserStateStore((store) => store.upsertThreadState);
@@ -663,7 +674,7 @@ export function BrowserPanel({
     hasActiveTab: activeTab !== null,
     workspaceReady: runtimeReady,
   });
-  const browserPageError = threadBrowserState?.lastError ?? null;
+  const browserPageError = threadBrowserState?.lastError ?? activeTab?.lastError ?? null;
   const browserAddressSuggestions = buildBrowserAddressSuggestions({
     query: addressValue,
     activeTabId: activeTab?.id ?? null,
@@ -683,7 +694,7 @@ export function BrowserPanel({
     activeTabId,
     browserStateVersion: threadBrowserState?.version ?? 0,
     enabled:
-      isElectron && isLiveRuntime && workspaceReady && activeTab !== null && !showLocalServersHome,
+      canAnnotate && isLiveRuntime && workspaceReady && activeTab !== null && !showLocalServersHome,
     annotations: browserAnnotations,
     addAnnotation: addBrowserAnnotation,
     onError: setLocalError,
@@ -1101,7 +1112,7 @@ export function BrowserPanel({
   }, [isLiveRuntime, threadId]);
 
   useLayoutEffect(() => {
-    if (!api || !isLiveRuntime) {
+    if (!api || !isLiveRuntime || !workspaceReady) {
       return;
     }
 
@@ -1273,6 +1284,16 @@ export function BrowserPanel({
       scheduleSyncBounds();
     });
     observer.observe(element);
+    const overlayObserver = isMobileShell ? new MutationObserver((mutations) => {
+      if (mutations.some((mutation) =>
+        (mutation.target instanceof Element && mutation.target.closest(NATIVE_BROWSER_OBSCURING_OVERLAY_SELECTOR)) ||
+        [...mutation.addedNodes, ...mutation.removedNodes].some((node) => node instanceof Element &&
+          (node.matches(NATIVE_BROWSER_OBSCURING_OVERLAY_SELECTOR) || node.querySelector(NATIVE_BROWSER_OBSCURING_OVERLAY_SELECTOR))),
+      )) scheduleSyncBounds();
+    }) : null;
+    overlayObserver?.observe(document.body, { childList: true, subtree: true, attributes: true,
+      attributeFilter: ["data-open", "data-state", "aria-hidden", "data-closed"],
+    });
     // A zoom change moves the slot on the DIP grid. It usually reflows the panel too
     // (so the observer above fires), but a slot with a fixed CSS px size keeps its
     // measured rect and would otherwise strand the native view at the old scale.
@@ -1287,6 +1308,7 @@ export function BrowserPanel({
     return () => {
       setBrowserWebviewOverlayOcclusion(browserWebviewRef.current, false);
       observer.disconnect();
+      overlayObserver?.disconnect();
       unsubscribeZoom();
       window.removeEventListener("resize", scheduleSyncBounds);
       window.removeEventListener(BROWSER_PANEL_BOUNDS_SYNC_EVENT, scheduleSyncBounds);
@@ -1309,6 +1331,7 @@ export function BrowserPanel({
     api,
     browserActionsMenuOpen,
     browserPageError,
+    workspaceReady,
     isLiveRuntime,
     isFloatingMode,
     showLocalServersHome,
@@ -1320,6 +1343,27 @@ export function BrowserPanel({
     if (!ensureLiveRuntime() || !api || !activeTab || activeTabIsBlank) return;
     void runBrowserAction(() => api.shell.openExternal(activeTab.url));
   }, [activeTab, activeTabIsBlank, api, ensureLiveRuntime, runBrowserAction]);
+
+  useEffect(() => {
+    if (!isMobileShell || !isLiveRuntime || !api || !activeTab?.canGoBack) return;
+    return registerBackDismissable(() => {
+      const viewport = browserViewportRef.current;
+      if (!viewport || viewport.getClientRects().length === 0 ||
+        viewport.closest('[inert],[aria-hidden="true"],[data-closed]') ||
+        getComputedStyle(viewport).visibility === "hidden") return false;
+      const rect = viewport.getBoundingClientRect();
+      if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight) return false;
+      const hasOverlay = Array.from(document.querySelectorAll<HTMLElement>(
+        '[role="dialog"],[role="alertdialog"],[role="menu"],[role="listbox"],[data-slot="popover-popup"]',
+      )).some((element) => !element.contains(viewport) && element.getClientRects().length > 0 &&
+        !element.closest('[inert],[aria-hidden="true"],[data-closed],[data-ending-style]'));
+      if (hasOverlay && dismissMobileOverlay(document)) return true;
+      void runBrowserAction(() => api.browser.goBack({ threadId, tabId: activeTab.id })).then((state) => {
+        if (state) upsertThreadState(state);
+      });
+      return true;
+    });
+  }, [activeTab, api, isLiveRuntime, runBrowserAction, threadId, upsertThreadState]);
 
   const onSubmitAddress = useCallback(() => {
     if (!ensureLiveRuntime()) {
@@ -1718,7 +1762,7 @@ export function BrowserPanel({
             variant="ghost"
             size="icon-sm"
             className="size-7 shrink-0"
-            disabled={!isElectron || !activeTab}
+            disabled={!hasEmbeddedPreview || !activeTab}
             onClick={() => {
               if (!ensureLiveRuntime()) return;
               if (!api || !activeTab) return;
@@ -1826,9 +1870,10 @@ export function BrowserPanel({
       <div className="flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]">
         <BrowserAnnotationButton
           controller={annotationController}
+          unavailableReason={!canAnnotate ? "Page annotations require the desktop app." : undefined}
           disabled={
             !isLiveRuntime ||
-            !isElectron ||
+            !canAnnotate ||
             !workspaceReady ||
             !activeTab ||
             showLocalServersHome ||
@@ -1841,9 +1886,9 @@ export function BrowserPanel({
           variant="ghost"
           size="icon-sm"
           className="size-7"
-          disabled={!isElectron || !activeTab}
+          disabled={!canCopyScreenshot || !activeTab}
           aria-label="Copy screenshot"
-          title="Copy screenshot"
+          title={canCopyScreenshot ? "Copy screenshot" : "Use Capture screenshot to attach the page."}
           onClick={onCopyScreenshotToClipboard}
         >
           <CameraIcon className="size-3.5" />
@@ -1887,7 +1932,7 @@ export function BrowserPanel({
             </MenuItem>
             <MenuItem
               className={BROWSER_ACTION_MENU_ITEM_CLASS_NAME}
-              disabled={!isElectron || !activeTab}
+              disabled={!canCaptureScreenshot || !activeTab}
               onClick={onCaptureScreenshot}
             >
               <BrowserActionMenuIcon icon={CameraIcon} />
@@ -1960,7 +2005,7 @@ export function BrowserPanel({
                 )}
               />
             ) : null}
-            {isLiveRuntime && workspaceReady && !isElectron && !showLocalServersHome ? (
+            {isLiveRuntime && workspaceReady && !hasEmbeddedPreview && !showLocalServersHome ? (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">
                 <GlobeIcon className="size-6 text-muted-foreground" />
                 <p className="text-sm font-medium">Open this page in your browser</p>

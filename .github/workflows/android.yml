@@ -73,7 +73,7 @@ jobs:
           profile: pixel_6
           disable-animations: true
           working-directory: apps/android
-          script: ./gradlew :app:connectedDebugAndroidTest --stacktrace
+          script: bash scripts/test-browser-device.sh emulator-5554
       - name: Upload build and test artifacts
         if: always()
         uses: actions/upload-artifact@v4

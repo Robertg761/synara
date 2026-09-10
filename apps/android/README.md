@@ -42,9 +42,9 @@ Native checks:
 
     cd apps/android
     ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleRelease
-    ./gradlew :app:connectedDebugAndroidTest
+    bash scripts/test-browser-device.sh emulator-5554
 
-The connected tests require a dedicated emulator or test device. They reset this app's saved pairing. CI compiles the shared renderer, checks Android builds, and exercises the native bridge on an emulator.
+The browser test harness requires an explicitly selected rooted API 36 emulator, Node, OpenSSL, curl, and adb. It creates a temporary HTTPS fixture and CA, adds the CA only inside that emulator's Conscrypt mount namespaces, and removes its bind mounts afterward. It refuses physical devices. Tests reset this app's saved pairing. CI compiles the shared renderer, checks Android builds, and exercises the native bridge on an emulator.
 
 ## Release
 
@@ -71,9 +71,19 @@ Use the secure remote-access URL from the server, including a trusted HTTPS tunn
 
 A synara://pair link prefills the shared connect screen. The user still submits the pairing form. Credentials stay in memory until the native secure store saves the resulting session; pairing tokens are not put in navigation history.
 
-Android Back first dismisses a shared popup, then navigates app history, then backgrounds the app at its root. Returning to the foreground wakes the existing shared transport.
+Android Back first dismisses a shared popup, then navigates the visible browser tab if it has history, then app history, then backgrounds the app at its root. Returning to the foreground wakes the existing shared transport.
 
 File exports use Android's share sheet. Files are written to app cache in bounded chunks; old exports expire on a later launch or export after 24 hours.
+
+## In-app browser
+
+The shared browser panel controls a separate Android WebView through SynaraBrowser. The guest has no Capacitor or JavaScript-to-native interface and receives no pairing or session credentials. It accepts HTTPS pages and about:blank, rejects the privileged app origin and local-file schemes, and cancels certificate errors. HTTP development servers need a reachable trusted HTTPS address.
+
+Tabs, navigation, Back/Forward, reload, and screenshot attachments use the shared browser contracts. Android keeps one guest renderer alive at a time, with at most 32 tabs across 16 thread workspaces. Inactive tabs save up to 256 KiB of native navigation history each; switching tabs reloads the page when necessary. Browser sessions reset with the app renderer and are not persisted across process termination. Native view bounds follow the shared panel; overlays and backgrounding hide the guest.
+
+Screenshot capture returns a PNG of the visible viewport, capped at 1600 pixels on the longest edge, to the existing composer attachment path. Image clipboard copying, DOM annotations, developer tools, and remote agent control are not implemented on Android. Guest file downloads direct the user to the external browser. Guest permission prompts and file chooser requests do not grant device access.
+
+The BrowserGuestHostTest instrumentation accepts `browserFixtureUrl` pointing to a trusted HTTPS fixture. It verifies navigation, tab restoration, native isolation, capture, and view visibility. The fixture needs title `Synara browser fixture` and a `#count` button whose label becomes `Clicked`.
 
 ## Release limitations
 

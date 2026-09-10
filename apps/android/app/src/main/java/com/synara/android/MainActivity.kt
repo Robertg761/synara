@@ -13,6 +13,7 @@ class MainActivity : BridgeActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         registerPlugin(SynaraShellPlugin::class.java)
+        registerPlugin(SynaraBrowserPlugin::class.java)
         super.onCreate(savedInstanceState)
     }
 }

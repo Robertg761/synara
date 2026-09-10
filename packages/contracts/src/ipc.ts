@@ -490,7 +490,15 @@ export interface BrowserUseOpenPanelRequest {
   threadId: ThreadId;
 }
 
-interface BrowserControlMethods {
+export interface BrowserCapabilities {
+  readonly embeddedPreview: boolean;
+  readonly captureScreenshot: boolean;
+  readonly copyScreenshot: boolean;
+  readonly annotations: boolean;
+}
+
+export interface BrowserControlMethods {
+  readonly capabilities?: BrowserCapabilities;
   open: (input: BrowserOpenInput) => Promise<ThreadBrowserState>;
   close: (input: BrowserThreadInput) => Promise<ThreadBrowserState>;
   hide: (input: BrowserThreadInput) => Promise<void>;
