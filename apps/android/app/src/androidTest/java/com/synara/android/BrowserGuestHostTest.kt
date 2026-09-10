@@ -34,13 +34,24 @@ class BrowserGuestHostTest {
                             host.execute("unknown", input("invalid-$index"))
                         }
                     }
+                    var firstOpenVersion = 0L
                     repeat(17) { index ->
-                        assertTrue(host.execute("open", input("browser-$index")).getBoolean("open"))
+                        val opened = host.execute("open", input("browser-$index"))
+                        assertTrue(opened.getBoolean("open"))
+                        if (index == 0) firstOpenVersion = opened.getLong("version")
                         host.execute("hide", input("browser-$index"))
                     }
-                    assertFalse(host.execute("getState", input("browser-0")).getBoolean("open"))
+                    val evicted = host.execute("getState", input("browser-0"))
+                    assertFalse(evicted.getBoolean("open"))
+                    assertTrue("An empty query must replace a missed eviction", evicted.getLong("version") > firstOpenVersion)
+                    assertTrue(host.execute("close", input("browser-0")).getLong("version") > firstOpenVersion)
                     assertTrue(host.execute("getState", input("browser-1")).getBoolean("open"))
-                    assertTrue(host.execute("getState", input("browser-16")).getBoolean("open"))
+                    val beforeReset = host.execute("getState", input("browser-16"))
+                    assertTrue(beforeReset.getBoolean("open"))
+                    host.execute("reset", JSObject())
+                    val afterReset = host.execute("getState", input("browser-16"))
+                    assertFalse(afterReset.getBoolean("open"))
+                    assertTrue(afterReset.getLong("version") > beforeReset.getLong("version"))
                 } finally {
                     host.destroy()
                 }

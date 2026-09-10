@@ -65,6 +65,7 @@ internal class BrowserGuestHost(
     fun execute(operation: String, input: JSObject): JSObject {
         if (operation == "reset") {
             destroy()
+            revision += 1
             return JSObject()
         }
         val id = input.optString("threadId")
@@ -81,7 +82,8 @@ internal class BrowserGuestHost(
         val existing = workspaces[id]
         if (existing == null) {
             when (operation) {
-                "getState", "close" -> return snapshot(Workspace(id))
+                // A missed eviction event must still supersede the client's last open state.
+                "getState", "close" -> return snapshot(Workspace(id, version = revision))
                 "hide", "setPanelBounds" -> return JSObject()
                 "open", "navigate", "newTab" -> Unit
                 else -> throw IllegalArgumentException("The browser tab is no longer available.")
