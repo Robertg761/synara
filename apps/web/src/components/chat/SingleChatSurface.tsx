@@ -47,6 +47,7 @@ import type { DiffEditBaseRev, DiffFileEditRequest } from "../../lib/diffEditBas
 import { editorCenterModeFamily, type EditorCenterMode } from "../../lib/editorCenterMode";
 import { gitBranchesQueryOptions } from "../../lib/gitReactQuery";
 import { ChevronLeftIcon } from "../../lib/icons";
+import { hasEmbeddedBrowser } from "../../lib/browserCapabilities";
 import { useLayoutMode } from "../../lib/layoutMode";
 import { canComposerHandlePanelWidth } from "../../lib/panelResize";
 import { projectListDirectoriesQueryOptions } from "../../lib/projectReactQuery";
@@ -1301,7 +1302,7 @@ export function SingleChatSurface(props: {
               onToggleDiff={handleToggleDiff}
               onOpenBrowserUrl={handleOpenBrowserUrl}
               onOpenTurnDiff={handleOpenTurnDiff}
-              // Split view, the in-app browser toggle and the right-dock toggle are desktop-only
+              // Split view and the right-dock toggle are desktop-only
               // affordances: omit the props on phone so the header never offers them (the dock
               // is not mounted there, so a toggle would only flip persisted `open` and show
               // nothing), and supply the phone back chevron in the header's leading slot
@@ -1322,6 +1323,7 @@ export function SingleChatSurface(props: {
                     // The phone shell mounts no sidebar, so the header's
                     // sidebar-toggle would be a dead control.
                     hideSidebarControls: true,
+                    ...(hasEmbeddedBrowser() ? { onToggleBrowser: handleToggleBrowser } : {}),
                   }
                 : {
                     onToggleBrowser: handleToggleBrowser,

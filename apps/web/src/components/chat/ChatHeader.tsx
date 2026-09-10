@@ -33,6 +33,7 @@ import {
   HistoryIcon,
   MessageCircleIcon,
   PanelRightCloseIcon,
+  GlobeIcon,
   PlusIcon,
   TerminalIcon,
   XIcon,
@@ -70,6 +71,7 @@ import { useOpenFavoriteEditorShortcut } from "~/hooks/useOpenFavoriteEditorShor
 import type { RepoDiffTotals } from "~/hooks/useRepoDiffTotals";
 import { ProviderIcon } from "../ProviderIcon";
 import { ProviderUsageMenuControl } from "../ProviderUsageMenuControl";
+import { PHONE_HEADER_ICON_BUTTON_CLASS } from "../phone/phoneChrome";
 import { EnvironmentToggle, type EnvironmentToggleState } from "./environment/EnvironmentToggle";
 
 /**
@@ -122,6 +124,8 @@ interface ChatHeaderProps {
   diffDisabledReason?: string | null;
   rightDockOpen?: boolean;
   onToggleRightDock?: () => void;
+  onToggleBrowser?: () => void;
+  browserOpen?: boolean;
   surfaceMode?: "single" | "split";
   isSidechat?: boolean;
   // When provided, the header collapses the
@@ -546,6 +550,8 @@ export function ChatHeader({
   diffDisabledReason: diffDisabledReasonProp,
   rightDockOpen: rightDockOpenProp,
   onToggleRightDock,
+  onToggleBrowser,
+  browserOpen,
   surfaceMode: surfaceModeProp,
   isSidechat: isSidechatProp,
   environment: environmentProp,
@@ -910,6 +916,19 @@ export function ChatHeader({
             branch is behind. The right-side panel control stays beside it, acting as the
             multi-pane dock toggle on single chats and the legacy diff toggle in split hosts.
             Falls back to the legacy controls when no environment is resolved. */}
+        {onToggleBrowser ? (
+          <IconButton
+            label="Open browser"
+            title="Open browser"
+            variant="ghost"
+            size="icon"
+            className={cn(PHONE_HEADER_ICON_BUTTON_CLASS, "shrink-0")}
+            aria-pressed={browserOpen ?? false}
+            onClick={onToggleBrowser}
+          >
+            <GlobeIcon className="size-4" />
+          </IconButton>
+        ) : null}
         {environment ? (
           <>
             <EnvironmentToggle environment={environment} />

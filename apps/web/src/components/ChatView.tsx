@@ -490,6 +490,7 @@ import { useRepoDiffTotals } from "~/hooks/useRepoDiffTotals";
 import { useCopyThreadIdToClipboard } from "~/hooks/useCopyToClipboard";
 import { useIsCoarsePointer, useIsMobile } from "~/hooks/useMediaQuery";
 import { useLayoutMode } from "~/lib/layoutMode";
+import { hasEmbeddedBrowser } from "~/lib/browserCapabilities";
 import {
   acknowledgedRiskIdsForFormWarnings,
   AutomationDialog,
@@ -6967,7 +6968,7 @@ export default function ChatView({
       if (command === "browser.toggle") {
         event.preventDefault();
         event.stopPropagation();
-        if (!isElectron) return;
+        if (!hasEmbeddedBrowser()) return;
         onToggleBrowser();
         return;
       }
@@ -12531,6 +12532,9 @@ export default function ChatView({
           diffOpen={resolvedDiffOpen}
           diffDisabledReason={diffDisabledReason}
           rightDockOpen={rightDockOpen}
+          {...(layoutMode === "phone" && hasEmbeddedBrowser() && !isEditorRail
+            ? { onToggleBrowser, browserOpen }
+            : {})}
           {...(onToggleRightDock ? { onToggleRightDock } : {})}
           environment={isEditorRail ? null : environmentHeaderState}
           surfaceMode={surfaceMode}
