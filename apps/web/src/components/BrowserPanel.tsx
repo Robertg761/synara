@@ -1,6 +1,6 @@
 // FILE: BrowserPanel.tsx
 // Purpose: Renders the in-app browser chrome and mirrors the native Electron view.
-// Layer: Desktop-only React component
+// Layer: Browser React component with native desktop previews
 // Depends on: browserStateStore, nativeApi browser bridge, DiffPanelShell
 //
 // Note: raw <button>s for autocomplete-suggestion rows and tab-title activate
@@ -847,7 +847,7 @@ export function BrowserPanel({
   }, [activeTab]);
 
   useLayoutEffect(() => {
-    if (!api || !isLiveRuntime || !workspaceReady || !activeTabId) {
+    if (!isElectron || !api || !isLiveRuntime || !workspaceReady || !activeTabId) {
       return;
     }
 
@@ -1316,6 +1316,11 @@ export function BrowserPanel({
     usesNativeRuntime,
   ]);
 
+  const onOpenExternal = useCallback(() => {
+    if (!ensureLiveRuntime() || !api || !activeTab || activeTabIsBlank) return;
+    void runBrowserAction(() => api.shell.openExternal(activeTab.url));
+  }, [activeTab, activeTabIsBlank, api, ensureLiveRuntime, runBrowserAction]);
+
   const onSubmitAddress = useCallback(() => {
     if (!ensureLiveRuntime()) {
       return;
@@ -1713,7 +1718,7 @@ export function BrowserPanel({
             variant="ghost"
             size="icon-sm"
             className="size-7 shrink-0"
-            disabled={!activeTab}
+            disabled={!isElectron || !activeTab}
             onClick={() => {
               if (!ensureLiveRuntime()) return;
               if (!api || !activeTab) return;
@@ -1836,7 +1841,7 @@ export function BrowserPanel({
           variant="ghost"
           size="icon-sm"
           className="size-7"
-          disabled={!activeTab}
+          disabled={!isElectron || !activeTab}
           aria-label="Copy screenshot"
           title="Copy screenshot"
           onClick={onCopyScreenshotToClipboard}
@@ -1882,7 +1887,7 @@ export function BrowserPanel({
             </MenuItem>
             <MenuItem
               className={BROWSER_ACTION_MENU_ITEM_CLASS_NAME}
-              disabled={!activeTab}
+              disabled={!isElectron || !activeTab}
               onClick={onCaptureScreenshot}
             >
               <BrowserActionMenuIcon icon={CameraIcon} />
@@ -1890,12 +1895,8 @@ export function BrowserPanel({
             </MenuItem>
             <MenuItem
               className={BROWSER_ACTION_MENU_ITEM_CLASS_NAME}
-              disabled={!activeTab}
-              onClick={() => {
-                if (!ensureLiveRuntime()) return;
-                if (!api || !activeTab) return;
-                void api.shell.openExternal(activeTab.url);
-              }}
+              disabled={!activeTab || activeTabIsBlank}
+              onClick={onOpenExternal}
             >
               <BrowserActionMenuIcon icon={ExternalLinkIcon} />
               <span>Open externally</span>
@@ -1958,6 +1959,20 @@ export function BrowserPanel({
                   "inset-0",
                 )}
               />
+            ) : null}
+            {isLiveRuntime && workspaceReady && !isElectron && !showLocalServersHome ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">
+                <GlobeIcon className="size-6 text-muted-foreground" />
+                <p className="text-sm font-medium">Open this page in your browser</p>
+                <p className="max-w-sm text-xs text-muted-foreground">
+                  Embedded previews, screenshots, and annotations require the desktop app.
+                  For development servers, use an address reachable from this device.
+                </p>
+                <Button variant="outline" onClick={onOpenExternal}>
+                  <ExternalLinkIcon className="size-3.5" />
+                  Open in browser
+                </Button>
+              </div>
             ) : null}
             {isLiveRuntime && browserPageError ? (
               <BrowserRuntimeError message={browserPageError} onReload={onReloadActiveTab} />
