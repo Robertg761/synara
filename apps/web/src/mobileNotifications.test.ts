@@ -51,6 +51,7 @@ describe("Android notification presentation", () => {
     expect(alert).toMatchObject({
       title: input.title,
       body: input.body,
+      isExactNotification: false,
       extra: { threadId: input.threadId, server: "wss://fixture.example" },
     });
     expect(alert.id).toBeGreaterThan(0);

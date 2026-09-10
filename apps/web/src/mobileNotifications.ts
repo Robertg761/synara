@@ -51,7 +51,8 @@ export async function showMobileNotification(input: {
       title: input.title,
       body: input.body,
       channelId: CHANNEL_ID,
-      // Immediate notifications need no exact-alarm permission or background service.
+      // Opt out explicitly: the plugin otherwise prompts for exact-alarm access.
+      isExactNotification: false,
       extra: { threadId: input.threadId, server: getShellServerWsUrl() },
     }],
   });
