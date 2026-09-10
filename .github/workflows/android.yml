@@ -47,6 +47,7 @@ jobs:
           bun run --cwd apps/web test
           src/mobilePairingIntent.test.ts src/mobileRuntime.test.ts
           src/mobileNotifications.test.ts src/wsNativeApi.test.ts
+          src/mobileBrowser.test.ts
           src/shellBridge.test.ts src/shellSession.test.ts
           src/mobileDownloads.test.ts src/lib/browserDownload.test.ts
           src/lib/mobileBackStack.test.ts src/shellSessionExit.test.ts
@@ -60,6 +61,7 @@ jobs:
           src/components/settings/DesktopSettingsPanels.browser.tsx
           src/lib/mobileOverlayBack.browser.tsx
           src/components/BrowserPanel.external.browser.tsx
+          src/components/BrowserPanel.mobile.browser.tsx
       - name: Package the desktop renderer
         run: bun run --cwd apps/android prepare:android
       - name: Native tests, lint, and release shrinking

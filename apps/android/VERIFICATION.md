@@ -32,7 +32,7 @@ Record observed results separately from source review. A passing build or a fixt
 ## Known release gaps
 
 - Reliable notifications while Android suspends or stops the app need server push.
-- Desktop browser annotations and agent control require platform-specific work beyond opening an external page.
+- Android browser annotations and remote agent control still need platform adapters.
 - Real provider workflows, signed upgrades, and physical-device accessibility testing must pass before production certification.
 
 Run focused checks during fixes. Follow the repository rules for the final workspace verification pass.
