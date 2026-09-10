@@ -13,8 +13,6 @@ const config: CapacitorConfig = {
     path: ".",
     backgroundColor: "#101012",
     minWebViewVersion: MIN_ANDROID_WEBVIEW_VERSION,
-    // Insets belong to the native container; phone layout handles the keyboard.
-    adjustMarginsForEdgeToEdge: "force",
   },
   server: {
     hostname: SYNARA_MOBILE_APP_HOSTNAME,
@@ -22,6 +20,8 @@ const config: CapacitorConfig = {
     errorPath: "webview-error.html",
   },
   plugins: {
+    // MainActivity owns native insets, independent of the installed WebView version.
+    SystemBars: { insetsHandling: "disable" },
     LocalNotifications: { smallIcon: "ic_notification" },
   },
 };

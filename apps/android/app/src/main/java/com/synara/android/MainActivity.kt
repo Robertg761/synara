@@ -15,5 +15,6 @@ class MainActivity : BridgeActivity() {
         registerPlugin(SynaraShellPlugin::class.java)
         registerPlugin(SynaraBrowserPlugin::class.java)
         super.onCreate(savedInstanceState)
+        NativeShellInsets.install(this)
     }
 }

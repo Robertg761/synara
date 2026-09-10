@@ -96,3 +96,5 @@ This migration removes the duplicate app and establishes shared feature ownershi
 Extend the shared browser tests for desktop and phone when features change. Extend native instrumentation tests when device integration changes.
 
 Use [the Android acceptance checklist](VERIFICATION.md) to track device coverage separately from shared-code coverage.
+
+System bars, cutouts, and the keyboard are excluded once by `NativeShellInsets` on the native WebView container. Capacitor SystemBars CSS inset handling is disabled: WebView 140+ otherwise switches to CSS passthrough and can place fixed headers beneath system controls. Guest browser bounds are relative to this protected viewport.

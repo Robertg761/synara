@@ -287,9 +287,14 @@ internal class BrowserGuestHost(
             if (saved == null || view.restoreState(saved) == null) view.loadUrl(tab.url)
         }
         guest?.apply {
-            translationX = (appView.left + left).toFloat()
-            translationY = (appView.top + top).toFloat()
-            layoutParams = layoutParams.apply { this.width = right - left; this.height = bottom - top }
+            // Both WebViews share the inset-padded container. Margins are viewport-relative;
+            // adding appView.top/left as translation would apply the system inset twice.
+            layoutParams = (layoutParams as ViewGroup.MarginLayoutParams).apply {
+                this.width = right - left
+                this.height = bottom - top
+                leftMargin = left
+                topMargin = top
+            }
             visibility = if (this@BrowserGuestHost.foreground && right > left && bottom > top) View.VISIBLE else View.INVISIBLE
         }
     }
