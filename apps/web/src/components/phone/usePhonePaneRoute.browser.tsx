@@ -26,6 +26,8 @@ import type {
   RightDockPaneKind,
   RightDockThreadState,
 } from "~/rightDockStore.logic";
+import { hasLegacyPanelRoute, useLegacyPanelRouteMigration } from "../chat/useLegacyPanelRouteMigration";
+import { parseDiffRouteSearch, type DiffRouteSearch } from "../../diffRouteSearch";
 import { usePhonePaneRouteSync } from "./usePhonePaneRoute";
 
 const THREAD_ID = ThreadId.makeUnsafe("thread-phone-pane");
@@ -33,9 +35,8 @@ const THREAD_PATH = `/${THREAD_ID}`;
 /** Long enough for any pending navigation/effect chain to settle and start oscillating. */
 const SETTLE_MS = 120;
 
-interface ThreadRouteSearch {
-  pane?: string | undefined;
-}
+type ThreadRouteSearch = DiffRouteSearch;
+const requestImmediateHydration = () => {};
 
 function createPane(id: string, kind: RightDockPaneKind): RightDockPane {
   return {
@@ -58,23 +59,33 @@ const EXPLORER_PANE = createPane("explorer", "explorer");
 let onThreadRouteBeforeLoad: ((search: ThreadRouteSearch) => void) | null = null;
 
 function PhonePaneRouteHarness() {
-  const urlPaneId = useRouterState({
-    select: (state) => (state.location.search as ThreadRouteSearch).pane ?? null,
-  });
+  const search = useRouterState({ select: (state) => state.location.search as ThreadRouteSearch });
+  const urlPaneId = search.pane ?? null;
   const dockState = useRightDockStore(useMemo(() => selectRightDockState(THREAD_ID), []));
-  const togglePhonePane = usePhonePaneRouteSync({ enabled: true, threadId: THREAD_ID, urlPaneId, dockState });
+  const togglePhonePane = usePhonePaneRouteSync({
+    enabled: !hasLegacyPanelRoute(search),
+    threadId: THREAD_ID,
+    urlPaneId,
+    dockState,
+  });
+  useLegacyPanelRouteMigration({ threadId: THREAD_ID, search, phone: true, requestImmediateHydration });
   // Exactly the rule the surface uses: the screen shows iff the URL names a live pane.
   const shownPaneId =
     urlPaneId !== null && dockState.panes.some((pane) => pane.id === urlPaneId) ? urlPaneId : "";
-  return <><button onClick={() => togglePhonePane({ kind: "browser" })}>Open browser</button><button onClick={() => togglePhonePane({ kind: "diff" })}>Open diff</button><div data-testid="phone-pane-screen">{shownPaneId}</div></>;
+  return (
+    <>
+      <button onClick={() => togglePhonePane({ kind: "browser" })}>Open browser</button>
+      <button onClick={() => togglePhonePane({ kind: "diff" })}>Open diff</button>
+      <div data-testid="phone-pane-screen">{shownPaneId}</div>
+    </>
+  );
 }
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
 const threadRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/$threadId",
-  validateSearch: (search: Record<string, unknown>): ThreadRouteSearch =>
-    typeof search.pane === "string" && search.pane.length > 0 ? { pane: search.pane } : {},
+  validateSearch: parseDiffRouteSearch,
   beforeLoad: ({ search }) => {
     onThreadRouteBeforeLoad?.(search);
   },
@@ -121,6 +132,23 @@ describe("usePhonePaneRouteSync", () => {
     useRightDockStore.setState({ dockStateByThreadId: {} });
   });
 
+  it.each(["browser", "diff"] as const)("consumes a legacy %s link without recreating a closed pane", async (kind) => {
+    seedDockState({ open: false, panes: [], activePaneId: null });
+    const route = await mountRoute(`${THREAD_PATH}?panel=${kind}`);
+    await expect.poll(() => route.paneParam()).toBeTruthy();
+    await settle();
+    const paneId = route.paneParam()!;
+    expect(shownPaneId()).toBe(paneId);
+    expect(route.history.location.search).not.toContain("panel=");
+    expect(route.historyIndex()).toBe(0);
+    useRightDockStore.getState().closePane(THREAD_ID, paneId);
+    await expect.poll(() => route.paneParam()).toBe(null);
+    await settle();
+    expect(dockThreadState()?.panes).toHaveLength(0);
+    expect(shownPaneId()).toBe("");
+    expect(route.history.length).toBe(1);
+  });
+
   it("adopts a cold-loaded pane param and closes it by replacing, never popping", async () => {
     seedDockState({ open: false, panes: [EXPLORER_PANE], activePaneId: "explorer" });
     const route = await mountRoute(`${THREAD_PATH}?pane=explorer`);
@@ -147,7 +175,9 @@ describe("usePhonePaneRouteSync", () => {
     seedDockState({ open: true, panes: [createPane(kind, kind)], activePaneId: kind });
     const route = await mountRoute(THREAD_PATH);
     await settle();
-    Array.from(document.querySelectorAll("button")).find((button) => button.textContent === `Open ${kind}`)!.click();
+    const button = Array.from(document.querySelectorAll("button")).find((entry) => entry.textContent === `Open ${kind}`)!;
+    button.click();
+    button.click();
     await expect.poll(() => route.paneParam()).toBe(kind);
     expect(shownPaneId()).toBe(kind);
     expect(route.historyIndex()).toBe(1);
@@ -155,6 +185,22 @@ describe("usePhonePaneRouteSync", () => {
     await expect.poll(() => dockThreadState()?.open).toBe(false);
     expect(route.paneParam()).toBe(null);
     expect(shownPaneId()).toBe("");
+  });
+
+  it("reconciles a different explicit request made during navigation", async () => {
+    seedDockState({ open: false, panes: [], activePaneId: null });
+    const route = await mountRoute(THREAD_PATH);
+    onThreadRouteBeforeLoad = (search) => {
+      if (!search.pane) return;
+      onThreadRouteBeforeLoad = null;
+      Array.from(document.querySelectorAll("button")).find((button) => button.textContent === "Open diff")!.click();
+    };
+    Array.from(document.querySelectorAll("button")).find((button) => button.textContent === "Open browser")!.click();
+    await expect.poll(() => dockThreadState()?.panes.find((pane) => pane.id === route.paneParam())?.kind).toBe("diff");
+    await settle();
+    expect(route.historyIndex()).toBe(2);
+    route.history.back();
+    await expect.poll(() => dockThreadState()?.panes.find((pane) => pane.id === route.paneParam())?.kind).toBe("browser");
   });
 
   it("leaves a persisted open dock alone when the URL names no pane", async () => {

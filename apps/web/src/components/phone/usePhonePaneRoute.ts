@@ -13,7 +13,11 @@ import { useCallback, useEffect, useRef } from "react";
 
 import { goBackInAppHistory } from "../../appNavigation";
 import { useRightDockStore } from "../../rightDockStore";
-import { resolveActivePane, type OpenPaneInput, type RightDockThreadState } from "../../rightDockStore.logic";
+import {
+  resolveActivePane,
+  type OpenPaneInput,
+  type RightDockThreadState,
+} from "../../rightDockStore.logic";
 import {
   NO_PREVIOUS_STORE_PANE,
   resolvePhonePaneSync,
@@ -217,7 +221,15 @@ export function usePhonePaneRouteSync(input: {
   return useCallback((pane: Omit<OpenPaneInput, "paneId">) => {
     if (!enabled) return;
     const store = useRightDockStore.getState();
-    const visiblePane = store.dockStateByThreadId[threadId]?.panes.find((entry) => entry.id === urlPaneId);
+    if (navigationRef.current) {
+      // Coalesce repeated taps. A different pane remains a store transition for
+      // the reconciliation pass after the current navigation settles.
+      store.openPane(threadId, pane);
+      return;
+    }
+    const visiblePane = store.dockStateByThreadId[threadId]?.panes.find(
+      (entry) => entry.id === urlPaneId,
+    );
     if (visiblePane?.kind === pane.kind) {
       store.toggleSingletonPane(threadId, pane);
       return;
@@ -237,5 +249,4 @@ export function usePhonePaneRouteSync(input: {
       if (navigationRef.current === issued) navigationRef.current = null;
     });
   }, [enabled, navigate, threadId, urlPaneId]);
-
 }

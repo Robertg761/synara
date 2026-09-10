@@ -125,6 +125,7 @@ import { RouteInsetSurface } from "../RouteInsetSurface";
 import { PHONE_HEADER_ICON_BUTTON_CLASS } from "../phone/phoneChrome";
 import { PhonePaneScreen } from "../phone/PhonePaneScreen";
 import { usePhonePaneRouteSync } from "../phone/usePhonePaneRoute";
+import { hasLegacyPanelRoute, useLegacyPanelRouteMigration } from "./useLegacyPanelRouteMigration";
 import { IconButton } from "../ui/icon-button";
 import { SidebarInset } from "../ui/sidebar";
 import { toastManager } from "../ui/toast";
@@ -132,7 +133,6 @@ import { WorkspaceSearchPalette, type WorkspaceSearchPaletteMode } from "../Work
 import {
   collectParentDirectoryPaths,
   resolveFilePreviewWorkspaceRoot,
-  resolveRoutePanelBootstrap,
   stripEditorViewSearchParams,
 } from "../../routes/-chatThreadRoute.logic";
 import { cn } from "~/lib/utils";
@@ -267,7 +267,6 @@ export function SingleChatSurface(props: {
   const { settings: appSettings } = useAppSettings();
   const { handleNewThread } = useHandleNewThread();
   const queryClient = useQueryClient();
-  const lastAppliedRoutePanelSearchKeyRef = useRef<string | null>(null);
   const [editorExpandedDirectories, setEditorExpandedDirectories] = useState<ReadonlySet<string>>(
     () => new Set(readEditorViewState(props.threadId)?.expandedDirectories ?? []),
   );
@@ -364,7 +363,7 @@ export function SingleChatSurface(props: {
   // `dockRendered: false` case), so it opts out.
   const phonePaneRouteEnabled = !dockVisibility.dockRendered && !editorViewActive;
   const togglePhonePane = usePhonePaneRouteSync({
-    enabled: phonePaneRouteEnabled,
+    enabled: phonePaneRouteEnabled && !hasLegacyPanelRoute(props.search),
     threadId: props.threadId,
     urlPaneId: props.search.pane ?? null,
     dockState,
@@ -764,45 +763,12 @@ export function SingleChatSurface(props: {
     });
   };
 
-  useEffect(() => {
-    const { nextAppliedSearchKey, panelPatch } = resolveRoutePanelBootstrap({
-      scopeId: props.threadId,
-      search: props.search,
-      lastAppliedSearchKey: lastAppliedRoutePanelSearchKeyRef.current,
-    });
-
-    lastAppliedRoutePanelSearchKeyRef.current = nextAppliedSearchKey;
-    if (!panelPatch) {
-      return;
-    }
-
-    if (panelPatch.panel === "browser") {
-      requestImmediateDockHydration("browser");
-      openPane(props.threadId, { kind: "browser" });
-    } else if (panelPatch.panel === "diff") {
-      requestImmediateDockHydration("diff");
-      openPane(props.threadId, {
-        kind: "diff",
-        diffTurnId: panelPatch.diffTurnId ?? null,
-        diffFilePath: panelPatch.diffFilePath ?? null,
-      });
-    } else {
-      setDockOpen(props.threadId, false);
-    }
-    void navigate({
-      to: "/$threadId",
-      params: { threadId: props.threadId },
-      replace: true,
-      search: (previous) => stripDiffSearchParams(previous),
-    });
-  }, [
-    navigate,
-    openPane,
-    props.search,
-    props.threadId,
-    requestImmediateDockHydration,
-    setDockOpen,
-  ]);
+  useLegacyPanelRouteMigration({
+    threadId: props.threadId,
+    search: props.search,
+    phone: phonePaneRouteEnabled,
+    requestImmediateHydration: requestImmediateDockHydration,
+  });
 
   useBrowserPanelDesktopBridge({
     onToggle: () => {
