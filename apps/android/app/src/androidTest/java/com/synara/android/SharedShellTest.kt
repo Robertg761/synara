@@ -100,6 +100,36 @@ class SharedShellTest {
         }
     }
 
+    @Test fun sharedBackgroundSurvivesSystemBarConfigurationReset() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            awaitJavascript(scenario, "document.documentElement.hasAttribute('data-theme-variant')")
+            for (color in listOf("#f4f4fa", "#171723")) {
+                awaitJavascript(scenario, """
+                    (() => {
+                      if (window.backgroundRequest !== '$color') {
+                        window.backgroundRequest = '$color'; window.backgroundReady = false;
+                        Capacitor.nativePromise('SystemBars', 'setStyle', {style: '${if (color == "#f4f4fa") "LIGHT" else "DARK"}'})
+                          .then(() => Capacitor.nativePromise('SynaraShell', 'setBackgroundColor', {color: '$color'}))
+                          .then(() => window.backgroundReady = true);
+                      }
+                      return window.backgroundReady === true;
+                    })()
+                """.trimIndent())
+                scenario.onActivity {
+                    val expected = android.graphics.Color.parseColor(color)
+                    assertEquals(expected, (it.window.decorView.background as android.graphics.drawable.ColorDrawable).color)
+                    it.bridge.onConfigurationChanged(android.content.res.Configuration(it.resources.configuration))
+                }
+                InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+                scenario.onActivity {
+                    val expected = android.graphics.Color.parseColor(color)
+                    assertEquals(expected, (it.window.decorView.background as android.graphics.drawable.ColorDrawable).color)
+                    assertEquals(expected, ((it.bridge.webView.parent as android.view.View).background as android.graphics.drawable.ColorDrawable).color)
+                }
+            }
+        }
+    }
+
     private fun assertNoLaunchUrl(activity: MainActivity) {
         awaitJavascript(activity, "document.body.innerText.includes('Connect to your Synara server.')")
         awaitJavascript(activity, """

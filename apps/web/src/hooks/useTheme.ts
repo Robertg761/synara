@@ -177,7 +177,7 @@ function applyThemeState(state: ThemeState, suppressTransitions = false) {
   }
 
   syncDesktopTheme(state.mode);
-  syncMobileTheme(variant);
+  syncMobileTheme(variant, cssVariableBuild.variables["--app-shell-background"]!);
 
   if (suppressTransitions) {
     // Force a reflow so the no-transitions class takes effect before removal.

@@ -5,6 +5,7 @@ import type { MobileBridge, MobileShellSession } from "@synara/contracts";
 import { isMobileShell } from "./env";
 
 interface SynaraShellPlugin {
+  setBackgroundColor: (options: { color: string }) => Promise<void>;
   getSession: () => Promise<{ serverUrl?: unknown; sessionToken?: unknown }>;
   setSession: (session: MobileShellSession) => Promise<void>;
   clearSession: () => Promise<void>;
@@ -42,4 +43,8 @@ export function getMobileBridge(): MobileBridge | null {
 export async function consumeMobileLaunchUrl(expectedUrl?: string): Promise<string | null> {
   if (!isMobileShell) return null;
   return bridge.consumeLaunchUrl(expectedUrl);
+}
+
+export async function setMobileBackgroundColor(color: string): Promise<void> {
+  if (isMobileShell) await plugin.setBackgroundColor({ color });
 }
