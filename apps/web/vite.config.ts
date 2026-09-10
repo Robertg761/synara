@@ -188,8 +188,9 @@ function precompressPlugin(): Plugin {
 }
 
 export default defineConfig({
-  // Dependency symlinks may be shared by review worktrees; optimizer state must not be.
-  cacheDir: path.resolve(import.meta.dirname, ".vite-cache"),
+  // Worktrees may share dependency symlinks, but must keep separate optimizer state.
+  // Retain a node_modules segment so compiler plugins exclude optimized dependencies.
+  cacheDir: path.resolve(import.meta.dirname, ".vite-cache/node_modules/.vite"),
   plugins: [
     {
       name: "synara-android-webview-target",
