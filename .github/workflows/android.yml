@@ -67,6 +67,7 @@ jobs:
           src/components/chat/composerPhoneChrome.browser.tsx
           src/components/chat/ChatHeader.browserPane.phone.browser.tsx
           src/components/onboarding/FeatureTourStep.browser.tsx
+          src/components/onboarding/OnboardingDialog.viewport.browser.tsx
           src/components/settings/DesktopSettingsPanels.browser.tsx
           src/components/settings/PhoneSettingsNavigation.browser.tsx
           src/components/terminal/terminalRuntime.mobile.browser.tsx

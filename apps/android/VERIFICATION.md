@@ -35,10 +35,12 @@ Record observed results separately from source review. A passing build or a fixt
 - Native instrumentation verified encrypted storage compatibility, incoming-link consumption across recreation, guest browser isolation and navigation, visible viewport capture, notification delivery, and shared-file bytes and access boundaries.
 - API 26 with stock WebView 69 displayed the script-free update screen instead of failing silently. The shared transport also has a regression test for supported WebViews that lack `AbortSignal.any`.
 - Debug and unsigned release APKs built successfully with release shrinking. Native unit tests and Android lint passed.
-- The integrated shared checks passed 269 focused unit tests and 28 browser checks across phone navigation, touch controls, settings, onboarding, browser entry, terminal rendering, downloads, notifications, and transport behavior. One browser assertion was updated to the current notification message and passed on rerun.
+- The integrated shared checks passed 307 focused unit tests and 51 browser checks across phone navigation, touch controls, settings, onboarding, browser entry, terminal rendering, downloads, notifications, and transport behavior. One browser assertion was updated to the current notification message and passed on rerun.
 - Browser capture through the shared menu produced a readable 1080-by-1435 page image in the composer. Native touch navigation and Android Back worked within the guest history.
 
 The phone terminal uses xterm's DOM renderer. The emulator exposed a blank WebGL canvas despite a valid context; forcing the existing fallback restored real server output. A regression test now verifies visible terminal text through hide/show with the native mobile renderer.
+
+Phone pane tests exercise the actual router and store, including restored desktop state, explicit content-open actions, rapid taps, Back, and older panel deep links. Dialog tests mount the onboarding flow at short landscape, short portrait, and desktop sizes, and verify that footer actions remain reachable.
 
 The message exchange above covers one provider round trip. Approvals, reconnect during a long response, and the remaining acceptance rows still need their own observed results.
 
