@@ -62,11 +62,11 @@ function PhonePaneRouteHarness() {
     select: (state) => (state.location.search as ThreadRouteSearch).pane ?? null,
   });
   const dockState = useRightDockStore(useMemo(() => selectRightDockState(THREAD_ID), []));
-  usePhonePaneRouteSync({ enabled: true, threadId: THREAD_ID, urlPaneId, dockState });
+  const togglePhonePane = usePhonePaneRouteSync({ enabled: true, threadId: THREAD_ID, urlPaneId, dockState });
   // Exactly the rule the surface uses: the screen shows iff the URL names a live pane.
   const shownPaneId =
     urlPaneId !== null && dockState.panes.some((pane) => pane.id === urlPaneId) ? urlPaneId : "";
-  return <div data-testid="phone-pane-screen">{shownPaneId}</div>;
+  return <><button onClick={() => togglePhonePane({ kind: "browser" })}>Open browser</button><button onClick={() => togglePhonePane({ kind: "diff" })}>Open diff</button><div data-testid="phone-pane-screen">{shownPaneId}</div></>;
 }
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
@@ -141,6 +141,20 @@ describe("usePhonePaneRouteSync", () => {
     expect(shownPaneId()).toBe("");
     expect(route.historyIndex()).toBe(0);
     expect(route.history.length).toBe(1);
+  });
+
+  it.each(["browser", "diff"] as const)("pushes an explicit phone open for an already active persisted %s", async (kind) => {
+    seedDockState({ open: true, panes: [createPane(kind, kind)], activePaneId: kind });
+    const route = await mountRoute(THREAD_PATH);
+    await settle();
+    Array.from(document.querySelectorAll("button")).find((button) => button.textContent === `Open ${kind}`)!.click();
+    await expect.poll(() => route.paneParam()).toBe(kind);
+    expect(shownPaneId()).toBe(kind);
+    expect(route.historyIndex()).toBe(1);
+    route.history.back();
+    await expect.poll(() => dockThreadState()?.open).toBe(false);
+    expect(route.paneParam()).toBe(null);
+    expect(shownPaneId()).toBe("");
   });
 
   it("leaves a persisted open dock alone when the URL names no pane", async () => {

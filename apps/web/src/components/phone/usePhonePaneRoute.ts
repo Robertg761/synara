@@ -9,11 +9,11 @@
 
 import type { ThreadId } from "@synara/contracts";
 import { useNavigate, useRouter } from "@tanstack/react-router";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 import { goBackInAppHistory } from "../../appNavigation";
 import { useRightDockStore } from "../../rightDockStore";
-import { resolveActivePane, type RightDockThreadState } from "../../rightDockStore.logic";
+import { resolveActivePane, type OpenPaneInput, type RightDockThreadState } from "../../rightDockStore.logic";
 import {
   NO_PREVIOUS_STORE_PANE,
   resolvePhonePaneSync,
@@ -59,7 +59,7 @@ export function usePhonePaneRouteSync(input: {
   threadId: ThreadId;
   urlPaneId: string | null;
   dockState: RightDockThreadState;
-}): void {
+}) {
   const navigate = useNavigate();
   const router = useRouter();
   const setActivePane = useRightDockStore((store) => store.setActivePane);
@@ -211,4 +211,31 @@ export function usePhonePaneRouteSync(input: {
     urlPaneExists,
     urlPaneId,
   ]);
+
+  // Explicit phone opens must push even when a persisted desktop dock already has
+  // this pane active: that case produces no observable store transition.
+  return useCallback((pane: Omit<OpenPaneInput, "paneId">) => {
+    if (!enabled) return;
+    const store = useRightDockStore.getState();
+    const visiblePane = store.dockStateByThreadId[threadId]?.panes.find((entry) => entry.id === urlPaneId);
+    if (visiblePane?.kind === pane.kind) {
+      store.toggleSingletonPane(threadId, pane);
+      return;
+    }
+    store.openPane(threadId, pane);
+    const state = useRightDockStore.getState().dockStateByThreadId[threadId];
+    const paneId = state ? resolveActivePane(state)?.id : undefined;
+    if (!paneId || paneId === urlPaneId) return;
+    pushedPaneStackRef.current.push(paneId);
+    const issued: PhonePaneNavigation = { kind: "settle", targetUrlPaneId: paneId };
+    navigationRef.current = issued;
+    void navigate({
+      to: "/$threadId",
+      params: { threadId },
+      search: (previous) => ({ ...previous, pane: paneId }),
+    }).catch(() => {
+      if (navigationRef.current === issued) navigationRef.current = null;
+    });
+  }, [enabled, navigate, threadId, urlPaneId]);
+
 }

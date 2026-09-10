@@ -363,7 +363,7 @@ export function SingleChatSurface(props: {
   // longer resolves is dropped in place. The editor view has no dock (it is the other
   // `dockRendered: false` case), so it opts out.
   const phonePaneRouteEnabled = !dockVisibility.dockRendered && !editorViewActive;
-  usePhonePaneRouteSync({
+  const togglePhonePane = usePhonePaneRouteSync({
     enabled: phonePaneRouteEnabled,
     threadId: props.threadId,
     urlPaneId: props.search.pane ?? null,
@@ -419,11 +419,19 @@ export function SingleChatSurface(props: {
 
   const handleToggleDiff = () => {
     requestImmediateDockHydration("diff");
-    toggleSingletonPane(props.threadId, { kind: "diff" });
+    if (phonePaneRouteEnabled) {
+      togglePhonePane({ kind: "diff" });
+    } else {
+      toggleSingletonPane(props.threadId, { kind: "diff" });
+    }
   };
   const handleToggleBrowser = () => {
     requestImmediateDockHydration("browser");
-    toggleSingletonPane(props.threadId, { kind: "browser" });
+    if (phonePaneRouteEnabled) {
+      togglePhonePane({ kind: "browser" });
+    } else {
+      toggleSingletonPane(props.threadId, { kind: "browser" });
+    }
   };
   const handleToggleDevice = () => {
     requestImmediateDockHydration("device");
