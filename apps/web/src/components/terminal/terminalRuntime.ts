@@ -24,6 +24,7 @@ import type { TerminalSessionSnapshot } from "@synara/contracts";
 import { Terminal } from "@xterm/xterm";
 
 import { readNativeApi } from "~/nativeApi";
+import { isMobileShell } from "~/env";
 import { suppressQueryResponses } from "~/lib/suppressQueryResponses";
 
 import { openInPreferredEditor } from "../../editorPreferences";
@@ -54,7 +55,9 @@ import type {
 import { waitForTerminalFontReady } from "./terminalFontSettle";
 import { observeTerminalWriteParsed } from "./terminalPerformance";
 
-const ENABLE_TERMINAL_WEBGL = true;
+// Android WebViews can report a healthy WebGL context while painting a blank terminal.
+// Use xterm's shared DOM renderer in the native mobile shell; desktop keeps WebGL.
+const ENABLE_TERMINAL_WEBGL = !isMobileShell;
 const VISUAL_RESIZE_MIN_INTERVAL_MS = 64;
 const BACKEND_RESIZE_DEBOUNCE_MS = 120;
 const WRITE_BATCH_SIZE_LIMIT = 262_144;
