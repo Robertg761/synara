@@ -1,6 +1,6 @@
 // FILE: FeatureTourStep.tsx
 // Purpose: "What Synara can do" tour built from TOUR_CARDS: a vertical list of topics on the
-//          left, the selected topic's text on the right, with a docs link per topic and live
+//          left on desktop, scrollable topics above the text on phones, with a docs link and live
 //          shortcut chips on the shortcuts topic.
 // Layer: Web UI component
 
@@ -49,8 +49,12 @@ export function FeatureTourStep() {
   if (!selectedCard) return null;
 
   return (
-    <div className="grid min-h-0 flex-1 grid-cols-[220px_minmax(0,1fr)] gap-8">
-      <div className="flex flex-col gap-0.5" role="tablist" aria-label="Synara capabilities">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 md:grid md:grid-cols-[220px_minmax(0,1fr)] md:gap-8">
+      <div
+        className="flex min-w-0 shrink-0 gap-1 overflow-x-auto pb-1 md:flex-col md:gap-0.5 md:overflow-x-visible md:pb-0"
+        role="tablist"
+        aria-label="Synara capabilities"
+      >
         {TOUR_CARDS.map((card) => {
           const Icon = card.icon;
           const selected = card.id === selectedCard.id;
@@ -63,7 +67,7 @@ export function FeatureTourStep() {
               aria-controls="onboarding-tour-panel"
               id={`onboarding-tour-tab-${card.id}`}
               className={cn(
-                "flex h-[34px] items-center gap-2.5 rounded-lg px-2.5 text-start text-[length:var(--app-font-size-ui-lg,13px)] outline-none transition-colors motion-reduce:transition-none",
+                "flex h-11 shrink-0 items-center gap-2.5 rounded-lg px-2.5 text-start md:h-[34px] text-[length:var(--app-font-size-ui-lg,13px)] outline-none transition-colors motion-reduce:transition-none",
                 "focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset",
                 selected
                   ? "bg-foreground/4 text-foreground"
