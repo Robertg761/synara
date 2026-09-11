@@ -10,8 +10,8 @@ import { PhoneSettingsNavigation } from "./PhoneSettingsNavigation";
 
 afterEach(async () => { await page.viewport(1280, 800); });
 
-it("makes every settings section and search target reachable on a phone", async () => {
-  await page.viewport(412, 844);
+it.each([{ width: 320, height: 700 }, { width: 393, height: 700 }, { width: 412, height: 700 }, { width: 732, height: 364 }])("makes settings sections reachable at $width x $height", async ({ width, height }) => {
+  await page.viewport(width, height);
   const select = vi.fn();
   const back = vi.fn();
   function Harness() {
@@ -32,7 +32,7 @@ it("makes every settings section and search target reachable on a phone", async 
     await expect.element(toggle).toHaveAttribute("aria-expanded", "false");
     await expect.element(toggle).toHaveTextContent(`Settings: ${item.label}`);
   }
-  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(412);
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
   await toggle.click();
   await screen.getByRole("textbox", { name: "Search settings" }).fill("Theme");
   await screen.getByRole("button", { name: "Theme", exact: true }).click();

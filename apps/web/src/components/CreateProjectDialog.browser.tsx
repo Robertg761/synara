@@ -24,6 +24,28 @@ describe("CreateProjectDialog GitHub source", () => {
     nativeApi.onProvisionProgress.mockClear();
   });
 
+  it.each([{ width: 320, height: 700 }, { width: 393, height: 700 }, { width: 412, height: 700 }, { width: 732, height: 364 }])("keeps the clone form footer reachable at $width x $height", async ({ width, height }) => {
+    await page.viewport(width, height);
+    const screen = await render(<CreateProjectDialog
+      open githubProvisioningAvailable spaces={[]} activeSpaceId={null}
+      defaultCloneParent={"/workspace/" + "long-folder-name/".repeat(12)}
+      onOpenChange={vi.fn()} onSubmit={vi.fn()} />);
+    await screen.getByRole("radio", { name: "GitHub" }).click();
+    await screen.getByLabelText("Repository").fill("organization/very-long-repository-name-for-mobile");
+    const popup = document.querySelector<HTMLElement>('[data-slot="dialog-popup"]')!;
+    const footer = popup.querySelector<HTMLElement>('[data-slot="dialog-footer"]')!;
+    const rect = footer.getBoundingClientRect();
+    expect(rect.left).toBeGreaterThanOrEqual(0);
+    expect(rect.right).toBeLessThanOrEqual(width);
+    expect(rect.bottom).toBeLessThanOrEqual(height);
+    const button = screen.getByRole("button", { name: "Clone and add" }).element() as HTMLElement;
+    const buttonRect = button.getBoundingClientRect();
+    expect(button.contains(document.elementFromPoint(buttonRect.left + buttonRect.width / 2, buttonRect.top + buttonRect.height / 2))).toBe(true);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
+    await screen.unmount();
+    await page.viewport(1280, 800);
+  });
+
   it("disables GitHub when the server does not advertise provisioning", async () => {
     await render(
       <CreateProjectDialog
