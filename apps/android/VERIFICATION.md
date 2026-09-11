@@ -50,6 +50,22 @@ The provider checks cover a message round trip and a file edit with diff review.
 
 Version 0.2.1 addresses the physical-phone report of header controls overlapping the status bar. The native container now owns system-bar, cutout, and keyboard insets; Capacitor's WebView-version-dependent CSS inset handling is disabled. Embedded browser bounds use that same protected viewport. Debug and unsigned release builds, seven JVM tests, Android lint, and all 13 native instrumentation tests passed. The new regression checks inset ownership after viewport-cover detection, cutout and keyboard transitions, consumed child insets, and guest position. The first browser capture check ran before painting; the test now explicitly waits for WebView visual state and the complete suite passed. Portrait and keyboard screenshots were inspected on API 36 with WebView 133. A physical-phone retest and execution on WebView 140+ remain unverified. The workspace Bun formatting, lint, and typecheck commands were not run because authorization is still pending.
 
+## Version 0.2.2 responsive follow-up
+
+The installed 0.2.1 APK reproduced the reported home control overlap at 393 CSS pixels: the branch picker extended 99 pixels beyond the viewport and covered Temporary. The shared phone tray now uses separate project and workspace rows, constrains branch text, and reserves a full touch target for Temporary. The welcome heading scrolls within the space above the composer on short screens.
+
+Six focused ChatView browser cases passed, covering 320, 390, 412, 732-by-364, and 1280 pixel viewports, actual branch/Temporary clicks, heading containment, and project reset across desktop/phone resizing. The resize test now reacquires DOM references after the phone shell remounts.
+
+The broader audit found overlapping expanded touch targets in native browser and terminal toolbars. Browser controls now have separate rows and 44-pixel targets; long tabs retain their width and scroll. Terminal workspace/sidebar actions also have separate 44-pixel cells. Nine browser and tab touch cases, eight terminal touch cases, 17 header/settings/project-dialog audit cases, and related desktop regressions passed. Android CI includes the new cases and an explicit coarse-pointer run.
+
+This audit does not establish every environment/file/diff workflow, populated terminal group, sidebar/project interaction, or physical-device accessibility behavior. The previously documented release gaps remain.
+
+The combined 0.2.2 Android renderer build, debug APK, and unsigned release APK passed. Seven JVM tests and Android lint passed. All 13 native instrumentation tests passed on the dedicated API 36 emulator. The debug APK retains the installed test build's signing certificate and increments versionCode to 4.
+
+Installed-app checks verified separate 44-pixel branch/Temporary controls with a 6-pixel gap at 393 CSS pixels, actual taps on both controls, and bounded landscape heading scrolling. The first browser check exposed that the phone uses the sidebar host rather than the sheet host used by the initial fixture. The final renderer enables native touch chrome in both, and all eight sidebar/sheet viewport cases pass. After rebuilding, the installed browser displayed two rows of 44-pixel controls; native taps created and closed a tab, and the HTTPS guest aligned below the toolbar and above the bottom system inset. The 13-test native suite ran before this final renderer-only host correction. A live terminal session was not exercised by this mock fixture; terminal touch geometry was covered by the browser tests.
+
+Published debug APK SHA-256: `7883ee720c3dd6880955adbb419191686abfe0bdfe2e90cc9db030e9566e345c`.
+
 ## Known release gaps
 
 - Reliable notifications while Android suspends or stops the app need server push.

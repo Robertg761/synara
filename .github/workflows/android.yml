@@ -67,6 +67,8 @@ jobs:
           src/components/phone/usePhonePaneRoute.browser.tsx
           src/components/chat/composerPhoneChrome.browser.tsx
           src/components/chat/ChatHeader.browserPane.phone.browser.tsx
+          src/components/chat/ChatHeader.responsive.browser.tsx
+          src/components/CreateProjectDialog.browser.tsx
           src/components/onboarding/FeatureTourStep.browser.tsx
           src/components/onboarding/OnboardingDialog.viewport.browser.tsx
           src/components/settings/DesktopSettingsPanels.browser.tsx
@@ -75,6 +77,19 @@ jobs:
           src/lib/mobileOverlayBack.browser.tsx
           src/components/BrowserPanel.external.browser.tsx
           src/components/BrowserPanel.mobile.browser.tsx
+      - name: Home composer controls at phone widths
+        run: >-
+          bun run --cwd apps/web test:browser --no-file-parallelism
+          src/components/ChatView.browser.tsx
+          -t "keeps long workspace controls separate"
+      - name: Browser and terminal controls with touch input
+        env:
+          VITEST_BROWSER_TOUCH: "1"
+        run: >-
+          bun run --cwd apps/web test:browser --no-file-parallelism
+          src/components/BrowserPanel.mobile.browser.tsx
+          src/components/BrowserTabStrip.phone.browser.tsx
+          src/components/terminal/TerminalChrome.phone.browser.tsx
       - name: Package the desktop renderer
         run: bun run --cwd apps/android prepare:android
       - name: Native tests, lint, and release shrinking
