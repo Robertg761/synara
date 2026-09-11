@@ -6579,6 +6579,102 @@ describe("ChatView transcript geometry (full app)", () => {
     }
   });
 
+  it.each([
+    { width: 320, height: 800 },
+    { width: 390, height: 800 },
+    { width: 412, height: 800 },
+    { width: 732, height: 364 },
+    { width: 1280, height: 800 },
+  ])("keeps long workspace controls separate at $width px", async ({ width, height }) => {
+    const branch = "feature/android-composer-tray-with-a-long-branch-name";
+    const cwd = "/repo/a-very-long-android-project-name-for-the-composer-tray";
+    useComposerDraftStore.setState({
+      draftThreadsByThreadId: {
+        [THREAD_ID]: {
+          projectId: PROJECT_ID,
+          createdAt: NOW_ISO,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          entryPoint: "chat",
+          branch,
+          worktreePath: null,
+          envMode: "local",
+        },
+      },
+      projectDraftThreadIdByProjectId: { [PROJECT_ID]: THREAD_ID },
+    });
+    const snapshot = createDraftOnlySnapshot();
+    const mounted = await mountChatView({
+      viewport: { width, height },
+      snapshot: {
+        ...snapshot,
+        projects: snapshot.projects.map((project) => ({
+          ...project,
+          title: "A very long Android project name for the composer tray",
+          workspaceRoot: cwd,
+        })),
+      },
+      configureFixture: (nextFixture) => {
+        nextFixture.gitBranchByCwd[cwd] = branch;
+      },
+    });
+    try {
+      const tray = await waitForElement(
+        () => document.querySelector<HTMLElement>("[data-empty-landing-controls]"),
+        "Missing workspace tray",
+      );
+      const temporary = page.getByLabelText("Temporary chat");
+      await expect.element(temporary).toBeInTheDocument();
+      const branchButton = await waitForElement(
+        () =>
+          Array.from(tray.querySelectorAll<HTMLButtonElement>("button")).find((button) =>
+            button.textContent?.includes(branch),
+          ) ?? null,
+        "Missing branch picker",
+      );
+      await waitForLayout();
+      const hero = document.querySelector<HTMLElement>("[data-empty-landing-hero]")!;
+      const heroRect = hero.getBoundingClientRect();
+      const heading = page.getByTestId("empty-landing-heading").element();
+      expect(heroRect.bottom).toBeLessThanOrEqual(tray.getBoundingClientRect().top);
+      expect(getComputedStyle(hero).overflowY).toBe("auto");
+      if (height < 400) {
+        expect(hero.scrollHeight).toBeGreaterThan(hero.clientHeight);
+        hero.scrollTop = hero.scrollHeight;
+        await waitForLayout();
+        expect(heading.getBoundingClientRect().bottom).toBeLessThanOrEqual(heroRect.bottom);
+      }
+      const branchRect = branchButton.getBoundingClientRect();
+      const temporaryRect = temporary.element().getBoundingClientRect();
+      const trayRect = tray.getBoundingClientRect();
+      const projectRect = page.getByTestId("project-picker-trigger").element().getBoundingClientRect();
+      expect(projectRect.left).toBeGreaterThanOrEqual(trayRect.left);
+      expect(projectRect.right).toBeLessThanOrEqual(trayRect.right);
+      expect(branchRect.right).toBeLessThanOrEqual(temporaryRect.left);
+      expect(branchRect.width).toBeGreaterThan(44);
+      expect(temporaryRect.right).toBeLessThanOrEqual(trayRect.right);
+      if (width < 768) {
+        expect(projectRect.bottom).toBeLessThanOrEqual(branchRect.top);
+        expect(temporaryRect.width).toBeGreaterThanOrEqual(44);
+        expect(temporaryRect.height).toBeGreaterThanOrEqual(44);
+      }
+      await temporary.click();
+      await expect.element(temporary).toHaveAttribute("aria-pressed", "true");
+      expect(
+        document
+          .elementFromPoint(
+            branchRect.x + branchRect.width / 2,
+            branchRect.y + branchRect.height / 2,
+          )
+          ?.closest("button"),
+      ).toBe(branchButton);
+      await page.getByRole("combobox").filter({ hasText: branch }).click();
+      await expect.element(page.getByPlaceholder("Search branches...")).toBeInTheDocument();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
   it("can detach an empty project draft back to a normal chat before first send", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
@@ -6620,7 +6716,10 @@ describe("ChatView transcript geometry (full app)", () => {
         .querySelector<HTMLElement>("[class*='transition-opacity']");
       expect(folderIcon).not.toBeNull();
       const expectResetAlignedWithFolderIcon = () => {
-        const folderIconRect = folderIcon!.getBoundingClientRect();
+        const folderIconRect = projectPickerTrigger
+          .element()
+          .querySelector<HTMLElement>("[class*='transition-opacity']")!
+          .getBoundingClientRect();
         const resetButtonRect = resetProjectButton.element().getBoundingClientRect();
         const folderIconCenterX = folderIconRect.left + folderIconRect.width / 2;
         const resetButtonCenterX = resetButtonRect.left + resetButtonRect.width / 2;
@@ -6663,6 +6762,8 @@ describe("ChatView transcript geometry (full app)", () => {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       expectResetAlignedWithFolderIcon();
       await mounted.setViewport(DEFAULT_VIEWPORT);
+      // Crossing the phone breakpoint remounts the chat surface.
+      const resizedComposerEditor = await waitForComposerEditor();
 
       const originalRequestAnimationFrame = window.requestAnimationFrame;
       let frameRequestCount = 0;
@@ -6688,7 +6789,7 @@ describe("ChatView transcript geometry (full app)", () => {
       }
 
       expect(frameRequestCount).toBe(0);
-      expect(document.activeElement).toBe(composerEditor);
+      expect(document.activeElement).toBe(resizedComposerEditor);
       await expect.element(page.getByText("Don't work in a project")).not.toBeInTheDocument();
       await expect.element(page.getByTestId("workspace-picker-trigger")).toBeInTheDocument();
     } finally {

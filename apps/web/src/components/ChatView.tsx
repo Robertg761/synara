@@ -11653,52 +11653,54 @@ export default function ChatView({
       // narrower width (w-14/15): tinted, rounded on top only, flush against the input
       // shell below. No overlap/underlay tricks — in dark mode a slice tucked behind the
       // composer's translucent corners reads as a visible cut along the seam.
-      className="chat-composer-shell mx-auto flex min-h-8 w-14/15 min-w-0 flex-nowrap items-center gap-x-1.5 overflow-hidden !rounded-b-none !rounded-t-[var(--composer-radius)] bg-[color-mix(in_srgb,var(--color-background-elevated-secondary)_76%,var(--color-background-surface)_24%)] px-2 py-1 transition-colors duration-150 ease-out motion-reduce:transition-none sm:min-h-7"
+      className="chat-composer-shell mx-auto grid grid-cols-[minmax(0,1fr)_44px] min-h-8 w-14/15 min-w-0 items-center gap-x-1.5 overflow-hidden md:flex md:flex-nowrap !rounded-b-none !rounded-t-[var(--composer-radius)] bg-[color-mix(in_srgb,var(--color-background-elevated-secondary)_76%,var(--color-background-surface)_24%)] px-2 py-1 transition-colors duration-150 ease-out motion-reduce:transition-none sm:min-h-7"
     >
-      {showContainerChatWorkspacePicker ? (
-        <ProjectPicker
-          align="start"
-          side="top"
-          triggerVariant="ghost"
-          triggerClassName={cn(
-            "h-8 px-2 py-1 sm:h-7 sm:px-2.5",
-            COMPOSER_FOLDER_PICKER_CAPSULE_HOVER_CLASS_NAME,
-          )}
-          showResetToHome={Boolean(
-            isStudioContainer ? resolvedThreadWorkingDirectory : resolvedThreadWorktreePath,
-          )}
-          selectedWorkspaceRoot={
-            isStudioContainer ? resolvedThreadWorkingDirectory : resolvedThreadWorktreePath
-          }
-          onSelectWorkspaceRoot={handleSelectWorkspaceRoot}
-          onResetToHome={handleResetWorkspaceToHome}
-          {...(!isStudioContainer
-            ? {
-                onSelectProject: handleSelectProjectForEmptyDraft,
-                onCreateProjectFromPath: handleCreateProjectFromPickerPath,
-              }
-            : {})}
-        />
-      ) : showEmptyLandingProjectPicker ? (
-        <ProjectPicker
-          align="start"
-          side="top"
-          triggerVariant="ghost"
-          triggerClassName={cn(
-            "h-8 px-2 py-1 sm:h-7 sm:px-2.5",
-            COMPOSER_FOLDER_PICKER_CAPSULE_HOVER_CLASS_NAME,
-          )}
-          selectionMode="project"
-          selectedProjectId={activeProject.id}
-          selectedWorkspaceRoot={activeProject.cwd}
-          showResetToHome
-          onSelectProject={handleSelectProjectForEmptyDraft}
-          onCreateProjectFromPath={handleCreateProjectFromPickerPath}
-          onResetToHome={handleResetWorkspaceToHome}
-        />
-      ) : (
-        emptyLandingProjectChip
-      )}
+      <div className="col-span-2 min-w-0 md:contents">
+        {showContainerChatWorkspacePicker ? (
+          <ProjectPicker
+            align="start"
+            side="top"
+            triggerVariant="ghost"
+            triggerClassName={cn(
+              "h-11 px-2 py-1 sm:h-11 md:h-7 md:px-2.5",
+              COMPOSER_FOLDER_PICKER_CAPSULE_HOVER_CLASS_NAME,
+            )}
+            showResetToHome={Boolean(
+              isStudioContainer ? resolvedThreadWorkingDirectory : resolvedThreadWorktreePath,
+            )}
+            selectedWorkspaceRoot={
+              isStudioContainer ? resolvedThreadWorkingDirectory : resolvedThreadWorktreePath
+            }
+            onSelectWorkspaceRoot={handleSelectWorkspaceRoot}
+            onResetToHome={handleResetWorkspaceToHome}
+            {...(!isStudioContainer
+              ? {
+                  onSelectProject: handleSelectProjectForEmptyDraft,
+                  onCreateProjectFromPath: handleCreateProjectFromPickerPath,
+                }
+              : {})}
+          />
+        ) : showEmptyLandingProjectPicker ? (
+          <ProjectPicker
+            align="start"
+            side="top"
+            triggerVariant="ghost"
+            triggerClassName={cn(
+              "h-11 px-2 py-1 sm:h-11 md:h-7 md:px-2.5",
+              COMPOSER_FOLDER_PICKER_CAPSULE_HOVER_CLASS_NAME,
+            )}
+            selectionMode="project"
+            selectedProjectId={activeProject.id}
+            selectedWorkspaceRoot={activeProject.cwd}
+            showResetToHome
+            onSelectProject={handleSelectProjectForEmptyDraft}
+            onCreateProjectFromPath={handleCreateProjectFromPickerPath}
+            onResetToHome={handleResetWorkspaceToHome}
+          />
+        ) : (
+          emptyLandingProjectChip
+        )}
+      </div>
       {/* Reserve the Local/branch slot so project selection fades controls in without resizing. */}
       <div
         aria-hidden={showEmptyLandingBranchToolbar ? undefined : true}
@@ -11731,7 +11733,7 @@ export default function ChatView({
           }
           aria-label="Temporary chat"
           className={cn(
-            "ml-auto shrink-0 gap-1.5 whitespace-nowrap px-2 text-[length:var(--app-font-size-ui-sm,11px)] font-normal sm:px-2.5",
+            "ml-auto size-11 sm:h-11 shrink-0 gap-1.5 whitespace-nowrap px-2 md:h-7 md:w-auto text-[length:var(--app-font-size-ui-sm,11px)] font-normal md:px-2.5",
             COMPOSER_TOOLBAR_CAPSULE_HOVER_CLASS_NAME,
             isThreadTemporary
               ? "text-[var(--color-text-accent)] hover:text-[var(--color-text-accent)]"
@@ -11739,7 +11741,7 @@ export default function ChatView({
           )}
         >
           <TemporaryThreadIcon className="size-3.5" />
-          <span className="sr-only sm:not-sr-only">Temporary</span>
+          <span className="sr-only md:not-sr-only">Temporary</span>
         </Button>
       ) : null}
     </div>
@@ -12675,10 +12677,13 @@ export default function ChatView({
                     anchored to the bottom of the pane (with its workspace-tools rail
                     stacked on top of the input) so starting a chat keeps the composer
                     where it lives for the rest of the conversation. */}
-                <div className="flex min-h-0 flex-1 items-center justify-center">
+                <div
+                  data-empty-landing-hero="true"
+                  className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+                >
                   <div
                     className={cn(
-                      "flex flex-col items-center gap-4 px-6 text-center select-none",
+                      "my-auto flex shrink-0 flex-col items-center gap-4 px-6 py-4 text-center select-none",
                       CHAT_COLUMN_FRAME_CLASS_NAME,
                     )}
                   >

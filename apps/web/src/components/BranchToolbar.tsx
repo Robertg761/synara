@@ -514,7 +514,7 @@ export default function BranchToolbar({
         className,
       )}
     >
-      <div className={isPanel ? "flex flex-col gap-0.5" : "flex items-center gap-2"}>
+      <div className={isPanel ? "flex flex-col gap-0.5" : "flex min-w-0 flex-1 items-center gap-2"}>
         {showEnvPicker ? (
           <Menu open={envPickerOpen} onOpenChange={setEnvPickerOpen}>
             <MenuTrigger
@@ -524,7 +524,7 @@ export default function BranchToolbar({
                   className={
                     isPanel
                       ? ENVIRONMENT_ROW_CLASS_NAME
-                      : COMPOSER_TOOLBAR_PICKER_TRIGGER_CLASS_NAME
+                      : `${COMPOSER_TOOLBAR_PICKER_TRIGGER_CLASS_NAME} shrink-0`
                   }
                 />
               }
