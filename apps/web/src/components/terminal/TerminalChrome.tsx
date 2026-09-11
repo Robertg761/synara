@@ -16,6 +16,7 @@ import { IconButton } from "~/components/ui/icon-button";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { XIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
+import { isMobileShell } from "~/env";
 import { selectRepresentativeTerminalVisualIdentity } from "~/terminalVisualIdentity";
 
 import { DOCK_HEADER_ICON_BUTTON_CLASS, SurfaceTabChip } from "../chat/chatHeaderControls";
@@ -44,7 +45,11 @@ function TerminalChromeActions(props: {
       {props.actions.map((action) => (
         <IconButton
           key={action.label}
-          className={cn(buttonClassName, action.disabled ? "pointer-events-none opacity-45" : "")}
+          className={cn(
+            buttonClassName,
+            isMobileShell && "min-h-11 min-w-11",
+            action.disabled ? "pointer-events-none opacity-45" : "",
+          )}
           label={action.label}
           tooltip={action.label}
           tooltipSide="bottom"
@@ -140,7 +145,12 @@ export function TerminalSidebar(props: {
 }) {
   return (
     <aside className="flex w-36 min-w-36 flex-col border border-border/70 bg-[var(--color-background-surface)]">
-      <div className="flex h-[22px] items-stretch justify-end border-b border-border/70">
+      <div
+        className={cn(
+          "flex h-[22px] items-stretch justify-end border-b border-border/70",
+          isMobileShell && "h-auto min-h-11",
+        )}
+      >
         <TerminalChromeActions actions={props.actions} variant="sidebar" />
       </div>
 
