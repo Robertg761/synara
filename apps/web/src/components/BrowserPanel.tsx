@@ -1707,7 +1707,8 @@ export function BrowserPanel({
     [api, ensureLiveRuntime, onClosePanel, runBrowserAction, threadId, upsertThreadState],
   );
 
-  const touchBrowserChrome = isMobileShell && mode === "sheet";
+  // PhonePaneScreen reuses the dock renderer's sidebar mode.
+  const touchBrowserChrome = isMobileShell && mode !== "floating";
   const header = (
     <div
       className={cn(

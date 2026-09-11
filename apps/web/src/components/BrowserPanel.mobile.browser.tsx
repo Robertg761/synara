@@ -19,7 +19,10 @@ afterEach(async () => { await page.viewport(1280, 800); });
 it.each([
   { width: 320, height: 700 }, { width: 393, height: 700 },
   { width: 412, height: 700 }, { width: 732, height: 364 },
-])("keeps native browser controls reachable at $width x $height", async ({ width, height }) => {
+].flatMap((viewport) => [
+  { ...viewport, mode: "sidebar" as const },
+  { ...viewport, mode: "sheet" as const },
+]))("keeps native $mode browser controls reachable at $width x $height", async ({ width, height, mode }) => {
   await page.viewport(width, height);
   const threadId = ThreadId.makeUnsafe("mobile-browser-panel");
   const snapshot: ThreadBrowserState = {
@@ -36,7 +39,7 @@ it.each([
     return <QueryClientProvider client={client}>
       <button onClick={() => setOpen(true)}>Open test dialog</button>
       <div data-browser-test-container style={{ width: "100%", height: height - 30, display: "flex" }}>
-        <BrowserPanel mode="sheet" threadId={threadId} onClosePanel={() => {}} />
+        <BrowserPanel mode={mode} threadId={threadId} onClosePanel={() => {}} />
       </div>
       {open ? <div role="dialog" aria-modal="true" data-slot="dialog-popup" style={{ position: "fixed", inset: 0, zIndex: 100, background: "white" }}>
         <button onClick={() => setOpen(false)}>Close test dialog</button>
