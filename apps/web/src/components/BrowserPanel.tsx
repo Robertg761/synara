@@ -1707,9 +1707,14 @@ export function BrowserPanel({
     [api, ensureLiveRuntime, onClosePanel, runBrowserAction, threadId, upsertThreadState],
   );
 
+  const touchBrowserChrome = isMobileShell && mode === "sheet";
   const header = (
     <div
-      className={cn("flex min-w-0 flex-1 items-center gap-2", mode === "floating" && "cursor-grab")}
+      className={cn(
+        "flex min-w-0 flex-1 items-center gap-2",
+        mode === "floating" && "cursor-grab",
+        touchBrowserChrome && "flex-col items-stretch [&_button]:min-h-11 [&_button]:min-w-11 [&_input]:min-h-11",
+      )}
       data-floating-browser-header={mode === "floating" ? "true" : undefined}
     >
       {/* Keep the browser chrome interactive inside Electron's draggable titlebar. */}
@@ -1867,7 +1872,7 @@ export function BrowserPanel({
           </div>
         ) : null}
       </div>
-      <div className="flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]">
+      <div className="flex shrink-0 items-center justify-end gap-1 [-webkit-app-region:no-drag]">
         <BrowserAnnotationButton
           controller={annotationController}
           unavailableReason={!canAnnotate ? "Page annotations require the desktop app." : undefined}
@@ -1960,7 +1965,11 @@ export function BrowserPanel({
   if (!api && isLiveRuntime) {
     return (
       <div className="contents" data-browser-panel="true">
-        <DiffPanelShell mode={mode} header={isFloatingMode ? null : header}>
+        <DiffPanelShell
+        mode={mode}
+        header={isFloatingMode ? null : header}
+        headerClassName={touchBrowserChrome ? "h-auto py-1" : undefined}
+      >
           <DiffPanelLoadingState label="Browser is unavailable." />
         </DiffPanelShell>
       </div>
@@ -1969,7 +1978,11 @@ export function BrowserPanel({
 
   return (
     <div className="contents" data-browser-panel="true">
-      <DiffPanelShell mode={mode} header={isFloatingMode ? null : header}>
+      <DiffPanelShell
+        mode={mode}
+        header={isFloatingMode ? null : header}
+        headerClassName={touchBrowserChrome ? "h-auto py-1" : undefined}
+      >
         <div className="flex min-h-0 flex-1 flex-col">
           {!isFloatingMode ? (
             <BrowserTabStrip
@@ -1977,6 +1990,7 @@ export function BrowserPanel({
               activeTabId={activeTabId}
               status={browserChromeStatus}
               dragRegion={isElectron && mode !== "sheet"}
+              touchControls={touchBrowserChrome}
               onSelectTab={(tabId) => void onSelectTab(tabId)}
               onCloseTab={onCloseTab}
               onCreateTab={onCreateTab}

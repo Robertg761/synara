@@ -26,6 +26,7 @@ export interface BrowserTabStripProps {
   // Extend the frameless window drag region across the strip's empty space so the panel
   // is easy to grab; interactive children stay no-drag via global CSS (`.drag-region button`).
   dragRegion: boolean;
+  touchControls?: boolean;
   onSelectTab: (tabId: string) => void;
   onCloseTab: (tabId: string) => void;
   onCreateTab: () => void;
@@ -87,6 +88,7 @@ export function BrowserTabStrip(props: BrowserTabStripProps) {
               className={cn(
                 "group flex min-w-0 max-w-[14rem] items-center px-2.5 text-left transition-colors",
                 BROWSER_CHROME_CONTROL_CLASS_NAME,
+                props.touchControls && "min-h-11 shrink-0",
                 isActive
                   ? cn(BROWSER_CHROME_CONTROL_FILLED_CLASS_NAME, "text-foreground")
                   : "border-transparent text-muted-foreground hover:border-border/60 hover:bg-background/40 hover:text-foreground",
@@ -102,7 +104,10 @@ export function BrowserTabStrip(props: BrowserTabStripProps) {
               </span>
               <button
                 type="button"
-                className="min-w-0 flex-1 truncate text-left"
+                className={cn(
+                  "min-w-0 flex-1 truncate text-left",
+                  props.touchControls && "min-h-11 min-w-11",
+                )}
                 onClick={() => onSelectTab(tab.id)}
               >
                 {tab.title || "Untitled"}
@@ -111,7 +116,10 @@ export function BrowserTabStrip(props: BrowserTabStripProps) {
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                className={closeButtonClassName(isActive)}
+                className={cn(
+                  closeButtonClassName(isActive),
+                  props.touchControls && "min-h-11 min-w-11",
+                )}
                 onClick={(event) => {
                   event.stopPropagation();
                   onCloseTab(tab.id);
@@ -130,7 +138,10 @@ export function BrowserTabStrip(props: BrowserTabStripProps) {
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                className="size-7 shrink-0 text-muted-foreground hover:text-foreground"
+                className={cn(
+                  "size-7 shrink-0 text-muted-foreground hover:text-foreground",
+                  props.touchControls && "min-h-11 min-w-11",
+                )}
                 aria-label="New tab"
                 onClick={onCreateTab}
               />

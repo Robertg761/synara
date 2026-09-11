@@ -26,7 +26,7 @@ export default mergeConfig(
       ],
       browser: {
         enabled: true,
-        provider: playwright(),
+        provider: playwright({ contextOptions: { hasTouch: process.env.VITEST_BROWSER_TOUCH === "1" } }),
         instances: [{ browser: "chromium" }],
         headless: true,
         // Vitest's own default is 414x896 — a PHONE viewport. Since the `/_chat` route tree

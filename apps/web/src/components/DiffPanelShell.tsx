@@ -24,6 +24,7 @@ function getDiffPanelHeaderRowClassName(mode: DiffPanelMode) {
 export function DiffPanelShell(props: {
   mode: DiffPanelMode;
   header?: ReactNode;
+  headerClassName?: string | undefined;
   children: ReactNode;
 }) {
   const shouldUseDragRegion = isElectron && props.mode !== "sheet" && props.mode !== "floating";
@@ -41,10 +42,14 @@ export function DiffPanelShell(props: {
     >
       {hasHeader ? (
         shouldUseDragRegion ? (
-          <div className={getDiffPanelHeaderRowClassName(props.mode)}>{props.header}</div>
+          <div className={cn(getDiffPanelHeaderRowClassName(props.mode), props.headerClassName)}>
+              {props.header}
+            </div>
         ) : (
           <div className={CHAT_SURFACE_HEADER_DIVIDER_CLASS_NAME}>
-            <div className={getDiffPanelHeaderRowClassName(props.mode)}>{props.header}</div>
+            <div className={cn(getDiffPanelHeaderRowClassName(props.mode), props.headerClassName)}>
+              {props.header}
+            </div>
           </div>
         )
       ) : null}
