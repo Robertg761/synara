@@ -43,8 +43,8 @@ export function DiffPanelShell(props: {
       {hasHeader ? (
         shouldUseDragRegion ? (
           <div className={cn(getDiffPanelHeaderRowClassName(props.mode), props.headerClassName)}>
-              {props.header}
-            </div>
+            {props.header}
+          </div>
         ) : (
           <div className={CHAT_SURFACE_HEADER_DIVIDER_CLASS_NAME}>
             <div className={cn(getDiffPanelHeaderRowClassName(props.mode), props.headerClassName)}>

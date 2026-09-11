@@ -1966,10 +1966,10 @@ export function BrowserPanel({
     return (
       <div className="contents" data-browser-panel="true">
         <DiffPanelShell
-        mode={mode}
-        header={isFloatingMode ? null : header}
-        headerClassName={touchBrowserChrome ? "h-auto py-1" : undefined}
-      >
+          mode={mode}
+          header={isFloatingMode ? null : header}
+          headerClassName={touchBrowserChrome ? "h-auto py-1" : undefined}
+        >
           <DiffPanelLoadingState label="Browser is unavailable." />
         </DiffPanelShell>
       </div>
