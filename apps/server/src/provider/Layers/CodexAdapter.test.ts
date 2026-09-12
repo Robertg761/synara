@@ -23,6 +23,7 @@ import {
   type CodexAppServerSendTurnInput,
 } from "../../codexAppServerManager.ts";
 import { ServerConfig } from "../../config.ts";
+import { CodexSessionStartError } from "../../codexErrorClassification.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import { CodexAdapter } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
@@ -175,8 +176,43 @@ const validationLayer = it.layer(
 );
 
 validationLayer("CodexAdapterLive validation", (it) => {
+  it.effect(
+    "preserves startup cleanup evidence without reclassifying unknown process failures",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* CodexAdapter;
+        for (const cause of [
+          new CodexSessionStartError("Codex stdout closed during initialization."),
+          new Error("Failed to prove Codex app-server process-tree exit."),
+        ]) {
+          validationManager.startSessionImpl.mockRejectedValueOnce(cause);
+          const result = yield* adapter
+            .startSession({
+              provider: "codex",
+              threadId: asThreadId("thread-start-failed"),
+              runtimeMode: "full-access",
+            })
+            .pipe(Effect.result);
+
+          assert.equal(result._tag, "Failure");
+          if (result._tag !== "Failure") throw new Error("Expected startup failure");
+          assert.equal(result.failure._tag, "ProviderAdapterProcessError");
+          if (result.failure._tag !== "ProviderAdapterProcessError") {
+            throw new Error("Expected process failure");
+          }
+          assert.equal(
+            result.failure.reason,
+            cause instanceof CodexSessionStartError ? "startup-failed" : undefined,
+          );
+          assert.equal(result.failure.cause, cause);
+          assert.equal(result.failure.detail, cause.message);
+        }
+      }),
+  );
+
   it.effect("returns validation error for non-codex provider on startSession", () =>
     Effect.gen(function* () {
+      validationManager.startSessionImpl.mockClear();
       const adapter = yield* CodexAdapter;
       const result = yield* adapter
         .startSession({
@@ -226,7 +262,28 @@ validationLayer("CodexAdapterLive validation", (it) => {
         effort: "high",
         serviceTier: "fast",
         runtimeMode: "full-access",
+        // The manager owns Codex session restarts, so it carries the capability
+        // facts its gateway lease derives from.
+        agentGatewayCapabilityInput: { enableComputerControl: false },
       });
+    }),
+  );
+  it.effect("carries computer control into the manager's gateway lease facts", () =>
+    Effect.gen(function* () {
+      validationManager.startSessionImpl.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      yield* adapter.startSession({
+        provider: "codex",
+        threadId: asThreadId("thread-computer"),
+        enableComputerControl: true,
+        runtimeMode: "full-access",
+      });
+
+      assert.deepStrictEqual(
+        validationManager.startSessionImpl.mock.calls[0]?.[0]?.agentGatewayCapabilityInput,
+        { enableComputerControl: true },
+      );
     }),
   );
   it.effect("forwards an external fork cursor when starting a session", () =>
@@ -247,7 +304,28 @@ validationLayer("CodexAdapterLive validation", (it) => {
         threadId: asThreadId("thread-import"),
         forkSourceResumeCursor,
         runtimeMode: "full-access",
+        agentGatewayCapabilityInput: { enableComputerControl: false },
       });
+    }),
+  );
+  it.effect("explicitly selects Standard when opening a session with Fast disabled", () =>
+    Effect.gen(function* () {
+      validationManager.startSessionImpl.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      yield* adapter.startSession({
+        provider: "codex",
+        threadId: asThreadId("thread-standard"),
+        resumeCursor: { threadId: "previously-fast-thread" },
+        modelSelection: {
+          provider: "codex",
+          model: "gpt-5.4",
+          options: { fastMode: false },
+        },
+        runtimeMode: "full-access",
+      });
+
+      assert.equal(validationManager.startSessionImpl.mock.calls[0]?.[0].serviceTier, "default");
     }),
   );
 });
@@ -333,6 +411,32 @@ const turnPreparationLayer = it.layer(
 );
 
 turnPreparationLayer("CodexAdapterLive turn input preparation", (it) => {
+  it.effect("clears Fast mode on the next turn while preserving an unspecified tier", () =>
+    Effect.gen(function* () {
+      turnPreparationManager.sendTurnImpl.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      for (const fastMode of [true, false, undefined]) {
+        yield* adapter.sendTurn({
+          threadId: asThreadId("thread-tier-toggle"),
+          input: "Continue",
+          attachments: [],
+          modelSelection: {
+            provider: "codex",
+            model: "gpt-5.4",
+            ...(fastMode !== undefined ? { options: { fastMode } } : {}),
+          },
+        });
+      }
+
+      const requests = turnPreparationManager.sendTurnImpl.mock.calls.map(([input]) => input);
+      assert.deepStrictEqual(
+        requests.map((input) => input.serviceTier),
+        ["fast", "default", undefined],
+      );
+      assert.equal(Object.hasOwn(requests[2]!, "serviceTier"), false);
+    }),
+  );
   it.effect("prepares equivalent rich send and steer manager payloads", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;
@@ -732,6 +836,40 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
       assert.equal(firstEvent.value.itemId, "msg_1");
       assert.equal(firstEvent.value.turnId, "turn-1");
       assert.equal(firstEvent.value.payload.itemType, "assistant_message");
+    }),
+  );
+
+  it.effect("keeps inspected images out of generated output artifacts", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      const payload = {
+        item: {
+          type: "imageView",
+          id: "view_1",
+          path: "/attachments/objects/upload.png",
+        },
+      };
+      lifecycleManager.emit("event", {
+        id: asEventId("evt-image-view"),
+        kind: "notification",
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        method: "item/completed",
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("turn-1"),
+        itemId: asItemId("view_1"),
+        payload,
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      assert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") return;
+      assert.equal(firstEvent.value.type, "item.completed");
+      if (firstEvent.value.type !== "item.completed") return;
+      assert.equal(firstEvent.value.payload.itemType, "image_view");
+      assert.equal(firstEvent.value.payload.title, "Image view");
+      assert.deepStrictEqual(firstEvent.value.payload.data, payload);
     }),
   );
 
@@ -1150,6 +1288,71 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("maps MCP tool-call approval elicitations to tool approvals", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      lifecycleManager.emit("event", {
+        id: asEventId("evt-mcp-tool-approval"),
+        kind: "request",
+        provider: "codex",
+        threadId: asThreadId("thread-1"),
+        createdAt: new Date().toISOString(),
+        method: "mcpServer/elicitation/request",
+        requestId: ApprovalRequestId.makeUnsafe("req-mcp-tool-1"),
+        requestKind: "tool",
+        payload: {
+          message: "Allow the tool call?",
+          _meta: {
+            tool_name: "computer_launch_app",
+            tool_params_display: [{ name: "app", value: "kcalc" }],
+          },
+        },
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      assert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some" || firstEvent.value.type !== "request.opened") return;
+      assert.equal(firstEvent.value.payload.requestType, "tool_approval");
+      assert.equal(firstEvent.value.payload.detail, "Allow the tool call?");
+      assert.deepEqual(firstEvent.value.payload.args, {
+        message: "Allow the tool call?",
+        _meta: {
+          tool_name: "computer_launch_app",
+          tool_params_display: [{ name: "app", value: "kcalc" }],
+        },
+      });
+    }),
+  );
+
+  it.effect("maps unrenderable MCP elicitations to runtime warnings", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      lifecycleManager.emit("event", {
+        id: asEventId("evt-mcp-elicitation-warning"),
+        kind: "error",
+        provider: "codex",
+        threadId: asThreadId("thread-1"),
+        createdAt: new Date().toISOString(),
+        method: "mcpServer/elicitation/request/unrenderable",
+        message: "Synara declined an MCP elicitation it cannot render yet.",
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      assert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") return;
+      assert.equal(firstEvent.value.type, "runtime.warning");
+      if (firstEvent.value.type !== "runtime.warning") return;
+      assert.equal(
+        firstEvent.value.payload.message,
+        "Synara declined an MCP elicitation it cannot render yet.",
+      );
+    }),
+  );
+
   it.effect("preserves file-read request type when mapping serverRequest/resolved", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;
@@ -1514,6 +1717,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
             total: {
               inputTokens: 11_833,
               cachedInputTokens: 3456,
+              cacheWriteInputTokens: 500,
               outputTokens: 6,
               reasoningOutputTokens: 0,
               totalTokens: 11_839,
@@ -1542,6 +1746,12 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
 
       assert.deepEqual(firstEvent.value.payload.usage, {
         usedTokens: 126,
+        cumulativeUsage: {
+          inputTokens: 11_833,
+          outputTokens: 6,
+          cachedInputTokens: 3456,
+          cacheCreationInputTokens: 500,
+        },
         totalProcessedTokens: 11_839,
         maxTokens: 258_400,
         inputTokens: 120,

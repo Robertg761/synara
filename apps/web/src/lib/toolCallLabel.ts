@@ -4,12 +4,9 @@
 // Exports: deriveReadableToolTitle, deriveReadableCommandDisplay, deriveFriendlyCommandTarget, command icon classifiers, deriveInlineCommandCall, normalizeCompactToolLabel, isGenericToolTitle, extractWebFetchUrl
 // Depends on: @synara/contracts tool lifecycle item types
 
-import {
-  BROWSER_TOOL_NAMES,
-  type BrowserToolName,
-  type ToolLifecycleItemType,
-} from "@synara/contracts";
+import type { ToolLifecycleItemType } from "@synara/contracts";
 import { BROWSER_TOOL_TITLES } from "@synara/shared/browserAutomationPresentation";
+import type { ComputerToolName } from "./computerToolPresentation";
 import { basenameOfPath } from "../file-icons";
 import { extractToolArgumentField } from "./toolArgumentSummary";
 
@@ -108,7 +105,13 @@ export interface ReadableToolTitleInput {
   readonly title?: string | null;
   readonly fallbackLabel: string;
   readonly itemType?: ToolLifecycleItemType | undefined;
-  readonly requestKind?: "command" | "file-read" | "file-change" | "permissions" | undefined;
+  readonly requestKind?:
+    | "command"
+    | "file-read"
+    | "file-change"
+    | "permissions"
+    | "tool"
+    | undefined;
   readonly command?: string | null;
   readonly payload?: Record<string, unknown> | null;
   readonly isRunning?: boolean;
@@ -120,15 +123,90 @@ interface SynaraMcpToolPresentation {
   readonly failed: string;
 }
 
-type SynaraBrowserToolName = `synara_${BrowserToolName}`;
-const BROWSER_TOOL_NAME_SET = new Set<string>(BROWSER_TOOL_NAMES);
+// Historical messages still contain retired tools; presentation does not expose them to agents.
+const BROWSER_HISTORY_TITLES = {
+  ...BROWSER_TOOL_TITLES,
+  browser_snapshot: "Snapshot browser page",
+  browser_webmcp_tools: "Discover page WebMCP tools",
+  browser_webmcp_call: "Call page WebMCP tool",
+  browser_click: "Click browser target",
+  browser_hover: "Hover browser target",
+  browser_drag: "Drag between browser targets",
+  browser_type: "Type into browser target",
+  browser_select: "Select browser options",
+  browser_press: "Press browser keys",
+  browser_scroll: "Scroll browser page",
+  browser_wait: "Wait for browser condition",
+  browser_evaluate: "Evaluate browser expression",
+} as const;
+type BrowserHistoryToolName = keyof typeof BROWSER_HISTORY_TITLES;
+type SynaraBrowserToolName = `synara_${BrowserHistoryToolName}`;
+const BROWSER_HISTORY_TOOL_NAMES = Object.keys(BROWSER_HISTORY_TITLES) as BrowserHistoryToolName[];
+const BROWSER_TOOL_NAME_SET = new Set<string>(BROWSER_HISTORY_TOOL_NAMES);
 
 const SYNARA_BROWSER_TOOL_PRESENTATIONS = Object.fromEntries(
-  BROWSER_TOOL_NAMES.map((toolName) => {
-    const title = BROWSER_TOOL_TITLES[toolName];
+  BROWSER_HISTORY_TOOL_NAMES.map((toolName) => {
+    const title = BROWSER_HISTORY_TITLES[toolName];
     return [`synara_${toolName}`, { running: title, completed: title, failed: title }];
   }),
 ) as Record<SynaraBrowserToolName, SynaraMcpToolPresentation>;
+
+/**
+ * The desktop tools, spoken. Every browser tool had a curated presentation and
+ * every computer tool had none, so the most consequential rows in the
+ * transcript — an agent moving a pointer on the user's own machine — fell
+ * through to the invented "Synara is handling computer click" fallback.
+ *
+ * The wording deliberately keeps the machine in the sentence ("this computer's
+ * desktop") rather than saying "the desktop", because on the backends that
+ * matter it is the user's own.
+ */
+const SYNARA_COMPUTER_TOOL_PRESENTATIONS = {
+  synara_computer_screenshot: presentComputerTool("taking a screenshot", "took a screenshot"),
+  synara_computer_get_state: presentComputerTool("reading the screen", "read the screen"),
+  synara_computer_get_screen_size: presentComputerTool(
+    "measuring the screen",
+    "measured the screen",
+  ),
+  synara_computer_list_windows: presentComputerTool("listing windows", "listed the windows"),
+  synara_computer_click: presentComputerTool("clicking the desktop", "clicked the desktop"),
+  synara_computer_double_click: presentComputerTool(
+    "double-clicking the desktop",
+    "double-clicked the desktop",
+  ),
+  synara_computer_right_click: presentComputerTool(
+    "right-clicking the desktop",
+    "right-clicked the desktop",
+  ),
+  synara_computer_move_cursor: presentComputerTool("moving the cursor", "moved the cursor"),
+  synara_computer_drag: presentComputerTool("dragging on the desktop", "dragged on the desktop"),
+  synara_computer_scroll: presentComputerTool("scrolling the desktop", "scrolled the desktop"),
+  synara_computer_type_text: presentComputerTool("typing on the desktop", "typed on the desktop"),
+  synara_computer_press_key: presentComputerTool("pressing a key", "pressed a key"),
+  synara_computer_hotkey: presentComputerTool("pressing a shortcut", "pressed a shortcut"),
+  synara_computer_set_value: presentComputerTool("setting a field", "set a field"),
+  synara_computer_perform_action: presentComputerTool(
+    "activating a control",
+    "activated a control",
+  ),
+  synara_computer_launch_app: presentComputerTool("opening an app", "opened an app"),
+  synara_computer_read_clipboard: presentComputerTool(
+    "reading the clipboard",
+    "read the clipboard",
+  ),
+  synara_computer_write_clipboard: presentComputerTool(
+    "writing to the clipboard",
+    "wrote to the clipboard",
+  ),
+} as const satisfies Record<`synara_${ComputerToolName}`, SynaraMcpToolPresentation>;
+
+function presentComputerTool(present: string, past: string): SynaraMcpToolPresentation {
+  return {
+    running: `Synara is ${present}`,
+    completed: `Synara ${past}`,
+    failed: `Synara couldn't finish ${present}`,
+  };
+}
 
 const SYNARA_MCP_TOOL_PRESENTATIONS = {
   synara_context: {
@@ -272,6 +350,7 @@ const SYNARA_MCP_TOOL_PRESENTATIONS = {
     failed: "Synara couldn't stop an automation",
   },
   ...SYNARA_BROWSER_TOOL_PRESENTATIONS,
+  ...SYNARA_COMPUTER_TOOL_PRESENTATIONS,
 } as const satisfies Record<string, SynaraMcpToolPresentation>;
 
 function normalizeSynaraMcpIdentifier(value: string): string {
@@ -282,8 +361,8 @@ function normalizeSynaraMcpIdentifier(value: string): string {
 }
 
 const SYNARA_BROWSER_TOOL_NAME_BY_PRESENTATION = new Map<string, SynaraBrowserToolName>(
-  BROWSER_TOOL_NAMES.map((toolName) => [
-    normalizeSynaraMcpIdentifier(BROWSER_TOOL_TITLES[toolName]),
+  BROWSER_HISTORY_TOOL_NAMES.map((toolName) => [
+    normalizeSynaraMcpIdentifier(BROWSER_HISTORY_TITLES[toolName]),
     `synara_${toolName}`,
   ]),
 );
@@ -514,6 +593,7 @@ function humanizeRequestKind(
 ): string | null {
   if (requestKind === "file-read") return "Read";
   if (requestKind === "file-change" || itemType === "file_change") return "Edited";
+  if (requestKind === "tool") return "Tool";
   // Don't handle command types here — let humanizeCommandToolLabel produce more specific labels
   if (itemType === "web_search") return "Searched the web";
   if (itemType === "image_generation") return "Generated image";

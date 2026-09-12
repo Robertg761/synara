@@ -8,6 +8,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -49,6 +50,7 @@ import { CodexJsonlFramer, CodexJsonlWriter } from "./codexAppServerTransport";
 import { ensureIsolatedScratchWorkspace } from "./scratchWorkspaces";
 import { SYNARA_HARNESS_POLICY_MARKER } from "./agentGateway/harnessPolicy.ts";
 import {
+  AGENT_GATEWAY_NO_CAPABILITIES,
   AGENT_GATEWAY_TURN_AUTHORITY_RETIRED,
   acquireAgentGatewaySessionLease,
 } from "./agentGateway/sessionLease.ts";
@@ -71,6 +73,22 @@ const autoTurnOverrides = {
   sandboxPolicy: { type: "workspaceWrite" },
 } as const;
 
+const approvalParams = (persist: ReadonlyArray<string> = ["session"]) => ({
+  threadId: "provider_parent",
+  turnId: "turn_mcp",
+  serverName: "synara",
+  mode: "form",
+  message: "Allow Synara to launch the calculator?",
+  requestedSchema: { type: "object", properties: {} },
+  _meta: {
+    codex_approval_kind: "mcp_tool_call",
+    persist,
+    tool_name: "computer_launch_app",
+    tool_params: { app: "kcalc" },
+    tool_params_display: [{ name: "app", value: "kcalc", display_name: "app" }],
+  },
+});
+
 describe("Codex Synara harness policy", () => {
   it("keeps the same host policy exactly once in default and plan instructions", () => {
     for (const instructions of [
@@ -88,7 +106,23 @@ describe("Codex Synara harness policy", () => {
         expect(instructions, name).toContain(`\`${name.slice("browser_".length)}\``);
       }
       expect(instructions).toContain("Do not search or filter \`ALL_TOOLS\`");
-      expect(instructions).toContain("sequentially in one \`functions.exec\` invocation");
+      expect(instructions).not.toContain("Use separate tool calls for browser steps");
+      expect(instructions).toContain("Independent tool calls may run concurrently");
+      expect(instructions).toContain("Batch related reads/actions in one browser_run script");
+      expect(instructions).toContain("Split the script when new page state requires inspection");
+      expect(instructions).not.toContain("no multi-action scripts");
+      expect(instructions).toContain("your first tool call is");
+      expect(instructions).toContain("text(r.structuredContent ?? r)");
+      expect(instructions).toContain("errors may only have");
+      expect(instructions).toContain("not a fresh whole-page snapshot by default");
+      expect(instructions).toContain("Do not rediscover tools after a model switch");
+      expect(instructions).toContain("print no unrelated catalogue");
+      expect(instructions).toContain("Snapshot diffs and aria refs do not persist between calls");
+      expect(instructions).toContain(
+        'human.click(page.getByRole("button",{name:"Log In",exact:true}))',
+      );
+      expect(instructions).toContain("never bare document/window/location");
+      expect(instructions).toContain("Script errors do not mean sign-in buttons are blocked");
     }
   });
 
@@ -549,6 +583,7 @@ describe("Codex app-server teardown", () => {
       },
       threadId,
       "codex",
+      AGENT_GATEWAY_NO_CAPABILITIES,
     );
     const context = {
       gatewaySessionLease,
@@ -596,7 +631,7 @@ describe("Codex app-server teardown", () => {
     expect(manager.hasSession(threadId)).toBe(false);
   });
 
-  it("releases the session lease once when the app-server exits spontaneously", () => {
+  it("releases the session lease once when the app-server exits spontaneously", async () => {
     class FakeCodexChild extends EventEmitter {
       readonly pid = 5252;
       exitCode: number | null = null;
@@ -606,7 +641,12 @@ describe("Codex app-server teardown", () => {
       readonly stderr = new PassThrough();
     }
     const child = new FakeCodexChild();
-    const manager = new CodexAppServerManager();
+    const teardownProcessTree = vi.fn(async () => ({
+      escalated: false,
+      signalErrors: [],
+      capturedBeforeRootExit: false,
+    }));
+    const manager = new CodexAppServerManager(undefined, { teardownProcessTree });
     const threadId = asThreadId("thread-codex-spontaneous-exit");
     const revokeSessionToken = vi.fn();
     const gatewaySessionLease = acquireAgentGatewaySessionLease(
@@ -619,6 +659,7 @@ describe("Codex app-server teardown", () => {
       },
       threadId,
       "codex",
+      AGENT_GATEWAY_NO_CAPABILITIES,
     );
     const context = {
       gatewaySessionLease,
@@ -650,11 +691,14 @@ describe("Codex app-server teardown", () => {
     internals.sessions.set(threadId, context);
     internals.attachProcessListeners(context);
 
+    child.exitCode = 1;
     child.emit("exit", 1, null);
     child.emit("exit", 1, null);
 
     expect(revokeSessionToken).toHaveBeenCalledOnce();
     expect(manager.hasSession(threadId)).toBe(false);
+    await vi.waitFor(() => expect(internals.sessions.has(threadId)).toBe(false));
+    expect(teardownProcessTree).toHaveBeenCalledOnce();
   });
 });
 
@@ -1195,18 +1239,39 @@ describe("buildCodexProcessEnv", () => {
     }
   });
 
-  it("repairs stale real files in Synara's Codex home overlay", async () => {
+  it("keeps Codex SQLite state out of Synara's Codex home overlay", async () => {
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "synara-codex-env-"));
     const runtimeHome = mkdtempSync(path.join(os.tmpdir(), "synara-runtime-home-"));
+    const lstatOrUndefined = (target: string) => {
+      try {
+        return lstatSync(target);
+      } catch {
+        return undefined;
+      }
+    };
     try {
-      const sourceMemoryPath = path.join(tempDir, "memories_1.sqlite");
       writeFileSync(path.join(tempDir, "config.toml"), 'model = "gpt-5.5"', "utf8");
-      writeFileSync(sourceMemoryPath, "fresh-source-db", "utf8");
+      writeFileSync(path.join(tempDir, "history.jsonl"), "", "utf8");
+      const sourceSqliteEntries = [
+        "state_5.sqlite",
+        "state_5.sqlite-wal",
+        "state_5.sqlite-shm",
+        "memories_1.sqlite",
+      ];
+      for (const entry of sourceSqliteEntries) {
+        writeFileSync(path.join(tempDir, entry), "source-db", "utf8");
+      }
 
       const overlayHome = path.join(runtimeHome, "codex-home-overlay");
-      const overlayMemoryPath = path.join(overlayHome, "memories_1.sqlite");
       mkdirSync(overlayHome, { recursive: true });
-      writeFileSync(overlayMemoryPath, "stale-overlay-db", "utf8");
+      // Links left behind by releases that mirrored SQLite state per file,
+      // including a WAL sidecar whose source Codex has since checkpointed away.
+      const legacyLinks = ["state_5.sqlite", "thread_history_1.sqlite-wal"];
+      for (const entry of legacyLinks) {
+        symlinkSync(path.join(tempDir, entry), path.join(overlayHome, entry), "file");
+      }
+      const staleOverlayDbPath = path.join(overlayHome, "memories_1.sqlite");
+      writeFileSync(staleOverlayDbPath, "stale-overlay-db", "utf8");
 
       const env = await buildCodexProcessEnv({
         env: { SYNARA_HOME: runtimeHome },
@@ -1215,8 +1280,17 @@ describe("buildCodexProcessEnv", () => {
       });
 
       expect(env.CODEX_HOME).toBe(overlayHome);
-      expect(lstatSync(overlayMemoryPath).isSymbolicLink()).toBe(true);
-      expect(readlinkSync(overlayMemoryPath)).toBe(sourceMemoryPath);
+      expect(env.CODEX_SQLITE_HOME).toBe(tempDir);
+      for (const entry of [...sourceSqliteEntries, ...legacyLinks]) {
+        if (entry === "memories_1.sqlite") continue;
+        expect(lstatOrUndefined(path.join(overlayHome, entry))).toBeUndefined();
+      }
+      // A regular database file in the overlay is not Synara's to destroy.
+      expect(lstatSync(staleOverlayDbPath).isSymbolicLink()).toBe(false);
+      expect(readFileSync(staleOverlayDbPath, "utf8")).toBe("stale-overlay-db");
+      const overlayHistoryPath = path.join(overlayHome, "history.jsonl");
+      expect(lstatSync(overlayHistoryPath).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(overlayHistoryPath)).toBe(path.join(tempDir, "history.jsonl"));
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
       rmSync(runtimeHome, { recursive: true, force: true });
@@ -2931,39 +3005,61 @@ describe("thread checkpoint control", () => {
     });
   });
 
-  it.skipIf(!process.env.CODEX_BINARY_PATH)("forks a provider thread via thread/fork", async () => {
+  it("forks a provider thread with an explicitly selected Standard tier", async () => {
+    const homePath = mkdtempSync(path.join(os.tmpdir(), "synara-codex-fork-tier-"));
+    writeFileSync(path.join(homePath, "app-server"), "process.stdin.resume();\n");
+    const previousSynaraHome = process.env.SYNARA_HOME;
+    process.env.SYNARA_HOME = path.join(homePath, "synara-home");
     const { manager, sendRequest } = createThreadControlHarness();
+    vi.spyOn(
+      manager as unknown as { assertSupportedCodexCliVersion: () => Promise<void> },
+      "assertSupportedCodexCliVersion",
+    ).mockResolvedValue(undefined);
     sendRequest.mockResolvedValue({
       thread: {
         id: "thread_forked",
       },
     });
 
-    const result = await manager.forkThread({
-      sourceThreadId: asThreadId("thread_1"),
-      sourceResumeCursor: {
-        threadId: "thread_1",
-      },
-      threadId: asThreadId("thread_2"),
-      runtimeMode: "full-access",
-    });
+    try {
+      const result = await manager.forkThread({
+        sourceThreadId: asThreadId("thread_1"),
+        sourceResumeCursor: {
+          threadId: "thread_1",
+        },
+        threadId: asThreadId("thread_2"),
+        cwd: homePath,
+        providerOptions: { codex: { binaryPath: process.execPath, homePath } },
+        modelSelection: {
+          provider: "codex",
+          model: "gpt-5.4",
+          options: { fastMode: false },
+        },
+        runtimeMode: "full-access",
+      });
 
-    expect(sendRequest).toHaveBeenNthCalledWith(
-      3,
-      expect.anything(),
-      "thread/fork",
-      expect.objectContaining({
+      const forkRequest = sendRequest.mock.calls.find(([, method]) => method === "thread/fork");
+      expect(forkRequest?.[2]).toMatchObject({
         threadId: "thread_1",
+        serviceTier: "default",
         approvalPolicy: "never",
         sandbox: "danger-full-access",
-      }),
-    );
-    expect(result).toEqual({
-      threadId: "thread_2",
-      resumeCursor: {
-        threadId: "thread_forked",
-      },
-    });
+      });
+      expect(result).toEqual({
+        threadId: "thread_2",
+        resumeCursor: {
+          threadId: "thread_forked",
+        },
+      });
+    } finally {
+      await manager.stopAll();
+      if (previousSynaraHome === undefined) {
+        delete process.env.SYNARA_HOME;
+      } else {
+        process.env.SYNARA_HOME = previousSynaraHome;
+      }
+      rmSync(homePath, { recursive: true, force: true });
+    }
   });
 
   it("rolls back turns via thread/rollback and resets session running state", async () => {
@@ -3407,6 +3503,220 @@ describe("respondToRequest", () => {
       context,
       expect.objectContaining({
         id: 101,
+      }),
+    );
+  });
+
+  it("leaves pending MCP tool approvals alone when a command is accepted for the session", async () => {
+    const { manager, context, writeMessage } = createPendingApprovalHarness();
+
+    await handleServerRequestForTest(manager, context, {
+      id: 100,
+      method: "mcpServer/elicitation/request",
+      params: {
+        turnId: "turn_2",
+        mode: "form",
+        message: "Approve this tool call",
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          persist: ["session"],
+          tool_name: "computer_launch_app",
+          tool_params_display: [{ name: "app", value: "kcalc" }],
+        },
+      },
+    });
+
+    const mcpRequest = [...context.pendingApprovals.values()].find(
+      (request) => String(request.method) === "mcpServer/elicitation/request",
+    );
+    if (!mcpRequest) {
+      throw new Error("Expected the MCP tool approval to remain pending.");
+    }
+
+    await manager.respondToRequest(
+      asThreadId("thread_1"),
+      ApprovalRequestId.makeUnsafe("req-approval-1"),
+      "acceptForSession",
+    );
+
+    // The command grant is not a tool grant: the tool approval still waits for its own answer.
+    expect(context.pendingApprovals.has(mcpRequest.requestId)).toBe(true);
+    expect(writeMessage).not.toHaveBeenCalledWith(context, expect.objectContaining({ id: 100 }));
+  });
+
+  it("keeps asking for MCP tool approvals while a command session grant is active", async () => {
+    const { manager, context, writeMessage } = createPendingApprovalHarness();
+
+    await manager.respondToRequest(
+      asThreadId("thread_1"),
+      ApprovalRequestId.makeUnsafe("req-approval-1"),
+      "acceptForSession",
+    );
+    expect(context.sessionApprovalOverride).toBeDefined();
+
+    await handleServerRequestForTest(manager, context, {
+      id: 100,
+      method: "mcpServer/elicitation/request",
+      params: {
+        turnId: "turn_2",
+        mode: "form",
+        message: "Approve this tool call",
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          persist: ["session"],
+          tool_name: "mcp_tool",
+          tool_params_display: [{ name: "app", value: "kcalc" }],
+        },
+      },
+    });
+
+    const mcpRequest = [...context.pendingApprovals.values()].find(
+      (request) => String(request.method) === "mcpServer/elicitation/request",
+    );
+    expect(mcpRequest).toBeDefined();
+    expect(writeMessage).not.toHaveBeenCalledWith(context, expect.objectContaining({ id: 100 }));
+  });
+});
+
+describe("MCP tool call elicitation approvals", () => {
+  it("tracks approval elicitations as tool requests and accepts them with the MCP response shape", async () => {
+    const { manager, context, emitEvent, writeMessage } = createCollabNotificationHarness();
+
+    await handleServerRequestForTest(manager, context, {
+      id: 70,
+      method: "mcpServer/elicitation/request",
+      params: approvalParams(),
+    });
+
+    const pendingRequest = Array.from(context.pendingApprovals.values())[0];
+    expect(pendingRequest).toEqual(
+      expect.objectContaining({
+        method: "mcpServer/elicitation/request",
+        requestKind: "tool",
+        mcpSessionPersistenceAdvertised: true,
+      }),
+    );
+    expect(emitEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "request",
+        requestKind: "tool",
+        payload: expect.objectContaining({
+          _meta: expect.objectContaining({
+            tool_name: "computer_launch_app",
+            tool_params_display: [{ name: "app", value: "kcalc", display_name: "app" }],
+          }),
+        }),
+      }),
+    );
+
+    await manager.respondToRequest(asThreadId("thread_1"), pendingRequest.requestId, "accept");
+
+    expect(writeMessage).toHaveBeenCalledWith(context, {
+      id: 70,
+      result: { action: "accept", content: null, _meta: null },
+    });
+  });
+
+  it("tells the composer when session persistence was not advertised", async () => {
+    const { manager, context, emitEvent } = createCollabNotificationHarness();
+
+    await handleServerRequestForTest(manager, context, {
+      id: 71,
+      method: "mcpServer/elicitation/request",
+      params: approvalParams(["always"]),
+    });
+
+    expect(emitEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "request",
+        requestKind: "tool",
+        payload: expect.objectContaining({ sessionApprovalAvailable: false }),
+      }),
+    );
+
+    emitEvent.mockClear();
+    await handleServerRequestForTest(manager, context, {
+      id: 72,
+      method: "mcpServer/elicitation/request",
+      params: approvalParams(["session"]),
+    });
+    const [event] = emitEvent.mock.calls.at(-1) ?? [];
+    expect(event).toEqual(expect.objectContaining({ kind: "request", requestKind: "tool" }));
+    expect((event as { payload?: Record<string, unknown> }).payload).not.toHaveProperty(
+      "sessionApprovalAvailable",
+    );
+  });
+
+  it.each([
+    ["acceptForSession", ["session"], { persist: "session" }],
+    ["acceptForSession", ["always"], null],
+  ] as const)(
+    "maps %s with persist=%j to the protocol response",
+    async (decision, persist, meta) => {
+      const { manager, context, writeMessage } = createCollabNotificationHarness();
+
+      await handleServerRequestForTest(manager, context, {
+        id: 71,
+        method: "mcpServer/elicitation/request",
+        params: approvalParams(persist),
+      });
+      const pendingRequest = Array.from(context.pendingApprovals.values())[0];
+      await manager.respondToRequest(asThreadId("thread_1"), pendingRequest.requestId, decision);
+
+      expect(writeMessage).toHaveBeenCalledWith(context, {
+        id: 71,
+        result: { action: "accept", content: null, _meta: meta },
+      });
+    },
+  );
+
+  it.each(["decline", "cancel"] as const)(
+    "maps %s to the matching elicitation action",
+    async (decision) => {
+      const { manager, context, writeMessage } = createCollabNotificationHarness();
+
+      await handleServerRequestForTest(manager, context, {
+        id: 72,
+        method: "mcpServer/elicitation/request",
+        params: approvalParams(),
+      });
+      const pendingRequest = Array.from(context.pendingApprovals.values())[0];
+      await manager.respondToRequest(asThreadId("thread_1"), pendingRequest.requestId, decision);
+
+      expect(writeMessage).toHaveBeenCalledWith(context, {
+        id: 72,
+        result: { action: decision, content: null, _meta: null },
+      });
+    },
+  );
+
+  it("cancels non-approval elicitations and emits a warning instead of an unsupported-request error", async () => {
+    const { manager, context, emitEvent, writeMessage } = createCollabNotificationHarness();
+
+    await handleServerRequestForTest(manager, context, {
+      id: 73,
+      method: "mcpServer/elicitation/request",
+      params: {
+        mode: "url",
+        message: "Authenticate with the MCP server",
+        url: "https://example.test/auth",
+      },
+    });
+
+    expect(context.pendingApprovals.size).toBe(0);
+    expect(writeMessage).toHaveBeenCalledWith(context, {
+      id: 73,
+      result: { action: "cancel", content: null, _meta: null },
+    });
+    expect(writeMessage).not.toHaveBeenCalledWith(
+      context,
+      expect.objectContaining({ error: expect.objectContaining({ code: -32601 }) }),
+    );
+    expect(emitEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "error",
+        method: "mcpServer/elicitation/request/unrenderable",
+        message: "Synara declined an MCP elicitation it cannot render yet.",
       }),
     );
   });

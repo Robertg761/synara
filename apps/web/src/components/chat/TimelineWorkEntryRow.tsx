@@ -52,6 +52,8 @@ import {
   isReasoningUpdateWorkEntry,
 } from "./agentActivity.logic";
 import { AutomationCreatedCard } from "./AutomationCreatedCard";
+import { ConnectedComputerSetupRequiredCard } from "./ComputerSetupRequiredCard";
+import { ComputerControlDeniedCard } from "./ComputerControlDeniedCard";
 import ChatMarkdown from "../ChatMarkdown";
 import { DiffStatLabel } from "./DiffStatLabel";
 import { type ExpandedImagePreview } from "./ExpandedImagePreview";
@@ -248,6 +250,7 @@ function workEntryIcon(workEntry: TimelineWorkEntry): LucideIcon {
   if (workEntry.requestKind === "command") return commandWorkEntryIcon(workEntry);
   if (workEntry.requestKind === "file-read") return SearchIcon;
   if (workEntry.requestKind === "file-change") return PencilIcon;
+  if (workEntry.requestKind === "tool") return McpIcon;
 
   if (workEntry.itemType === "command_execution" || workEntry.command) {
     return commandWorkEntryIcon(workEntry);
@@ -458,6 +461,8 @@ export const TimelineWorkEntryRow = memo(function TimelineWorkEntryRow(props: {
   onOpenTurnDiff?: (turnId: TurnId, filePath?: string) => void;
   onOpenAgentActivity?: (activityId: string) => void;
   onOpenAutomation?: (automationId: string) => void;
+  computerControlEnabled?: boolean;
+  onEnableComputerControl?: () => void;
   timestampFormat: TimestampFormat;
 }) {
   // Defaults are applied in the body (not in the destructuring pattern): a default
@@ -475,6 +480,8 @@ export const TimelineWorkEntryRow = memo(function TimelineWorkEntryRow(props: {
     onOpenTurnDiff,
     onOpenAgentActivity,
     onOpenAutomation,
+    computerControlEnabled,
+    onEnableComputerControl,
     timestampFormat,
   } = props;
   const textFontSizePx = textFontSizePxProp ?? chatMetaFontSizePx;
@@ -557,8 +564,38 @@ export const TimelineWorkEntryRow = memo(function TimelineWorkEntryRow(props: {
   );
   const liveActivityNowMs = useLiveActivityNow(workEntry.liveActivity);
   const liveActivityMetaText = workEntry.liveActivity
-    ? formatLiveActivityMeta(workEntry.liveActivity, liveActivityNowMs)
+    ? formatLiveActivityMeta(workEntry.liveActivity, liveActivityNowMs, {
+        subagent: workEntry.itemType === "collab_agent_tool_call",
+      })
     : null;
+
+  // A computer-control denial renders as an actionable card (enable + retry)
+  // instead of a buried tool-error line. Kept after the hooks above so the
+  // early return never changes hook order.
+  if (workEntry.computerSetupRequired) {
+    return (
+      <ConnectedComputerSetupRequiredCard
+        {...workEntry.computerSetupRequired}
+        textFontSizePx={textFontSizePx}
+        metaFontSizePx={chatMetaFontSizePx}
+      />
+    );
+  }
+
+  const computerControlDenied = workEntry.computerControlDenied;
+  if (computerControlDenied) {
+    return (
+      <div className={cn(compact ? "py-0.5" : "py-1")}>
+        <ComputerControlDeniedCard
+          toolName={computerControlDenied.toolName}
+          {...(computerControlEnabled !== undefined ? { computerControlEnabled } : {})}
+          textFontSizePx={textFontSizePx}
+          metaFontSizePx={chatMetaFontSizePx}
+          {...(onEnableComputerControl ? { onEnable: onEnableComputerControl } : {})}
+        />
+      </div>
+    );
+  }
 
   // A created-automation row renders as its own card instead of a tool-call line.
   // Kept after the hooks above so the early return never changes hook order.
@@ -887,13 +924,15 @@ function providerContextLifecycleReasonLabel(
 ): string {
   switch (reason) {
     case "conversation-rebuilt":
-      return "Conversation rebuilt";
+      return "Conversation rebuilt from a summary";
     case "fresh-session":
-      return "Fresh provider session";
+      return "New session started";
+    case "interrupt-escalation":
+      return "Turn stop escalated to a session restart";
     case "native-history-unavailable":
-      return "Native history unavailable";
+      return "Previous history unavailable";
     case "native-resume-failed":
-      return "Native resume failed";
+      return "Could not resume the previous session";
   }
 }
 
@@ -909,24 +948,24 @@ function ProviderContextLifecycleDetails(props: {
       <dl className="grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1.5 rounded-lg border border-border/45 bg-background/60 px-3 py-2.5 text-[11px]">
         <dt className="text-muted-foreground/56">Provider</dt>
         <dd className="text-foreground/84">{provider}</dd>
-        <dt className="text-muted-foreground/56">Native history</dt>
+        <dt className="text-muted-foreground/56">Previous history</dt>
         <dd className="text-foreground/84">
-          {info.nativeHistory === "available" ? "Available" : "Unavailable"}
+          {info.nativeHistory === "available" ? "Available" : "Lost"}
         </dd>
-        <dt className="text-muted-foreground/56">Restart</dt>
+        <dt className="text-muted-foreground/56">Session restarted</dt>
         <dd className="text-foreground/84">{info.sessionRestarted ? "Yes" : "No"}</dd>
-        <dt className="text-muted-foreground/56">Context change</dt>
+        <dt className="text-muted-foreground/56">Why</dt>
         <dd className="text-foreground/84">
           {providerContextLifecycleReasonLabel(info.restartReason)}
         </dd>
-        <dt className="text-muted-foreground/56">Recap</dt>
+        <dt className="text-muted-foreground/56">Summary included</dt>
         <dd className="text-foreground/84">
-          {info.recapInjected ? `${info.recapCharacters.toLocaleString()} characters` : "Not sent"}
+          {info.recapInjected ? `${info.recapCharacters.toLocaleString()} characters` : "No"}
         </dd>
       </dl>
       {info.recapPreview ? (
         <section className="space-y-2">
-          <h3 className="text-[11px] font-medium text-muted-foreground/56">Recap preview</h3>
+          <h3 className="text-[11px] font-medium text-muted-foreground/56">Summary preview</h3>
           <pre
             className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border/45 bg-background/60 px-3 py-2.5 font-chat-code text-[11px] leading-relaxed text-foreground/84"
             data-session-context-recap-preview="true"
@@ -935,7 +974,7 @@ function ProviderContextLifecycleDetails(props: {
           </pre>
           {info.recapPreviewTruncated ? (
             <p className="text-[10px] text-muted-foreground/56">
-              Showing a bounded preview of the recap sent to the model.
+              Showing a short preview of the summary sent with your message.
             </p>
           ) : null}
         </section>

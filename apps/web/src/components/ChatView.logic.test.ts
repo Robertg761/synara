@@ -4,13 +4,16 @@ import {
   MessageId,
   ThreadId,
   TurnId,
+  type ComputerAvailability,
   type GitWorktreeSetupProgressEvent,
   type ModelSlug,
   type RuntimeMode,
 } from "@synara/contracts";
 import { describe, expect, it, vi } from "vitest";
 
+import type { QueuedComposerChatTurn } from "../composerDraftStore";
 import type { WorkLogEntry } from "../session-logic";
+import { AppSettingsSchema } from "../appSettings";
 
 import {
   appendVoiceTranscriptToPrompt,
@@ -25,6 +28,8 @@ import {
   derivePromptHistoryFromMessages,
   failWorktreeSetupSnapshot,
   filterSidechatTranscriptMessages,
+  threadHasProviderLockingActivity,
+  threadHasProviderLockingMessages,
   hasFileUndoSettled,
   isComposerCursorOnFirstLine,
   isComposerCursorOnLastLine,
@@ -35,6 +40,14 @@ import {
   resolveWorkingLabel,
   deriveComposerSendState,
   deriveComposerVoiceState,
+  editAndResendDispatchFields,
+  queuedChatTurnDispatchFields,
+  queuedPlanFollowUpDispatchFields,
+  resolveEffectiveComputerControl,
+  resolveQueuedTurnDispatchSettings,
+  threadSettingsDispatchFields,
+  turnStartDispatchFields,
+  type TurnDispatchSettings,
   describeVoiceRecordingStartError,
   hasLiveTurnTakenOver,
   hasServerAcknowledgedLocalDispatch,
@@ -847,6 +860,56 @@ describe("voice helpers", () => {
     ]);
   });
 
+  it("does not lock Side chat providers on fork-import history alone", () => {
+    const importedOnly = {
+      sidechatSourceThreadId: ThreadId.makeUnsafe("source-thread"),
+      latestTurn: null,
+      session: null,
+      messages: [
+        {
+          id: "message-imported" as never,
+          role: "assistant" as const,
+          text: "Previous context",
+          turnId: null,
+          streaming: false,
+          source: "fork-import" as const,
+          createdAt: "2026-05-02T10:00:00.000Z",
+          completedAt: "2026-05-02T10:00:00.000Z",
+        },
+      ],
+    };
+
+    expect(threadHasProviderLockingMessages(importedOnly)).toBe(false);
+    expect(threadHasProviderLockingActivity(importedOnly)).toBe(false);
+
+    const withNative = {
+      ...importedOnly,
+      messages: [
+        ...importedOnly.messages,
+        {
+          id: "message-native" as never,
+          role: "user" as const,
+          text: "Fresh side question",
+          turnId: null,
+          streaming: false,
+          source: "native" as const,
+          createdAt: "2026-05-02T10:01:00.000Z",
+          completedAt: "2026-05-02T10:01:00.000Z",
+        },
+      ],
+    };
+
+    expect(threadHasProviderLockingMessages(withNative)).toBe(true);
+    expect(threadHasProviderLockingActivity(withNative)).toBe(true);
+
+    expect(
+      threadHasProviderLockingMessages({
+        sidechatSourceThreadId: null,
+        messages: importedOnly.messages,
+      }),
+    ).toBe(true);
+  });
+
   it("appends a transcript to the existing prompt without disturbing spacing", () => {
     expect(appendVoiceTranscriptToPrompt("Hello there   ", "  next line  ")).toBe(
       "Hello there\nnext line",
@@ -1497,6 +1560,7 @@ describe("deriveComposerSendState", () => {
         },
       ],
       pastedTexts: [],
+      pullRequestContexts: [],
     });
 
     expect(state.trimmedPrompt).toBe("");
@@ -1526,6 +1590,7 @@ describe("deriveComposerSendState", () => {
         },
       ],
       pastedTexts: [],
+      pullRequestContexts: [],
     });
 
     expect(state.trimmedPrompt).toBe("yoo  waddup");
@@ -1543,6 +1608,7 @@ describe("deriveComposerSendState", () => {
       fileCommentCount: 0,
       terminalContexts: [],
       pastedTexts: [],
+      pullRequestContexts: [],
     });
 
     expect(state.hasSendableContent).toBe(true);
@@ -1558,6 +1624,7 @@ describe("deriveComposerSendState", () => {
       fileCommentCount: 1,
       terminalContexts: [],
       pastedTexts: [],
+      pullRequestContexts: [],
     });
 
     expect(state.hasSendableContent).toBe(true);
@@ -1573,6 +1640,7 @@ describe("deriveComposerSendState", () => {
       fileCommentCount: 0,
       terminalContexts: [],
       pastedTexts: [],
+      pullRequestContexts: [],
     });
 
     expect(state.hasSendableContent).toBe(true);
@@ -1588,6 +1656,7 @@ describe("deriveComposerSendState", () => {
       fileCommentCount: 0,
       terminalContexts: [],
       pastedTexts: [],
+      pullRequestContexts: [],
     });
 
     expect(state.hasSendableContent).toBe(true);
@@ -2552,6 +2621,12 @@ describe("resolveRuntimeModeAfterApprovalDecision", () => {
       resolveRuntimeModeAfterApprovalDecision("auto", "acceptForSession", "permissions"),
     ).toBeNull();
   });
+
+  it("does not widen a tool approval to full access", () => {
+    expect(
+      resolveRuntimeModeAfterApprovalDecision("approval-required", "acceptForSession", "tool"),
+    ).toBeNull();
+  });
 });
 
 describe("commitAfterRuntimeModePersistence", () => {
@@ -2942,5 +3017,280 @@ describe("resolveDraftFallbackModelSelection", () => {
         settingsDefaultProvider: "grok",
       }),
     ).toEqual({ provider: "grok", model: "grok-4.6" });
+  });
+});
+
+describe("turn dispatch settings", () => {
+  const LIVE_SETTINGS: TurnDispatchSettings = {
+    modelSelection: { provider: "codex", model: "gpt-5.6-sol" },
+    providerOptions: { codex: { binaryPath: "/live/codex" } },
+    enableComputerControl: true,
+    assistantDeliveryMode: "streaming",
+    runtimeMode: "auto",
+    interactionMode: "plan",
+    envMode: "worktree",
+  };
+
+  const QUEUED_CHAT_TURN = {
+    id: "queued-1",
+    kind: "chat",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    previewText: "queued",
+    prompt: "queued",
+    pullRequestContexts: [],
+    images: [],
+    files: [],
+    assistantSelections: [],
+    browserAnnotations: [],
+    terminalContexts: [],
+    fileComments: [],
+    pastedTexts: [],
+    skills: [],
+    mentions: [],
+    selectedProvider: "claudeAgent",
+    selectedModel: "opus-4.8",
+    selectedPromptEffort: null,
+    modelSelection: { provider: "claudeAgent", model: "opus-4.8" },
+    providerOptionsForDispatch: { codex: { binaryPath: "/queued/codex" } },
+    enableComputerControl: false,
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+    envMode: "local",
+  } as const satisfies QueuedComposerChatTurn;
+
+  // Every dispatch site spreads one of these projections. The key lists below are
+  // the wire shape: they must stay exactly what the hand-written payloads sent
+  // before the projections existed, in the same order.
+  it("projects a thread.turn.start payload", () => {
+    const fields = turnStartDispatchFields(LIVE_SETTINGS, "steer");
+    expect(Object.keys(fields)).toEqual([
+      "modelSelection",
+      "providerOptions",
+      "enableComputerControl",
+      "assistantDeliveryMode",
+      "dispatchMode",
+      "runtimeMode",
+      "interactionMode",
+    ]);
+    expect(fields).toEqual({
+      modelSelection: LIVE_SETTINGS.modelSelection,
+      providerOptions: LIVE_SETTINGS.providerOptions,
+      enableComputerControl: true,
+      assistantDeliveryMode: "streaming",
+      dispatchMode: "steer",
+      runtimeMode: "auto",
+      interactionMode: "plan",
+    });
+  });
+
+  it("projects an edit-and-resend payload without a dispatch mode", () => {
+    const fields = editAndResendDispatchFields(LIVE_SETTINGS);
+    expect(Object.keys(fields)).toEqual([
+      "modelSelection",
+      "providerOptions",
+      "enableComputerControl",
+      "assistantDeliveryMode",
+      "runtimeMode",
+      "interactionMode",
+    ]);
+  });
+
+  it("projects a queued chat turn, with and without a source plan", () => {
+    const withPlan = queuedChatTurnDispatchFields(LIVE_SETTINGS, {
+      threadId: ThreadId.makeUnsafe("thread-1"),
+      planId: "plan-1",
+    });
+    expect(Object.keys(withPlan)).toEqual([
+      "modelSelection",
+      "providerOptionsForDispatch",
+      "enableComputerControl",
+      "sourceProposedPlan",
+      "runtimeMode",
+      "interactionMode",
+      "envMode",
+    ]);
+    // The workflow-resume site passes no plan; the key must stay absent rather
+    // than land on the persisted draft as `undefined`.
+    const withoutPlan = queuedChatTurnDispatchFields(LIVE_SETTINGS, undefined);
+    expect(Object.keys(withoutPlan)).toEqual([
+      "modelSelection",
+      "providerOptionsForDispatch",
+      "enableComputerControl",
+      "runtimeMode",
+      "interactionMode",
+      "envMode",
+    ]);
+    expect("sourceProposedPlan" in withoutPlan).toBe(false);
+  });
+
+  it("projects a queued plan follow-up without an interaction mode or environment", () => {
+    expect(Object.keys(queuedPlanFollowUpDispatchFields(LIVE_SETTINGS))).toEqual([
+      "modelSelection",
+      "providerOptionsForDispatch",
+      "enableComputerControl",
+      "runtimeMode",
+    ]);
+  });
+
+  it("projects the thread-level settings for creation and persistence", () => {
+    expect(threadSettingsDispatchFields(LIVE_SETTINGS)).toEqual({
+      modelSelection: LIVE_SETTINGS.modelSelection,
+      runtimeMode: "auto",
+      interactionMode: "plan",
+    });
+  });
+
+  it("omits provider options entirely when there are none", () => {
+    const withoutOptions: TurnDispatchSettings = { ...LIVE_SETTINGS, providerOptions: undefined };
+    expect("providerOptions" in turnStartDispatchFields(withoutOptions, "queue")).toBe(false);
+    expect("providerOptions" in editAndResendDispatchFields(withoutOptions)).toBe(false);
+    expect(
+      "providerOptionsForDispatch" in queuedChatTurnDispatchFields(withoutOptions, undefined),
+    ).toBe(false);
+    expect("providerOptionsForDispatch" in queuedPlanFollowUpDispatchFields(withoutOptions)).toBe(
+      false,
+    );
+  });
+
+  it("replays a queued turn's frozen settings instead of the live composer's", () => {
+    expect(resolveQueuedTurnDispatchSettings(LIVE_SETTINGS, QUEUED_CHAT_TURN)).toEqual({
+      modelSelection: QUEUED_CHAT_TURN.modelSelection,
+      providerOptions: QUEUED_CHAT_TURN.providerOptionsForDispatch,
+      enableComputerControl: false,
+      // Not carried by a queued turn: it follows the live app setting.
+      assistantDeliveryMode: "streaming",
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      envMode: "local",
+    });
+  });
+
+  it("keeps the live settings when there is no queued turn", () => {
+    expect(resolveQueuedTurnDispatchSettings(LIVE_SETTINGS, null)).toBe(LIVE_SETTINGS);
+    expect(resolveQueuedTurnDispatchSettings(LIVE_SETTINGS, undefined)).toBe(LIVE_SETTINGS);
+  });
+
+  it("falls back to live settings for fields a persisted queued turn never stored", () => {
+    const {
+      providerOptionsForDispatch: _options,
+      enableComputerControl: _control,
+      ...legacyTurn
+    } = QUEUED_CHAT_TURN;
+    const resolved = resolveQueuedTurnDispatchSettings(LIVE_SETTINGS, legacyTurn);
+    expect(resolved.providerOptions).toEqual(LIVE_SETTINGS.providerOptions);
+    expect(resolved.enableComputerControl).toBe(true);
+  });
+
+  it("leaves the environment alone for a queued plan follow-up", () => {
+    const resolved = resolveQueuedTurnDispatchSettings(LIVE_SETTINGS, {
+      id: "queued-2",
+      kind: "plan-follow-up",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      previewText: "follow up",
+      text: "follow up",
+      interactionMode: "default",
+      selectedProvider: "codex",
+      selectedModel: "gpt-5.6-sol",
+      selectedPromptEffort: null,
+      modelSelection: { provider: "codex", model: "gpt-5.6-sol" },
+      runtimeMode: "approval-required",
+    });
+    expect(resolved.envMode).toBe("worktree");
+    expect(resolved.runtimeMode).toBe("approval-required");
+    expect(resolved.enableComputerControl).toBe(true);
+  });
+});
+
+describe("resolveEffectiveComputerControl", () => {
+  it.each<ComputerAvailability | undefined>([
+    undefined,
+    { kind: "available", backend: "mac" },
+    {
+      kind: "permission-required",
+      missing: ["accessibility", "screenRecording"],
+      message: "Allow Synara in System Settings.",
+      buildSignature: "adhoc",
+    },
+    { kind: "backend-unavailable", message: "Reconnecting." },
+  ])(
+    "defaults tools on while the backend is ready, loading, or needs setup: %j",
+    (availability) => {
+      expect(
+        resolveEffectiveComputerControl({
+          draftOverride: undefined,
+          availability,
+          chatHasTurns: false,
+          allowInNewChats: AppSettingsSchema.makeUnsafe({}).allowComputerControlInNewChats,
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it("stays off on a server that cannot support computer use", () => {
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: undefined,
+        availability: { kind: "unsupported-platform", platform: "win32" },
+        allowInNewChats: true,
+        chatHasTurns: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("honors the machine-wide opt-out for an untouched chat", () => {
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: undefined,
+        availability: { kind: "available", backend: "mac" },
+        allowInNewChats: false,
+        chatHasTurns: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not apply the new-chat default retroactively to a chat that already has turns", () => {
+    // Turning the setting on must not hand existing conversations the desktop
+    // (and its screenshots) on their next turn; only chats that start afterwards
+    // follow it, and those capture it on their first send.
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: undefined,
+        availability: { kind: "available", backend: "mac" },
+        allowInNewChats: true,
+        chatHasTurns: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("lets a per-chat override win in both directions, even against the default", () => {
+    // Override on while the machine opted out.
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: true,
+        availability: { kind: "available", backend: "mac" },
+        allowInNewChats: false,
+        chatHasTurns: true,
+      }),
+    ).toBe(true);
+    // Override off while the machine (and availability) would default it on.
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: false,
+        availability: { kind: "available", backend: "mac" },
+        allowInNewChats: true,
+        chatHasTurns: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps a conversation's choice while reconnecting", () => {
+    expect(
+      resolveEffectiveComputerControl({
+        draftOverride: true,
+        availability: { kind: "backend-unavailable", message: "Reconnecting." },
+        allowInNewChats: false,
+        chatHasTurns: false,
+      }),
+    ).toBe(true);
   });
 });

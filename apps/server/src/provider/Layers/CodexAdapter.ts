@@ -54,7 +54,11 @@ import {
   resolveAcpTurnIdleTimeoutMs,
 } from "../acp/AcpTurnIdleWatchdog.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
-import { acquireAgentGatewaySessionLease } from "../../agentGateway/sessionLease.ts";
+import {
+  acquireAgentGatewaySessionLease,
+  AGENT_GATEWAY_NO_CAPABILITIES,
+  captureAgentGatewayCapabilityInput,
+} from "../../agentGateway/sessionLease.ts";
 import { filterProviderPromptImageAttachments } from "../promptAttachments.ts";
 import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import {
@@ -64,8 +68,12 @@ import {
   isCodexGeneratedImageItemType,
   sanitizeNestedCodexGeneratedImagePayloads,
 } from "../../codexGeneratedImages.ts";
-import { isNonFatalCodexErrorMessage } from "../../codexErrorClassification.ts";
+import {
+  CodexSessionStartError,
+  isNonFatalCodexErrorMessage,
+} from "../../codexErrorClassification.ts";
 import { ServerConfig } from "../../config.ts";
+import { resolveCodexServiceTier } from "../../codexServiceTier.ts";
 import { makeRuntimeTaskListItem } from "../runtimeTaskList.ts";
 import { extractProposedPlanMarkdown } from "../planMode.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
@@ -188,12 +196,13 @@ function codexModelSelectionOverrides(
     return {};
   }
 
+  const serviceTier = resolveCodexServiceTier(modelSelection);
   return {
     model: modelSelection.model,
     ...(modelSelection.options?.reasoningEffort !== undefined
       ? { effort: modelSelection.options.reasoningEffort }
       : {}),
-    ...(modelSelection.options?.fastMode ? { serviceTier: "fast" } : {}),
+    ...(serviceTier !== undefined ? { serviceTier } : {}),
   };
 }
 
@@ -264,6 +273,7 @@ function providerErrorMapsToWarning(event: ProviderEvent): boolean {
   return (
     event.kind === "error" &&
     (event.method === "process/stderr" ||
+      event.method === "mcpServer/elicitation/request/unrenderable" ||
       (event.method === "error" &&
         typeof event.message === "string" &&
         isNonFatalCodexErrorMessage(event.message)))
@@ -291,8 +301,24 @@ function normalizeCodexTokenUsage(value: unknown): ThreadTokenUsageSnapshot | un
   const reasoningOutputTokens =
     asNumber(lastUsage?.reasoning_output_tokens) ?? asNumber(lastUsage?.reasoningOutputTokens);
 
+  const totalInput = asNumber(totalUsage?.input_tokens) ?? asNumber(totalUsage?.inputTokens);
+  const totalOutput = asNumber(totalUsage?.output_tokens) ?? asNumber(totalUsage?.outputTokens);
+  const totalCached =
+    asNumber(totalUsage?.cached_input_tokens) ?? asNumber(totalUsage?.cachedInputTokens);
+  const totalWrites =
+    asNumber(totalUsage?.cacheWriteInputTokens) ?? asNumber(totalUsage?.cache_write_input_tokens);
   return {
     usedTokens,
+    ...(totalInput !== undefined && totalOutput !== undefined
+      ? {
+          cumulativeUsage: {
+            inputTokens: totalInput,
+            outputTokens: totalOutput,
+            ...(totalCached !== undefined ? { cachedInputTokens: totalCached } : {}),
+            ...(totalWrites !== undefined ? { cacheCreationInputTokens: totalWrites } : {}),
+          },
+        }
+      : {}),
     ...(totalProcessedTokens !== undefined && totalProcessedTokens > usedTokens
       ? { totalProcessedTokens }
       : {}),
@@ -469,6 +495,8 @@ function toRequestTypeFromMethod(method: string): CanonicalRequestType {
       return "file_change_approval";
     case "item/permissions/requestApproval":
       return "permissions_approval";
+    case "mcpServer/elicitation/request":
+      return "tool_approval";
     case "applyPatchApproval":
       return "apply_patch_approval";
     case "execCommandApproval":
@@ -494,6 +522,8 @@ function toRequestTypeFromKind(kind: unknown): CanonicalRequestType {
       return "file_change_approval";
     case "permissions":
       return "permissions_approval";
+    case "tool":
+      return "tool_approval";
     default:
       return "unknown";
   }
@@ -1102,7 +1132,10 @@ function mapToRuntimeEvents(
     }
 
     const detail =
-      asString(payload?.command) ?? asString(payload?.reason) ?? asString(payload?.prompt);
+      asString(payload?.command) ??
+      asString(payload?.reason) ??
+      asString(payload?.prompt) ??
+      asString(payload?.message);
     return [
       {
         ...runtimeEventBase(event, canonicalThreadId),
@@ -1883,8 +1916,16 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
               ? {
                   agentGatewayMcp: {
                     endpointUrl: () => agentGatewayCredentials.mcpEndpointUrl,
-                    acquireSessionLease: (threadId) =>
-                      acquireAgentGatewaySessionLease(agentGatewayCredentials, threadId, PROVIDER)!,
+                    // Codex leases inside the app-server manager, which owns
+                    // session restarts. The manager carries the start input's
+                    // capability facts; review runtimes request none.
+                    acquireSessionLease: (threadId, capabilityInput) =>
+                      acquireAgentGatewaySessionLease(
+                        agentGatewayCredentials,
+                        threadId,
+                        PROVIDER,
+                        capabilityInput ?? AGENT_GATEWAY_NO_CAPABILITIES,
+                      )!,
                   },
                 }
               : {}),
@@ -2041,6 +2082,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           ? { forkSourceResumeCursor: input.forkSourceResumeCursor }
           : {}),
         ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
+        agentGatewayCapabilityInput: captureAgentGatewayCapabilityInput(input),
         runtimeMode: input.runtimeMode,
         ...codexModelSelectionOverrides(input.modelSelection),
       };
@@ -2052,6 +2094,9 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
             provider: PROVIDER,
             threadId: input.threadId,
             detail: toMessage(cause, "Failed to start Codex adapter session."),
+            ...(cause instanceof CodexSessionStartError
+              ? { reason: "startup-failed" as const }
+              : {}),
             cause,
           }),
       }).pipe(Effect.map((session) => session));
@@ -2433,7 +2478,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
             turnWatchdogs.clear();
             manager.off("event", listener);
           });
-          yield* ingress.stop;
+          yield* ingress.abort;
           yield* Queue.shutdown(runtimeEventQueue);
         }),
     );

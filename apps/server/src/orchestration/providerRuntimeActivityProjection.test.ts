@@ -55,6 +55,27 @@ function expectSchemaValidActivities(event: ProviderRuntimeEvent, sessionSequenc
   }
 }
 
+it.each(["info", "warning", "error"])("projects Pi %s notifications as notices", (type) => {
+  const [activity] = projectProviderRuntimeActivities(
+    runtimeEvent({
+      provider: "pi",
+      type: "runtime.warning",
+      eventId: "pi-notification",
+      turnId: TURN_ID,
+      payload: { message: "Extension notification", detail: { type } },
+      raw: { source: "pi.sdk.event", method: "extension/ui/notify", payload: { type } },
+    }),
+  );
+
+  expect(activity).toMatchObject({
+    tone: "info",
+    kind: "runtime.warning",
+    summary: type === "info" ? "Pi extension" : "Runtime warning",
+    payload: { message: "Extension notification", detail: "Extension notification" },
+  });
+  expect(() => decodeActivityAppendCommand(activity!)).not.toThrow();
+});
+
 describe("projected activities satisfy the orchestration command schema", () => {
   it("omits an absent approval request id instead of emitting an explicit undefined", () => {
     expectSchemaValidActivities(
@@ -510,6 +531,35 @@ describe("provider runtime activity projection", () => {
       },
     });
 
+    const toolApproval = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "request.opened",
+        eventId: "tool-approval-request",
+        requestId: ApprovalRequestId.makeUnsafe("tool-request-1"),
+        payload: {
+          requestType: "tool_approval",
+          detail: "Allow Synara to launch the calculator?",
+          args: {
+            _meta: {
+              tool_name: "computer_launch_app",
+              tool_params_display: [{ name: "app", value: "kcalc", display_name: "app" }],
+            },
+          },
+        },
+      }),
+    )[0];
+    expect(toolApproval).toMatchObject({
+      kind: "approval.requested",
+      summary: "Tool approval requested",
+      payload: {
+        requestKind: "tool",
+        requestType: "tool_approval",
+        detail: "Allow Synara to launch the calculator?",
+        toolName: "computer_launch_app",
+        toolParamsDisplay: [{ name: "app", value: "kcalc", display_name: "app" }],
+      },
+    });
+
     const userInput = [
       runtimeEvent({
         type: "user-input.requested",
@@ -556,6 +606,66 @@ describe("provider runtime activity projection", () => {
         },
       },
     ]);
+  });
+
+  it.each(["tool_approval", "dynamic_tool_call"] as const)(
+    "renders Claude-shaped %s approvals as tool approvals with parameter rows",
+    (requestType) => {
+      const [approval] = projectProviderRuntimeActivities(
+        runtimeEvent({
+          type: "request.opened",
+          provider: "claudeAgent",
+          eventId: `claude-${requestType}-request`,
+          requestId: ApprovalRequestId.makeUnsafe(`claude-${requestType}-1`),
+          payload: {
+            requestType,
+            detail: "mcp__synara__computer_launch_app: {}",
+            args: {
+              toolName: "mcp__synara__computer_launch_app",
+              input: { app: "kcalc", args: ["--hidpi"], headless: false },
+              sessionApprovalAvailable: true,
+              toolUseId: "toolu_01",
+            },
+          },
+        }),
+      );
+
+      expect(approval).toMatchObject({
+        kind: "approval.requested",
+        summary: "Tool approval requested",
+        payload: {
+          requestKind: "tool",
+          requestType,
+          toolName: "mcp__synara__computer_launch_app",
+          toolParamsDisplay: [
+            { name: "app", value: "kcalc" },
+            { name: "args", value: '["--hidpi"]' },
+            { name: "headless", value: "false" },
+          ],
+          sessionApprovalAvailable: true,
+        },
+      });
+      expect(() => decodeActivityAppendCommand(approval!)).not.toThrow();
+    },
+  );
+
+  it("omits tool presentation when a Claude tool approval carries no input", () => {
+    const [approval] = projectProviderRuntimeActivities(
+      runtimeEvent({
+        type: "request.opened",
+        provider: "claudeAgent",
+        eventId: "claude-tool-approval-empty-input",
+        requestId: ApprovalRequestId.makeUnsafe("claude-tool-approval-empty"),
+        payload: {
+          requestType: "tool_approval",
+          detail: "Agent: {}",
+          args: { toolName: "Agent", input: {}, sessionApprovalAvailable: false },
+        },
+      }),
+    );
+
+    expect(approval?.payload).toMatchObject({ requestKind: "tool", toolName: "Agent" });
+    expect(approval?.payload).not.toHaveProperty("toolParamsDisplay");
   });
 
   it("bounds pathological tool payloads before persistence", () => {
@@ -669,6 +779,8 @@ describe("provider runtime activity projection", () => {
         turnId: TURN_ID,
         payload: {
           state: "completed",
+          tokenAccountingVersion: 1,
+          mainLoopTokens: 1_000,
           modelUsage: {
             "claude-fable-5": {
               inputTokens: 100,
@@ -685,8 +797,17 @@ describe("provider runtime activity projection", () => {
       kind: "turn.completed",
       payload: {
         state: "completed",
+        provider: "claudeAgent",
+        tokenAccountingVersion: 1,
+        mainLoopTokens: 1_000,
         modelUsage: {
-          "claude-fable-5": { inputTokens: 960, outputTokens: 40, totalTokens: 1_000 },
+          "claude-fable-5": {
+            inputTokens: 960,
+            outputTokens: 40,
+            totalTokens: 1_000,
+            cacheReadInputTokens: 800,
+            cacheCreationInputTokens: 60,
+          },
         },
       },
     });

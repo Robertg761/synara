@@ -18,11 +18,21 @@ import {
   type ProviderRuntimeEvent,
   type RuntimeMode,
 } from "@synara/contracts";
-import { Cache, Cause, Deferred, Duration, Effect, Layer, Option, Ref, Stream } from "effect";
+import {
+  Cache,
+  Cause,
+  Deferred,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  Queue,
+  Ref,
+  Stream,
+} from "effect";
 import * as Semaphore from "effect/Semaphore";
 import { makeDrainableWorker, startDrainableWorkerProducers } from "@synara/shared/DrainableWorker";
 import { providerSupportsNativeTurnSteering } from "@synara/shared/providerMetadata";
-import { buildStalePendingRequestFailureDetail } from "@synara/shared/threadSummary";
 import {
   buildSubagentIdentityDirectory,
   collectSubagentProviderThreadIds,
@@ -45,7 +55,10 @@ import {
 } from "../../provider/terminalTurnApplicability.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
-import { ProjectionPendingInteractionRepository } from "../../persistence/Services/ProjectionPendingInteractions.ts";
+import {
+  type ProjectionPendingInteraction,
+  ProjectionPendingInteractionRepository,
+} from "../../persistence/Services/ProjectionPendingInteractions.ts";
 import { ProjectionPendingInteractionRepositoryLive } from "../../persistence/Layers/ProjectionPendingInteractions.ts";
 import { ProviderRuntimeEventRepositoryLive } from "../../persistence/Layers/ProviderRuntimeEvents.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
@@ -62,6 +75,10 @@ import {
   OrchestrationCommandPreviouslyRejectedError,
 } from "../Errors.ts";
 import { makeRuntimeJournalPoisonGate } from "../runtimeJournalPoisonGate.ts";
+import {
+  buildStalePendingRequestSettlementCommand,
+  pendingInteractionRequestKind,
+} from "../stalePendingInteractions.ts";
 import { isExpiredSidechat } from "../sidechatLifecycle.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
@@ -1833,51 +1850,55 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * A `session.started` event marks a freshly (re)started provider runtime
-   * whose in-memory approval/user-input callbacks are empty, so any durable
-   * pending interaction recorded before it can never be answered. Requests
-   * from the new runtime are ingested strictly after this event, so every
-   * unsettled row seen here is provably orphaned. Settle them as stale —
-   * leaving them open kept the prompt on screen while every response was
-   * silently dropped, wedging the thread until the user abandoned it.
+   * Settles durable pending interactions whose provider callback is provably
+   * gone, reporting each one as a stale request failure.
+   *
+   * Two signals reach here:
+   *
+   *  - `session.started` marks a freshly (re)started provider runtime whose
+   *    in-memory approval/user-input callbacks are empty, so any durable
+   *    pending interaction recorded before it can never be answered. Requests
+   *    from the new runtime are ingested strictly after this event, so every
+   *    unsettled row seen here is provably orphaned (no scope filter).
+   *  - A terminal event (`turn.completed`/`turn.aborted`/`session.exited`) ends
+   *    the turn or session that owned the request. Without this, interrupting a
+   *    turn without restarting the session left the row `pending` forever:
+   *    the sidebar showed "Awaiting Input" on an idle thread and every answer
+   *    failed because no provider session was bound.
+   *
+   * `scopeFilter` narrows which rows a terminal event may settle. ProviderService
+   * permits overlapping sends on one thread, so turn-scoped events must match
+   * strictly on `turnId` — a concurrent turn in the same lifecycle generation can
+   * own its own still-live interaction. Only `session.exited` may scope by
+   * generation, because it kills every turn in that generation.
+   *
+   * A graceful teardown emits the runtime's own resolution event first, so the
+   * row is already `confirmed` by the time this runs. An ungraceful death
+   * (kill -9 and friends) emits no event at all, so rows that outlive the
+   * process are settled at boot instead — same rows, same command shape, via
+   * the shared builder in `../stalePendingInteractions.ts`.
    */
   const settleUnanswerablePendingInteractions = (
     threadId: ThreadId,
     event: ProviderRuntimeEvent,
     now: string,
+    scopeFilter?: (row: ProjectionPendingInteraction) => boolean,
   ) =>
     Effect.gen(function* () {
-      const rows = yield* pendingInteractions.listByThreadId({ threadId });
+      const rows = yield* pendingInteractions.listUnsettled({ threadId });
       for (const row of rows) {
-        // `uncertain` rows were already reported as unanswerable; re-reporting
-        // on every session start would duplicate the failure activity.
-        if (row.status === "confirmed" || row.status === "uncertain") continue;
-        const isApproval = row.interactionKind === "approval";
-        const requestKind = isApproval ? ("approval" as const) : ("user-input" as const);
-        const commandId = providerCommandId(event, `stale-pending-${requestKind}`, row.requestId);
-        yield* orchestrationEngine.dispatch({
-          type: "thread.activity.append",
-          commandId,
-          threadId,
-          activity: {
-            id: EventId.makeUnsafe(commandId),
-            tone: "error",
-            kind: isApproval
-              ? "provider.approval.respond.failed"
-              : "provider.user-input.respond.failed",
-            summary: isApproval
-              ? "Provider approval response failed"
-              : "Provider user input response failed",
-            payload: {
-              detail: buildStalePendingRequestFailureDetail(requestKind, row.requestId),
-              requestId: row.requestId,
-              ...(row.lifecycleGeneration ? { lifecycleGeneration: row.lifecycleGeneration } : {}),
-            },
-            turnId: null,
-            createdAt: now,
-          },
-          createdAt: now,
-        });
+        if (scopeFilter && !scopeFilter(row)) continue;
+        const requestKind = pendingInteractionRequestKind(row.interactionKind);
+        yield* orchestrationEngine.dispatch(
+          buildStalePendingRequestSettlementCommand({
+            threadId,
+            commandId: providerCommandId(event, `stale-pending-${requestKind}`, row.requestId),
+            requestKind,
+            requestId: row.requestId,
+            lifecycleGeneration: row.lifecycleGeneration,
+            now,
+          }),
+        );
       }
     });
 
@@ -2330,6 +2351,69 @@ const make = Effect.gen(function* () {
             }
           }
         }
+      }
+
+      // A turn or session that ends without a session restart takes its
+      // provider callbacks with it, so any interaction it still owns can never
+      // be answered. Settle those rows now instead of waiting for a
+      // `session.started` that an interrupt alone never produces.
+      // Claude explicitly resolves callbacks when their owning foreground turn
+      // or background agent ends. A foreground terminal event alone does not
+      // establish that its agent-owned requests have become unanswerable.
+      if (
+        shouldApplyThreadLifecycle &&
+        isTerminalTurnEvent &&
+        eventTurnId !== undefined &&
+        event.provider !== "claudeAgent"
+      ) {
+        // Turn-scoped by default: overlapping sends share a lifecycle
+        // generation, so a sibling turn's interaction must survive this turn's
+        // terminal event.
+        //
+        // Rows with no turn id are the exception, and a strictly turn-scoped
+        // filter can never match them. A provider can open an interaction that
+        // names no turn at all — a Codex MCP elicitation carries no `turnId` in
+        // its JSON-RPC params, and Claude's `canUseTool` falls back to
+        // `undefined` when no turn state is bound — and an interrupt emits no
+        // `session.exited`, so nothing settled those rows until the next server
+        // boot: "Awaiting Input" on an idle thread, exactly what this block
+        // exists to prevent. Settle them here, but only once this terminal
+        // event drains the thread's last outstanding turn, because while a
+        // sibling turn is still running it may be the one blocked on the
+        // request. Keep honouring the generation the row was opened in: a
+        // stale terminal event is accepted upstream when it still names the
+        // binding's active turn, and it must not settle a newer generation's
+        // live request.
+        const remainingOutstandingTurns = (yield* Ref.get(outstandingTurnIdsByThreadRef)).get(
+          thread.id,
+        );
+        const settlesTurnlessRows = (remainingOutstandingTurns?.size ?? 0) === 0;
+        const terminalGeneration = event.lifecycleGeneration;
+        yield* settleUnanswerablePendingInteractions(
+          thread.id,
+          event,
+          now,
+          (row) =>
+            row.turnId === eventTurnId ||
+            (row.turnId === null &&
+              settlesTurnlessRows &&
+              (terminalGeneration === undefined ||
+                row.lifecycleGeneration === null ||
+                row.lifecycleGeneration === terminalGeneration)),
+        );
+      } else if (shouldApplyThreadLifecycle && event.type === "session.exited") {
+        // The whole session is gone, so every turn in its generation dies with
+        // it. Without a generation on the event, fall back to settling all rows
+        // (the same blanket scope `session.started` uses).
+        const exitedGeneration = event.lifecycleGeneration;
+        yield* settleUnanswerablePendingInteractions(
+          thread.id,
+          event,
+          now,
+          exitedGeneration === undefined
+            ? undefined
+            : (row) => row.lifecycleGeneration === exitedGeneration,
+        );
       }
 
       if (event.type === "user-input.resolved") {
@@ -2906,24 +2990,51 @@ const make = Effect.gen(function* () {
       });
     });
 
+  // Processed journal rows are acknowledged once per drained page rather than
+  // once per event: the durable cursor moves in one transaction through every
+  // row the worker completed, which removes a commit (and its consumer,
+  // open-turn and index page writes) from every streamed token. The cursor is
+  // flushed before anything reads or moves it out of band (quarantine,
+  // dead-lettering, the page-progress check) and when ingestion stops. A crash
+  // between processing and the flush leaves at most one page unacknowledged.
+  // In-process retries must flush the completed prefix before reading another
+  // page: command receipts deduplicate durable writes, not buffered text or
+  // other process-local aggregation state.
+  let pendingAckedSequence: number | null = null;
+
+  const flushRuntimeCursor = Effect.suspend(() => {
+    const throughSequence = pendingAckedSequence;
+    if (throughSequence === null) return Effect.void;
+    return runtimeEvents
+      .advanceConsumerCursorThrough({
+        consumerName: PROVIDER_RUNTIME_INGESTION_CONSUMER,
+        throughSequence,
+        updatedAt: new Date().toISOString(),
+      })
+      .pipe(
+        Effect.flatMap((advanced) =>
+          advanced
+            ? Effect.sync(() => {
+                // Keep a newer completed prefix if work advanced during the
+                // SQL call. A failed/uncertain commit retains this retry fence.
+                if (pendingAckedSequence === throughSequence) pendingAckedSequence = null;
+              })
+            : Effect.die(
+                new Error(
+                  `Provider runtime cursor could not advance through event ${throughSequence}`,
+                ),
+              ),
+        ),
+      );
+  });
+
   const processInput = (input: RuntimeIngestionInput) =>
     input.source === "runtime"
       ? processRuntimeEvent(input.event, input.sequence).pipe(
           Effect.andThen(
-            runtimeEvents.advanceConsumerCursor({
-              consumerName: PROVIDER_RUNTIME_INGESTION_CONSUMER,
-              eventSequence: input.sequence,
-              updatedAt: new Date().toISOString(),
+            Effect.sync(() => {
+              pendingAckedSequence = Math.max(pendingAckedSequence ?? 0, input.sequence);
             }),
-          ),
-          Effect.flatMap((advanced) =>
-            advanced
-              ? Effect.void
-              : Effect.die(
-                  new Error(
-                    `Provider runtime cursor could not advance through event ${input.sequence}`,
-                  ),
-                ),
           ),
         )
       : processDomainEvent(input.event);
@@ -2949,6 +3060,10 @@ const make = Effect.gen(function* () {
     // assistant output — for at least a minute. Quarantine this deterministically
     // unreplayable row immediately, exactly as the poison gate eventually would,
     // and keep the accepted event available in the retained diagnostic tail.
+    // A failure while flushing the preceding rows must block this page too;
+    // otherwise a later successful row could acknowledge past the poison row.
+    runtimeJournalPageBlocked = true;
+    yield* flushRuntimeCursor;
     const advanced = yield* runtimeEvents
       .advanceConsumerCursor({
         consumerName: PROVIDER_RUNTIME_INGESTION_CONSUMER,
@@ -2985,6 +3100,7 @@ const make = Effect.gen(function* () {
       });
       return;
     }
+    runtimeJournalPageBlocked = false;
     yield* Effect.logError(
       "provider runtime unreplayable command quarantined without blocking the journal",
       {
@@ -3030,6 +3146,17 @@ const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker(processInputSafely, {
     capacity: PROVIDER_RUNTIME_INGESTION_CAPACITY,
   });
+  // Registered after the worker so it runs before the worker's own finalizer
+  // (LIFO): rows the worker already completed are acknowledged on shutdown.
+  yield* Effect.addFinalizer(() =>
+    flushRuntimeCursor.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider runtime cursor flush failed during shutdown", {
+          cause: Cause.pretty(cause),
+        }),
+      ),
+    ),
+  );
   const runtimeJournalDrainLock = yield* Semaphore.make(1);
 
   // A deterministically failing row would otherwise pin the single global
@@ -3041,6 +3168,7 @@ const make = Effect.gen(function* () {
   const poisonGate = makeRuntimeJournalPoisonGate();
 
   const deadLetterPoisonHeadRow = Effect.gen(function* () {
+    yield* flushRuntimeCursor;
     const cursor = yield* runtimeEvents.getConsumerCursor(PROVIDER_RUNTIME_INGESTION_CONSUMER);
     if (!poisonGate.noteBlockedDrain(cursor, Date.now())) return false;
     const highWater = yield* runtimeEvents.getHighWaterSequence;
@@ -3070,9 +3198,13 @@ const make = Effect.gen(function* () {
   const drainRuntimeJournalThrough = (throughSequenceInclusive?: number) =>
     runtimeJournalDrainLock.withPermits(1)(
       Effect.gen(function* () {
+        // An interrupted drain may have left accepted work in the worker.
+        // Finish it before retrying its acknowledgement or reading the cursor.
+        yield* worker.drain;
         const replayFence = throughSequenceInclusive ?? (yield* runtimeEvents.getHighWaterSequence);
         let hadBacklog = false;
         while (true) {
+          yield* flushRuntimeCursor;
           const cursor = yield* runtimeEvents.getConsumerCursor(
             PROVIDER_RUNTIME_INGESTION_CONSUMER,
           );
@@ -3099,6 +3231,7 @@ const make = Effect.gen(function* () {
             }),
           );
           yield* worker.drain;
+          yield* flushRuntimeCursor;
           if (runtimeJournalPageBlocked) {
             // Either the poison threshold was reached and the head row was
             // skipped (loop again from the fresh cursor), or the drain yields
@@ -3254,10 +3387,50 @@ const make = Effect.gen(function* () {
         ...(streamPersistedEvents === undefined ? {} : { streamPersistedEvents }),
         append: (event) => runtimeEvents.append(event),
       });
+      // Live notifications only raise the drain fence and wake one long-lived
+      // drain fiber; they never run a drain themselves. The fiber keeps going
+      // while newer notifications moved the fence, so events that arrive while
+      // a drain is in flight are processed as pages (and acknowledged once per
+      // page) instead of one drain and one acknowledgement per notification.
+      // With no backlog this still drains one event at a time; the batching
+      // engages exactly when ingestion falls behind the providers.
+      let requestedLiveFence = 0;
+      const liveDrainWakeups = yield* Queue.sliding<void>(1);
+      yield* Effect.forkScoped(
+        Effect.forever(
+          Effect.gen(function* () {
+            yield* Queue.take(liveDrainWakeups);
+            while (true) {
+              const fence = requestedLiveFence;
+              yield* drainRuntimeJournalThrough(fence).pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.failCause(cause)
+                    : Effect.logWarning("provider runtime event journal ingestion failed", {
+                        throughSequence: fence,
+                        cause: Cause.pretty(cause),
+                      }),
+                ),
+              );
+              if (requestedLiveFence <= fence) return;
+              // A blocked page yields to the safety poller instead of spinning.
+              const cursor = yield* runtimeEvents.getConsumerCursor(
+                PROVIDER_RUNTIME_INGESTION_CONSUMER,
+              );
+              if (cursor < fence) return;
+            }
+          }),
+        ),
+      );
       yield* Effect.forkScoped(
         Stream.runForEach(persistedRuntimeEvents, (persisted) =>
           Deferred.await(startupRuntimeReplayComplete).pipe(
-            Effect.andThen(drainRuntimeJournalThrough(persisted.sequence)),
+            Effect.andThen(
+              Effect.sync(() => {
+                requestedLiveFence = Math.max(requestedLiveFence, persisted.sequence);
+              }),
+            ),
+            Effect.andThen(Queue.offer(liveDrainWakeups, undefined)),
             Effect.catchCause((cause) =>
               Cause.hasInterruptsOnly(cause)
                 ? Effect.failCause(cause)

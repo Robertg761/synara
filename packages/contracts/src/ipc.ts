@@ -62,8 +62,14 @@ import type {
   GitInitInput,
   GitListBranchesInput,
   GitListBranchesResult,
+  GitListRecentCommitsInput,
+  GitListRecentCommitsResult,
   GitPullInput,
   GitPullResult,
+  GitBlameLineInput,
+  GitBlameLineResult,
+  GitReadFileAtRevInput,
+  GitReadFileAtRevResult,
   GitReadWorkingTreeDiffInput,
   GitReadWorkingTreeDiffResult,
   GitWorkingTreeDiffStatsResult,
@@ -169,6 +175,23 @@ import type {
   DeviceTypeTextInput,
   ThreadDeviceState,
 } from "./device";
+import type {
+  ComputerActionResult,
+  ComputerEvent,
+  ComputerGetStatusInput,
+  ComputerGetStateInput,
+  ComputerState,
+  ComputerInputClickInput,
+  ComputerInputKeyInput,
+  ComputerInputScrollInput,
+  ComputerListWindowsInput,
+  ComputerListWindowsResult,
+  ComputerProvisionInput,
+  ComputerProvisionResult,
+  ComputerStatusResult,
+  ComputerThreadInput,
+  ThreadComputerState,
+} from "./computer";
 import type { StudioListThreadOutputsInput, StudioListThreadOutputsResult } from "./studio";
 import type {
   ServerConfig,
@@ -321,6 +344,8 @@ export interface DesktopUpdateActionResult {
 }
 
 export interface BrowserTabState {
+  /** Live popup relationship; not restored as an OAuth session after restart. */
+  openerTabId?: string;
   id: string;
   url: string;
   title: string;
@@ -385,6 +410,10 @@ export interface BrowserSetPanelBoundsInput {
   threadId: ThreadId;
   bounds: BrowserPanelBounds | null;
   surface?: "native" | "renderer";
+  /** A DOM overlay temporarily covers a still-mounted browser panel. */
+  occluded?: boolean;
+  /** Keep the live native page offscreen and show a non-interactive thumbnail. */
+  preview?: boolean;
   /** Guest page zoom for a presentation surface; omitted/1 keeps the normal 100% viewport. */
   pageZoomFactor?: number;
 }
@@ -470,6 +499,14 @@ export interface DesktopAppSnapErrorEvent {
   capturedAt: string;
 }
 
+export interface DesktopAppSnapWindowEntry {
+  windowId: number;
+  appName: string | null;
+  bundleIdentifier: string | null;
+  windowTitle: string | null;
+  appIconDataUrl: string | null;
+}
+
 // Pushed from the desktop main process when the in-app browser copy-link chord fires
 // while the native page (not the React chrome) holds keyboard focus.
 export interface BrowserCopyLinkEvent {
@@ -485,6 +522,7 @@ export interface BrowserUseOpenPanelRequest {
 }
 
 interface BrowserControlMethods {
+  vault?: import("./browserVault").BrowserVaultMethods;
   open: (input: BrowserOpenInput) => Promise<ThreadBrowserState>;
   close: (input: BrowserThreadInput) => Promise<ThreadBrowserState>;
   hide: (input: BrowserThreadInput) => Promise<void>;
@@ -495,6 +533,7 @@ interface BrowserControlMethods {
   copyLink: (input: BrowserTabInput) => Promise<void>;
   copyScreenshotToClipboard: (input: BrowserTabInput) => Promise<void>;
   captureScreenshot: (input: BrowserTabInput) => Promise<BrowserCaptureScreenshotResult>;
+  capturePreview: (input: BrowserTabInput) => Promise<string | null>;
   navigate: (input: BrowserNavigateInput) => Promise<ThreadBrowserState>;
   reload: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
   goBack: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
@@ -566,7 +605,16 @@ export interface SynaraStorageSnapshot {
   readonly entries: Readonly<Record<string, string>>;
 }
 
+export type DesktopSafariAccessInfo =
+  | { supported: false }
+  | { supported: true; appName: string; appPath: string | null };
+
 export interface DesktopBridge {
+  safariAccess?: {
+    getInfo: () => Promise<DesktopSafariAccessInfo>;
+    openSettings: () => Promise<boolean>;
+    revealApp: () => Promise<boolean>;
+  };
   getWsUrl: () => string | null;
   /**
    * Absolute filesystem path for a File from drag/drop or file inputs.
@@ -638,6 +686,8 @@ export interface DesktopBridge {
     requestPermissions: () => Promise<DesktopAppSnapState>;
     listPendingCaptures: () => Promise<DesktopAppSnapCapture[]>;
     acknowledgeCapture: (captureId: string) => Promise<void>;
+    listWindows: () => Promise<DesktopAppSnapWindowEntry[]>;
+    captureWindow: (input: { windowId: number }) => Promise<DesktopAppSnapCapture>;
     onCaptured: (listener: (capture: DesktopAppSnapCapture) => void) => () => void;
     onError: (listener: (error: DesktopAppSnapErrorEvent) => void) => () => void;
     onState: (listener: (state: DesktopAppSnapState) => void) => () => void;
@@ -738,6 +788,7 @@ export interface NativeApi {
     // Existing branch/worktree API
     githubRepository: (input: GitHubRepositoryInput) => Promise<GitHubRepositoryResult>;
     listBranches: (input: GitListBranchesInput) => Promise<GitListBranchesResult>;
+    listRecentCommits: (input: GitListRecentCommitsInput) => Promise<GitListRecentCommitsResult>;
     createWorktree: (input: GitCreateWorktreeInput) => Promise<GitCreateWorktreeResult>;
     createDetachedWorktree: (
       input: GitCreateDetachedWorktreeInput,
@@ -766,9 +817,11 @@ export interface NativeApi {
     readWorkingTreeDiff: (
       input: GitReadWorkingTreeDiffInput,
     ) => Promise<GitReadWorkingTreeDiffResult>;
+    readFileAtRev: (input: GitReadFileAtRevInput) => Promise<GitReadFileAtRevResult>;
     workingTreeDiffStats: (
       input: GitReadWorkingTreeDiffInput,
     ) => Promise<GitWorkingTreeDiffStatsResult>;
+    blameLine: (input: GitBlameLineInput) => Promise<GitBlameLineResult>;
     summarizeDiff: (input: GitSummarizeDiffInput) => Promise<GitSummarizeDiffResult>;
     runStackedAction: (input: GitRunStackedActionInput) => Promise<GitRunStackedActionResult>;
     onActionProgress: (callback: (event: GitActionProgressEvent) => void) => () => void;
@@ -946,5 +999,19 @@ export interface NativeApi {
     describeUi: (input: DeviceDescribeUiInput) => Promise<DeviceDescribeUiResult>;
     scrollToElement: (input: DeviceScrollToElementInput) => Promise<DeviceScrollToElementResult>;
     onEvent: (callback: (event: DeviceEvent) => void) => () => void;
+  };
+  computer: {
+    changePermission: (input: { threadId: ThreadId; enabled: boolean }) => Promise<void>;
+    /** Thread-independent backend status for surfaces outside any conversation. */
+    getStatus: (input: ComputerGetStatusInput) => Promise<ComputerStatusResult>;
+    /** Read-only observation used to check a paused window before resuming. */
+    getState: (input: ComputerGetStateInput) => Promise<ComputerState>;
+    provision: (input: ComputerProvisionInput) => Promise<ComputerProvisionResult>;
+    getThreadState: (input: ComputerThreadInput) => Promise<ThreadComputerState>;
+    /** User input from the computer dock pane; needs no agent turn in flight. */
+    inputClick: (input: ComputerInputClickInput) => Promise<ComputerActionResult>;
+    inputScroll: (input: ComputerInputScrollInput) => Promise<ComputerActionResult>;
+    inputKey: (input: ComputerInputKeyInput) => Promise<ComputerActionResult>;
+    onEvent: (callback: (event: ComputerEvent) => void) => () => void;
   };
 }

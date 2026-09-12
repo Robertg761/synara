@@ -2,6 +2,7 @@ import "../index.css";
 
 import {
   DEVICE_WS_METHODS,
+  COMPUTER_WS_METHODS,
   ORCHESTRATION_WS_METHODS,
   type MessageId,
   type OrchestrationReadModel,
@@ -28,7 +29,11 @@ import {
   sendEffectRpcExit,
   type EffectRpcWebSocketClient,
 } from "../test/effectRpcWebSocketMock";
-import { createBrowserTestServerConfig, createFullscreenTestHost } from "../test/browserHarness";
+import {
+  createBrowserTestServerConfig,
+  createBrowserTestServerSettings,
+  createFullscreenTestHost,
+} from "../test/browserHarness";
 import { resetWsNativeApiForTest } from "../wsNativeApi";
 
 const THREAD_ID = "thread-kb-toast-test" as ThreadId;
@@ -170,6 +175,9 @@ function resolveWsRpc(tag: string): unknown {
   if (tag === ORCHESTRATION_WS_METHODS.getSnapshot) {
     return fixture.snapshot;
   }
+  if (tag === WS_METHODS.serverGetSettings) {
+    return createBrowserTestServerSettings(NOW_ISO);
+  }
   if (tag === WS_METHODS.serverGetConfig) {
     return fixture.serverConfig;
   }
@@ -262,7 +270,8 @@ const worker = setupWorker(
         // socket dying and answers with a full reconnect. That loops forever
         // and fills the run with schema errors about an Exit whose Success
         // value is `{}` where Void was expected.
-        method === DEVICE_WS_METHODS.subscribeEvents
+        method === DEVICE_WS_METHODS.subscribeEvents ||
+        method === COMPUTER_WS_METHODS.subscribeEvents
       ) {
         return;
       }

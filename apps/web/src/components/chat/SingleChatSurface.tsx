@@ -15,6 +15,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import type { EditorLeaveGuard } from "../EditorWorkspaceView";
 
 import { useAppSettings } from "../../appSettings";
 import { useComposerDraftStore } from "../../composerDraftStore";
@@ -25,6 +26,7 @@ import { useBrowserPanelDesktopBridge } from "../../hooks/useBrowserPanelDesktop
 import { useDockPaneRuntimeActivation } from "../../hooks/useDockPaneRuntimeActivation";
 import { useHandleNewThread } from "../../hooks/useHandleNewThread";
 import { useDevicePaneOpenRequests } from "../../hooks/useDeviceEventBridge";
+import { useComputerPaneOpenRequests } from "../../hooks/useComputerEventBridge";
 import { useDeviceSupport } from "../../hooks/useDeviceSupport";
 import { useRepoDiffTotals } from "../../hooks/useRepoDiffTotals";
 import {
@@ -41,6 +43,8 @@ import {
 } from "../../lib/chatPaneScope";
 import type { DockPaneRuntimeMode } from "../../lib/dockPaneActivation";
 import type { FileCommentSelection } from "../../lib/fileComments";
+import type { DiffEditBaseRev, DiffFileEditRequest } from "../../lib/diffEditBaseRev";
+import { editorCenterModeFamily, type EditorCenterMode } from "../../lib/editorCenterMode";
 import { gitBranchesQueryOptions } from "../../lib/gitReactQuery";
 import { canComposerHandlePanelWidth } from "../../lib/panelResize";
 import { projectListDirectoriesQueryOptions } from "../../lib/projectReactQuery";
@@ -54,6 +58,7 @@ import {
 import {
   prefetchWorkspaceFile,
   resolveDockFileOpenTarget,
+  resolveWorkspaceDirectoryOpenTarget,
   resolveWorkspaceFileOpenTarget,
   WorkspaceFileOpenerContext,
   type WorkspaceFileOpener,
@@ -84,6 +89,7 @@ import {
   ChatMountLoader,
   DeferredChatView,
   LazyBrowserPanel,
+  LazyComputerPanel,
   LazyDevicePanel,
   LazyDiffPanel,
   noopChatSurfaceAction,
@@ -102,12 +108,11 @@ import {
   CHAT_MAIN_CONTENT_SURFACE_CLASS_NAME,
   CHAT_MAIN_VIEWPORT_SHELL_CLASS_NAME,
 } from "./composerPickerStyles";
-import { routeSingleBrowserPanelOpenRequest } from "./browserPanelOpenRequest";
+import { routeSingleDockPaneOpenRequest } from "./dockPaneOpenRequest";
 import {
   selectFloatingBrowserRequested,
   useFloatingBrowserRequestStore,
 } from "./floatingBrowserRequestStore";
-import { routeSingleDevicePaneOpenRequest } from "./devicePaneOpenRequest";
 import { pullRequestDetailInputFromPane } from "../pullRequest/pullRequestDetail.logic";
 import { usePullRequestPaneStateIcon } from "../pullRequest/usePullRequestPaneStateIcon";
 import { RouteInsetSurface } from "../RouteInsetSurface";
@@ -251,11 +256,17 @@ export function SingleChatSurface(props: {
   const [editorExpandedDirectories, setEditorExpandedDirectories] = useState<ReadonlySet<string>>(
     () => new Set(readEditorViewState(props.threadId)?.expandedDirectories ?? []),
   );
-  const [editorCenterMode, setEditorCenterMode] = useState<"file" | "diff">(() =>
+  const [editorCenterMode, setEditorCenterMode] = useState<EditorCenterMode>(() =>
     props.search.editorFilePath
       ? "file"
       : (readEditorViewState(props.threadId)?.centerMode ?? "diff"),
   );
+  const [editorEditTarget, setEditorEditTarget] = useState<{
+    filePath: string;
+    basePath: string | null;
+    baseRev: DiffEditBaseRev;
+    returnMode: "file" | "diff";
+  } | null>(null);
   // This route component is reused across thread navigations; reload the
   // persisted editor view state when the thread changes.
   const editorViewStateThreadIdRef = useRef(props.threadId);
@@ -281,7 +292,7 @@ export function SingleChatSurface(props: {
     }
     storeEditorViewState(props.threadId, {
       expandedDirectories: [...editorExpandedDirectories],
-      centerMode: editorCenterMode,
+      centerMode: editorCenterModeFamily(editorCenterMode),
     });
   }, [editorCenterMode, editorExpandedDirectories, editorViewActive, props.threadId]);
   const [editorDiffPanelState, setEditorDiffPanelState] = useState<
@@ -294,6 +305,7 @@ export function SingleChatSurface(props: {
   const [editorDiffFiles, setEditorDiffFiles] = useState<ReadonlyArray<FileDiffMetadata>>([]);
   const [editorDiffFilesLoading, setEditorDiffFilesLoading] = useState(false);
   const [editorDiffOptionsControl, setEditorDiffOptionsControl] = useState<ReactNode | null>(null);
+  const [editorDiffVisibleFilePath, setEditorDiffVisibleFilePath] = useState<string | null>(null);
   const [searchPaletteOpen, setSearchPaletteOpen] = useState(false);
   const [searchPaletteMode, setSearchPaletteMode] = useState<WorkspaceSearchPaletteMode>("files");
   const floatingBrowserRequested = useFloatingBrowserRequestStore(
@@ -417,6 +429,19 @@ export function SingleChatSurface(props: {
     });
   };
 
+  // Chat-owned actions that replace the editor (file links, diff toggles,
+  // turn diffs) run through the editor's own dirty/saving guard, since they
+  // change state on the same route and the router blocker cannot see them.
+  const editorLeaveGuardRef = useRef<EditorLeaveGuard | null>(null);
+  const guardEditorLeave = (run: () => void) => {
+    const guard = editorLeaveGuardRef.current;
+    if (guard) {
+      guard.guardLeavingEdit(run);
+    } else {
+      run();
+    }
+  };
+
   const handleCloseEditorView = () => {
     void navigate({
       to: "/$threadId",
@@ -425,19 +450,21 @@ export function SingleChatSurface(props: {
     });
   };
 
-  const handleSelectEditorFile = (filePath: string) => {
-    setEditorCenterMode("file");
-    void navigate({
-      to: "/$threadId",
-      params: { threadId: props.threadId },
-      replace: true,
-      search: (previous) => ({
-        ...stripDiffSearchParams(previous),
-        view: "editor",
-        editorFilePath: filePath,
-      }),
+  const handleSelectEditorFile = (filePath: string) =>
+    guardEditorLeave(() => {
+      setEditorCenterMode("file");
+      setEditorEditTarget(null);
+      void navigate({
+        to: "/$threadId",
+        params: { threadId: props.threadId },
+        replace: true,
+        search: (previous) => ({
+          ...stripDiffSearchParams(previous),
+          view: "editor",
+          editorFilePath: filePath,
+        }),
+      });
     });
-  };
 
   const handleToggleEditorDirectory = (directoryPath: string) => {
     setEditorExpandedDirectories((previous) => {
@@ -451,20 +478,63 @@ export function SingleChatSurface(props: {
     });
   };
 
-  const handleEditorToggleDiff = () => {
-    setEditorCenterMode((current) =>
-      current === "diff" && props.search.editorFilePath ? "file" : "diff",
-    );
+  const handleEditFileInEditorView = (filePath: string) =>
+    guardEditorLeave(() => {
+      setEditorEditTarget({
+        filePath,
+        basePath: null,
+        baseRev: { rev: "HEAD" },
+        returnMode: "file",
+      });
+      setEditorCenterMode("fileEdit");
+    });
+
+  const handleEditDiffFileInEditorView = (request: DiffFileEditRequest) =>
+    guardEditorLeave(() => {
+      setEditorEditTarget({
+        filePath: request.filePath,
+        basePath: request.basePath ?? null,
+        baseRev: request.baseRev,
+        returnMode: "diff",
+      });
+      setEditorCenterMode(request.mode === "diff" ? "diffEdit" : "fileEdit");
+    });
+
+  const handleCloseEditorEdit = () => {
+    setEditorCenterMode(editorEditTarget?.returnMode ?? "file");
+    setEditorEditTarget(null);
   };
 
-  const handleEditorOpenTurnDiff = (turnId: TurnId, filePath?: string) => {
-    setEditorCenterMode("diff");
-    setEditorDiffPanelState({
-      panel: "diff",
-      diffTurnId: turnId,
-      diffFilePath: filePath ?? null,
+  const handleEditDiffFileFromDock = (request: DiffFileEditRequest) => {
+    handleEditDiffFileInEditorView(request);
+    void navigate({
+      to: "/$threadId",
+      params: { threadId: props.threadId },
+      search: (previous) => ({
+        ...stripDiffSearchParams(previous),
+        view: "editor",
+      }),
     });
   };
+
+  const handleEditorToggleDiff = () =>
+    guardEditorLeave(() => {
+      setEditorEditTarget(null);
+      setEditorCenterMode((current) =>
+        editorCenterModeFamily(current) === "diff" && props.search.editorFilePath ? "file" : "diff",
+      );
+    });
+
+  const handleEditorOpenTurnDiff = (turnId: TurnId, filePath?: string) =>
+    guardEditorLeave(() => {
+      setEditorCenterMode("diff");
+      setEditorEditTarget(null);
+      setEditorDiffPanelState({
+        panel: "diff",
+        diffTurnId: turnId,
+        diffFilePath: filePath ?? null,
+      });
+    });
 
   const handleUpdateEditorDiffPanelState = (
     patch: Partial<Pick<SplitViewPanePanelState, "panel" | "diffTurnId" | "diffFilePath">>,
@@ -482,14 +552,19 @@ export function SingleChatSurface(props: {
     setEditorDiffFiles(files);
     setEditorDiffFilesLoading(isLoading);
   };
-  const handleSelectEditorDiffFile = (filePath: string) => {
-    setEditorCenterMode("diff");
-    setEditorDiffPanelState((previous) => ({
-      ...previous,
-      panel: "diff",
-      diffFilePath: filePath,
-    }));
+  const handleEditorDiffVisibleFileChange = (filePath: string | null) => {
+    setEditorDiffVisibleFilePath(filePath);
   };
+  const handleSelectEditorDiffFile = (filePath: string) =>
+    guardEditorLeave(() => {
+      setEditorCenterMode("diff");
+      setEditorEditTarget(null);
+      setEditorDiffPanelState((previous) => ({
+        ...previous,
+        panel: "diff",
+        diffFilePath: filePath,
+      }));
+    });
   const handleEditorDiffOptionsChange = (control: ReactNode | null) => {
     setEditorDiffOptionsControl(control);
   };
@@ -507,7 +582,7 @@ export function SingleChatSurface(props: {
   // the React Query cache and the matching Shiki highlighter loads, so the
   // preview paints instantly on click.
   const prefetchOpenerFile = (path: string) => {
-    if (!workspaceRoot) {
+    if (!workspaceRoot || resolveWorkspaceDirectoryOpenTarget(path, workspaceRoot) !== null) {
       return;
     }
     const relativePath = resolveWorkspaceFileOpenTarget(path, workspaceRoot);
@@ -515,11 +590,19 @@ export function SingleChatSurface(props: {
       prefetchWorkspaceFile(queryClient, workspaceRoot, relativePath);
     }
   };
-  // Chat surface: file references open in the right-dock file pane. References
-  // outside the workspace report unhandled so chips fall back to the external
-  // editor.
+  // Chat surface: file references open in the right-dock file pane, while the
+  // workspace root and explicit directory references open in Explorer.
+  // Other references retain the existing dock file preview and external-editor
+  // fallback behavior.
   const dockFileOpener: WorkspaceFileOpener = {
     openFile: (path) => {
+      const directoryPath = resolveWorkspaceDirectoryOpenTarget(path, workspaceRoot);
+      if (directoryPath !== null) {
+        requestImmediateDockHydration("explorer");
+        openPane(props.threadId, { kind: "explorer" });
+        requestExplorerReveal(props.threadId, directoryPath);
+        return true;
+      }
       // In-workspace references map to relative paths for the file-read RPC;
       // binary previews in a session's scratch workspace (outside the chat
       // workspace) open by absolute path through the local-image route.
@@ -636,12 +719,11 @@ export function SingleChatSurface(props: {
       toggleSingletonPane(props.threadId, { kind: "browser" });
     },
     onOpen: (requestedThreadId) => {
-      routeSingleBrowserPanelOpenRequest({
+      routeSingleDockPaneOpenRequest({
         currentThreadId: props.threadId,
         requestedThreadId,
-        requestImmediateBrowserHydration: () => requestImmediateDockHydration("browser"),
-        showFloatingBrowser: requestFloatingBrowser,
-        rememberFloatingBrowser: requestFloatingBrowser,
+        requestImmediateHydration: () => requestImmediateDockHydration("browser"),
+        openPane: requestFloatingBrowser,
       });
     },
   });
@@ -650,14 +732,26 @@ export function SingleChatSurface(props: {
     onOpenPaneRequested:
       hasDeviceSupport && appSettings.autoOpenDevicePane
         ? (event) => {
-            routeSingleDevicePaneOpenRequest({
+            routeSingleDockPaneOpenRequest({
               currentThreadId: props.threadId,
               requestedThreadId: event.threadId,
-              requestImmediateDeviceHydration: () => requestImmediateDockHydration("device"),
-              openDevicePane: (threadId) => openPane(threadId, { kind: "device" }),
+              requestImmediateHydration: () => requestImmediateDockHydration("device"),
+              openPane: (threadId) => openPane(threadId, { kind: "device" }),
             });
           }
         : null,
+  });
+  useComputerPaneOpenRequests({
+    onOpenPaneRequested: appSettings.autoOpenComputerPane
+      ? (event) => {
+          routeSingleDockPaneOpenRequest({
+            currentThreadId: props.threadId,
+            requestedThreadId: event.threadId,
+            requestImmediateHydration: () => requestImmediateDockHydration("computer"),
+            openPane: (threadId) => openPane(threadId, { kind: "computer" }),
+          });
+        }
+      : null,
   });
 
   const excludedThreadIds = new Set<ThreadId>([props.threadId]);
@@ -744,18 +838,12 @@ export function SingleChatSurface(props: {
       return;
     }
 
-    await handleNewThread(
-      projectId,
-      {
-        envMode: appSettings.defaultThreadEnvMode,
-      },
-      {
-        search: (previous) => ({
-          ...stripEditorViewSearchParams(stripDiffSearchParams(previous)),
-          view: "editor",
-        }),
-      },
-    );
+    await handleNewThread(projectId, undefined, {
+      search: (previous) => ({
+        ...stripEditorViewSearchParams(stripDiffSearchParams(previous)),
+        view: "editor",
+      }),
+    });
   };
   const handleSelectEditorProject = (projectId: ProjectId) => {
     void openEditorProject(projectId).catch((error: unknown) => {
@@ -845,6 +933,19 @@ export function SingleChatSurface(props: {
             />
           </Suspense>
         );
+      case "computer":
+        return (
+          <Suspense fallback={<PanelStateMessage>Loading computer...</PanelStateMessage>}>
+            <LazyComputerPanel
+              mode="sidebar"
+              threadId={props.threadId}
+              onClosePanel={() => closePane(props.threadId, pane.id)}
+              runtimeMode={context.runtimeMode}
+              isVisible={context.isVisible}
+              onRequestLive={requestActiveDockPaneLive}
+            />
+          </Suspense>
+        );
       case "pullRequest":
         return (
           <Suspense fallback={<PanelStateMessage>Loading pull request...</PanelStateMessage>}>
@@ -878,6 +979,7 @@ export function SingleChatSurface(props: {
               })
             }
             onClosePanel={() => closePane(props.threadId, pane.id)}
+            onEditFile={handleEditDiffFileFromDock}
             liveRefreshEnabled={context.isActive && dockState.open}
             queriesEnabled={context.isActive && dockState.open}
           />
@@ -1024,7 +1126,7 @@ export function SingleChatSurface(props: {
   }, [workspaceRoot, queryClient, selectedEditorFilePath]);
 
   const editorChatPanelState: SplitViewPanePanelState = {
-    panel: editorCenterMode === "diff" ? "diff" : null,
+    panel: editorCenterModeFamily(editorCenterMode) === "diff" ? "diff" : null,
     diffTurnId: editorDiffPanelState.diffTurnId,
     diffFilePath: editorDiffPanelState.diffFilePath,
     hasOpenedPanel: true,
@@ -1046,9 +1148,16 @@ export function SingleChatSurface(props: {
               selectedFilePath={selectedEditorFilePath}
               expandedDirectories={editorExpandedDirectories}
               centerMode={editorCenterMode}
+              editFilePath={editorEditTarget?.filePath ?? null}
+              editDiffBasePath={editorEditTarget?.basePath ?? null}
+              editDiffBaseRev={editorEditTarget?.baseRev ?? null}
+              onEditFile={handleEditFileInEditorView}
+              onCloseEdit={handleCloseEditorEdit}
               diffFiles={editorDiffFiles}
               diffFilesLoading={editorDiffFilesLoading}
-              selectedDiffFilePath={editorDiffPanelState.diffFilePath ?? null}
+              selectedDiffFilePath={
+                editorDiffVisibleFilePath ?? editorDiffPanelState.diffFilePath ?? null
+              }
               diffOptionsControl={editorDiffOptionsControl}
               onSelectDiffFile={handleSelectEditorDiffFile}
               onSelectFile={handleSelectEditorFile}
@@ -1059,6 +1168,7 @@ export function SingleChatSurface(props: {
               onAskWhyInChat={handleAskWhyInChat}
               onCommentInChat={handleCommentInChat}
               onSelectProject={handleSelectEditorProject}
+              leaveGuardRef={editorLeaveGuardRef}
               diffPanel={
                 <LazyDiffPanel
                   mode="sidebar"
@@ -1066,12 +1176,14 @@ export function SingleChatSurface(props: {
                   panelState={editorDiffPanelState}
                   onUpdatePanelState={handleUpdateEditorDiffPanelState}
                   liveRefreshEnabled={editorCenterMode === "diff"}
+                  onEditFile={handleEditDiffFileInEditorView}
                   // Keep diff data warm while browsing files so switching to the
                   // diff tab renders instantly instead of cold-fetching.
                   queriesEnabled
                   hideHeader
                   onRenderableFilesChange={handleEditorDiffFilesChange}
                   onEditorDiffOptionsChange={handleEditorDiffOptionsChange}
+                  onVisibleFileChange={handleEditorDiffVisibleFileChange}
                 />
               }
               chatPanel={
@@ -1123,9 +1235,9 @@ export function SingleChatSurface(props: {
               onToggleDiff={handleToggleDiff}
               onToggleRightDock={handleToggleRightDock}
               onToggleBrowser={handleToggleBrowser}
-              {...(hasDeviceSupport ? { onToggleDevice: handleToggleDevice } : {})}
               onOpenBrowserUrl={handleOpenBrowserUrl}
               onOpenTurnDiff={handleOpenTurnDiff}
+              {...(hasDeviceSupport ? { onToggleDevice: handleToggleDevice } : {})}
               onSplitSurface={handleSplitSurface}
               viewModeAction={{
                 label: "Editor view",
@@ -1166,9 +1278,7 @@ export function SingleChatSurface(props: {
           onSelectPane={handleSelectDockPane}
           onClosePane={(paneId) => closePane(props.threadId, paneId)}
           onCollapse={() => setDockOpen(props.threadId, false)}
-          onOpenChange={(open) => {
-            setDockOpen(props.threadId, open);
-          }}
+          onOpenChange={(open) => setDockOpen(props.threadId, open)}
           onAddPane={handleAddDockPane}
           renderPane={renderDockPane}
         />

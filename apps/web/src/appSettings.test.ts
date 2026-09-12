@@ -42,6 +42,21 @@ import {
   resolveTerminalFontFamilyStack,
 } from "./appSettings";
 
+describe("computer control defaults", () => {
+  it("enables computer tools for fresh and older settings without a saved preference", () => {
+    expect(AppSettingsSchema.makeUnsafe({}).allowComputerControlInNewChats).toBe(true);
+    const decoded = Schema.decodeUnknownSync(AppSettingsSchema)({ autoOpenComputerPane: false });
+    expect(normalizeStoredAppSettings(decoded).allowComputerControlInNewChats).toBe(true);
+  });
+
+  it("preserves a saved machine-wide opt-out", () => {
+    const decoded = Schema.decodeUnknownSync(AppSettingsSchema)({
+      allowComputerControlInNewChats: false,
+    });
+    expect(normalizeStoredAppSettings(decoded).allowComputerControlInNewChats).toBe(false);
+  });
+});
+
 describe("server-backed provider enablement", () => {
   it("reads disabled providers from the server settings view", () => {
     expect(
@@ -407,18 +422,15 @@ describe("environment panel defaults", () => {
   it("starts optional text sections disabled without overriding explicit preferences", () => {
     const defaults = AppSettingsSchema.makeUnsafe({});
     expect(defaults).toMatchObject({
-      showEnvironmentMarkers: false,
       showEnvironmentInstructions: false,
       showEnvironmentNotepad: false,
     });
 
     const enabled = AppSettingsSchema.makeUnsafe({
-      showEnvironmentMarkers: true,
       showEnvironmentInstructions: true,
       showEnvironmentNotepad: true,
     });
     expect(enabled).toMatchObject({
-      showEnvironmentMarkers: true,
       showEnvironmentInstructions: true,
       showEnvironmentNotepad: true,
     });

@@ -392,7 +392,15 @@ function buildContextWindowActivityPayload(
   // Stamp the emitting provider so token stats can attribute usage to the
   // provider that actually processed the turn, not the thread's persisted
   // model selection (which can drift, e.g. across future per-turn providers).
-  return toActivityPayload({ ...usage, provider: event.provider });
+  return toActivityPayload({
+    ...usage,
+    provider: event.provider,
+    ...(event.providerRefs?.providerThreadId
+      ? {
+          usageSessionId: `${event.providerRefs.providerThreadId}${event.lifecycleGeneration ? `:${event.lifecycleGeneration}` : ""}`,
+        }
+      : {}),
+  });
 }
 
 function asPositiveFiniteNumber(value: unknown): number | undefined {
@@ -400,6 +408,8 @@ function asPositiveFiniteNumber(value: unknown): number | undefined {
 }
 
 interface CompactModelUsage {
+  readonly cacheReadInputTokens?: number;
+  readonly cacheCreationInputTokens?: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly totalTokens: number;
@@ -430,7 +440,24 @@ function compactTurnModelUsage(
     if (totalTokens <= 0) {
       continue;
     }
-    compact[model] = { inputTokens, outputTokens, totalTokens };
+    // Preserve reported zeroes; missing cache counters must remain unknown.
+    const cacheReadInputTokens = usage.cacheReadInputTokens;
+    const cacheCreationInputTokens = usage.cacheCreationInputTokens;
+    compact[model] = {
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      ...(typeof cacheReadInputTokens === "number" &&
+      Number.isFinite(cacheReadInputTokens) &&
+      cacheReadInputTokens >= 0
+        ? { cacheReadInputTokens }
+        : {}),
+      ...(typeof cacheCreationInputTokens === "number" &&
+      Number.isFinite(cacheCreationInputTokens) &&
+      cacheCreationInputTokens >= 0
+        ? { cacheCreationInputTokens }
+        : {}),
+    };
   }
   return Object.keys(compact).length > 0 ? compact : undefined;
 }
@@ -481,11 +508,16 @@ export function runtimeTurnState(
 
 function requestKindFromCanonicalRequestType(
   requestType: string | undefined,
-): "command" | "file-read" | "file-change" | "permissions" | undefined {
+): "command" | "file-read" | "file-change" | "permissions" | "tool" | undefined {
   if (requestType === "command_execution_approval" || requestType === "exec_command_approval")
     return "command";
   if (requestType === "file_read_approval") return "file-read";
   if (requestType === "permissions_approval") return "permissions";
+  if (requestType === "tool_approval") return "tool";
+  // Legacy Claude classification: generic/MCP tool approvals were labelled with the
+  // item type instead of the canonical "tool_approval". Kept so persisted events
+  // still resolve to a renderable kind.
+  if (requestType === "dynamic_tool_call") return "tool";
   return requestType === "file_change_approval" || requestType === "apply_patch_approval"
     ? "file-change"
     : undefined;
@@ -511,6 +543,60 @@ function sessionApprovalAvailable(
   return typeof args?.sessionApprovalAvailable === "boolean"
     ? args.sessionApprovalAvailable
     : undefined;
+}
+
+// Approval cards render `toolParamsDisplay` entries as name/value rows, so a raw
+// tool-input object has to be flattened into that shape. Values are stringified
+// here rather than passed through as nested JSON: the card prints one compact line
+// per parameter, and pre-formatting keeps the persisted payload small.
+function toolParamsDisplayFromToolInput(
+  input: Record<string, unknown> | undefined,
+): ReadonlyArray<{ readonly name: string; readonly value: string }> | undefined {
+  if (!input) {
+    return undefined;
+  }
+  const entries = Object.entries(input).map(([name, value]) => ({
+    name,
+    value:
+      typeof value === "string" ? value : (safeStringifyToolParamValue(value) ?? String(value)),
+  }));
+  return entries.length > 0 ? entries : undefined;
+}
+
+function safeStringifyToolParamValue(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function requestedMcpToolCallPresentation(
+  event: Extract<ProviderRuntimeEvent, { type: "request.opened" }>,
+): { toolName?: string; toolParamsDisplay?: unknown } {
+  // "dynamic_tool_call" is the legacy Claude request type for the same approval.
+  if (
+    event.payload.requestType !== "tool_approval" &&
+    event.payload.requestType !== "dynamic_tool_call"
+  ) {
+    return {};
+  }
+  const args = asObject(event.payload.args);
+  // Codex ships presentation through MCP elicitation `_meta`; Claude's canUseTool
+  // request carries the tool name and the raw tool input instead.
+  const metadata = asObject(args?._meta);
+  const toolName = asString(metadata?.tool_name) ?? asString(args?.toolName);
+  const toolParamsDisplay = Array.isArray(metadata?.tool_params_display)
+    ? boundActivityData(metadata.tool_params_display)
+    : boundActivityDataOrUndefined(toolParamsDisplayFromToolInput(asObject(args?.input)));
+  return {
+    ...(toolName ? { toolName } : {}),
+    ...(toolParamsDisplay !== undefined ? { toolParamsDisplay } : {}),
+  };
+}
+
+function boundActivityDataOrUndefined(value: unknown): unknown {
+  return value === undefined ? undefined : boundActivityData(value);
 }
 
 export function projectProviderRuntimeActivities(
@@ -584,6 +670,8 @@ export function projectProviderRuntimeActivities(
         event.type === "request.opened" ? requestedPermissionProfile(event) : undefined;
       const canApproveForSession =
         event.type === "request.opened" ? sessionApprovalAvailable(event) : undefined;
+      const toolCallPresentation =
+        event.type === "request.opened" ? requestedMcpToolCallPresentation(event) : {};
       const requestId = nonEmptyTrimmed(event.requestId);
       return [
         {
@@ -602,7 +690,9 @@ export function projectProviderRuntimeActivities(
                     ? "File-change approval requested"
                     : requestKind === "permissions"
                       ? "Permission approval requested"
-                      : "Approval requested",
+                      : requestKind === "tool"
+                        ? "Tool approval requested"
+                        : "Approval requested",
           payload: toActivityPayload({
             // Omitted, never `undefined`: `Schema.Json` rejects a member that is
             // explicitly present and undefined.
@@ -616,6 +706,7 @@ export function projectProviderRuntimeActivities(
               ? { detail: truncateDetail(event.payload.detail) }
               : {}),
             ...(permissionProfile ? { permissionProfile } : {}),
+            ...toolCallPresentation,
             ...(canApproveForSession !== undefined
               ? { sessionApprovalAvailable: canApproveForSession }
               : {}),
@@ -661,6 +752,10 @@ export function projectProviderRuntimeActivities(
       // line ("Moved to background: <work>"), not as a runtime warning.
       const detailSubtype = asString(asObject(event.payload.detail)?.subtype);
       const isBackgroundMove = detailSubtype === "background_tasks_changed";
+      const isPiInfoNotification =
+        event.provider === "pi" &&
+        raw?.method === "extension/ui/notify" &&
+        asObject(event.payload.detail)?.type === "info";
       const message = truncateDetail(event.payload.message);
       return [
         {
@@ -668,12 +763,14 @@ export function projectProviderRuntimeActivities(
           createdAt: event.createdAt,
           tone: "info",
           kind: "runtime.warning",
-          summary: isBackgroundMove
-            ? "Moved to background"
-            : event.provider === "opencode" &&
-                (nativeType === "session.next.retried" || nativeType === "session.status")
-              ? "OpenCode retrying"
-              : "Runtime warning",
+          summary: isPiInfoNotification
+            ? "Pi extension"
+            : isBackgroundMove
+              ? "Moved to background"
+              : event.provider === "opencode" &&
+                  (nativeType === "session.next.retried" || nativeType === "session.status")
+                ? "OpenCode retrying"
+                : "Runtime warning",
           // Keep the user-visible message even when raw detail is structured.
           payload: toActivityPayload({
             message,
@@ -964,7 +1061,7 @@ export function projectProviderRuntimeActivities(
     case "item.updated":
     case "item.completed":
     case "item.started": {
-      if (event.type !== "item.started" && event.payload.itemType === "context_compaction") {
+      if (event.payload.itemType === "context_compaction") {
         const failed = event.type === "item.completed" && event.payload.status === "failed";
         return [
           {
@@ -973,8 +1070,8 @@ export function projectProviderRuntimeActivities(
             tone: failed ? "error" : "info",
             kind: "context-compaction",
             summary:
-              event.type === "item.updated"
-                ? "Compacting conversation..."
+              event.type !== "item.completed"
+                ? "Compacting context"
                 : failed
                   ? "Context compaction failed"
                   : "Context compacted",
@@ -1061,6 +1158,10 @@ export function projectProviderRuntimeActivities(
           summary,
           payload: toActivityPayload({
             state,
+            ...(event.provider === "claudeAgent" ? { provider: event.provider } : {}),
+            ...(event.payload.tokenAccountingVersion === 1
+              ? { tokenAccountingVersion: 1, mainLoopTokens: event.payload.mainLoopTokens }
+              : {}),
             ...(modelUsage ? { modelUsage } : {}),
             ...(typeof event.payload.totalCostUsd === "number"
               ? { totalCostUsd: event.payload.totalCostUsd }
