@@ -4129,12 +4129,14 @@ describe("ChatView transcript geometry (full app)", () => {
             to: "/$threadId",
             params: { threadId: OTHER_THREAD_ID },
           });
-          await waitForLayout();
+          // Router navigation can finish before React commits the new transcript.
+          // Wait for the old list to unmount so the return cannot race that commit.
+          await vi.waitFor(() => expect(container.isConnected).toBe(false));
           await mounted.router.navigate({ to: "/$threadId", params: { threadId: THREAD_ID } });
-          container = await waitForElement(
-            () => document.querySelector<HTMLElement>("[data-chat-scroll-container='true']"),
-            "Transcript did not remount.",
-          );
+          container = await waitForElement(() => {
+            const next = document.querySelector<HTMLElement>("[data-chat-scroll-container='true']");
+            return next?.querySelector(`[data-message-id='${messageId}']`) ? next : null;
+          }, "Streaming transcript did not remount.");
           await waitForLayout();
         } else if (action === "arrow" || keyboardKey !== null || action === "find") {
           const arrow = await waitForElement(
