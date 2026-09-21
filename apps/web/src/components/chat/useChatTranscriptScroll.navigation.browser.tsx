@@ -71,3 +71,56 @@ it.each([false, true])(
     }
   },
 );
+
+it("re-sticks to the end when rows measure taller after a thread switch", async () => {
+  vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const viewport = document.createElement("div");
+  // A remounted list scrolls to its estimated end first; the tail then grows as
+  // rows measure. Model both sizes without layout.
+  let scrollHeight = 1_000;
+  Object.defineProperties(viewport, {
+    scrollHeight: { get: () => scrollHeight },
+    clientHeight: { value: 200 },
+    scrollTop: { value: 0, writable: true },
+  });
+  const scrollToEnd = vi.fn(() => {
+    viewport.scrollTop = scrollHeight - 200;
+  });
+  const listRef = {
+    current: { getScrollableNode: () => viewport, scrollToEnd } as unknown as LegendListRef,
+  };
+  function Harness({ threadId }: { threadId: string }) {
+    useChatTranscriptScroll({
+      activeThreadId: ThreadId.makeUnsafe(threadId),
+      legendListRef: listRef,
+      timelineEntries: [],
+      hasStreamingAssistantText: true,
+      composerTranscriptInsetPx: 0,
+      isInactiveSplitPane: false,
+    });
+    return null;
+  }
+  const render = (threadId: string) =>
+    flushSync(() => root.render(<Harness threadId={threadId} />));
+  try {
+    render("first");
+    await vi.advanceTimersByTimeAsync(16);
+    expect(scrollToEnd).toHaveBeenCalledTimes(1);
+    expect(viewport.scrollTop).toBe(800);
+    // Rows measure taller than the estimate right after the end scroll.
+    scrollHeight = 1_300;
+    await vi.advanceTimersByTimeAsync(64);
+    expect(viewport.scrollTop).toBe(1_100);
+    expect(scrollToEnd).toHaveBeenCalledTimes(2);
+    // Once the height is stable at the end, the follow stops re-scrolling.
+    await vi.advanceTimersByTimeAsync(400);
+    expect(scrollToEnd).toHaveBeenCalledTimes(2);
+  } finally {
+    flushSync(() => root.unmount());
+    host.remove();
+    vi.useRealTimers();
+  }
+});

@@ -31,6 +31,10 @@ interface ChatTranscriptScrollInput {
   isInactiveSplitPane: boolean;
 }
 
+// Frames the auto-follow keeps re-sticking to the end after a non-animated end
+// scroll while a freshly mounted list is still measuring its rows.
+const FOLLOW_SETTLE_MAX_FRAMES = 12;
+
 export function useChatTranscriptScroll({
   activeThreadId,
   legendListRef,
@@ -451,6 +455,7 @@ export function useChatTranscriptScroll({
     }
     // Re-apply the bottom stick only for real transcript messages; tool/work
     // rows can arrive quickly and should not churn scroll/layout work.
+    let settleFrameId: number | null = null;
     const frameId = window.requestAnimationFrame(() => {
       // The tail-anchor slide owns the scroll after a send; a re-snap here
       // would hard-jump past the smooth slide mid-flight. Once the anchor
@@ -461,11 +466,50 @@ export function useChatTranscriptScroll({
       const shouldAnimate = animateNextAutoFollowScrollRef.current;
       animateNextAutoFollowScrollRef.current = false;
       scrollToEnd(shouldAnimate);
+      if (shouldAnimate) {
+        return;
+      }
+      // A transcript that just (re)mounted, after a thread switch, still carries
+      // estimated row heights, so this end-scroll lands on the estimated end and
+      // the tail keeps growing as rows measure. Re-stick for a few frames until
+      // the height settles at the bottom, unless the reader takes over.
+      let remainingFrames = FOLLOW_SETTLE_MAX_FRAMES;
+      let lastScrollHeight = legendListRef.current?.getScrollableNode()?.scrollHeight ?? null;
+      const settle = () => {
+        settleFrameId = null;
+        if (
+          isUserScrollDetachedRef.current ||
+          tailAnchorScrollInFlightRef.current ||
+          settledScrollInFlightRef.current ||
+          pendingScrollGestureRef.current !== null
+        ) {
+          return;
+        }
+        const container = legendListRef.current?.getScrollableNode();
+        if (!(container instanceof HTMLElement)) {
+          return;
+        }
+        const grew = container.scrollHeight !== lastScrollHeight;
+        lastScrollHeight = container.scrollHeight;
+        if (!isScrollContainerNearBottom(container, 1)) {
+          scrollToEnd();
+        } else if (!grew) {
+          return;
+        }
+        remainingFrames -= 1;
+        if (remainingFrames > 0) {
+          settleFrameId = window.requestAnimationFrame(settle);
+        }
+      };
+      settleFrameId = window.requestAnimationFrame(settle);
     });
     return () => {
       window.cancelAnimationFrame(frameId);
+      if (settleFrameId !== null) {
+        window.cancelAnimationFrame(settleFrameId);
+      }
     };
-  }, [activeThreadId, scrollToEnd, transcriptAutoFollowSignal]);
+  }, [activeThreadId, legendListRef, scrollToEnd, transcriptAutoFollowSignal]);
 
   // A composer that grows (attachments, approval cards, queued turns) eats into the
   // transcript's bottom content inset, which would push the tail behind the frosted
