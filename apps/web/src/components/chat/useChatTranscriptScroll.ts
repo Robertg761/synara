@@ -430,6 +430,19 @@ export function useChatTranscriptScroll({
     scrollToEnd,
     setTranscriptScrollDetached,
   ]);
+  // Reset ownership before the auto-follow layout effect checks it. A passive
+  // reset runs too late after switching away from a detached transcript, and
+  // its state update does not change the auto-follow effect dependencies.
+  useLayoutEffect(() => {
+    isAtEndRef.current = true;
+    settledScrollRequestRef.current += 1;
+    settledScrollInFlightRef.current = false;
+    programmaticScrollUntilRef.current = 0;
+    setTranscriptScrollDetached(false);
+    showScrollDebouncer.current.cancel();
+    const settle = window.setTimeout(() => setShowScrollToBottom(false), 0);
+    return () => window.clearTimeout(settle);
+  }, [activeThreadId, setTranscriptScrollDetached]);
   useLayoutEffect(() => {
     const shouldFollowPendingTurn =
       activeThreadId !== null && autoFollowThreadIdRef.current === activeThreadId;
@@ -538,16 +551,6 @@ export function useChatTranscriptScroll({
         }
       });
   }, [legendListRef, cancelPendingScrollGesture, setTranscriptScrollDetached]);
-  useEffect(() => {
-    isAtEndRef.current = true;
-    settledScrollRequestRef.current += 1;
-    settledScrollInFlightRef.current = false;
-    programmaticScrollUntilRef.current = 0;
-    setTranscriptScrollDetached(false);
-    showScrollDebouncer.current.cancel();
-    const settle = window.setTimeout(() => setShowScrollToBottom(false), 0);
-    return () => window.clearTimeout(settle);
-  }, [activeThreadId, setTranscriptScrollDetached]);
 
   return {
     showScrollToBottom,
