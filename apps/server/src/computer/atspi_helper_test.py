@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -403,7 +404,8 @@ class AtspiWindowSearchTest(unittest.TestCase):
         self.assertFalse(HELPER.configure_atspi())
 
     def test_probe_reports_whether_atspi_imported(self):
-        self.assertEqual(HELPER.probe(), {"ok": True, "atspi": True, "reason": None})
+        with patch.object(HELPER, "ATSPI_IMPORT_ERROR", None):
+            self.assertEqual(HELPER.probe(), {"ok": True, "atspi": True, "reason": None})
         HELPER.Atspi = None
         original = HELPER.ATSPI_IMPORT_ERROR
         HELPER.ATSPI_IMPORT_ERROR = "No module named 'gi'"
