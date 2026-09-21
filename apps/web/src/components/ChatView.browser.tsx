@@ -2061,6 +2061,14 @@ async function mountChatView(options: {
     cleanedUp = true;
     await screen.unmount();
     if (host.isConnected) host.remove();
+    // React Query retries and background refetches outlive the unmounted tree.
+    // A leftover provider-discovery retry can recreate the websocket API inside
+    // the next test's beforeEach reset window, before that test configures its
+    // fixture; the transport then caches the neutral fixture's welcome, which
+    // onServerWelcome replays, so the next mount never receives its workspace
+    // paths. Cancel and drop this mount's queries so nothing outlives the test.
+    await router.options.context.queryClient.cancelQueries();
+    router.options.context.queryClient.clear();
   };
 
   return {
