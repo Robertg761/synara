@@ -63,6 +63,11 @@ async function makeBackend(
       throw new Error("provisioning must not run in this test");
     },
     dbusFactory: async () => fakeDbus(),
+    atspi: {
+      readTrees: async () => [],
+      setText: async () => false,
+      dispose: async () => undefined,
+    },
     ...options,
   });
 }
@@ -167,6 +172,11 @@ describe("HyprlandComputerBackend instance selection", () => {
       busNameHasOwner: async () => false,
       buildToolingPresent: () => false,
       dbusFactory: async () => fakeDbus(),
+      atspi: {
+        readTrees: async () => [],
+        setText: async () => false,
+        dispose: async () => undefined,
+      },
     });
 
     await expect(backend.probeAvailability()).resolves.toEqual({
@@ -185,6 +195,11 @@ describe("HyprlandComputerBackend instance selection", () => {
       pluginDirectory: await installedPluginDirectory("SynaraComputerUsePluginV1.so"),
       busNameHasOwner: async () => false,
       dbusFactory: async () => fakeDbus(),
+      atspi: {
+        readTrees: async () => [],
+        setText: async () => false,
+        dispose: async () => undefined,
+      },
     });
 
     await expect(backend.probeAvailability()).resolves.toMatchObject({
@@ -385,6 +400,11 @@ describe("HyprlandComputerBackend setup gate", () => {
         args.join(" ").endsWith("-j version") ? JSON.stringify({ version: "0.56.2" }) : "",
       busNameHasOwner: async () => false,
       dbusFactory: async () => fakeDbus(),
+      atspi: {
+        readTrees: async () => [],
+        setText: async () => false,
+        dispose: async () => undefined,
+      },
       provisionPlugin: async () => ({
         action: "installed-from-source" as const,
         pluginId: "SynaraComputerUsePluginV1",

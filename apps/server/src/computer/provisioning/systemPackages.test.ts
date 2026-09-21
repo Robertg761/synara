@@ -39,7 +39,7 @@ describe("planSystemPackageInstall", () => {
     expect(
       planSystemPackageInstall((command) => command === "dnf", { id: "gentoo" })?.manager,
     ).toBe("dnf");
-    expect(planSystemPackageInstall(EVERY_MANAGER, undefined)?.manager).toBe("pacman");
+    expect(planSystemPackageInstall(EVERY_MANAGER, { id: "unknown" })?.manager).toBe("pacman");
   });
 
   it("falls back to PATH when a derivative swapped the manager out from under it", () => {
