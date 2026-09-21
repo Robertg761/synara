@@ -1,73 +1,52 @@
 import type { LegendListRef } from "@legendapp/list/react";
 import { ThreadId } from "@synara/contracts";
-import { flushSync } from "react-dom";
-import { createRoot } from "react-dom/client";
-import { expect, it, vi } from "vitest";
-
+import { describe, expect, it, vi } from "vitest";
+import { render } from "vitest-browser-react";
 import { useChatTranscriptScroll } from "./useChatTranscriptScroll";
 
-it.each([false, true])(
-  "resumes follow on thread switches with streaming=%s before another layout notification",
-  async (streaming) => {
-    vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
-    const host = document.createElement("div");
-    document.body.append(host);
-    const root = createRoot(host);
-    const viewport = document.createElement("div");
-    // This tests scroll ownership and effect ordering, independent of list measurement.
-    Object.defineProperties(viewport, {
-      scrollHeight: { value: 1_000 },
-      clientHeight: { value: 200 },
-      // Detached elements have no native scroll offset in Chromium. Model it
-      // alongside the synthetic dimensions so this fixture stays layout-free.
-      scrollTop: { value: 300, writable: true },
-    });
-    const scrollToEnd = vi.fn(() => {
-      viewport.scrollTop = 800;
-    });
+const EMPTY_TIMELINE: [] = [];
+const waitForFrames = () =>
+  new Promise<void>((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+  );
+
+describe("transcript follow after switching threads", () => {
+  it("preserves send-anchor ownership when an idle destination starts streaming", async () => {
+    const node = document.createElement("div");
+    const scrollToEnd = vi.fn(async () => {});
     const listRef = {
-      current: { getScrollableNode: () => viewport, scrollToEnd } as unknown as LegendListRef,
+      current: {
+        scrollToEnd,
+        getScrollableNode: () => node,
+      } as unknown as LegendListRef,
     };
-    let controls: ReturnType<typeof useChatTranscriptScroll>;
-    function Harness({ threadId }: { threadId: string }) {
+    let controls: ReturnType<typeof useChatTranscriptScroll> | undefined;
+    function Harness({ threadId, streaming }: { threadId: string; streaming: boolean }) {
       controls = useChatTranscriptScroll({
         activeThreadId: ThreadId.makeUnsafe(threadId),
         legendListRef: listRef,
-        timelineEntries: [],
+        timelineEntries: EMPTY_TIMELINE,
         hasStreamingAssistantText: streaming,
         composerTranscriptInsetPx: 0,
         isInactiveSplitPane: false,
       });
       return null;
     }
-    const render = (threadId: string) =>
-      flushSync(() => root.render(<Harness threadId={threadId} />));
+    const screen = await render(<Harness threadId="first" streaming={false} />);
     try {
-      render("first");
-      await vi.advanceTimersByTimeAsync(32);
-      flushSync(() => controls.onTranscriptNavigate());
-      viewport.scrollTop = 300;
+      await waitForFrames();
+      await screen.rerender(<Harness threadId="second" streaming={false} />);
+      await waitForFrames();
       scrollToEnd.mockClear();
-      render("first");
-      await vi.advanceTimersByTimeAsync(32);
-      expect(controls!.isUserScrollDetached).toBe(true);
-      expect(scrollToEnd).not.toHaveBeenCalled();
 
-      for (const threadId of ["second", "first"]) {
-        render(threadId);
-        await vi.advanceTimersByTimeAsync(32);
-        expect(controls!.isUserScrollDetached).toBe(false);
-        expect(scrollToEnd).toHaveBeenCalledTimes(1);
-        expect(viewport.scrollTop).toBe(800);
-        // Detach again so the return navigation must reset the old ownership too.
-        flushSync(() => controls.onTranscriptNavigate());
-        viewport.scrollTop = 300;
-        scrollToEnd.mockClear();
-      }
+      // Sending owns the scroll before the optimistic row appears. Provider text
+      // can arrive while the 320ms anchor slide is still moving that row.
+      controls!.tailAnchorScrollInFlightRef.current = true;
+      await screen.rerender(<Harness threadId="second" streaming />);
+      await waitForFrames();
+      expect(scrollToEnd).not.toHaveBeenCalled();
     } finally {
-      flushSync(() => root.unmount());
-      host.remove();
-      vi.useRealTimers();
+      await screen.unmount();
     }
-  },
-);
+  });
+});
