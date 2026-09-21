@@ -18,8 +18,10 @@ it.each([false, true])(
     Object.defineProperties(viewport, {
       scrollHeight: { value: 1_000 },
       clientHeight: { value: 200 },
+      // Detached elements have no native scroll offset in Chromium. Model it
+      // alongside the synthetic dimensions so this fixture stays layout-free.
+      scrollTop: { value: 300, writable: true },
     });
-    viewport.scrollTop = 300;
     const scrollToEnd = vi.fn(() => {
       viewport.scrollTop = 800;
     });
