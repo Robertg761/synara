@@ -146,6 +146,7 @@ class RaisingAccessible(FakeAccessible):
 class AtspiHelperTest(unittest.TestCase):
     def setUp(self):
         HELPER.Atspi = FakeAtspi
+        HELPER.ATSPI_IMPORT_ERROR = None
         FakeAtspi.desktop = None
 
     def test_descends_through_application_to_find_a_frame(self):
