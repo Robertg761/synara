@@ -161,10 +161,10 @@ describe("ComputerServiceLive", () => {
   /**
    * The Electron app configures the Cua host socket on every platform, Linux
    * included, so socket presence cannot be what routes a Linux desktop: the
-   * Linux tiers decide first, and Cua is what remains when none claims the
-   * host. Naming it explicitly reaches it on any platform.
+   * Linux tiers decide first, and a host no tier claims would fall through
+   * to Cua. Naming it explicitly reaches it on any platform.
    */
-  it("keeps Cua as the Linux fallback and the explicit choice", async () => {
+  it("keeps the Linux tiers ahead of a configured Cua socket, and Cua reachable by name", async () => {
     vi.stubEnv("SYNARA_CUA_HOST_SOCKET", "/tmp/synara-cua-test.sock");
     try {
       await Effect.runPromise(
@@ -172,18 +172,20 @@ describe("ComputerServiceLive", () => {
           Effect.gen(function* () {
             const service = yield* ComputerService;
             expect(service.supported).toBe(true);
-            expect(service.availability).not.toMatchObject({ kind: "unsupported-platform" });
-            // The Cua host, observing a Linux desktop it does not drive.
-            expect(backendOf(service)).toBeInstanceOf(CuaComputerBackend);
+            // A Linux desktop backend, not the observation-only Cua host.
+            expect(backendOf(service)).not.toBeInstanceOf(CuaComputerBackend);
             expect(service.manager.guidanceProfile).toEqual({
               dialect: "linux",
-              dedicatedSeat: false,
+              dedicatedSeat: true,
             });
           }).pipe(
             Effect.provide(
               makeComputerServiceLayer({
                 platform: "linux",
-                selection: { env: { SYNARA_CUA_HOST_SOCKET: "/tmp/synara-cua-test.sock" } },
+                selection: {
+                  env: { SYNARA_CUA_HOST_SOCKET: "/tmp/synara-cua-test.sock" },
+                  busNameHasOwner: async () => false,
+                },
               }),
             ),
           ),
@@ -196,8 +198,13 @@ describe("ComputerServiceLive", () => {
             const service = yield* ComputerService;
             expect(service.supported).toBe(true);
             expect(service.availability).not.toMatchObject({ kind: "unsupported-platform" });
+            // Named explicitly: the Cua host, observing a desktop it does not drive.
             expect(backendOf(service)).toBeInstanceOf(CuaComputerBackend);
-          }).pipe(Effect.provide(makeComputerServiceLayer({ platform: "win32" }))),
+            expect(service.manager.guidanceProfile).toEqual({
+              dialect: "linux",
+              dedicatedSeat: false,
+            });
+          }).pipe(Effect.provide(makeComputerServiceLayer({ platform: "linux" }))),
         ),
       );
     } finally {
@@ -205,15 +212,26 @@ describe("ComputerServiceLive", () => {
     }
   });
 
-  it("refuses a Linux host with no tier and no host endpoint rather than faking one", async () => {
+  /**
+   * The floor on Linux: a host that is neither KWin nor any other plugin-able
+   * compositor gets the headless nested desktop, constructed but never booted
+   * by the act of starting the server.
+   */
+  it("gives a Linux host no tier claims the nested desktop, without booting it", async () => {
     await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
           const service = yield* ComputerService;
-          expect(service.supported).toBe(false);
-          expect(service.availability).toEqual({
-            kind: "backend-unavailable",
-            message: "No computer backend is available on this server.",
+          expect(service.supported).toBe(true);
+          expect(service.availability).not.toMatchObject({ kind: "unsupported-platform" });
+          if (service.availability.kind === "available") {
+            expect(service.availability.backend).toBe("nested-kwin");
+          }
+          // Passive: the probe answers from the distribution and the host
+          // environment alone, so the same fake, un-engaged manager reports it.
+          expect(service.manager.guidanceProfile).toEqual({
+            dialect: "linux",
+            dedicatedSeat: true,
           });
         }).pipe(
           Effect.provide(
