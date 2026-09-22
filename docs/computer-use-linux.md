@@ -262,6 +262,70 @@ and boots a real private bus and `kwin_wayland --virtual`. The unit tests cover
 mode and size parsing, environment construction, load planning, dormancy and
 the status read with fake spawners and the shared plugin doubles.
 
+## Backend: Hyprland plugin
+
+`HyprlandComputerBackend.ts` drives `apps/server/native/computer-use-hyprland/`
+loaded into the human's own Hyprland. It reports backend `hyprland`,
+`visibleDesktop: true`, the full capability set and the release hotkey, and
+inherits `dedicatedSeat`, `textRangeSelection: false`, the lock handling and
+the input-readiness check from the KWin engine; the plugin speaks the identical
+`org.synara.ComputerUse` interface. Selected when a live Hyprland instance
+answers for the environment — the signature named by
+`SYNARA_HYPRLAND_INSTANCE_SIGNATURE`, or else the inherited
+`HYPRLAND_INSTANCE_SIGNATURE`, with a socket that accepts connections — and
+checked before the KWin bus probe, so a stray test `kwin_wayland` owning
+`org.kde.KWin` cannot misroute a Hyprland desktop.
+
+### Plugin
+
+A single-file plugin (`synarahyprlandplugin.cpp` with `sessionauth.h` and
+`capturetransform.h`) built with `make` against the installed Hyprland headers
+through `pkg-config hyprland`, plus sdbus-c++, cairo and pixman. The Hyprland
+ABI changes per release, so builds are per exact version; the plugin registers
+as `synara-computer-use` and self-reports its module path in `healthJson`,
+because `hyprctl plugin list` reports names while load and unload address
+plugins by absolute path.
+
+Input is direct per-client injection only: raw wire events on the target
+client's own `wl_pointer` and `wl_keyboard` resources with seat-manager serials
+and an xkb modifier mirror. The compositor's seat state is observed, never
+changed; an enter the human's seat sends to a sibling surface of the agent's
+target invalidates the agent's own enter, and every agent action ends by
+handing the shared pointer and keyboard back to the seat with its real focus
+and modifiers. The ghost cursor is drawn with cairo, pixel-matched to the KWin
+item. Capture is an offscreen GPU render composited with the ghost cursor; the
+human's cursor is never in the offscreen scene. `Meta+Shift+Esc` is bound
+through the keybind hook with the same latch semantics as KWin.
+
+### Backend and provisioning
+
+`hyprlandPluginHost.ts` implements `KWinComputerDbus` on top of `hyprctl`,
+translating between KWin's id vocabulary and Hyprland's path vocabulary so the
+engine never learns the difference; `hyprctl` always exits 0, so every answer
+is parsed from reply text, and a load refusal's reason is passed into the
+backend's refusal message. `hyprlandPluginProvisioning.ts` installs under
+`$XDG_DATA_HOME/synara/hyprland-computer-use/plugins` as
+`SynaraComputerUsePluginV<n>.so` with the stamp under `$XDG_STATE_HOME`; there
+is no env script and no relogin, since `hyprctl plugin load` takes effect live.
+A prebuild is used only when `manifest.json` matches the running Hyprland
+version and architecture exactly; otherwise `scripts/install-and-load.sh
+--build-only` builds from source, honouring the turn's abort signal. Superseded
+generations are unloaded before their files are deleted, because Hyprland
+unloads by the path it loaded from. `SYNARA_HYPRLAND_PLUGIN_DIR`,
+`SYNARA_HYPRLAND_PREBUILT_DIR`, `SYNARA_HYPRLAND_SOURCE_DIR` and
+`SYNARA_HYPRLAND_STATE_ROOT` override the paths and are listed in `turbo.json`
+with `HYPRLAND_INSTANCE_SIGNATURE`. The plugin sources ship outside ASAR like
+the KWin ones.
+
+### Testing
+
+`.github/workflows/hyprland-plugin.yml` compiles the compositor-free fixtures
+(`tests/focus_test.py`, `capturetransform_test.cpp`) against stub protocol
+resources and builds the whole plugin where Hyprland's headers install. The
+backend and host tests drive `hyprctl` and the plugin through fakes.
+Development runs against a disposable Hyprland nested inside a headless
+`kwin_wayland --virtual`, never the desktop the developer is sitting at.
+
 ## Known gaps
 
 - Nothing here is verified against a live compositor by the test suite.
@@ -281,3 +345,5 @@ the status read with fake spawners and the shared plugin doubles.
   provisions one.
 - The nested session's private `dbus-daemon` inherits the host environment
   with service activation on.
+- On Hyprland, the pointer and modifier hand-back after an action aimed at a
+  surface the human is also using is best effort.

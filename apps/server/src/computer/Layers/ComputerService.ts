@@ -7,6 +7,7 @@ import { CUA_HOST_SOCKET_ENV } from "@synara/shared/cuaDriverProtocol";
 import { ComputerManager } from "../ComputerManager.ts";
 import { CuaComputerBackend } from "../CuaComputerBackend.ts";
 import { FakeComputerBackend } from "../FakeComputerBackend.ts";
+import { HyprlandComputerBackend } from "../HyprlandComputerBackend.ts";
 import { KWinComputerBackend } from "../KWinComputerBackend.ts";
 import { NestedComputerBackend } from "../nestedComputerBackend.ts";
 import { nestedAtspiMode, parseNestedSizeEnv } from "../nestedKWinSession.ts";
@@ -54,6 +55,9 @@ const LINUX_BACKENDS: Record<LinuxBackendChoice, () => ComputerBackend> = {
   // Constructed, not connected: the backend touches the compositor on first
   // real use, and its `provision()` is the settings panel's one-click setup.
   kwin: () => new KWinComputerBackend(),
+  // The same real-desktop tier on a Hyprland session: the plugin loads live
+  // through hyprctl, so construction touches nothing.
+  hyprland: () => new HyprlandComputerBackend(),
   // Constructed, not booted: the nested compositor is expensive and — in
   // window mode — visible, so nothing may appear because a server started.
   // The backend boots its session on first real use. The geometry comes from
@@ -181,6 +185,9 @@ async function selectBackend(
     const linux = await selectLinuxBackend({
       env,
       busNameHasOwner: selection?.busNameHasOwner ?? sessionBusNameHasOwner,
+      ...(selection?.hyprlandSessionPresent
+        ? { hyprlandSessionPresent: selection.hyprlandSessionPresent }
+        : {}),
       ...(isLinuxBackendChoice(override) ? { override } : {}),
     });
     if (linux) return makeLinuxBackend(linux);

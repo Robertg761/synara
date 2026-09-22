@@ -302,6 +302,38 @@ describe("ComputerServiceLive", () => {
     );
   });
 
+  it("routes a live Hyprland session to the Hyprland backend ahead of a KWin bus owner", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const service = yield* ComputerService;
+          expect(service.supported).toBe(true);
+          // The passive probe answers from the host it runs on: a live
+          // Hyprland desktop reports the Hyprland backend, any other host
+          // reports the absent session — never a fake, and never the KWin
+          // plugin the stray bus owner would have suggested.
+          expect(service.availability).not.toMatchObject({ kind: "unsupported-platform" });
+          if (service.availability.kind === "available") {
+            expect(service.availability.backend).toBe("hyprland");
+          } else if (service.availability.kind === "backend-unavailable") {
+            expect(service.availability.message).toContain("Hyprland");
+          }
+        }).pipe(
+          Effect.provide(
+            makeComputerServiceLayer({
+              platform: "linux",
+              selection: {
+                env: { XDG_SESSION_TYPE: "wayland" },
+                busNameHasOwner: async (name) => name === "org.kde.KWin",
+                hyprlandSessionPresent: () => true,
+              },
+            }),
+          ),
+        ),
+      ),
+    );
+  });
+
   it("selects the fake backend only when explicitly requested", async () => {
     vi.stubEnv("SYNARA_COMPUTER_BACKEND", "fake");
     try {
