@@ -61,8 +61,10 @@ import {
   COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
   computerBackendActionResult,
   ComputerBackendError,
+  computerGuidanceProfile,
   type ComputerAgentDialect,
   type ComputerBackend,
+  type ComputerGuidanceProfile,
   type ComputerBackendActionResult,
   type ComputerBrowserCallResult,
   type ComputerCaptureRequest,
@@ -465,6 +467,11 @@ export class ComputerManager {
    */
   get agentDialect(): ComputerAgentDialect {
     return this.backend.agentDialect ?? "linux";
+  }
+
+  /** What the session-start guidance says about this desktop. */
+  get guidanceProfile(): ComputerGuidanceProfile {
+    return computerGuidanceProfile(this.backend);
   }
 
   get supportsFocusNeutralSemanticText(): boolean {
@@ -1238,11 +1245,18 @@ export class ComputerManager {
     // not be the thing that installs and loads compositor code on a machine
     // where nothing has ever used the feature, so before first engagement it
     // answers from the side-effect-free probe.
+    //
+    // A backend with its own passive status read boots its desktop on demand,
+    // so the establishing read is not for a timer to make: polling it would
+    // respawn the desktop the human just closed. Such a backend answers every
+    // status read passively; the desktop starts again on the next real use.
     let availability: ComputerAvailability;
     try {
-      availability = this.backendEngaged
-        ? await this.backend.availability({ refresh: true })
-        : await this.backend.probeAvailability();
+      availability = this.backend.statusAvailability
+        ? await this.backend.statusAvailability()
+        : this.backendEngaged
+          ? await this.backend.availability({ refresh: true })
+          : await this.backend.probeAvailability();
     } catch (error) {
       availability = {
         kind: "backend-unavailable",
@@ -3566,6 +3580,17 @@ export class ComputerManager {
     target: ComputerTarget,
     range: ComputerTextRange,
   ): Promise<ComputerActionResult> {
+    // Refused here, before the lease is claimed and the window restacked and
+    // aimed: a backend that cannot select a range would refuse the dispatch
+    // anyway, and every step before it would have been paid for nothing.
+    if (this.backend.textRangeSelection === false) {
+      throw new ComputerBackendError(
+        "Selecting a text range is not supported on this desktop: the accessibility layer " +
+          "exposes no selection to set. Use set_value to replace the field, or click and " +
+          "keyboard navigation to place the caret.",
+        { rejectedOperation: "selectText" },
+      );
+    }
     return this.withSemanticControl(threadId, target.windowId, async () => {
       const resolved = await this.prepareSemanticDispatch(target, threadId, true);
       const result = await timedComputerLeg("dispatch", () =>
@@ -4150,7 +4175,7 @@ export class ComputerManager {
     const changed = held?.threadId !== owner;
     assertDesktopOperationActive();
     if (changed) {
-      await this.backend.clearFocusWindow?.();
+      await this.resetInputDelivery();
       assertDesktopOperationActive();
     }
     // Stamp the claiming caller's own turn when it carries one; the map only
@@ -4201,6 +4226,18 @@ export class ComputerManager {
       ...(lease.turnId ? { turnId: lease.turnId } : {}),
       ...detail,
     });
+  }
+
+  /**
+   * The seat as the next owner must find it: nothing aimed, nothing held,
+   * nothing remembered about the previous owner's targets. A backend without
+   * the full reset still has focus to clear, which is the part that matters
+   * most — the next owner's unscoped keystroke otherwise lands in the window
+   * the previous owner aimed at.
+   */
+  private async resetInputDelivery(): Promise<void> {
+    if (this.backend.resetInputDelivery) await this.backend.resetInputDelivery();
+    else await this.backend.clearFocusWindow?.();
   }
 
   /**
@@ -4307,7 +4344,7 @@ export class ComputerManager {
       // The queue can admit a newer turn before this release gets its slot.
       // Even a thread-level teardown belongs to the turn observed above.
       if (this.lease.turnId !== releasedTurnId) return;
-      await this.backend.clearFocusWindow?.();
+      await this.resetInputDelivery();
       this.recordLeaseLifecycle("released", this.lease);
       this.lease = null;
       // The released turn is no longer this thread's authority: a later

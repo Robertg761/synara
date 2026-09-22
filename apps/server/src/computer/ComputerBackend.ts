@@ -370,6 +370,25 @@ export const NO_COMPUTER_CAPABILITIES: ComputerCapabilities = {
  */
 export type ComputerAgentDialect = "linux" | "macos";
 
+/**
+ * The two facts about a desktop that the model is told once, at session start,
+ * by guidance rendered far from the backend (`agentGateway/computerGuidance.ts`).
+ */
+export interface ComputerGuidanceProfile {
+  readonly dialect: ComputerAgentDialect;
+  /** See `ComputerBackend.dedicatedSeat`. */
+  readonly dedicatedSeat: boolean;
+}
+
+export function computerGuidanceProfile(
+  backend: Pick<ComputerBackend, "agentDialect" | "dedicatedSeat">,
+): ComputerGuidanceProfile {
+  return {
+    dialect: backend.agentDialect ?? "linux",
+    dedicatedSeat: backend.dedicatedSeat === true,
+  };
+}
+
 /** Provider-side contract shared by real display backends and the CI fake. */
 export interface ComputerBackend {
   /**
@@ -378,6 +397,24 @@ export interface ComputerBackend {
    * but the macOS one uses.
    */
   readonly agentDialect?: ComputerAgentDialect;
+  /**
+   * The agent drives this desktop through a seat of its own — a compositor
+   * plugin's dedicated seat, or a private compositor — so its input never
+   * touches the human's cursor, focus or keystrokes, and it has no browser
+   * route. Only the Linux compositor backends set it. Guidance reads it rather
+   * than the live capability set because the model is told about its desktop
+   * once, at session start, and a backend whose desktop has not booted yet
+   * reports no capabilities at all until its first real use. Absent means the
+   * desktop is described the way it always was: the Cua host's wording.
+   */
+  readonly dedicatedSeat?: boolean;
+  /**
+   * Whether `selectText` can succeed on this desktop. `false` refuses the call
+   * in the manager before the lease is claimed and the window restacked and
+   * aimed for a dispatch the backend would refuse anyway. Absent means
+   * supported.
+   */
+  readonly textRangeSelection?: boolean;
   readonly computerId: ComputerId;
   /**
    * Whether this host could drive a desktop, answered without doing anything to
@@ -398,6 +435,22 @@ export interface ComputerBackend {
    * user the feature.
    */
   probeAvailability(): Promise<ComputerAvailability>;
+  /**
+   * The passive status read, for a backend whose desktop boots on demand and
+   * must not be respawned by a status poll.
+   *
+   * `ComputerManager.getStatus` answers the settings screen's ten-second poll
+   * from `availability({ refresh: true })` once something real has engaged
+   * the backend, which is right for a desktop that is always there: the read
+   * reports what it finds. A backend that starts a private compositor on first
+   * use cannot afford it — the poll would boot a desktop nobody asked for, and
+   * re-boot the one the human just closed. Such a backend implements this to
+   * report the last established state without touching the desktop, and the
+   * manager uses it for every status read, before and after engagement; the
+   * desktop starts again on the next real use or from Set up. Absent means
+   * `availability()` is safe to poll.
+   */
+  statusAvailability?(): Promise<ComputerAvailability>;
   /**
    * Availability as established, not as guessed: this may connect, install, and
    * load whatever the backend needs, so it belongs on paths that are about to
@@ -519,6 +572,16 @@ export interface ComputerBackend {
    */
   raiseWindow?(windowId: string): Promise<void>;
   clearFocusWindow?(): Promise<void>;
+  /**
+   * The seat as the next owner must find it: nothing aimed, nothing held,
+   * nothing remembered about the previous owner's targets. The manager calls
+   * it on every desktop lease change and release, where `clearFocusWindow`
+   * alone would leave a button or modifier the previous owner pressed still
+   * held for the next one — a compositor seat outlives the thread that drove
+   * it. Absent means the backend has nothing to hold: the manager clears the
+   * aim through `clearFocusWindow` instead.
+   */
+  resetInputDelivery?(): Promise<void>;
   /**
    * Names the thread currently holding the desktop, for backends that draw an
    * agent cursor the human can see. `null` when nobody holds it. Best effort by

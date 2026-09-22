@@ -583,6 +583,83 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("keeps a status poll passive on a backend with a dedicated status read", async () => {
+    // The panel polls every ten seconds. A poll that establishes the desktop is
+    // a poll that installs a plugin and boots a compositor nobody asked for.
+    const statusReads: number[] = [];
+    const backend = Object.assign(new FakeComputerBackend(), {
+      statusAvailability: async () => {
+        statusReads.push(1);
+        return { kind: "available", backend: "fake" } as const;
+      },
+    });
+    const manager = new ComputerManager({ backend });
+
+    // Before engagement and after: the passive read answers both, and the
+    // establishing read is left to the next real use of the desktop.
+    await manager.getStatus();
+    expect(statusReads).toHaveLength(1);
+    await manager.listWindows();
+    const establishedReads = backend.callsFor("availability").length;
+    await manager.getStatus();
+    expect(statusReads).toHaveLength(2);
+    expect(backend.callsFor("availability")).toHaveLength(establishedReads);
+
+    await manager.dispose();
+  });
+
+  it("refuses a text selection the backend cannot make before touching the desktop", async () => {
+    const backend = Object.assign(new FakeComputerBackend(), { textRangeSelection: false });
+    const manager = new ComputerManager({ backend });
+    try {
+      await expect(
+        manager.selectText("thread-1", { windowId: "fake-calculator" }, { start: 0, length: 1 }),
+      ).rejects.toMatchObject({ rejectedOperation: "selectText" });
+      // Nothing was claimed, restacked or aimed for a dispatch that could
+      // never have happened.
+      for (const method of ["clearFocusWindow", "raiseWindow", "focusWindow", "selectText"]) {
+        expect(backend.callsFor(method), method).toHaveLength(0);
+      }
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("resets input delivery, not only the aim, when the desktop changes hands", async () => {
+    // A compositor seat outlives the thread that drove it: a button or modifier
+    // the previous owner still held would be held for the next one, and for the
+    // human once the lease is released.
+    const resets: string[] = [];
+    const backend = Object.assign(new FakeComputerBackend(), {
+      resetInputDelivery: async () => {
+        resets.push("reset");
+      },
+    });
+    const manager = new ComputerManager({ backend });
+    try {
+      await manager.withAgentActivity(
+        "a",
+        () => manager.pressKey("a", "enter"),
+        undefined,
+        "turn-a",
+      );
+      expect(resets).toEqual(["reset"]);
+      await manager.releaseDesktopControl("a", "turn-a");
+      expect(resets).toEqual(["reset", "reset"]);
+      await manager.withAgentActivity(
+        "b",
+        () => manager.pressKey("b", "enter"),
+        undefined,
+        "turn-b",
+      );
+      expect(resets).toEqual(["reset", "reset", "reset"]);
+      // The full reset replaces the aim-only clear on both transitions.
+      expect(backend.callsFor("clearFocusWindow")).toHaveLength(0);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it("answers getStatus without a thread, corrected by live health", async () => {
     const backend = new FakeComputerBackend();
     const manager = new ComputerManager({ backend });
