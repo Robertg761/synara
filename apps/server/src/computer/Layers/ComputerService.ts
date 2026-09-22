@@ -7,6 +7,8 @@ import { CUA_HOST_SOCKET_ENV } from "@synara/shared/cuaDriverProtocol";
 import { ComputerManager } from "../ComputerManager.ts";
 import { CuaComputerBackend } from "../CuaComputerBackend.ts";
 import { FakeComputerBackend } from "../FakeComputerBackend.ts";
+import { KWinComputerBackend } from "../KWinComputerBackend.ts";
+import { sessionBusNameHasOwner } from "../sessionBusNames.ts";
 import { UnavailableComputerBackend } from "../UnavailableComputerBackend.ts";
 import { ComputerService, type ComputerServiceShape } from "../Services/ComputerService.ts";
 import type { ComputerBackend } from "../ComputerBackend.ts";
@@ -37,7 +39,7 @@ export interface ComputerServiceLiveOptions {
    * host socket and the Linux tiers are read from (defaults to the process
    * environment), and the Linux detection probes (default to the live host).
    */
-  readonly selection?: Omit<LinuxBackendSelectionDependencies, "override">;
+  readonly selection?: Partial<Omit<LinuxBackendSelectionDependencies, "override">>;
 }
 
 /**
@@ -45,7 +47,11 @@ export interface ComputerServiceLiveOptions {
  * that registers a tier in `linuxBackendSelection.ts` cannot forget to say how
  * it is built; the type fails the build otherwise.
  */
-const LINUX_BACKENDS: Record<LinuxBackendChoice, () => ComputerBackend> = {};
+const LINUX_BACKENDS: Record<LinuxBackendChoice, () => ComputerBackend> = {
+  // Constructed, not connected: the backend touches the compositor on first
+  // real use, and its `provision()` is the settings panel's one-click setup.
+  kwin: () => new KWinComputerBackend(),
+};
 
 let warnedMissingControlStatePath = false;
 
@@ -134,7 +140,7 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
  */
 async function selectBackend(
   platform: NodeJS.Platform,
-  selection: Omit<LinuxBackendSelectionDependencies, "override"> | undefined,
+  selection: ComputerServiceLiveOptions["selection"],
 ): Promise<ComputerBackend> {
   const env = selection?.env ?? process.env;
   let override: ComputerBackendOverride | undefined;
@@ -153,7 +159,8 @@ async function selectBackend(
   }
   if (platform === "linux") {
     const linux = await selectLinuxBackend({
-      ...selection,
+      env,
+      busNameHasOwner: selection?.busNameHasOwner ?? sessionBusNameHasOwner,
       ...(isLinuxBackendChoice(override) ? { override } : {}),
     });
     if (linux) return makeLinuxBackend(linux);
