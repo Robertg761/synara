@@ -98,7 +98,11 @@ describe("nested session environment", () => {
 
   it("leaves XAUTHORITY alone for a plugin too old to report the cookie", () => {
     expect(
-      nestedSessionEnv({ busAddress: BUS_ADDRESS, waylandDisplay: "synara-nested-1", xDisplay: ":9" }),
+      nestedSessionEnv({
+        busAddress: BUS_ADDRESS,
+        waylandDisplay: "synara-nested-1",
+        xDisplay: ":9",
+      }),
     ).not.toHaveProperty("XAUTHORITY");
   });
 
@@ -621,7 +625,11 @@ describe("the private bus and the session's own processes", () => {
 
     await session.dispose();
     // Torn down with the session, before the compositor and the bus.
-    expect(harness.tornDown).toEqual([launcher?.child.pid, harness.spawns[1]?.child.pid, harness.spawns[0]?.child.pid]);
+    expect(harness.tornDown).toEqual([
+      launcher?.child.pid,
+      harness.spawns[1]?.child.pid,
+      harness.spawns[0]?.child.pid,
+    ]);
   });
 
   it("reports no accessibility bus when perception is off or no launcher exists", async () => {

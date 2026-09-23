@@ -569,7 +569,10 @@ export class NestedComputerBackend extends KWinComputerBackend {
    * read — only holds it off, so a panel refreshing never keeps an otherwise
    * idle desktop alive.
    */
-  private async duringUse<T>(run: () => Promise<T>, kind: "use" | "observation" = "use"): Promise<T> {
+  private async duringUse<T>(
+    run: () => Promise<T>,
+    kind: "use" | "observation" = "use",
+  ): Promise<T> {
     this.usesInFlight += 1;
     if (kind === "use") this.lastUseAt = Date.now();
     try {

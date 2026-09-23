@@ -809,7 +809,10 @@ async function readXServer(dbus: KWinComputerDbus): Promise<NestedXServer> {
   try {
     const plugin = await dbus.connectPlugin();
     const health = asRecord(parseJsonPayload(await plugin.healthJson()));
-    return { xDisplay: nonEmptyString(health.xDisplay), xAuthority: nonEmptyString(health.xAuthority) };
+    return {
+      xDisplay: nonEmptyString(health.xDisplay),
+      xAuthority: nonEmptyString(health.xAuthority),
+    };
   } catch {
     return { xDisplay: undefined, xAuthority: undefined };
   }
@@ -988,7 +991,14 @@ const HELPER_ENVIRONMENT_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /** Locale and graphics-driver selection, which the compositor needs to render at all. */
-const HELPER_ENVIRONMENT_PREFIXES: readonly string[] = ["LC_", "MESA_", "LIBGL_", "__GLX_", "__EGL_", "VK_"];
+const HELPER_ENVIRONMENT_PREFIXES: readonly string[] = [
+  "LC_",
+  "MESA_",
+  "LIBGL_",
+  "__GLX_",
+  "__EGL_",
+  "VK_",
+];
 
 /**
  * The environment of the session's own processes — its bus daemon, its

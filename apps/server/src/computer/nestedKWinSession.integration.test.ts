@@ -24,7 +24,6 @@ import { KWinComputerBackend } from "./KWinComputerBackend.ts";
 import { NestedComputerBackend } from "./nestedComputerBackend.ts";
 import {
   nestedKWinBackendOptions,
-  nestedSessionEnv,
   startNestedKWinSession,
   type NestedKWinSession,
 } from "./nestedKWinSession.ts";
@@ -144,7 +143,9 @@ describe.skipIf(!enabled)("nested KWin session", () => {
       ...marker.processes.filter((entry) => entry.role !== "compositor" && entry.role !== "app"),
       ...childPids(compositor.pid).map((pid) => ({ pid, role: "xwayland" as const })),
     ];
-    console.info(`nested session processes inspected: ${inspected.map((entry) => entry.role).join(", ")}`);
+    console.info(
+      `nested session processes inspected: ${inspected.map((entry) => entry.role).join(", ")}`,
+    );
     expect(inspected.map((entry) => entry.role)).toEqual(
       expect.arrayContaining(["bus", "xwayland"]),
     );
@@ -349,7 +350,8 @@ describe.skipIf(!enabled)("nested backend lifecycle", () => {
         const backend = nestedBackend({});
         try {
           await waitFor(
-            async () => ((await markers()).length === 0 && !(await exists(runtimeDirectory))) || undefined,
+            async () =>
+              ((await markers()).length === 0 && !(await exists(runtimeDirectory))) || undefined,
             WINDOW_TIMEOUT_MS,
           );
           for (const orphan of orphans) {

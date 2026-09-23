@@ -21,7 +21,8 @@ const KWIN_PID = 91_001;
 const BUS_PID = 91_002;
 const SESSION_ID = "90001-0a1b2c3d";
 const KWIN_COMMAND = "kwin_wayland --virtual --socket synara-nested-7";
-const BUS_COMMAND = "dbus-daemon --config-file /run/user/1000/x/bus.conf --print-address=1 --nofork";
+const BUS_COMMAND =
+  "dbus-daemon --config-file /run/user/1000/x/bus.conf --print-address=1 --nofork";
 
 const directories: string[] = [];
 
@@ -334,9 +335,12 @@ describe("reapStaleNestedSessions", () => {
 
   it("never reaps this server's own session", async () => {
     const stateDirectory = await makeStateDirectory();
-    await writeNestedSessionMarker(marker({ serverPid: LIVE_SERVER_PID, serverStartTime: "7000" }), {
-      stateDirectory,
-    });
+    await writeNestedSessionMarker(
+      marker({ serverPid: LIVE_SERVER_PID, serverStartTime: "7000" }),
+      {
+        stateDirectory,
+      },
+    );
     const fake = host({ stateDirectory, living: [KWIN_PID, BUS_PID] });
 
     await expect(reapStaleNestedSessions(fake.dependencies)).resolves.toEqual([]);

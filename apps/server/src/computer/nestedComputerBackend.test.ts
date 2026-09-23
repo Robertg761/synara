@@ -208,18 +208,20 @@ function makeHarness(
         state.clipboardInstalled = true;
         return `Installed ${plan.packages.join(", ")} with ${plan.manager}.`;
       }),
-    provisionPlugin: options.provisionPlugin ?? (async () => {
-      options.onPluginProvision?.();
-      pluginProvisions.push(1);
-      state.installedPlugins = [PLUGIN_ID];
-      return {
-        action: "installed-from-source",
-        pluginId: PLUGIN_ID,
-        pluginDirectory: "/home/agent/.local/lib/qt6/plugins/kwin/effects/plugins",
-        requiresRelogin: false,
-        summary: "Compiled and installed the Synara KWin plugin.",
-      };
-    }),
+    provisionPlugin:
+      options.provisionPlugin ??
+      (async () => {
+        options.onPluginProvision?.();
+        pluginProvisions.push(1);
+        state.installedPlugins = [PLUGIN_ID];
+        return {
+          action: "installed-from-source",
+          pluginId: PLUGIN_ID,
+          pluginDirectory: "/home/agent/.local/lib/qt6/plugins/kwin/effects/plugins",
+          requiresRelogin: false,
+          summary: "Compiled and installed the Synara KWin plugin.",
+        };
+      }),
   };
   const backend = new NestedComputerBackend(backendOptions);
   backend.onEvent?.((event) => events.push(event));
@@ -436,7 +438,12 @@ describe("idle shutdown", () => {
 
       // An app that forked and let its launcher exit still has a window.
       fakeDesktop.windowsJson = JSON.stringify([
-        { id: "w1", title: "kcalc", appName: "kcalc", bounds: { x: 0, y: 0, width: 10, height: 10 } },
+        {
+          id: "w1",
+          title: "kcalc",
+          appName: "kcalc",
+          bounds: { x: 0, y: 0, width: 10, height: 10 },
+        },
       ]);
       await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
       expect(harness.disposedSessions).toEqual([]);
@@ -1055,7 +1062,10 @@ describe("disposal during a package install", () => {
       },
     });
     const provision = harness.backend.provision().catch((error: unknown) => error);
-    for (let turn = 0; turn < 20 && !installSignal; turn += 1) await Promise.resolve();
+    for (let turn = 0; turn < 20; turn += 1) {
+      if (installSignal) break;
+      await Promise.resolve();
+    }
     expect(installSignal?.aborted).toBe(false);
 
     await harness.backend.dispose();
@@ -1079,7 +1089,10 @@ describe("disposal during a plugin build", () => {
       },
     });
     const availability = harness.backend.availability();
-    for (let turn = 0; turn < 20 && !provisionSignal; turn += 1) await Promise.resolve();
+    for (let turn = 0; turn < 20; turn += 1) {
+      if (provisionSignal) break;
+      await Promise.resolve();
+    }
     expect(provisionSignal?.aborted).toBe(false);
 
     await harness.backend.dispose();
