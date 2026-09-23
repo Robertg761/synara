@@ -2290,6 +2290,35 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
+  it("samples the human-active guard again right before the semantic write", async () => {
+    const dbus = new FakeDbus();
+    let writes = 0;
+    const backend = makeBackend(dbus, {
+      glideDurationMs: 0,
+      atspi: {
+        readTrees: async () => [],
+        setText: async () => {
+          writes += 1;
+          return true;
+        },
+        dispose: async () => undefined,
+      },
+    });
+    await backend.availability();
+    // The human starts typing into the window while the focusing click runs.
+    const button = dbus.plugin.button;
+    dbus.plugin.button = async (code, pressed) => {
+      dbus.plugin.humanState = { humanFocusWindowId: "window-1", msSinceHumanInput: 50 };
+      return button(code, pressed);
+    };
+
+    await expect(backend.setValue(resolvedTarget({ editable: true }), "ab")).rejects.toThrow(
+      /computer_human_active/,
+    );
+    expect(writes).toBe(0);
+    await backend.dispose();
+  });
+
   it("refuses a semantic activate aimed at the human's window", async () => {
     const dbus = new FakeDbus();
     const backend = makeBackend(dbus, { glideDurationMs: 0 });

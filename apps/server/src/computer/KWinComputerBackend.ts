@@ -1486,6 +1486,10 @@ export class KWinComputerBackend implements ComputerBackend {
       this.listWindows(),
     );
     const clicked = await this.click(point);
+    // Sampled again right before the write: the first sample can be seconds
+    // old by now (a tree walk, the click's glide), and the human may have
+    // started typing into this window in between.
+    await this.guardHumanActiveWindow(await this.ensurePlugin(), target.node.windowId);
     if (!(await this.writeValueThroughAtspi(target, value))) {
       throw new ComputerBackendError(
         "Could not confirm that AT-SPI replaced the control's value. Read the control again before retrying; it may have changed.",
