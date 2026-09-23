@@ -1877,12 +1877,18 @@ export class KWinComputerBackend implements ComputerBackend {
   ): Promise<ComputerBackendActionResult> {
     const plugin = await this.ensurePlugin();
     assertDesktopOperationActive();
-    const sink = this.inputSink(plugin);
-    await this.moveCursor(from);
+    // Both ends checked against the live controls before any input: the
+    // input sink below notes input, which retires the resolution the check
+    // reads, and the start alone would spend it.
+    const [start = from, end = to] = await this.perception.pointsForDispatch([from, to], () =>
+      this.listWindows(),
+    );
+    await this.moveCursor(start);
     this.throwIfDisposed();
+    const sink = this.inputSink(plugin);
     await sink.button(EVDEV_BUTTON_CODES.left, true, POINTER_SEQUENCE_OPERATIONS.buttonPress);
     try {
-      await this.glidePointer(plugin, from, to, durationMs);
+      await this.glidePointer(plugin, start, end, durationMs);
     } finally {
       if (!this.disposed) {
         await sink.button(
@@ -1892,8 +1898,8 @@ export class KWinComputerBackend implements ComputerBackend {
         );
       }
     }
-    this.currentPoint = to;
-    return await this.pointerResult(plugin, to);
+    this.currentPoint = end;
+    return await this.pointerResult(plugin, end);
   }
 
   async scroll(

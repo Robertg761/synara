@@ -4973,6 +4973,25 @@ describe("KWinComputerBackend perception", () => {
       await backend.dispose();
     });
 
+    it("checks both ends of a drag against the live controls", async () => {
+      const { backend, checks, lastMove } = setup(() => ({
+        ok: true,
+        frame: { x: 10, y: 60, width: 100, height: 30 },
+        clientSize: { width: 640, height: 480 },
+        showing: true,
+      }));
+      await backend.availability();
+      const { point } = await resolveSave(backend);
+      // Dragged from elsewhere onto the resolved control.
+      await backend.drag({ x: 100, y: 100 }, point, 0);
+      expect(checks).toEqual([
+        expect.objectContaining({ path: [0], role: "button", label: "Save" }),
+      ]);
+      // It moved 40 px down since the tree was read; the drop follows it.
+      expect(lastMove()?.args).toEqual([1_020, 1_628]);
+      await backend.dispose();
+    });
+
     it("finds a control that moved in the tree again, or refuses", async () => {
       const moved = setup(
         () => ({ ok: false, reason: "node-changed" }),

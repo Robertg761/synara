@@ -201,11 +201,29 @@ export class AtspiPerception {
     point: ComputerPoint,
     readWindows: () => Promise<readonly ComputerWindow[]>,
   ): Promise<ComputerPoint> {
+    const [checked] = await this.pointsForDispatch([point], readWindows);
+    return checked ?? point;
+  }
+
+  /**
+   * `pointForDispatch` for an action with several points (a drag's start and
+   * end), all against the same one resolution, which the first point would
+   * otherwise spend.
+   */
+  async pointsForDispatch(
+    points: readonly ComputerPoint[],
+    readWindows: () => Promise<readonly ComputerWindow[]>,
+  ): Promise<ComputerPoint[]> {
     const resolution = this.takeResolution();
-    if (!resolution) return point;
-    const node = controlAt(resolution.root, point);
-    if (!node) return point;
-    return await this.validatedPoint(node, point, resolution.screenSize, readWindows);
+    if (!resolution) return [...points];
+    const checked: ComputerPoint[] = [];
+    for (const point of points) {
+      const node = controlAt(resolution.root, point);
+      checked.push(
+        node ? await this.validatedPoint(node, point, resolution.screenSize, readWindows) : point,
+      );
+    }
+    return checked;
   }
 
   /**
