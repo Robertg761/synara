@@ -307,7 +307,10 @@ states.
 Capture requests are rendered at the next safe compositor render opportunity.
 `maxDimension = 0` keeps native pixels; otherwise the PNG is downscaled so its
 largest dimension is at most `maxDimension`. The plugin reads back the native
-resolution first, then applies `maxDimension` during PNG encoding. The agent's
+resolution first, then applies `maxDimension` during PNG encoding, which uses
+zlib level 1 (Qt quality 80): about half the encode time of the default level
+for files a few percent larger. An opaque capture (a region; a window capture
+keeps its alpha) is written as three-channel RGB. The agent's
 own cursor is painted into the pixels, so the agent sees its pointer the way a
 person sees theirs; the human's cursor never is — on the shared desktop it is
 claimed by an exclusive `ItemTreeView` that is deliberately never painted.

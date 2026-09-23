@@ -117,6 +117,12 @@ static constexpr int s_captureEncodeDeadlineMilliseconds = 5000;
 static constexpr int s_captureMaxNativeSide = 16384;
 static constexpr qint64 s_captureMaxNativePixels = 64LL * 1024 * 1024;
 static const QString s_captureSizeLimitReason = QStringLiteral("capture exceeds 16384 pixels per side or 64 megapixels");
+// Qt's PNG writer maps quality q to zlib level (100 - q) * 9 / 91, so 80 is
+// level 1 (checked with a deflateInit2 shim; the default, -1, is zlib's 6).
+// Measured on a 2048x1152 desktop-like frame: 97 ms -> 55 ms for RGBA and
+// 45 ms for the RGBX an opaque capture uses, for files about 4% larger. Every
+// preview still and every observation pays the encode, so speed wins.
+static constexpr int s_pngFastQuality = 80;
 // The ghost cursor is drawn by the plugin instead of taken from the human's
 // cursor theme: a second arrow in their own theme is indistinguishable from
 // theirs, and being able to tell the two apart is the whole point of it.
@@ -530,7 +536,9 @@ static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &na
     }
 
     image.setText(QStringLiteral("SynaraCaptureScale"), QString::number(effectiveScale, 'f', 3));
-    image = image.convertToFormat(QImage::Format_RGBA8888);
+    // An opaque capture has nothing to say in its alpha channel, and RGBX is
+    // written as a three-channel PNG: a quarter less for zlib to chew through.
+    image = image.convertToFormat(opaqueBackground ? QImage::Format_RGBX8888 : QImage::Format_RGBA8888);
     if (image.isNull()) {
         *error = QStringLiteral("PNG image conversion failed");
         return {};
@@ -538,7 +546,7 @@ static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &na
 
     QByteArray png;
     QBuffer buffer(&png);
-    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG")) {
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG", s_pngFastQuality)) {
         *error = QStringLiteral("PNG encoding failed");
         return {};
     }
