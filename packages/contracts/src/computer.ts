@@ -368,6 +368,14 @@ export const ComputerHealth = Schema.Struct({
    * and absent is not the same claim as `false`.
    */
   backgroundInputDegraded: Schema.optional(Schema.Boolean),
+  /**
+   * `unavailable` by choice rather than by fault: the backend let its desktop
+   * or its connection go on purpose (an idle shutdown or release, a desktop
+   * that is not running right now) and the next real use brings it back.
+   * Optional, and set only by a backend that makes that distinction; absent
+   * is not the same claim as `false`.
+   */
+  dormant: Schema.optional(Schema.Boolean),
 });
 export type ComputerHealth = typeof ComputerHealth.Type;
 

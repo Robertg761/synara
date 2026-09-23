@@ -5407,6 +5407,14 @@ export class ComputerManager {
     if (this.backendHealth.status === "connected" || availability.kind !== "available") {
       return availability;
     }
+    // Dormant is the same idle, reached later: the backend let its desktop go
+    // on purpose (an idle shutdown or release) and the next use brings it
+    // back. Only the backend can tell that apart from a lost connection, so
+    // only its explicit marker counts — a backend that never sets it (Cua)
+    // is corrected exactly as before.
+    if (this.backendHealth.status === "unavailable" && this.backendHealth.dormant === true) {
+      return availability;
+    }
     return {
       kind: "backend-unavailable",
       message: healthUnavailableMessage(this.backendHealth),

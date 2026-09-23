@@ -590,6 +590,34 @@ describe("ComputerManager and FakeComputerBackend", () => {
     await manager.dispose();
   });
 
+  it("does not call a desktop the backend let go of on purpose disconnected", async () => {
+    const backend = new FakeComputerBackend();
+    const manager = new ComputerManager({ backend });
+    await manager.listWindows();
+    const idle = {
+      status: "unavailable" as const,
+      consecutiveFailures: 0,
+      reconnects: 0,
+      captureAvailable: false,
+    };
+
+    // An idle shutdown or release: the next use brings the desktop back, so
+    // the panel keeps the verdict the last availability read gave.
+    backend.emitHealthChanged({ ...idle, dormant: true });
+    expect((await manager.getStatus()).availability).toEqual({ kind: "available", backend: "fake" });
+    expect((await manager.getThreadState("thread-dormant")).availability.kind).toBe("available");
+
+    // The same reading without the backend's marker is still a lost desktop,
+    // which is what every backend that never sets it (Cua) keeps reporting.
+    backend.emitHealthChanged(idle);
+    expect((await manager.getStatus()).availability).toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("not connected"),
+    });
+
+    await manager.dispose();
+  });
+
   it("keeps a status poll passive on a backend with a dedicated status read", async () => {
     // The panel polls every ten seconds. A poll that establishes the desktop is
     // a poll that installs a plugin and boots a compositor nobody asked for.
