@@ -1484,7 +1484,13 @@ export class KWinComputerBackend implements ComputerBackend {
       return { settled: false, waitedMs: quietMs };
     }
     if (changeBound !== undefined) {
-      return await this.settleAfterNoChange(plugin, wait, quietMs, quietBound - quietWaitMs, quietWaitMs);
+      return await this.settleAfterNoChange(
+        plugin,
+        wait,
+        quietMs,
+        quietBound - quietWaitMs,
+        quietWaitMs,
+      );
     }
     const remaining = timeoutMs - quietWaitMs;
     if (remaining <= 0) return { settled: false, waitedMs: quietWaitMs };
