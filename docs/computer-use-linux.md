@@ -266,7 +266,9 @@ selects it ahead of detection; `SYNARA_COMPUTER_BACKEND=nested` forces it.
 (`$XDG_RUNTIME_DIR/synara-nested-sessions/<id>`, mode 0700; the user's cache
 directory when there is no runtime directory, never `/tmp`), starts a private
 `dbus-daemon` there, then `kwin_wayland --virtual --xwayland
---no-global-shortcuts` on that bus, waits for `org.kde.KWin`, unloads every
+--no-global-shortcuts --no-lockscreen` on that bus (without `--no-lockscreen`
+KWin locks along with the human's logind session, and the plugin refuses every
+call with `SessionLocked` until they unlock), waits for `org.kde.KWin`, unloads every
 loaded Synara plugin id and loads the newest installed one. Size comes from
 `SYNARA_COMPUTER_NESTED_SIZE` (`WxH`, default 1920x1080).
 

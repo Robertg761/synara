@@ -276,6 +276,7 @@ describe("startNestedKWinSession", () => {
       "--virtual",
       "--xwayland",
       "--no-global-shortcuts",
+      "--no-lockscreen",
       "--socket",
       "synara-test-1",
       "--width",
@@ -376,6 +377,7 @@ describe("startNestedKWinSession", () => {
     expect(harness.spawns[1]?.args).toEqual([
       "--xwayland",
       "--no-global-shortcuts",
+      "--no-lockscreen",
       "--socket",
       "synara-test-2",
       "--width",

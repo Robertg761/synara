@@ -948,6 +948,10 @@ function compositorArgs(
     // to be driven instead, so it has to be able to run them at all.
     "--xwayland",
     "--no-global-shortcuts",
+    // The agent's desktop is not the human's seat: without this, KWin joins
+    // the logind session it was started from and locks with the human's
+    // screen, and every call is refused with SessionLocked until they unlock.
+    "--no-lockscreen",
     "--socket",
     socketName,
     "--width",
