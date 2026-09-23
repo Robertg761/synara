@@ -195,7 +195,7 @@ the desktop-space `ComputerUiNode` tree the manager exposes.
 
 ### Engine behaviour
 
-The same engine drives all three Linux backends.
+How the engine in `KWinComputerBackend.ts` behaves, whichever backend it serves:
 
 - Connection: a dead bus is noticed from the socket itself (dbus-next never
   emits `disconnect`), and every call waiting on it fails at once. Reconnects
@@ -206,8 +206,8 @@ The same engine drives all three Linux backends.
   reported once as `desktop-gone`.
 - Action path: a window list read once serves the whole desktop operation
   (75 ms, dropped on any input, focus or raise), through `windowsStateJson`
-  when offered. No glide under a pixel, for the human's pane input, or on the
-  nested desktop. Text goes through `keys` a word at a time. Model captures
+  when offered. No glide under a pixel or for the human's pane input. Text
+  goes through `keys` a word at a time. Model captures
   use the core's 1536 px budget. `launchApp` reports the pid, the app id a
   launcher hands off to, and whether one of its windows took activation.
 - Settle: with `waitForSettle`, an action waits until the target window has
@@ -515,14 +515,12 @@ for a Hyprland upgraded on disk but not restarted.
 ## Known gaps
 
 - Nothing here is verified against a live compositor by the test suite.
-- Keyboard layout support is US-only: text and character keys are refused on
-  any other layout; named keys still work.
+- Text and character keys need a US layout without dead keys (`us`,
+  `us(altgr-intl)`, `us(euro)`) and are refused on any other; named keys
+  still work.
 - No protocol-level drag-and-drop and no client-side titlebar moves; both need
   a button serial on the human's seat. Modified pointer input (modifier plus
   click or scroll) is refused.
-- `launchApp` never reports `focusChangedDuringLaunch`: the agent's seat cannot
-  take the human's focus, and the backend does not observe whether the
-  application activated itself.
 - X11 sessions are unsupported; Xwayland clients inside a Wayland session are
   in scope, except that their override-redirect menus are not pointer targets
   on KWin.
