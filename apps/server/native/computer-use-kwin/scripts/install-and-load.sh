@@ -271,13 +271,12 @@ source_hash() {
 
 path_signature() {
     local path libdir
-    for libdir in /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
-    for path in "$libdir"/libkwin.so* "$libdir"/cmake/KWin/*.cmake
-    do
-        if [[ -e "$path" ]]; then
-            stat -Lc '%n:%i:%s:%Y' "$path"
-        fi
-    done
+    for libdir in "${KWIN_LIBRARY_ROOTS[@]}"; do
+        for path in "$libdir"/libkwin.so* "$libdir"/cmake/KWin/*.cmake; do
+            if [[ -e "$path" ]]; then
+                stat -Lc '%n:%i:%s:%Y' "$path"
+            fi
+        done
     done
 }
 
@@ -287,10 +286,32 @@ rpm_signature() {
     fi
 }
 
+# The installed KWin version (what the next session will run), read off disk
+# rather than asked of `kwin_wayland --version`, which aborts - and dumps core -
+# when it is run outside a compositor start on some hosts. The soname symlink
+# (libkwin.so.6 -> libkwin.so.6.7.4) names the exact release; KWin's cmake
+# package version stands in on a machine without it. Empty when neither is
+# there. Mirrors detectInstalledKwinVersion() in the server.
 kwin_version() {
-    if command -v kwin_wayland >/dev/null 2>&1; then
-        kwin_wayland --version 2>/dev/null || true
-    fi
+    local root link target version
+    for root in "${KWIN_LIBRARY_ROOTS[@]}"; do
+        for link in "$root"/libkwin.so.[0-9]*; do
+            [[ -L "$link" && "${link##*/}" =~ ^libkwin\.so\.[0-9]+$ ]] || continue
+            target="$(readlink -- "$link")" || continue
+            if [[ "${target##*/}" =~ ^libkwin\.so\.([0-9]+(\.[0-9]+)+)$ ]]; then
+                printf '%s\n' "${BASH_REMATCH[1]}"
+                return 0
+            fi
+        done
+    done
+    for root in "${KWIN_LIBRARY_ROOTS[@]}"; do
+        version="$(sed -n 's/^set(PACKAGE_VERSION "\([0-9][0-9.]*\)")$/\1/p' \
+            "$root/cmake/KWin/KWinConfigVersion.cmake" 2>/dev/null | head -n 1)" || true
+        if [[ -n "$version" ]]; then
+            printf '%s\n' "$version"
+            return 0
+        fi
+    done
 }
 
 # The version of the compositor in front of the user, asked of the compositor

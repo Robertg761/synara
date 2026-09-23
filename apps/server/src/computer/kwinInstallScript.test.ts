@@ -120,6 +120,9 @@ describe("KWin install-and-load.sh", () => {
     };
   }
 
+  const stateRoot = () =>
+    join(sandbox.home, ".local", "state", "synara", "kwin-computer-use-plugin");
+
   describe("build dependency check (R14)", () => {
     it("names a header KWin's cmake config needs before running cmake", async () => {
       const source = await sourceCopy("source");
@@ -157,6 +160,47 @@ describe("KWin install-and-load.sh", () => {
       expect(result.stdout.trim().split("\n").at(-1)).toMatch(
         /\/build\/kwin\/plugins\/SynaraComputerUsePlugin\.so$/,
       );
+    });
+  });
+
+  describe("KWin version probe", () => {
+    it("reads the installed KWin version off libkwin's soname, never running kwin_wayland", async () => {
+      const source = await sourceCopy("source");
+      const tree = await fakeKwinTree();
+
+      const result = sandbox.run(
+        join(source, "scripts", "install-and-load.sh"),
+        [],
+        scriptEnv(tree),
+      );
+
+      expect(result.stderr).not.toContain("ERROR");
+      expect(result.status).toBe(0);
+      expect(await readFile(join(stateRoot(), "install.stamp"), "utf8")).toContain(
+        "kwin_version=6.7.4\n",
+      );
+      expect((await sandbox.calls()).filter((call) => call.startsWith("kwin_wayland"))).toEqual([]);
+    });
+
+    it("falls back to KWin's cmake package version when there is no libkwin symlink", async () => {
+      const source = await sourceCopy("source");
+      const tree = await fakeKwinTree({ libkwin: false });
+      await writeFile(
+        join(tree.libraryRoot, "cmake", "KWin", "KWinConfigVersion.cmake"),
+        'set(PACKAGE_VERSION "6.5.1")\n',
+      );
+
+      const result = sandbox.run(
+        join(source, "scripts", "install-and-load.sh"),
+        [],
+        scriptEnv(tree),
+      );
+
+      expect(result.status).toBe(0);
+      expect(await readFile(join(stateRoot(), "install.stamp"), "utf8")).toContain(
+        "kwin_version=6.5.1\n",
+      );
+      expect((await sandbox.calls()).filter((call) => call.startsWith("kwin_wayland"))).toEqual([]);
     });
   });
 });
