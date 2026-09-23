@@ -1653,7 +1653,9 @@ export class ComputerManager {
           timeoutMs: policy?.timeoutMs ?? COMPUTER_ACTION_OBSERVER_SETTLE_TIMEOUT_MS,
           quietMs: Math.min(this.actionSettleMs, policy?.quietMs ?? this.actionSettleMs),
           ...(policy?.quietWithinMs === undefined ? {} : { quietWithinMs: policy.quietWithinMs }),
-          ...(policy?.changeWithinMs === undefined ? {} : { changeWithinMs: policy.changeWithinMs }),
+          ...(policy?.changeWithinMs === undefined
+            ? {}
+            : { changeWithinMs: policy.changeWithinMs }),
         });
         this.observerSettle = "supported";
         currentComputerCall()?.timing?.count(
