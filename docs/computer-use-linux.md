@@ -327,7 +327,8 @@ device to the compositor's own pipeline instead of a second seat: focus follows
 clicks, KWin owns the xkb state, Xwayland forwards to X11 clients, and the
 human-activity guard is off because no human sits in that compositor. The mode
 is enabled only through the compositor's environment, set by
-`nestedKWinSession.ts`, never by a D-Bus method.
+`nestedKWinSession.ts`, never by a D-Bus method. The pointer does not glide
+there: the pane shows stills, so nobody would see the motion.
 
 Launched applications get the session's runtime directory, the nested
 `WAYLAND_DISPLAY`, the private bus, and the nested Xwayland's `DISPLAY` on top
