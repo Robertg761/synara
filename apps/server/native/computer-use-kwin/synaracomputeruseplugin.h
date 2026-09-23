@@ -352,7 +352,7 @@ private:
     void dismissAgentPopups(const std::function<bool(const Window *)> &shouldDismiss);
     // Who pressed into which client last, for attributing the next popup.
     void noteAgentPress(const Window *window);
-    void handleHumanPointerPress(const QPointF &position);
+    void handleHumanPointerPress(const QPointF &position, bool byPointerFocus);
     void handleHumanKeyPress();
     void watchHumanSeat();
     void watchHumanPointer();
@@ -495,8 +495,10 @@ private:
     std::unique_ptr<CaptureTargetPool> m_captureTargets;
     QTimer m_captureTargetIdle;
     std::shared_ptr<CaptureRequest> m_captureRequest;
-    // Popups the agent opened, held without a grab, oldest first.
+    // Popups the agent opened, held without a grab, oldest first; and popups
+    // taken for the agent's at creation whose grab request has not come yet.
     QList<QPointer<Window>> m_agentPopups;
+    QList<QPointer<Window>> m_withheldGrabPopups;
     quint64 m_popupsDismissed = 0;
     // The last press into a client by each party: which client and when.
     // Compared, never dereferenced.

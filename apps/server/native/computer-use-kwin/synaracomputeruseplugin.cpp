@@ -249,11 +249,14 @@ public:
     std::function<void()> onPointerInput;
     std::function<void()> onKeyboardInput;
     /**
-     * A press of any pointer-class device, and where it landed; and a key
-     * press. Run after onPointerInput or onKeyboardInput for the same event:
-     * the popup rule (handleHumanPointerPress) attributes and dismisses by them.
+     * A press of any pointer-class device, where it landed and whether it is
+     * the pointer's (whose focus names the surface it reaches) or a touch
+     * point's or a pen's (which reach the window at their own position); and
+     * a key press. Run after onPointerInput or onKeyboardInput for the same
+     * event: the popup rule (handleHumanPointerPress) attributes and
+     * dismisses by them.
      */
-    std::function<void(const QPointF &)> onPointerPress;
+    std::function<void(const QPointF &, bool byPointerFocus)> onPointerPress;
     std::function<void()> onKeyPress;
 
     /** Milliseconds since the last real event of any device, or -1 if none. */
@@ -283,7 +286,7 @@ public:
     {
         notePointer();
         if (event->state == PointerButtonState::Pressed && onPointerPress) {
-            onPointerPress(event->position);
+            onPointerPress(event->position, true);
         }
     }
     void pointerAxis(PointerAxisEvent *) override
@@ -301,7 +304,7 @@ public:
     {
         notePointer();
         if (onPointerPress) {
-            onPointerPress(event->pos);
+            onPointerPress(event->pos, false);
         }
     }
     void touchMotion(TouchMotionEvent *) override
@@ -320,7 +323,7 @@ public:
     {
         notePointer();
         if (event->type == TabletToolTipEvent::Press && onPointerPress) {
-            onPointerPress(event->position);
+            onPointerPress(event->position, false);
         }
     }
     void tabletToolButtonEvent(TabletToolButtonEvent *) override
@@ -1542,8 +1545,8 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
             m_humanInputSpy->onKeyboardInput = [this] {
                 handleHumanKeyboardInput();
             };
-            m_humanInputSpy->onPointerPress = [this](const QPointF &position) {
-                handleHumanPointerPress(position);
+            m_humanInputSpy->onPointerPress = [this](const QPointF &position, bool byPointerFocus) {
+                handleHumanPointerPress(position, byPointerFocus);
             };
             m_humanInputSpy->onKeyPress = [this] {
                 handleHumanKeyPress();
@@ -4685,13 +4688,15 @@ bool SynaraComputerUsePlugin::resetInputDelivery()
  * Toolkits route key navigation to an open menu themselves, so the agent's
  * keys still reach the menu through the window that opened it.
  *
- * Attribution at creation is by who pressed into that client last - the
- * agent (on either path) or the human - or by the parent popup when this is a
- * submenu. The grab request is then checked against the exact answer: the
- * agent seat, or a serial the agent's own direct injection issued. A mismatch
- * either way dismisses the popup, which the agent or the human simply reopens:
- * a grab never reaches the filter for an agent popup, and a human popup is
- * never left without the grab it asked for.
+ * Whether to cut the connection is guessed at creation, by who pressed into
+ * that client last - the agent (on either path) or the human - or by the
+ * parent popup when this is a submenu. The popup becomes the agent's only
+ * when its grab request arrives and is checked against the exact answer: the
+ * agent seat, or a serial one of the agent's bursts minted. A popup that
+ * never asks for a grab (a tooltip, an autocomplete list) is left alone, and
+ * a mismatch either way dismisses the popup, which the agent or the human
+ * simply reopens: a grab never reaches the filter for an agent popup, and a
+ * human popup is never left without the grab it asked for.
  */
 void SynaraComputerUsePlugin::watchPopups()
 {
@@ -4724,9 +4729,14 @@ void SynaraComputerUsePlugin::handlePopupCreated(XdgPopupInterface *popup)
     const qint64 agentAge = client && m_lastAgentPressClient == client && m_lastAgentPress.isValid() ? m_lastAgentPress.elapsed() : -1;
     const qint64 humanAge = client && m_lastHumanPressClient == client && m_lastHumanPress.isValid() ? m_lastHumanPress.elapsed() : -1;
     if (popupOpenedByAgent(parent, agentAge, humanAge)) {
+        // Cut now, before the client can ask: whose popup it is waits for the
+        // grab request, and one that never asks - a tooltip, an autocomplete
+        // list - is nobody's to dismiss.
         QObject::disconnect(popup, &XdgPopupInterface::grabRequested, window, nullptr);
-        m_agentPopups.append(window);
+        m_withheldGrabPopups.removeAll(nullptr);
+        m_withheldGrabPopups.append(window);
         connect(window, &Window::closed, this, [this, window]() {
+            m_withheldGrabPopups.removeAll(window);
             m_agentPopups.removeAll(window);
         });
     }
@@ -4742,7 +4752,17 @@ void SynaraComputerUsePlugin::handlePopupCreated(XdgPopupInterface *popup)
 void SynaraComputerUsePlugin::handlePopupGrab(Window *window, SeatInterface *seat, quint32 serial)
 {
     const bool agentGrab = (m_seat && seat == m_seat) || agentMintedSerial(serial);
-    if (agentGrab == isAgentPopup(window)) {
+    const bool withheld = std::any_of(m_withheldGrabPopups.cbegin(), m_withheldGrabPopups.cend(), [window](const QPointer<Window> &popup) {
+        return popup == window;
+    });
+    if (agentGrab && withheld) {
+        // The agent's, and its grab never reached KWin: from here on the
+        // plugin dismisses it where the grab would have.
+        m_withheldGrabPopups.removeAll(window);
+        m_agentPopups.append(window);
+        return;
+    }
+    if (agentGrab == withheld) {
         return;
     }
     // The creation-time guess was wrong. An agent grab that got through would
@@ -4783,17 +4803,26 @@ void SynaraComputerUsePlugin::noteAgentPress(const Window *window)
 }
 
 /**
- * The human pressed at @p position. Recorded for attribution against seat0's
- * pointer focus (the press has not been delivered yet, so that is still the
- * surface it is about to reach), then the agent's popups are dismissed unless
- * the press is on one of them. The press itself goes on to wherever it was
- * going: this is a spy, and nothing here filters it.
+ * The human pressed at @p position. Recorded for attribution against the
+ * client the press is about to reach - seat0's pointer focus for the pointer
+ * (the press has not been delivered yet, so that is still the surface it is
+ * going to), the window under a finger or a pen for touch and tablet, whose
+ * points are delivered where they land wherever the pointer is - then the
+ * agent's popups are dismissed unless the press is on one of them. The press
+ * itself goes on to wherever it was going: this is a spy, and nothing here
+ * filters it.
  */
-void SynaraComputerUsePlugin::handleHumanPointerPress(const QPointF &position)
+void SynaraComputerUsePlugin::handleHumanPointerPress(const QPointF &position, bool byPointerFocus)
 {
-    SeatInterface *seat = waylandServer() ? waylandServer()->seat() : nullptr;
-    PointerInterface *pointer = seat ? seat->pointer() : nullptr;
-    const SurfaceInterface *focus = pointer ? pointer->focusedSurface() : nullptr;
+    const SurfaceInterface *focus = nullptr;
+    if (byPointerFocus) {
+        SeatInterface *seat = waylandServer() ? waylandServer()->seat() : nullptr;
+        PointerInterface *pointer = seat ? seat->pointer() : nullptr;
+        focus = pointer ? pointer->focusedSurface() : nullptr;
+    } else if (input()) {
+        const Window *window = input()->findToplevel(position);
+        focus = window ? window->surface() : nullptr;
+    }
     m_lastHumanPressClient = focus ? focus->client() : nullptr;
     m_lastHumanPress.restart();
     if (m_agentPopups.isEmpty()) {
