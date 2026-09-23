@@ -43,6 +43,7 @@ import {
 import { resolveAppLaunchOnHost, type AppLaunchResolver } from "./appLaunchResolution.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
 import { AtspiPerception } from "./atspiPerception.ts";
+import { isPaneInput } from "./paneInput.ts";
 import { atspiTextWriteAddress } from "./atspiTreeTargeting.ts";
 import {
   alignRect,
@@ -1355,7 +1356,9 @@ export class KWinComputerBackend implements ComputerBackend {
     // `AtspiPerception.pointForDispatch`.
     const point = await this.perception.pointForDispatch(target, () => this.listWindows());
     const from = this.currentPoint ?? (await this.readPluginState(plugin)).position ?? point;
-    await this.glidePointer(plugin, from, point, this.glideDurationMs);
+    // The glide is for someone watching an agent's pointer; the human's own
+    // input from the pane goes straight to where they pointed.
+    await this.glidePointer(plugin, from, point, isPaneInput() ? 0 : this.glideDurationMs);
     this.currentPoint = point;
     return await this.pointerResult(plugin, point);
   }

@@ -29,6 +29,13 @@ export const GLIDE_FRAME_INTERVAL_MS = 16;
 /** Longest jump between samples, so a fast glide over a long path stays smooth. */
 const GLIDE_MAX_STEP_PX = 80;
 /**
+ * Shorter than this, the pointer is already where it is going: the glide is
+ * one move to the exact target, due at once. Twelve samples and 180 ms to
+ * cross less than a pixel was the whole cost of every click on the spot the
+ * cursor already sat on, and of every wheel notch sent from the pane.
+ */
+export const GLIDE_MIN_DISTANCE_PX = 1;
+/**
  * How long a synthesized button stays down. Long enough that a toolkit's press
  * and release are not coalesced into nothing, short enough not to register as a
  * press-and-hold.
@@ -70,7 +77,8 @@ export interface ComputerInputSink {
  * latency is absorbed by the sleep budget instead of being added on top of it
  * and the glide lands at roughly `durationMs`. The final sample is due at
  * exactly `durationMs`; `durationMs === 0` makes every sample due immediately,
- * which degenerates to moving as fast as the transport allows.
+ * which degenerates to moving as fast as the transport allows. A path shorter
+ * than `GLIDE_MIN_DISTANCE_PX` is a single sample, whatever the duration.
  */
 export function pointerGlideSteps(
   from: ComputerPoint,
@@ -80,6 +88,7 @@ export function pointerGlideSteps(
 ): readonly PointerGlideStep[] {
   const duration = Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0;
   const distance = Math.hypot(to.x - from.x, to.y - from.y);
+  if (!(distance >= GLIDE_MIN_DISTANCE_PX)) return [{ point: { x: to.x, y: to.y }, offsetMs: 0 }];
   const steps = Math.max(
     minimumSteps,
     Math.ceil(distance / GLIDE_MAX_STEP_PX),

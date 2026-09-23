@@ -69,6 +69,17 @@ describe("pointerGlideSteps", () => {
     ]);
   });
 
+  it("moves once, at once, when the pointer is already within a pixel of the target", () => {
+    // Twelve samples over 180 ms used to cross zero pixels on every click at
+    // the cursor's own position and every wheel notch from the pane.
+    expect(pointerGlideSteps({ x: 10, y: 10 }, { x: 10.4, y: 10.3 }, 180)).toEqual([
+      { point: { x: 10.4, y: 10.3 }, offsetMs: 0 },
+    ]);
+    expect(pointerGlideSteps({ x: 10, y: 10 }, { x: 10, y: 10 }, 1_500)).toHaveLength(1);
+    // A real pixel still glides.
+    expect(pointerGlideSteps({ x: 10, y: 10 }, { x: 11, y: 10 }, 180).length).toBeGreaterThan(1);
+  });
+
   it("keeps the distance minimum so a fast glide over a long path stays smooth", () => {
     const steps = pointerGlideSteps(origin, { x: 800, y: 0 }, 0);
 
