@@ -3418,9 +3418,18 @@ void SynaraComputerUsePlugin::detachInputDevice()
         return;
     }
     m_deviceAttached = false;
-    if (m_inputDevice && input()) {
-        input()->removeInputDevice(m_inputDevice.get());
+    if (!m_inputDevice || !input()) {
+        return;
     }
+    input()->removeInputDevice(m_inputDevice.get());
+    // KWin's removeInputDevice() leaves in place every connection that
+    // addInputDevice() made, so adding the same device again on the next start
+    // would deliver each agent event once per session this plugin has run.
+    // KWin's own virtual devices (fake input, EIS) are never re-added either:
+    // a removed one is destroyed, which drops its connections, and the next
+    // add uses a fresh one. Deferred, because a stop can run from inside one of
+    // the old device's own emissions.
+    std::exchange(m_inputDevice, std::make_unique<SynaraVirtualInputDevice>(this)).release()->deleteLater();
 }
 
 void SynaraComputerUsePlugin::ensureSeat()
