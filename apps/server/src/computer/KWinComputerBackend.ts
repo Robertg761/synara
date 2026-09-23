@@ -2197,6 +2197,17 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   /**
+   * Drops the live connection without disposing the backend, for a subclass
+   * that ends its desktop on purpose (the nested idle shutdown). Nothing is
+   * rescheduled: the next use connects afresh through `dbusFactory`.
+   */
+  protected releaseConnection(): void {
+    this.standDownReconnect();
+    this.invalidateConnection();
+    this.publishHealth();
+  }
+
+  /**
    * The pinned plugin proxy addresses a generation that is gone — the plugin
    * was unloaded or reloaded, or the compositor restarted. Nothing about the
    * bus connection is wrong, but every call through the proxy will fail until
