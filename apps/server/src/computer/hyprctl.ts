@@ -22,6 +22,8 @@ import { readdir, readFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 
+import { ComputerBackendError } from "./ComputerBackend.ts";
+
 /** Set by Hyprland in every process of the session; names the instance. */
 export const HYPRLAND_SIGNATURE_ENV = "HYPRLAND_INSTANCE_SIGNATURE";
 
@@ -100,8 +102,11 @@ function hyprlandInstanceDirectory(
  * replaced it after a restart, or a pinned dev-test instance — they name a
  * dead socket or, worse, the human's own desktop, where a launched window
  * must never appear. So for another instance `WAYLAND_DISPLAY` comes from its
- * lock or is removed, and `DISPLAY` (whose Xwayland no file names) is removed:
- * an X11-only app then fails to start rather than opening somewhere else.
+ * lock, and `DISPLAY` (whose Xwayland no file names) is removed: an X11-only
+ * app then fails to start rather than opening somewhere else. A lock that
+ * cannot be read or names no socket is a refusal: removing `WAYLAND_DISPLAY`
+ * is not neutral, because a Wayland client without it connects to
+ * `wayland-0`, which is usually the human's session.
  */
 export async function hyprlandInstanceEnvironment(
   signature: string,
@@ -119,6 +124,14 @@ export async function hyprlandInstanceEnvironment(
       [HYPRLAND_SIGNATURE_ENV]: signature,
       ...(waylandDisplay ? { WAYLAND_DISPLAY: waylandDisplay } : {}),
     };
+  }
+  if (!waylandDisplay) {
+    throw new ComputerBackendError(
+      `The Wayland socket of Hyprland instance ${signature} could not be read from its ` +
+        "hyprland.lock, so nothing is started there: without it an app would open on the " +
+        "default Wayland display instead.",
+      { retryable: true },
+    );
   }
   return {
     [HYPRLAND_SIGNATURE_ENV]: signature,

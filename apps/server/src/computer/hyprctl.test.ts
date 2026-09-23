@@ -180,17 +180,18 @@ describe("hyprlandInstanceEnvironment", () => {
     });
   });
 
-  it("never falls back to the inherited socket for another instance", async () => {
-    // A pinned dev-test instance whose lock cannot be read: no display at
-    // all, rather than the human's.
+  it("refuses another instance whose socket its lock does not name", async () => {
+    // A pinned dev-test instance whose lock cannot be read: neither the
+    // inherited socket nor none at all (a client without WAYLAND_DISPLAY
+    // connects to wayland-0, usually the human's session), but a refusal.
     for (const read of [
       locks({}),
       locks({ "/run/user/1000/hypr/new/hyprland.lock": "1\n../x\n" }),
+      locks({ "/run/user/1000/hypr/new/hyprland.lock": "1\n" }),
     ]) {
-      await expect(hyprlandInstanceEnvironment("new", env, read)).resolves.toEqual({
-        HYPRLAND_INSTANCE_SIGNATURE: "new",
-        WAYLAND_DISPLAY: undefined,
-        DISPLAY: undefined,
+      await expect(hyprlandInstanceEnvironment("new", env, read)).rejects.toMatchObject({
+        retryable: true,
+        message: expect.stringContaining("could not be read"),
       });
     }
   });
