@@ -532,7 +532,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly idleTimeoutMs: number;
   private readonly idleReleaseMs: number;
   /** The last plugin call, lease change or pane detach; see `releaseIfIdle`. */
-  private lastUseAt: number;
+  private lastPluginUseAt: number;
   private pluginCallsInFlight = 0;
   private idleReleaseTimer: ReturnType<typeof setInterval> | undefined;
   /** Released for being idle: passive answers until the next real use. */
@@ -717,7 +717,7 @@ export class KWinComputerBackend implements ComputerBackend {
             )
           : 0),
     );
-    this.lastUseAt = this.now();
+    this.lastPluginUseAt = this.now();
     this.humanActiveGuardMs = normalizeHumanActiveGuard(
       options.humanActiveGuardMs ??
         parseHumanActiveGuardEnv(process.env.SYNARA_COMPUTER_HUMAN_ACTIVE_MS),
@@ -761,8 +761,7 @@ export class KWinComputerBackend implements ComputerBackend {
       options.readInstallStamp ??
       (() => readInstallStamp(options.installStampPath ?? installStampPath(stateRoot)));
     this.runningKwinVersion = options.runningKwinVersion;
-    this.installedKwinVersion =
-      options.installedKwinVersion ?? (async () => readHostKwinVersion());
+    this.installedKwinVersion = options.installedKwinVersion ?? (async () => readHostKwinVersion());
     this.linuxDistribution = options.linuxDistribution ?? detectLinuxDistribution;
     this.provisionPlugin =
       options.provisionPlugin ??
@@ -824,9 +823,7 @@ export class KWinComputerBackend implements ComputerBackend {
             ? "reconnecting"
             : "unavailable",
         captureAvailable: this.pluginHealth?.capture === true,
-        ...(this.dormant && !this.connectedPlugin() && !this.reconnecting
-          ? { dormant: true }
-          : {}),
+        ...(this.dormant && !this.connectedPlugin() && !this.reconnecting ? { dormant: true } : {}),
       }),
       emit: (health) => this.emit({ type: "health-changed", health }),
       now: () => this.now(),
@@ -1227,7 +1224,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async setDrivingAgent(name: string | null): Promise<void> {
     this.drivingAgent = name?.trim() ? name.trim() : null;
-    this.lastUseAt = this.now();
+    this.lastPluginUseAt = this.now();
     // Only pushed to a session that is already up. A start pushes the cached
     // name itself, so naming a thread must not be what starts the session -
     // the human would get an agent cursor before any agent asked for one.
@@ -1726,7 +1723,7 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async detachStream(): Promise<void> {
-    this.lastUseAt = this.now();
+    this.lastPluginUseAt = this.now();
     this.streamGeneration += 1;
     this.cancelCaptureRecovery();
     this.stillDedupe.reset();
@@ -2502,7 +2499,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.connectedCompositor = compositor;
     this.desktopGoneReported = false;
     this.idleReleased = false;
-    this.lastUseAt = this.now();
+    this.lastPluginUseAt = this.now();
     this.startIdleReleaseTimer();
     // The backoff is not reset here: a connection that is lost again at once
     // proved nothing. See `scheduleReconnect`.
@@ -3014,14 +3011,14 @@ export class KWinComputerBackend implements ComputerBackend {
     // Every input and capture passes through here, which makes it the one
     // place that knows the desktop is in use; see `releaseIfIdle`.
     this.pluginCallsInFlight += 1;
-    this.lastUseAt = this.now();
+    this.lastPluginUseAt = this.now();
     try {
       return await invoke();
     } catch (error) {
       throw this.reportPluginFailure(error);
     } finally {
       this.pluginCallsInFlight -= 1;
-      this.lastUseAt = this.now();
+      this.lastPluginUseAt = this.now();
     }
   }
 
@@ -3049,7 +3046,7 @@ export class KWinComputerBackend implements ComputerBackend {
     if (!plugin || this.disposed || this.connectPromise || this.startPromise) return undefined;
     if (this.drivingAgent !== null || this.streamListener !== undefined) return undefined;
     if (this.pluginCallsInFlight > 0 || this.capturePending > 0) return undefined;
-    if (this.now() - this.lastUseAt < this.idleReleaseMs) return undefined;
+    if (this.now() - this.lastPluginUseAt < this.idleReleaseMs) return undefined;
     return plugin;
   }
 

@@ -14,7 +14,10 @@ describe("readHostKwinVersion", () => {
     // The development package's cmake version file first.
     expect(
       readHostKwinVersion(
-        readers({ "/usr/lib/cmake/KWin/KWinConfigVersion.cmake": 'set(PACKAGE_VERSION "6.7.4")' }, {}),
+        readers(
+          { "/usr/lib/cmake/KWin/KWinConfigVersion.cmake": 'set(PACKAGE_VERSION "6.7.4")' },
+          {},
+        ),
       ),
     ).toBe("6.7.4");
     // Without it, the versioned library every KWin package installs.

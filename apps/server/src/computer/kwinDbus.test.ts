@@ -118,7 +118,8 @@ describe("connectPlugin owner pinning", () => {
               }
               // The plugin registers on KWin's own connection: one unique name.
               if (name === COMPUTER_SERVICE) return Promise.resolve(options.owner);
-              if (name === "org.kde.KWin") return Promise.resolve(options.kwinOwner ?? options.owner);
+              if (name === "org.kde.KWin")
+                return Promise.resolve(options.kwinOwner ?? options.owner);
               return Promise.resolve(":0.0");
             },
             RequestName: async () => 1,

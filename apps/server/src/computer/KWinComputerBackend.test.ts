@@ -1510,7 +1510,9 @@ describe("KWinComputerBackend", () => {
     expect(dbus.loaded).toEqual(["SynaraComputerUsePluginV5"]);
     expect(backend.health()).toMatchObject({
       status: "connected",
-      lastFailure: { message: expect.stringContaining("refused to load SynaraComputerUsePluginV6") },
+      lastFailure: {
+        message: expect.stringContaining("refused to load SynaraComputerUsePluginV6"),
+      },
     });
     await backend.dispose();
   });
@@ -3858,7 +3860,11 @@ describe("KWinComputerBackend supervision", () => {
     // What both plugins actually report: the short name without the variant,
     // and xkeyboard-config's descriptive name beside it.
     dbus.plugin.keyboardLayout = "us";
-    for (const name of ["English (Dvorak)", "English (Colemak)", "English (US, intl., with dead keys)"]) {
+    for (const name of [
+      "English (Dvorak)",
+      "English (Colemak)",
+      "English (US, intl., with dead keys)",
+    ]) {
       dbus.plugin.keyboardLayoutName = name;
       await expect(backend.typeText("ok")).rejects.toMatchObject({
         retryable: false,
@@ -4323,8 +4329,7 @@ describe("KWinComputerBackend reconnect timer", () => {
       // Mid-reload: KWin lists the plugin, but nothing owns the service yet.
       let ownerless = 3;
       const nameOwner = dbus.nameOwner;
-      dbus.nameOwner = async (name: string) =>
-        ownerless-- > 0 ? undefined : nameOwner(name);
+      dbus.nameOwner = async (name: string) => (ownerless-- > 0 ? undefined : nameOwner(name));
       dbus.disconnect();
       await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS);
       expect(backend.health().status).toBe("connected");
@@ -4447,13 +4452,14 @@ describe("KWinComputerBackend reconnect timer", () => {
   });
 });
 
-describe("KWinComputerBackend plugin unloaded by someone (R12)", () => {
-  function unloadEverything(dbus: FakeDbus): void {
-    dbus.loaded = [];
-    dbus.serviceOwner = undefined;
-    dbus.changeServiceOwner(undefined);
-  }
+/** Someone unloads every Synara plugin: KWin lists none and nobody owns the service. */
+function unloadEverything(dbus: FakeDbus): void {
+  dbus.loaded = [];
+  dbus.serviceOwner = undefined;
+  dbus.changeServiceOwner(undefined);
+}
 
+describe("KWinComputerBackend plugin unloaded by someone (R12)", () => {
   it("does not load it back into the same compositor on its own", async () => {
     vi.useFakeTimers();
     try {
