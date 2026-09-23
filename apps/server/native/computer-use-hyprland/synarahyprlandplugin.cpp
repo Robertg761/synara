@@ -110,6 +110,9 @@ namespace {
 // defined with the plumbing below, needed by anything that emits a signal
 // from outside a pass.
 void driveDbus();
+// Frees the capture stream's idle pixel-pack buffers; defined with the
+// capture jobs, needed when a session stops.
+void releaseIdlePixelPackBuffers();
 
 // ---------------------------------------------------------------------------
 // Constants shared with the KWin plugin. Names and values must stay in lock
@@ -1981,6 +1984,7 @@ void stopSession(StopReason reason) {
             Render::GL::g_pHyprOpenGL->makeEGLCurrent();
         g.captureFbs.clear();
     }
+    releaseIdlePixelPackBuffers();
 
     if (changed)
         emitSessionStopped(g.stopReason);
@@ -2758,27 +2762,6 @@ struct SCapturePixels {
     int                  h = 0;
 };
 
-SCapturePixels readFramebufferPixels(const SP<Render::IFramebuffer>& fb) {
-    SCapturePixels img;
-    img.w = static_cast<int>(fb->m_size.x);
-    img.h = static_cast<int>(fb->m_size.y);
-    if (img.w <= 0 || img.h <= 0)
-        captureFailed("offscreen framebuffer has no pixels");
-    img.rgba.resize(size_t(img.w) * size_t(img.h) * 4);
-    // glReadPixels reads GL_READ_FRAMEBUFFER; IFramebuffer::bind() only binds
-    // the draw side, so bind the read side explicitly like core readPixels does.
-    const auto glFb = dynamic_cast<Render::GL::CGLFramebuffer*>(fb.get());
-    if (!glFb)
-        captureFailed("capture requires the GL renderer");
-    g_pHyprOpenGL->makeEGLCurrent();
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, glFb->getFBID());
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, img.w, img.h, GL_RGBA, GL_UNSIGNED_BYTE, img.rgba.data());
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    return img;
-}
-
 // Premultiplied RGBA8 rows into a cairo ARGB32 (native-endian) surface. The
 // caller owns the returned surface.
 cairo_surface_t* pixelsToCairo(const SCapturePixels& img) {
@@ -2816,7 +2799,7 @@ SP<Render::IFramebuffer> captureFramebuffer(const PHLMONITOR& monitor) {
     return fb;
 }
 
-SCapturePixels renderMonitorPixels(const PHLMONITOR& monitor) {
+SP<Render::IFramebuffer> renderMonitorFramebuffer(const PHLMONITOR& monitor) {
     CRegion    fakeDamage{0, 0, monitor->m_transformedSize.x, monitor->m_transformedSize.y};
     const auto fb = captureFramebuffer(monitor);
     if (!g_pHyprRenderer->beginFullFakeRender(monitor, fakeDamage, fb))
@@ -2827,7 +2810,7 @@ SCapturePixels renderMonitorPixels(const PHLMONITOR& monitor) {
     (g_pHyprRenderer.get()->*renderAllClientsForWorkspacePtr())(monitor, monitor->m_activeWorkspace, Time::steadyNow(), Vector2D{0, 0}, 1.f);
     g_pHyprRenderer->endRender();
     g_pHyprRenderer->m_bRenderingSnapshot = false;
-    return readFramebufferPixels(fb);
+    return fb;
 }
 
 // The ghost cursor and badge, composited over a capture the same way the
@@ -2835,7 +2818,7 @@ SCapturePixels renderMonitorPixels(const PHLMONITOR& monitor) {
 // pointer exactly where the human sees it. Drawn from a snapshot taken on the
 // compositor thread when the capture was admitted, because the drawing runs
 // on the encode worker. `region` is the captured rect in global logical
-// coordinates, `scale` the capture's device pixels per logical unit. No-op
+// coordinates, `scaleX`/`scaleY` the image pixels per logical unit. No-op
 // when no session was running - a capture of a released desktop has no ghost
 // on screen either.
 struct SGhostSnapshot {
@@ -2856,9 +2839,12 @@ SGhostSnapshot ghostSnapshot() {
     return ghost;
 }
 
-void drawGhostCursorOverlay(cairo_t* cr, const SGhostSnapshot& ghost, const CBox& region, double scale) {
+void drawGhostCursorOverlay(cairo_t* cr, const SGhostSnapshot& ghost, const CBox& region, double scaleX, double scaleY) {
     if (!ghost.visible)
         return;
+    // The art is drawn at one scale; the two differ only by the rounding of
+    // the image's size.
+    const double scale  = std::max(scaleX, scaleY);
     const double size   = ghost.size;
     const double margin = strokeMargin(size);
 
@@ -2868,16 +2854,16 @@ void drawGhostCursorOverlay(cairo_t* cr, const SGhostSnapshot& ghost, const CBox
 
     if (ghost.badgeAlpha > 0) {
         SRenderedImage badge = renderBadgeImage(ghost.name, size, scale);
-        const double   bx    = (ghost.pos.x + std::round(size * 0.55) - margin - region.x) * scale;
-        const double   by    = (ghost.pos.y + std::round(size * 0.90) - margin - region.y) * scale;
+        const double   bx    = (ghost.pos.x + std::round(size * 0.55) - margin - region.x) * scaleX;
+        const double   by    = (ghost.pos.y + std::round(size * 0.90) - margin - region.y) * scaleY;
         cairo_set_source_surface(cr, badge.surface, bx, by);
         cairo_paint_with_alpha(cr, ghost.badgeAlpha);
         cairo_surface_destroy(badge.surface);
     }
 
     SRenderedImage arrow = renderCursorImage(size, scale);
-    const double   ax    = (ghost.pos.x - margin - region.x) * scale;
-    const double   ay    = (ghost.pos.y - margin - region.y) * scale;
+    const double   ax    = (ghost.pos.x - margin - region.x) * scaleX;
+    const double   ay    = (ghost.pos.y - margin - region.y) * scaleY;
     cairo_set_source_surface(cr, arrow.surface, ax, ay);
     cairo_paint(cr);
     cairo_surface_destroy(arrow.surface);
@@ -3059,28 +3045,8 @@ SEncodedImage encodeCaptureImage(cairo_surface_t* surface, CaptureFormat format,
     return {encodePng(surface, opaque), "image/png"};
 }
 
-// Downscales so the longest side fits maxDimension (0 = uncapped), then
-// encodes. Consumes the surface.
-SEncodedImage finishCapture(cairo_surface_t* surface, uint32_t maxDimension, CaptureFormat format, bool opaque) {
-    const int w       = cairo_image_surface_get_width(surface);
-    const int h       = cairo_image_surface_get_height(surface);
-    const int largest = std::max(w, h);
-    if (maxDimension > 0 && largest > static_cast<int>(maxDimension)) {
-        const double     factor = double(maxDimension) / largest;
-        const int        sw     = std::max(1, static_cast<int>(std::lround(w * factor)));
-        const int        sh     = std::max(1, static_cast<int>(std::lround(h * factor)));
-        cairo_surface_t* scaled = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, sw, sh);
-        cairo_t*         cr     = cairo_create(scaled);
-        cairo_scale(cr, double(sw) / w, double(sh) / h);
-        cairo_set_source_surface(cr, surface, 0, 0);
-        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
-        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-        cairo_paint(cr);
-        cairo_destroy(cr);
-        cairo_surface_flush(scaled);
-        cairo_surface_destroy(surface);
-        surface = scaled;
-    }
+// Encodes the finished image. Consumes the surface.
+SEncodedImage finishCapture(cairo_surface_t* surface, CaptureFormat format, bool opaque) {
     SEncodedImage image;
     try {
         image = encodeCaptureImage(surface, format, opaque);
@@ -3104,10 +3070,22 @@ void captureNativeSize(const CBox& region, double scale, int& nativeW, int& nati
         captureFailed("capture dimensions are too large");
 }
 
-cairo_surface_t* captureTarget(const CBox& region, double scale) {
-    int nativeW = 0, nativeH = 0;
-    captureNativeSize(region, scale, nativeW, nativeH);
-    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, nativeW, nativeH);
+// The size of the image a capture answers with: native, or scaled down so
+// its longest side fits maxDimension (0 = uncapped). The layers are stitched
+// straight into an image of this size, never at native size first.
+void captureTargetSize(int nativeW, int nativeH, uint32_t maxDimension, int& targetW, int& targetH) {
+    targetW             = nativeW;
+    targetH             = nativeH;
+    const int largest   = std::max(nativeW, nativeH);
+    if (maxDimension == 0 || largest <= static_cast<int>(maxDimension))
+        return;
+    const double factor = double(maxDimension) / largest;
+    targetW             = std::max(1, static_cast<int>(std::lround(nativeW * factor)));
+    targetH             = std::max(1, static_cast<int>(std::lround(nativeH * factor)));
+}
+
+cairo_surface_t* captureTarget(int width, int height) {
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
     if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
         cairo_surface_destroy(surface);
         captureFailed("capture image allocation failed");
@@ -3127,21 +3105,34 @@ std::optional<CBox> intersectBoxes(const CBox& a, const CBox& b) {
 
 // ---------------------------------------------------------------------------
 // Capture jobs. The compositor thread does only what needs the GL context:
-// the offscreen render and the pixel readback. Everything after - the output
-// transform, stitching monitors, the ghost overlay, downscaling and the PNG
-// encode - runs on one worker thread, and the D-Bus reply goes out from the
-// compositor thread once the worker hands the job back through an eventfd on
-// the Wayland loop. The bus method is asynchronous, so a capture stream never
-// stalls the compositor on zlib, and the worker touches no compositor state:
-// a job carries copies of everything it needs, and the bus connection is
+// the offscreen render, and queueing the readback of just the pixels the
+// capture covers into a pixel-pack buffer behind a fence - never a
+// synchronous glReadPixels, which would stall the compositor until the GPU
+// had finished the render and the copy. A timer on the Wayland loop polls the
+// fences without waiting and maps each buffer once its copy has landed.
+// Everything after - copying the pixels out of the mapping, the output
+// transform, stitching monitors at the image's final size, the ghost overlay
+// and the encode - runs on one worker thread, and the D-Bus reply goes out
+// from the compositor thread once the worker hands the job back through an
+// eventfd on the Wayland loop, which also unmaps the buffers. The bus method
+// is asynchronous, so a capture stream never stalls the compositor on the GPU
+// or on zlib, and the worker touches no compositor state: a job carries
+// copies of everything it needs, and the bus connection and every GL call are
 // only ever used from the compositor thread.
 // ---------------------------------------------------------------------------
 
 struct SCaptureLayer {
-    SCapturePixels pixels;    // as read back: the output's native orientation
-    unsigned       transform; // the output's wl_output_transform, applied by the worker
-    CBox           box;       // the layer's logical box on the desktop
-    double         scale;     // the layer's own device pixels per logical unit
+    SCapturePixels pixels;        // the output's native orientation; filled by the worker for a buffered readback
+    unsigned       transform = 0; // the output's wl_output_transform, applied by the worker
+    CBox           box;           // the logical box on the desktop the pixels cover
+    // A buffered readback: the pixel-pack buffer the GPU copies into, the
+    // fence that says it has, and once it has, the buffer's mapping, which
+    // the worker reads. The GL names are touched on the compositor thread
+    // only; the mapping stays valid until that thread unmaps it.
+    GLuint         pbo         = 0;
+    size_t         pboCapacity = 0;
+    GLsync         fence       = nullptr;
+    const uint8_t* mapped      = nullptr;
 };
 
 struct SCaptureJob {
@@ -3152,14 +3143,23 @@ struct SCaptureJob {
     bool                                             extended = false;
     uint64_t                                         epoch    = 0;
     CBox                                             region;
-    double                                           scale        = 1;
-    uint32_t                                         maxDimension = 0;
-    bool                                             opaque       = true;
-    CaptureFormat                                    format       = CaptureFormat::Png;
+    int                                              targetW = 1;
+    int                                              targetH = 1;
+    bool                                             opaque  = true;
+    CaptureFormat                                    format  = CaptureFormat::Png;
     SGhostSnapshot                                   ghost;
     std::vector<SCaptureLayer>                       layers;
+    int64_t                                          readbackStartMs = 0;
     SEncodedImage                                    image;
     std::string                                      error;
+
+    SCaptureJob() = default;
+    // Gives back the layers' GL resources. Every job ends on the compositor
+    // thread - replied to, refused at admission, or dropped at unload - and
+    // never while the worker still holds it.
+    ~SCaptureJob();
+    SCaptureJob(const SCaptureJob&)            = delete;
+    SCaptureJob& operator=(const SCaptureJob&) = delete;
 };
 
 struct SCaptureWorker {
@@ -3174,38 +3174,243 @@ struct SCaptureWorker {
 };
 SCaptureWorker captureWorker;
 
+// Compositor-thread state of the buffered readbacks: jobs whose fences have
+// not all signalled yet, the timer that polls them, and idle pixel-pack
+// buffers kept for the next capture of a stream.
+struct SPixelPackBuffer {
+    GLuint name     = 0;
+    size_t capacity = 0;
+};
+struct SCaptureReadback {
+    std::deque<UP<SCaptureJob>>   waiting;
+    wl_event_source*              timer = nullptr;
+    std::vector<SPixelPackBuffer> idle;
+};
+SCaptureReadback captureReadback;
+
+// How often the fences are polled, and how long a readback may take before
+// the capture fails instead of waiting on a GPU that has stopped answering.
+constexpr int     READBACK_POLL_MS    = 1;
+constexpr int64_t READBACK_TIMEOUT_MS = 2000;
+// Idle buffers kept: two monitors' worth for a stream, no more.
+constexpr size_t  READBACK_IDLE_BUFFERS = 2;
+
 void driveDbus();
 
-// Admission for both capture shapes: the size limits are checked before any
-// GPU work, and the ghost and lock epoch are snapshotted while still on the
-// compositor thread.
 // One encoding and one waiting is all a capture stream ever needs; a caller
 // that keeps asking faster than the worker encodes would otherwise pile up
 // monitor-sized pixel copies in the queue.
 constexpr size_t CAPTURE_QUEUE_LIMIT = 2;
 
+// Admission for both capture shapes: the size limits are checked before any
+// GPU work, and the ghost and lock epoch are snapshotted while still on the
+// compositor thread.
 UP<SCaptureJob> newCaptureJob(const CBox& region, double scale, uint32_t maxDimension, bool opaque, uint32_t flags) {
     int nativeW = 0, nativeH = 0;
     captureNativeSize(region, scale, nativeW, nativeH);
     {
         std::lock_guard lock(captureWorker.mutex);
-        if (captureWorker.pending.size() + captureWorker.done.size() >= CAPTURE_QUEUE_LIMIT)
+        if (captureReadback.waiting.size() + captureWorker.pending.size() + captureWorker.done.size() >= CAPTURE_QUEUE_LIMIT)
             captureFailed("captures are queued faster than they are encoded; retry after the pending ones complete");
     }
-    auto job          = makeUnique<SCaptureJob>();
-    job->epoch        = g.lockEpoch;
-    job->region       = region;
-    job->scale        = scale;
-    job->maxDimension = maxDimension;
-    job->opaque       = opaque;
-    job->format       = captureFormat(flags);
-    job->ghost        = ghostSnapshot();
+    auto job    = makeUnique<SCaptureJob>();
+    job->epoch  = g.lockEpoch;
+    job->region = region;
+    captureTargetSize(nativeW, nativeH, maxDimension, job->targetW, job->targetH);
+    job->opaque = opaque;
+    job->format = captureFormat(flags);
+    job->ghost  = ghostSnapshot();
     return job;
+}
+
+// Restores on scope exit the pack buffer, read framebuffer and pack alignment
+// a readback changed: the compositor's own readbacks (screencopy) must find
+// the GL state as they left it.
+struct SReadbackGlState {
+    GLint previousPackBuffer = 0;
+    GLint previousAlignment  = 4;
+    GLint previousReadFb     = 0;
+    SReadbackGlState() {
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &previousPackBuffer);
+        glGetIntegerv(GL_PACK_ALIGNMENT, &previousAlignment);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFb);
+    }
+    ~SReadbackGlState() {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, GLuint(previousPackBuffer));
+        glPixelStorei(GL_PACK_ALIGNMENT, previousAlignment);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(previousReadFb));
+    }
+    SReadbackGlState(const SReadbackGlState&)            = delete;
+    SReadbackGlState& operator=(const SReadbackGlState&) = delete;
+};
+
+// A pixel-pack buffer of at least `size` bytes: an idle one when there is
+// one (grown if it is too small), else a new one. 0 when GL refused.
+SPixelPackBuffer acquirePixelPackBuffer(size_t size) {
+    SPixelPackBuffer buffer;
+    if (!captureReadback.idle.empty()) {
+        buffer = captureReadback.idle.back();
+        captureReadback.idle.pop_back();
+    } else {
+        glGenBuffers(1, &buffer.name);
+    }
+    if (!buffer.name)
+        return {};
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer.name);
+    if (buffer.capacity < size) {
+        while (glGetError() != GL_NO_ERROR)
+            ;
+        glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(size), nullptr, GL_STREAM_READ);
+        if (glGetError() != GL_NO_ERROR) {
+            glDeleteBuffers(1, &buffer.name);
+            return {};
+        }
+        buffer.capacity = size;
+    }
+    return buffer;
+}
+
+// Hands a layer's GL resources back: the fence deleted, the buffer unmapped
+// and kept for the next capture, or deleted when enough are kept already.
+// Compositor thread only, and never while the worker may still read the
+// mapping.
+void releaseLayerReadback(SCaptureLayer& layer) {
+    if (!layer.fence && !layer.pbo)
+        return;
+    if (!g_pHyprOpenGL) {
+        // The GL context is gone with the renderer; so are its objects.
+        layer.fence  = nullptr;
+        layer.pbo    = 0;
+        layer.mapped = nullptr;
+        return;
+    }
+    g_pHyprOpenGL->makeEGLCurrent();
+    if (layer.fence) {
+        glDeleteSync(layer.fence);
+        layer.fence = nullptr;
+    }
+    if (layer.pbo) {
+        const SReadbackGlState state;
+        if (layer.mapped) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, layer.pbo);
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            layer.mapped = nullptr;
+        }
+        if (captureReadback.idle.size() < READBACK_IDLE_BUFFERS)
+            captureReadback.idle.push_back({layer.pbo, layer.pboCapacity});
+        else
+            glDeleteBuffers(1, &layer.pbo);
+        layer.pbo = 0;
+    }
+}
+
+void releaseJobReadbacks(SCaptureJob& job) {
+    for (SCaptureLayer& layer : job.layers)
+        releaseLayerReadback(layer);
+}
+
+SCaptureJob::~SCaptureJob() {
+    releaseJobReadbacks(*this);
+}
+
+// The idle buffers go with the session, like the offscreen framebuffers.
+void releaseIdlePixelPackBuffers() {
+    if (captureReadback.idle.empty())
+        return;
+    if (g_pHyprOpenGL) {
+        g_pHyprOpenGL->makeEGLCurrent();
+        for (const SPixelPackBuffer& buffer : captureReadback.idle)
+            glDeleteBuffers(1, &buffer.name);
+    }
+    captureReadback.idle.clear();
+}
+
+// The pixels a capture needs from one output: the native (as-read)
+// rectangle of its framebuffer, `fbW` x `fbH`, whose image under the output
+// `transform` shows the part of `need` (global logical coordinates) that
+// falls on `monitorBox`, and the logical box those whole pixels cover.
+struct SCaptureLayerRect {
+    SPixelRect native;
+    CBox       box;
+};
+
+std::optional<SCaptureLayerRect> captureLayerRect(const CBox& monitorBox, int fbW, int fbH, unsigned transform, const CBox& need) {
+    const auto part = intersectBoxes(need, monitorBox);
+    if (!part || monitorBox.w <= 0 || monitorBox.h <= 0 || fbW <= 0 || fbH <= 0)
+        return std::nullopt;
+    // Pixels in the output's logical orientation, per logical unit.
+    const int    transformedW = (transform & 1) ? fbH : fbW;
+    const int    transformedH = (transform & 1) ? fbW : fbH;
+    const double sx           = transformedW / monitorBox.w;
+    const double sy           = transformedH / monitorBox.h;
+    const int    x0           = std::clamp(static_cast<int>(std::floor((part->x - monitorBox.x) * sx)), 0, transformedW);
+    const int    y0           = std::clamp(static_cast<int>(std::floor((part->y - monitorBox.y) * sy)), 0, transformedH);
+    const int    x1           = std::clamp(static_cast<int>(std::ceil((part->x + part->w - monitorBox.x) * sx)), 0, transformedW);
+    const int    y1           = std::clamp(static_cast<int>(std::ceil((part->y + part->h - monitorBox.y) * sy)), 0, transformedH);
+    if (x1 <= x0 || y1 <= y0)
+        return std::nullopt;
+    return SCaptureLayerRect{
+        nativeRectForTransformed({x0, y0, x1 - x0, y1 - y0}, fbW, fbH, transform),
+        CBox{monitorBox.x + x0 / sx, monitorBox.y + y0 / sy, (x1 - x0) / sx, (y1 - y0) / sy},
+    };
+}
+
+// Queues the readback of the part of `need` (global logical coordinates)
+// that `monitor`'s framebuffer `fb` shows, as one more layer of `job`: only
+// those pixels are copied (captureLayerRect). Asynchronous into a pixel-pack
+// buffer when GL gives one, synchronous otherwise. Nothing is added when the
+// part is empty.
+void addCaptureLayer(SCaptureJob& job, const SP<Render::IFramebuffer>& fb, const PHLMONITOR& monitor, const CBox& need) {
+    const int fbW = static_cast<int>(fb->m_size.x);
+    const int fbH = static_cast<int>(fb->m_size.y);
+    if (fbW <= 0 || fbH <= 0)
+        captureFailed("offscreen framebuffer has no pixels");
+    const unsigned transform = unsigned(monitor->m_transform);
+    const auto     rect      = captureLayerRect(monitor->logicalBox(), fbW, fbH, transform, need);
+    if (!rect)
+        return;
+    const SPixelRect& native = rect->native;
+
+    SCaptureLayer layer;
+    layer.transform = transform;
+    layer.box       = rect->box;
+    layer.pixels.w  = native.w;
+    layer.pixels.h  = native.h;
+    const size_t bytes = size_t(native.w) * size_t(native.h) * 4;
+
+    // glReadPixels reads GL_READ_FRAMEBUFFER; IFramebuffer::bind() only binds
+    // the draw side, so bind the read side explicitly like core readPixels does.
+    const auto glFb = dynamic_cast<Render::GL::CGLFramebuffer*>(fb.get());
+    if (!glFb)
+        captureFailed("capture requires the GL renderer");
+    g_pHyprOpenGL->makeEGLCurrent();
+    const SReadbackGlState state;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, glFb->getFBID());
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    if (const SPixelPackBuffer buffer = acquirePixelPackBuffer(bytes); buffer.name) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer.name);
+        glReadPixels(native.x, native.y, native.w, native.h, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        layer.pbo         = buffer.name;
+        layer.pboCapacity = buffer.capacity;
+        layer.fence       = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        // Submitted now, so the fence signals without anything else having to
+        // flush the queue first.
+        glFlush();
+        if (!layer.fence) {
+            job.layers.push_back(std::move(layer));
+            captureFailed("GPU readback could not be fenced");
+        }
+    } else {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        layer.pixels.rgba.resize(bytes);
+        glReadPixels(native.x, native.y, native.w, native.h, GL_RGBA, GL_UNSIGNED_BYTE, layer.pixels.rgba.data());
+    }
+    job.layers.push_back(std::move(layer));
 }
 
 // Worker-thread side: pixels in, encoded image out. Nothing here reads `g`.
 void encodeCapture(SCaptureJob& job) {
-    cairo_surface_t* target = captureTarget(job.region, job.scale);
+    cairo_surface_t* target = captureTarget(job.targetW, job.targetH);
     cairo_t*         cr     = cairo_create(target);
     if (job.opaque) {
         // A screen is opaque: black under any monitor gap or transparent
@@ -3215,15 +3420,20 @@ void encodeCapture(SCaptureJob& job) {
         cairo_set_source_rgba(cr, 0, 0, 0, 1);
         cairo_paint(cr);
     }
+    // Image pixels per logical unit.
+    const double scaleX = job.targetW / job.region.w;
+    const double scaleY = job.targetH / job.region.h;
     for (SCaptureLayer& layer : job.layers) {
+        if (layer.mapped)
+            layer.pixels.rgba.assign(layer.mapped, layer.mapped + size_t(layer.pixels.w) * size_t(layer.pixels.h) * 4);
         transformCapturePixels(layer.pixels.rgba, layer.pixels.w, layer.pixels.h, layer.transform);
         cairo_surface_t* layerSurf = pixelsToCairo(layer.pixels);
         cairo_save(cr);
-        cairo_translate(cr, (layer.box.x - job.region.x) * job.scale, (layer.box.y - job.region.y) * job.scale);
+        cairo_translate(cr, (layer.box.x - job.region.x) * scaleX, (layer.box.y - job.region.y) * scaleY);
         // Pixels now have the output's logical orientation, including
-        // reflections; stitching happens at the sharpest scale so no
-        // layer's pixels get thrown away.
-        cairo_scale(cr, job.scale / layer.scale, job.scale / layer.scale);
+        // reflections, and are resampled once, straight to the image's final
+        // size: no native-size intermediate for a downscaled capture.
+        cairo_scale(cr, layer.box.w * scaleX / layer.pixels.w, layer.box.h * scaleY / layer.pixels.h);
         cairo_set_source_surface(cr, layerSurf, 0, 0);
         cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
         cairo_set_operator(cr, job.opaque ? CAIRO_OPERATOR_OVER : CAIRO_OPERATOR_SOURCE);
@@ -3232,10 +3442,10 @@ void encodeCapture(SCaptureJob& job) {
         cairo_surface_destroy(layerSurf);
         std::vector<uint8_t>().swap(layer.pixels.rgba);
     }
-    drawGhostCursorOverlay(cr, job.ghost, job.region, job.scale);
+    drawGhostCursorOverlay(cr, job.ghost, job.region, scaleX, scaleY);
     cairo_destroy(cr);
     cairo_surface_flush(target);
-    job.image = finishCapture(target, job.maxDimension, job.format, job.opaque);
+    job.image = finishCapture(target, job.format, job.opaque);
 }
 
 void captureWorkerMain() {
@@ -3270,8 +3480,10 @@ void captureWorkerMain() {
 
 // The reply, on the compositor thread. A job whose lock epoch has moved on
 // answers SessionLocked: its pixels came from a desktop that has since been
-// locked away, and the server retries after the unlock.
+// locked away, and the server retries after the unlock. Its GL resources go
+// back first: nothing reads the mapping any more.
 void replyCapture(SCaptureJob& job) {
+    releaseJobReadbacks(job);
     // Sending can fail if the connection has gone; this runs inside Wayland
     // loop callbacks, where an escaping exception would end the compositor.
     try {
@@ -3320,10 +3532,7 @@ void ensureCaptureWorker() {
     captureWorker.thread     = std::thread(captureWorkerMain);
 }
 
-// The job carries the call it answers (`reply` or `replyEx`), set by the
-// handler that admitted it.
-void submitCapture(UP<SCaptureJob> job) {
-    ensureCaptureWorker();
+void enqueueForEncoding(UP<SCaptureJob> job) {
     {
         std::lock_guard lock(captureWorker.mutex);
         captureWorker.pending.push_back(std::move(job));
@@ -3331,9 +3540,92 @@ void submitCapture(UP<SCaptureJob> job) {
     captureWorker.wake.notify_one();
 }
 
-// Joins the worker and answers whatever it had queued or finished with an
-// error, rather than leaving those callers to time out; run before the bus
-// connection goes away.
+// Whether every buffered readback of `job` has landed; each that has is
+// mapped for the worker. Never waits: a fence that has not signalled is
+// asked again on the next poll.
+bool readbacksLanded(SCaptureJob& job) {
+    bool landed = true;
+    for (SCaptureLayer& layer : job.layers) {
+        if (!layer.fence)
+            continue;
+        const GLenum status = glClientWaitSync(layer.fence, 0, 0);
+        if (status == GL_WAIT_FAILED)
+            captureFailed("GPU readback failed");
+        if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
+            landed = false;
+            continue;
+        }
+        glDeleteSync(layer.fence);
+        layer.fence = nullptr;
+        const SReadbackGlState state;
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, layer.pbo);
+        layer.mapped = static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(size_t(layer.pixels.w) * size_t(layer.pixels.h) * 4), GL_MAP_READ_BIT));
+        if (!layer.mapped)
+            captureFailed("GPU readback could not be mapped");
+    }
+    return landed;
+}
+
+int onReadbackTimer(void* /*data*/) {
+    if (captureReadback.waiting.empty())
+        return 0;
+    if (!g_pHyprOpenGL) {
+        for (auto& job : captureReadback.waiting) {
+            job->error = "render unavailable";
+            replyCapture(*job);
+        }
+        captureReadback.waiting.clear();
+        driveDbus();
+        return 0;
+    }
+    g_pHyprOpenGL->makeEGLCurrent();
+    std::deque<UP<SCaptureJob>> still;
+    bool                        replied = false;
+    for (auto& job : captureReadback.waiting) {
+        try {
+            if (readbacksLanded(*job)) {
+                enqueueForEncoding(std::move(job));
+                continue;
+            }
+            if (nowMs() - job->readbackStartMs > READBACK_TIMEOUT_MS)
+                captureFailed("GPU readback timed out");
+            still.push_back(std::move(job));
+        } catch (const sdbus::Error& e) {
+            job->error = e.getMessage();
+            replyCapture(*job);
+            replied = true;
+        }
+    }
+    captureReadback.waiting.swap(still);
+    if (!captureReadback.waiting.empty() && captureReadback.timer)
+        wl_event_source_timer_update(captureReadback.timer, READBACK_POLL_MS);
+    if (replied)
+        driveDbus();
+    return 0;
+}
+
+// The job carries the call it answers (`reply` or `replyEx`), set by the
+// handler that admitted it. A job still waiting on buffered readbacks waits
+// on the poll timer; one read synchronously goes straight to the worker.
+void submitCapture(UP<SCaptureJob> job) {
+    ensureCaptureWorker();
+    const bool buffered = std::ranges::any_of(job->layers, [](const SCaptureLayer& layer) { return layer.fence != nullptr; });
+    if (!buffered) {
+        enqueueForEncoding(std::move(job));
+        return;
+    }
+    if (!captureReadback.timer)
+        captureReadback.timer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, onReadbackTimer, nullptr);
+    if (!captureReadback.timer)
+        captureFailed("capture readback could not be scheduled");
+    job->readbackStartMs = nowMs();
+    captureReadback.waiting.push_back(std::move(job));
+    wl_event_source_timer_update(captureReadback.timer, READBACK_POLL_MS);
+}
+
+// Joins the worker and answers whatever it had queued or finished, and every
+// job still waiting on its readback, with an error, rather than leaving those
+// callers to time out; run before the bus connection goes away.
 void stopCaptureWorker() {
     if (captureWorker.thread.joinable()) {
         {
@@ -3343,7 +3635,7 @@ void stopCaptureWorker() {
         captureWorker.wake.notify_one();
         captureWorker.thread.join();
     }
-    for (auto* queue : {&captureWorker.pending, &captureWorker.done}) {
+    for (auto* queue : {&captureReadback.waiting, &captureWorker.pending, &captureWorker.done}) {
         for (auto& job : *queue) {
             job->error = "the plugin is unloading";
             job->image = {};
@@ -3351,6 +3643,11 @@ void stopCaptureWorker() {
         }
         queue->clear();
     }
+    if (captureReadback.timer) {
+        wl_event_source_remove(captureReadback.timer);
+        captureReadback.timer = nullptr;
+    }
+    releaseIdlePixelPackBuffers();
     if (captureWorker.doneSource) {
         wl_event_source_remove(captureWorker.doneSource);
         captureWorker.doneSource = nullptr;
@@ -3370,10 +3667,10 @@ void noteCaptureActivity(uint32_t flags) {
         noteActivity();
 }
 
-// Compositor-thread side of a window capture: admission and the one
-// offscreen render. Hyprland's own single-window snapshot renders the window
-// with its decorations and popups at its real position on a transparent
-// monitor-sized canvas.
+// Compositor-thread side of a window capture: admission, the one offscreen
+// render, and the readback of the window's own rectangle. Hyprland's own
+// single-window snapshot renders the window with its decorations and popups
+// at its real position on a transparent monitor-sized canvas.
 UP<SCaptureJob> captureWindow(const std::string& windowId, uint32_t maxDimension, uint32_t flags) {
     requireControlAvailable();
     requireUnlockedSession();
@@ -3394,12 +3691,13 @@ UP<SCaptureJob> captureWindow(const std::string& windowId, uint32_t maxDimension
     const auto fb = g_pHyprRenderer->makeSnapshotFB(window);
     if (!fb)
         captureFailed("window is not visible for capture");
-    job->layers.push_back({readFramebufferPixels(fb), unsigned(monitor->m_transform), monitor->logicalBox(), double(monitor->m_scale)});
+    addCaptureLayer(*job, fb, monitor, *region);
     return job;
 }
 
 // Compositor-thread side of a region capture: every intersecting monitor is
-// rendered at its own scale; the worker stitches them at the sharpest one.
+// rendered at its own scale and read back only where the region covers it;
+// the worker stitches them at the image's final size.
 UP<SCaptureJob> captureRegion(int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t maxDimension, uint32_t flags) {
     requireControlAvailable();
     requireUnlockedSession();
@@ -3425,10 +3723,9 @@ UP<SCaptureJob> captureRegion(int32_t x, int32_t y, uint32_t width, uint32_t hei
 
     auto job = newCaptureJob(*region, scale, maxDimension, true, flags);
     for (const auto& mon : monitors)
-        job->layers.push_back({renderMonitorPixels(mon), unsigned(mon->m_transform), mon->logicalBox(), double(mon->m_scale)});
+        addCaptureLayer(*job, renderMonitorFramebuffer(mon), mon, *region);
     return job;
 }
-
 
 // ---------------------------------------------------------------------------
 // D-Bus plumbing: the connection's fds run on Hyprland's Wayland event loop,

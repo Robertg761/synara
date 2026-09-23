@@ -26,3 +26,38 @@ inline void transformCapturePixels(std::vector<uint8_t>& pixels, int& width, int
     width = outWidth;
     height = outHeight;
 }
+
+// A rectangle of whole pixels.
+struct SPixelRect {
+    int x = 0, y = 0, w = 0, h = 0;
+};
+
+// The native (as-read) framebuffer rectangle whose image under `transform` is
+// `logical`, a rectangle in the transformed image. A wl_output_transform is a
+// rotation or reflection of the whole image, so the preimage of an
+// axis-aligned rectangle is one too, and transformCapturePixels applied to
+// just those native pixels gives exactly `logical`'s part of the transformed
+// whole: a capture can read back only the pixels it needs.
+inline SPixelRect nativeRectForTransformed(const SPixelRect& logical, int nativeWidth, int nativeHeight, unsigned transform) {
+    if (logical.w <= 0 || logical.h <= 0)
+        return {};
+    const int  W       = nativeWidth, H = nativeHeight;
+    const auto inverse = [&](int dx, int dy, int& x, int& y) {
+        switch (transform) {
+            case 1: x = W - 1 - dy; y = dx; break;
+            case 2: x = W - 1 - dx; y = H - 1 - dy; break;
+            case 3: x = dy; y = H - 1 - dx; break;
+            case 4: x = W - 1 - dx; y = dy; break;
+            case 5: x = dy; y = dx; break;
+            case 6: x = dx; y = H - 1 - dy; break;
+            case 7: x = W - 1 - dy; y = H - 1 - dx; break;
+            default: x = dx; y = dy; break;
+        }
+    };
+    int ax = 0, ay = 0, bx = 0, by = 0;
+    inverse(logical.x, logical.y, ax, ay);
+    inverse(logical.x + logical.w - 1, logical.y + logical.h - 1, bx, by);
+    const int x0 = ax < bx ? ax : bx, x1 = ax < bx ? bx : ax;
+    const int y0 = ay < by ? ay : by, y1 = ay < by ? by : ay;
+    return {x0, y0, x1 - x0 + 1, y1 - y0 + 1};
+}

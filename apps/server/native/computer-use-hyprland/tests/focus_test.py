@@ -112,7 +112,7 @@ def compile_and_run(fixture_name, production, prefix, packages=()):
         cpp = Path(directory) / "fixture.cpp"
         cpp.write_text(fixture.replace("// PRODUCTION_DEFINITIONS", production))
         binary = Path(directory) / "fixture-test"
-        subprocess.run(["g++", STANDARD, "-Wall", "-Wextra", str(cpp), "-o", str(binary), *flags], check=True)
+        subprocess.run(["g++", STANDARD, "-Wall", "-Wextra", "-I", str(ROOT), str(cpp), "-o", str(binary), *flags], check=True)
         subprocess.run([str(binary)], check=True)
 
 
@@ -193,6 +193,13 @@ class FocusRegressionTest(unittest.TestCase):
             ("PNG_COMPRESSION_LEVEL", "variable"), "writePngRows", "encodePng", "encodeJpeg", "encodeLuma", ("SEncodedImage", "struct"), "encodeCaptureImage",
         ])
         compile_and_run("codec_fixture.cpp", production, "synara-codec-test-", packages=("cairo", "libturbojpeg", "libpng"))
+
+    def test_partial_readback_and_stitching(self):
+        production = definitions(self.source, [
+            "intersectBoxes", ("SCaptureLayerRect", "struct"), "captureLayerRect",
+            "captureTargetSize", "captureTarget", "pixelsToCairo", "encodeCapture",
+        ])
+        compile_and_run("stitch_fixture.cpp", production, "synara-stitch-test-", packages=("cairo",))
 
     def test_window_identity(self):
         production = definitions(self.source, [

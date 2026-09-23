@@ -43,7 +43,8 @@ struct Monitor {
 using PHLMONITOR = std::shared_ptr<Monitor>;
 struct Window { std::weak_ptr<Monitor> m_monitor; };
 using PHLWINDOW = std::shared_ptr<Window>;
-struct Renderer { void* makeSnapshotFB(PHLWINDOW) { unexpectedRender(); } };
+struct Framebuffer {};
+struct Renderer { std::shared_ptr<Framebuffer> makeSnapshotFB(PHLWINDOW) { unexpectedRender(); } };
 struct RendererHandle {
     explicit operator bool() const { ++rendererAccesses; return false; }
     Renderer* operator->() const { unexpectedRender(); }
@@ -54,15 +55,12 @@ CBox workspaceGeometry() { unexpectedRender(); }
 std::optional<CBox> intersectBoxes(const CBox&, const CBox&) { unexpectedRender(); }
 struct MonitorState { std::vector<PHLMONITOR> monitors() { unexpectedRender(); } };
 namespace State { MonitorState* monitorState() { unexpectedRender(); } }
-struct SCapturePixels { std::vector<uint8_t> rgba; int w = 0, h = 0; };
-SCapturePixels readFramebufferPixels(void*) { unexpectedRender(); }
-SCapturePixels renderMonitorPixels(PHLMONITOR) { unexpectedRender(); }
-void transformCapturePixels(std::vector<uint8_t>&, int&, int&, unsigned) { unexpectedRender(); }
+std::shared_ptr<Framebuffer> renderMonitorFramebuffer(PHLMONITOR) { unexpectedRender(); }
 
 // The job a capture hands to the encode worker. Only its shape is needed:
 // admission must fail before one is ever made.
-struct SCaptureLayer { SCapturePixels pixels; unsigned transform; CBox box; double scale; };
-struct SCaptureJob { std::vector<SCaptureLayer> layers; };
+struct SCaptureJob {};
+void addCaptureLayer(SCaptureJob&, const std::shared_ptr<Framebuffer>&, const PHLMONITOR&, const CBox&) { unexpectedRender(); }
 constexpr uint32_t CAPTURE_FLAG_PASSIVE = 1;
 template <typename T> using UP = std::unique_ptr<T>;
 UP<SCaptureJob> newCaptureJob(const CBox&, double, uint32_t, bool, uint32_t) { unexpectedRender(); }

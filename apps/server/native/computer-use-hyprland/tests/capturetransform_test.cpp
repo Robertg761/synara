@@ -18,4 +18,30 @@ int main() {
         for (int i = 0; i < 6; ++i) for (int channel = 0; channel < 4; ++channel)
             assert(pixels[i * 4 + channel] == expected[transform][i]);
     }
+
+    // Reading back only a sub-rectangle: for every transform and every
+    // rectangle of a non-square image, transforming just the native pixels
+    // nativeRectForTransformed names gives the same pixels as cropping the
+    // transformed whole.
+    const int W = 5, H = 3;
+    std::vector<uint8_t> native;
+    for (int i = 0; i < W * H; ++i) native.insert(native.end(), 4, uint8_t(i + 1));
+    for (unsigned transform = 0; transform < 8; ++transform) {
+        std::vector<uint8_t> whole = native;
+        int tw = W, th = H;
+        transformCapturePixels(whole, tw, th, transform);
+        for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x)
+        for (int h = 1; y + h <= th; ++h) for (int w = 1; x + w <= tw; ++w) {
+            const SPixelRect n = nativeRectForTransformed({x, y, w, h}, W, H, transform);
+            assert(n.x >= 0 && n.y >= 0 && n.x + n.w <= W && n.y + n.h <= H);
+            std::vector<uint8_t> part;
+            for (int ny = n.y; ny < n.y + n.h; ++ny)
+                part.insert(part.end(), native.begin() + (ny * W + n.x) * 4, native.begin() + (ny * W + n.x + n.w) * 4);
+            int pw = n.w, ph = n.h;
+            transformCapturePixels(part, pw, ph, transform);
+            assert(pw == w && ph == h);
+            for (int py = 0; py < h; ++py) for (int px = 0; px < w; ++px)
+                assert(part[(py * w + px) * 4] == whole[((y + py) * tw + x + px) * 4]);
+        }
+    }
 }
