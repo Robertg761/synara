@@ -52,7 +52,6 @@ struct SynaraComputerUsePlugin {
     void noteAgentInput() {}
     // The popup rule's bookkeeping; attribution has its own fixture.
     template <class W> void noteAgentPress(const W&) {}
-    void noteAgentSerial(quint32) {}
     void setTimestampNow() {}
     void directPointerButton(quint32 button, bool pressed) {
         events.push_back({"direct-button", m_directPointerSurface.window, button, pressed});

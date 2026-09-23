@@ -118,9 +118,11 @@ unclaimed rather than given a backend that refuses forever.
   compositor or the server raised it. Every refusal is decided before the
   plugin sends anything; a raise that would bury their window is refused too,
   and no activation is borrowed in an application they are typing in. Serials
-  the agent's events carry never count as the human's interaction, so a
-  client cannot use an agent click to obtain an activation token and take the
-  human's keyboard (Chromium did, between two of its windows).
+  the agent's events carry never count as the human's interaction: KWin
+  refuses an activation token that quotes one, so a client cannot use an
+  agent click to take the human's keyboard (Chromium did, between two of its
+  windows), while a launch the human started still takes focus when it maps
+  in the middle of the agent's work.
 - `Meta+Shift+Esc` stops the session and latches until pressed again; a plugin
   that could not register the shortcut is reported as a setup blocker rather
   than advertising a hotkey that does not exist.

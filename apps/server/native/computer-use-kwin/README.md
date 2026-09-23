@@ -358,16 +358,19 @@ astray:
   action leaves no enter, focus change or borrowed activation behind.
 - **The agent's serials are not the human's interaction.** KWin grants an
   `xdg_activation` token for any serial at or after the last interaction it saw
-  on a real device, and every agent event carries a fresh, newer serial. So a
-  client could turn an agent click into real activation, and one did: Chromium
-  requests a token with the click's serial when one of its other windows has
-  focus, and KWin moved the human's keyboard to the agent's window (measured on
-  KWin 6.7.4). At the end of every agent call the plugin moves KWin's last
-  interaction past the serials the call minted, so such a token is refused. The
-  human's own next press or key sets it back to theirs. The cost is narrow: an
-  activation the human set off within the same instant as an agent call (a
-  window they launched still mapping, a dialog their click opened) may demand
-  attention instead of taking focus.
+  on a real device (and for any serial at all to the active window), and every
+  agent event carries a fresh, newer serial. So a client could turn an agent
+  click into real activation, and one did: Chromium requests a token with the
+  click's serial when one of its other windows has focus, and KWin moved the
+  human's keyboard to the agent's window (measured on KWin 6.7.4). The plugin
+  records the serials every agent call minted and installs its own token
+  creator in place of KWin's: a token quoting one of them, or the agent seat,
+  is refused (`stateJson` counts them in `activationTokensRefused`); any other
+  request gets KWin's own decision and is issued by KWin's integration with
+  the serial KWin would have stored. KWin's last interaction is never touched,
+  so a launch the human set off (Kickoff, KRunner, a link) still activates
+  when its window maps while the agent is busy. Unloading the plugin puts
+  KWin's creator back.
 - **A dead target is an error, not a fallback.** Once `focusWindow` has named a
   target, that target closing does not silently retarget key events to whatever
   window happens to be under the pointer. Key methods return `false` until the

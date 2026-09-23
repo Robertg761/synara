@@ -37,6 +37,10 @@ struct QElapsedTimer {
     void restart() { valid = true; }
     bool isValid() const { return valid; }
 };
+struct SynaraSerialBurst {
+    quint32 after = 0;
+    quint32 last = 0;
+};
 struct ClientConnection {};
 struct SurfaceInterface {
     ClientConnection* owner = nullptr;
@@ -77,13 +81,15 @@ struct SynaraComputerUsePlugin {
     quint64 m_popupsDismissed = 0;
     const ClientConnection* m_lastHumanPressClient = nullptr;
     QElapsedTimer m_lastHumanPress;
-    std::array<quint32, 64> m_agentSerials = {};
-    size_t m_agentSerialNext = 0;
+    std::array<SynaraSerialBurst, 512> m_agentBursts = {};
+    size_t m_agentBurstNext = 0;
+    size_t m_agentBurstCount = 0;
 
     void handlePopupGrab(Window* window, SeatInterface* seat, quint32 serial);
     bool isAgentPopup(const Window* window) const;
     void dismissAgentPopups(const std::function<bool(const Window*)>& shouldDismiss);
-    void noteAgentSerial(quint32 serial);
+    void noteAgentBurst(quint32 after, quint32 last);
+    bool agentMintedSerial(quint32 serial) const;
     void handleHumanPointerPress(const QPointF& position);
 };
 
@@ -113,7 +119,8 @@ int main() {
             Window agentMenu{"agent-menu", 100, 100, 50, 80};
             Window humanMenu{"human-menu", 400, 100, 50, 80};
             plugin.m_agentPopups.append(&agentMenu);
-            plugin.noteAgentSerial(4242);
+            // A burst that minted 4240..4242, the press among them.
+            plugin.noteAgentBurst(4239, 4242);
             dismissed.clear();
             plugin.handlePopupGrab(&agentMenu, &plugin.agentSeat, 1);
             plugin.handlePopupGrab(&agentMenu, &seat0, 4242);
@@ -131,6 +138,9 @@ int main() {
             check(dismissed.size() == 3 && dismissed[2] == "misread", "a human grab on a popup taken for the agent's is closed, not left without its grab");
             plugin.handlePopupGrab(&humanMenu, &seat0, 0);
             check(dismissed.size() == 3, "serial 0 never matches the empty slots of the ring");
+            plugin.handlePopupGrab(&humanMenu, &seat0, 4239);
+            plugin.handlePopupGrab(&humanMenu, &seat0, 4243);
+            check(dismissed.size() == 3, "the serials either side of the burst are not the agent's");
             check(plugin.m_popupsDismissed == 3, "every dismissal is counted");
         }
         {

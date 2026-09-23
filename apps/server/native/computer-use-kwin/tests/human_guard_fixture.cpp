@@ -73,25 +73,6 @@ struct Workspace {
     const QList<Window*>& stackingOrder() const { return stacking; }
     static Workspace* self() { static Workspace w; return &w; }
 };
-using quint32 = uint32_t;
-struct Display {
-    quint32 current = 100;
-    quint32 serial() { return current; }
-};
-struct WaylandServer {
-    Display displayObject;
-    Display* display() { return &displayObject; }
-};
-WaylandServer server;
-WaylandServer* waylandServer() { return &server; }
-struct InputRedirection {
-    quint32 lastInteraction = 0;
-    int sets = 0;
-    quint32 lastInteractionSerial() const { return lastInteraction; }
-    void setLastInteractionSerial(quint32 serial) { lastInteraction = serial; ++sets; }
-};
-InputRedirection inputObject;
-InputRedirection* input() { return &inputObject; }
 SurfaceInterface* humanKeyboardFocus = nullptr;
 SurfaceInterface* humanKeyboardSurfaceInClientOf(const SurfaceInterface* surface) {
     return surface && humanKeyboardFocus && humanKeyboardFocus->client() == surface->client() ? humanKeyboardFocus : nullptr;
@@ -104,9 +85,6 @@ struct SynaraComputerUsePlugin {
     qint64 humanAge = -1;
     Window* humanWindow = nullptr;
     QPointer<Window> m_activatedWindow;
-    quint32 m_burstStartSerial = 0;
-    quint32 displaySerial() const;
-    void concealAgentSerials();
 
     qint64 humanInputAgeMilliseconds() const { return humanAge; }
     Window* humanFocusWindow() const { return humanWindow; }
@@ -195,36 +173,6 @@ int main() {
             Workspace::self()->stacking = {&agentWindow, &humanWindow, &menu};
             plugin.humanWindow = &menu;
             check(plugin.humanWindowCoveredByRaise(&agentWindow) == &humanWindow, "their open menu counts as the window that opened it");
-        }
-        {
-            // A burst that minted serials 101..104: KWin's last interaction
-            // moves past them, so a token asked for with any of them is refused
-            // (KWin grants only serials at or after the last interaction).
-            SynaraComputerUsePlugin plugin;
-            inputObject.lastInteraction = 90;
-            plugin.m_burstStartSerial = plugin.displaySerial();
-            server.displayObject.current = 104;
-            plugin.concealAgentSerials();
-            check(inputObject.lastInteraction == 105, "every serial the burst minted is now older than the last interaction");
-            // The human's own next event is newer again, and KWin records it.
-            server.displayObject.current = 106;
-            inputObject.lastInteraction = 106;
-            // A burst that sent nothing leaves KWin alone.
-            const int sets = inputObject.sets;
-            plugin.m_burstStartSerial = plugin.displaySerial();
-            plugin.concealAgentSerials();
-            check(inputObject.sets == sets && inputObject.lastInteraction == 106, "nothing minted, nothing moved");
-            // Never backwards.
-            plugin.m_burstStartSerial = 100;
-            inputObject.lastInteraction = 200;
-            plugin.concealAgentSerials();
-            check(inputObject.lastInteraction == 200, "the last interaction never moves back");
-            SynaraComputerUsePlugin owned;
-            owned.m_ownsCompositor = true;
-            inputObject.lastInteraction = 10;
-            owned.m_burstStartSerial = 1;
-            owned.concealAgentSerials();
-            check(inputObject.lastInteraction == 10, "a compositor the agent owns keeps KWin's own rule");
         }
     } catch (const std::exception& failure) {
         std::cout << "FAILED: " << failure.what() << "\n";

@@ -28,16 +28,19 @@
 #include "pointer_input.h"
 #include "scene/imageitem.h"
 #include "scene/workspacescene.h"
+#include "utils/serial.h"
 #include "wayland/clientconnection.h"
 #include "wayland/display.h"
 #include "wayland/keyboard.h"
 #include "wayland/pointer.h"
 #include "wayland/seat.h"
 #include "wayland/surface.h"
+#include "wayland/xdgactivation_v1.h"
 #include "wayland/xdgshell.h"
 #include "wayland_server.h"
 #include "window.h"
 #include "workspace.h"
+#include "xdgactivationv1.h"
 #include "xkb.h"
 
 #include <KGlobalAccel>
@@ -1404,6 +1407,44 @@ void SynaraAgentCursorItem::refresh()
     m_badgeItem->setSize(badge.deviceIndependentSize());
 }
 
+static bool serialInBurst(quint32 serial, const SynaraSerialBurst &burst)
+{
+    return quint32(serial - burst.after - 1) < quint32(burst.last - burst.after);
+}
+
+// KWin's answer to a token it will not grant (XdgActivationV1Integration).
+static const QString s_notGrantedToken = QStringLiteral("not-granted-666");
+// Set on KWin's XdgActivationV1Interface to the instance whose creator is
+// installed, so an older instance unloading after a newer one loaded leaves
+// the newer one's in place.
+static constexpr const char *s_activationOwnerProperty = "synaraActivationTokenCreator";
+
+// KWin's own test (xdgactivationv1.cpp): Plasma's shell and lock screen may
+// hand out tokens without a serial of their own.
+static bool isPrivilegedInWindowManagement(const ClientConnection *client)
+{
+    const QStringList requestedInterfaces = client->property("requestedInterfaces").toStringList();
+    return requestedInterfaces.contains(QLatin1StringView("org_kde_plasma_window_management"))
+        || requestedInterfaces.contains(QLatin1StringView("kde_lockscreen_overlay_v1"));
+}
+
+/**
+ * Whether a token is granted: never for a serial of the agent's, otherwise
+ * exactly KWin 6.7.4's rule - any request from a privileged client or from the
+ * active window (or while nothing is active), else a serial no older than the
+ * human's last interaction and not from the future.
+ */
+static bool activationTokenGranted(bool agentSerial, bool privileged, bool fromActiveWindow, UInt32Serial lastInteraction, UInt32Serial serial, UInt32Serial displaySerial)
+{
+    if (agentSerial) {
+        return false;
+    }
+    if (privileged || fromActiveWindow) {
+        return true;
+    }
+    return lastInteraction <= serial && displaySerial >= serial;
+}
+
 /**
  * One borrow of a client's seat0 objects by direct injection.
  *
@@ -1428,7 +1469,7 @@ public:
     {
         if (--m_plugin->m_directInjectionDepth == 0) {
             m_plugin->restoreHumanDelivery();
-            m_plugin->concealAgentSerials();
+            m_plugin->noteAgentBurst(m_plugin->m_burstStartSerial, m_plugin->displaySerial());
         }
     }
     Q_DISABLE_COPY_MOVE(DirectInjectionScope)
@@ -1500,6 +1541,7 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
         }
         watchHumanSeat();
         watchPopups();
+        installActivationTokenCreator();
     }
     ensureCursorItem();
     setCursorVisible(false);
@@ -1548,6 +1590,8 @@ SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
     // The compositor outlives the plugin, so the hide owed on its cursor must
     // not: a mid-session unload would otherwise leave the desktop cursorless.
     setNativeCursorHidden(false);
+    // Before this code can go away with the library.
+    restoreActivationTokenCreator();
     // Before anything else touches input: ~InputEventSpy uninstalls itself from
     // InputRedirection, and that has to happen while InputRedirection is still
     // the one this was installed into.
@@ -1784,6 +1828,7 @@ QString SynaraComputerUsePlugin::stateJson() const
                      return popup && !popup->isDeleted();
                  })));
     state.insert(QStringLiteral("agentPopupsDismissed"), double(m_popupsDismissed));
+    state.insert(QStringLiteral("activationTokensRefused"), double(m_activationTokensRefused));
     // The human-active guard, laid out so a server or a diagnosing human can see
     // each half of the rule separately: which window is theirs, and how long ago
     // they last touched anything. `msSinceHumanInput` is -1 when no real device
@@ -2662,11 +2707,6 @@ void SynaraComputerUsePlugin::sendButton(quint32 code, bool pressed)
     setTimestampNow();
     m_seat->notifyPointerButton(code, pressed ? PointerButtonState::Pressed : PointerButtonState::Released);
     m_seat->notifyPointerFrame();
-    if (pressed) {
-        // A toolkit may quote this serial in a popup grab on seat0 rather than
-        // on the seat it came from.
-        noteAgentSerial(m_seat->pointerButtonSerial(code));
-    }
 }
 
 void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
@@ -2705,9 +2745,6 @@ void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
     } else {
         setTimestampNow();
         const quint32 serial = waylandServer()->display()->nextSerial();
-        if (pressed) {
-            noteAgentSerial(serial);
-        }
         // Delivered on the agent's own seat, never through KWin's real keyboard
         // pipeline, so the user's focus and typing are untouched.
         m_seat->notifyKeyboardKey(keyCode,
@@ -4044,10 +4081,9 @@ void SynaraComputerUsePlugin::directPointerButton(quint32 code, bool pressed)
         return;
     }
     SurfaceInterface *surface = m_directPointerSurface;
+    // Minted inside the burst, so it is recorded as the agent's: a popup the
+    // press opens asks for its grab with it (handlePopupGrab).
     const quint32 serial = nextDirectSerial();
-    // A popup the press opens asks for its grab with this serial, which is how
-    // the grab is known to be the agent's (handlePopupGrab).
-    noteAgentSerial(serial);
     const quint32 time = directTimestampMs();
     for (wl_resource *resource : clientInputResources(surface, "wl_pointer")) {
         wl_pointer_send_button(resource,
@@ -4234,7 +4270,6 @@ void SynaraComputerUsePlugin::directKeyboardKey(quint32 keyCode, bool pressed)
         return;
     }
     const quint32 serial = nextDirectSerial();
-    noteAgentSerial(serial);
     const quint32 time = directTimestampMs();
     for (wl_resource *resource : clientInputResources(surface, "wl_keyboard")) {
         wl_keyboard_send_key(resource,
@@ -4300,33 +4335,126 @@ quint32 SynaraComputerUsePlugin::displaySerial() const
 }
 
 /**
- * Keeps the serials a burst minted from counting as the human's interaction.
- *
- * KWin grants an xdg_activation token for any serial at or after the last
- * interaction it saw on a real device (XdgActivationV1Integration::requestToken:
- * `lastInteractionSerial() <= serial`), and every event the agent sends - on
- * either path - carries a fresh display serial, which is always newer. So a
- * client could turn the agent's click into real activation: measured on KWin
- * 6.7.4, Chromium answers a click into one of its windows by requesting a
- * token with that click's serial while another of its windows has the
- * human's focus, KWin granted it, and seat0's keyboard - the human's - moved
- * to the agent's window. Moving KWin's last interaction past everything the
- * burst minted makes every such token "not granted", and costs the human
- * nothing: their own next press or key sets it back to theirs. A compositor
- * the agent owns has no human focus to steal, and keeps KWin's behaviour.
+ * Records the serials one burst minted as the agent's. Bursts that follow each
+ * other with nothing minted in between share a range, so a long run of typing
+ * costs one slot; the ring keeps the most recent 512 of them.
  */
-void SynaraComputerUsePlugin::concealAgentSerials()
+void SynaraComputerUsePlugin::noteAgentBurst(quint32 after, quint32 last)
 {
-    if (m_ownsCompositor || !input()) {
+    if (after == last) {
         return;
     }
-    const quint32 latest = displaySerial();
-    if (latest == m_burstStartSerial) {
+    if (m_agentBurstCount > 0) {
+        SynaraSerialBurst &previous = m_agentBursts[(m_agentBurstNext + m_agentBursts.size() - 1) % m_agentBursts.size()];
+        if (previous.last == after) {
+            previous.last = last;
+            return;
+        }
+    }
+    m_agentBursts[m_agentBurstNext] = {after, last};
+    m_agentBurstNext = (m_agentBurstNext + 1) % m_agentBursts.size();
+    m_agentBurstCount = std::min(m_agentBurstCount + 1, m_agentBursts.size());
+}
+
+bool SynaraComputerUsePlugin::agentMintedSerial(quint32 serial) const
+{
+    for (size_t i = 0; i < m_agentBurstCount; ++i) {
+        if (serialInBurst(serial, m_agentBursts[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * xdg_activation on the human's desktop: KWin's own token rule, except that a
+ * serial the agent minted never counts as the human's interaction.
+ *
+ * KWin grants a token for any serial at or after the last interaction it saw
+ * on a real device (XdgActivationV1Integration::requestToken:
+ * `lastInteractionSerial() <= serial`), or for any serial at all when the
+ * request comes from the active window, and activates the window that
+ * presents it while nothing newer happened (Workspace::mayActivate:
+ * `lastInteractionSerial() <= tokenSerial`). Every event the agent sends - on
+ * either path - carries a fresh display serial, newer than anything the
+ * human did, so a client could turn the agent's click into real activation:
+ * measured on KWin 6.7.4, Chromium answers a click into one of its windows by
+ * requesting a token with that click's serial while another of its windows
+ * has the human's focus, KWin granted it, and seat0's keyboard - the human's -
+ * moved to the agent's window.
+ *
+ * So the creator is replaced by one that refuses a token quoting the agent
+ * seat or a serial one of the agent's bursts minted, and otherwise makes
+ * KWin's decision and hands the token out through KWin's integration
+ * (requestPrivilegedToken, then the client's own serial for an unprivileged
+ * request, which is what KWin stores). Nothing the agent does moves KWin's
+ * last interaction, so a launch the human started - Kickoff, KRunner, a link
+ * - still activates when its window maps in the middle of the agent's work.
+ * A compositor the agent owns has no human focus to protect and keeps KWin's
+ * creator.
+ */
+void SynaraComputerUsePlugin::installActivationTokenCreator()
+{
+    if (m_ownsCompositor || !waylandServer() || !waylandServer()->xdgActivationIntegration()) {
         return;
     }
-    if (input()->lastInteractionSerial() <= latest) {
-        input()->setLastInteractionSerial(latest + 1);
+    // Owned by the WaylandServer; a plugin has no other way to reach it.
+    m_activation = waylandServer()->findChild<XdgActivationV1Interface *>();
+    if (!m_activation) {
+        return;
     }
+    m_activation->setActivationTokenCreator([this](ClientConnection *client, SurfaceInterface *surface, uint serial, SeatInterface *seat, const QString &appId) {
+        return createActivationToken(client, surface, serial, seat, appId);
+    });
+    // The newest instance owns the creator: during a versioned reload the old
+    // one unloads after the new one has installed its own.
+    m_activation->setProperty(s_activationOwnerProperty, QVariant::fromValue<QObject *>(this));
+}
+
+/**
+ * Puts KWin's own creator back before this plugin's code is unloaded. KWin
+ * keeps no handle to its original, so a fresh XdgActivationV1Integration - code
+ * that lives in KWin - installs it, and its activation handler is cut so the
+ * original integration stays the one that activates surfaces. A token object
+ * a client created while this creator was installed and has not committed yet
+ * keeps a copy of it; KWin copies the creator into every token, and nothing
+ * outside KWin can reach those.
+ */
+void SynaraComputerUsePlugin::restoreActivationTokenCreator()
+{
+    if (!m_activation || m_activation->property(s_activationOwnerProperty).value<QObject *>() != this) {
+        return;
+    }
+    m_activation->setProperty(s_activationOwnerProperty, QVariant());
+    if (!waylandServer() || !Workspace::self()) {
+        return;
+    }
+    auto *kwinCreator = new XdgActivationV1Integration(m_activation, waylandServer());
+    QObject::disconnect(m_activation, &XdgActivationV1Interface::activateRequested, kwinCreator, nullptr);
+}
+
+QString SynaraComputerUsePlugin::createActivationToken(ClientConnection *client, SurfaceInterface *surface, uint serial, SeatInterface *seat, const QString &appId)
+{
+    XdgActivationV1Integration *integration = waylandServer() ? waylandServer()->xdgActivationIntegration() : nullptr;
+    Workspace *workspace = Workspace::self();
+    if (!integration || !workspace || !input()) {
+        return s_notGrantedToken;
+    }
+    const bool privileged = client && isPrivilegedInWindowManagement(client);
+    const bool agentSerial = (m_seat && seat == m_seat) || agentMintedSerial(serial);
+    const Window *active = workspace->activeWindow();
+    const bool fromActiveWindow = !active || (surface && active->surface() == surface);
+    if (!activationTokenGranted(agentSerial, privileged, fromActiveWindow, input()->lastInteractionSerial(), serial, displaySerial())) {
+        ++m_activationTokensRefused;
+        return s_notGrantedToken;
+    }
+    const QString token = integration->requestPrivilegedToken(surface, serial, seat, appId);
+    if (!privileged) {
+        // requestPrivilegedToken stored KWin's last interaction as the token's
+        // serial; an unprivileged request keeps its own, as in KWin.
+        workspace->setActivationToken(token, serial, appId);
+    }
+    return token;
 }
 
 /**
@@ -4598,8 +4726,7 @@ void SynaraComputerUsePlugin::handlePopupCreated(XdgPopupInterface *popup)
 
 void SynaraComputerUsePlugin::handlePopupGrab(Window *window, SeatInterface *seat, quint32 serial)
 {
-    const bool agentGrab = (m_seat && seat == m_seat)
-        || (serial != 0 && std::ranges::find(m_agentSerials, serial) != m_agentSerials.end());
+    const bool agentGrab = (m_seat && seat == m_seat) || agentMintedSerial(serial);
     if (agentGrab == isAgentPopup(window)) {
         return;
     }
@@ -4638,12 +4765,6 @@ void SynaraComputerUsePlugin::noteAgentPress(const Window *window)
     }
     m_lastAgentPressClient = window->surface()->client();
     m_lastAgentPress.restart();
-}
-
-void SynaraComputerUsePlugin::noteAgentSerial(quint32 serial)
-{
-    m_agentSerials[m_agentSerialNext] = serial;
-    m_agentSerialNext = (m_agentSerialNext + 1) % m_agentSerials.size();
 }
 
 /**

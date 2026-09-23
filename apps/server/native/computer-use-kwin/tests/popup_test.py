@@ -15,9 +15,10 @@ class PopupTest(unittest.TestCase):
         window = re.search(r"^static constexpr qint64 s_popupAttributionMs = \d+;", source, re.MULTILINE)
         self.assertIsNotNone(owner)
         self.assertIsNotNone(window)
-        free = "\n".join([owner.group(0), window.group(0), definition(source, "popupOpenedByAgent", member=False)])
+        free = "\n".join([owner.group(0), window.group(0), definition(source, "popupOpenedByAgent", member=False),
+                          definition(source, "serialInBurst", member=False)])
         definitions = [definition(source, name) for name in
-                       ["handlePopupGrab", "isAgentPopup", "dismissAgentPopups", "noteAgentSerial", "handleHumanPointerPress"]]
+                       ["handlePopupGrab", "isAgentPopup", "dismissAgentPopups", "noteAgentBurst", "agentMintedSerial", "handleHumanPointerPress"]]
         run_fixture(FIXTURE, definitions, prefix="synara-kwin-popup-test-", replacements={"// PRODUCTION_FREE": free})
 
 

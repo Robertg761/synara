@@ -11,8 +11,7 @@ class HumanGuardTest(unittest.TestCase):
     def test_activation_and_raise_guards(self):
         source = PLUGIN_SOURCE.read_text()
         definitions = [definition(source, name) for name in
-                       ["humanKeyboardInSiblingOf", "updateWindowActivation", "clearWindowActivation", "humanWindowCoveredByRaise",
-                        "displaySerial", "concealAgentSerials"]]
+                       ["humanKeyboardInSiblingOf", "updateWindowActivation", "clearWindowActivation", "humanWindowCoveredByRaise"]]
         run_fixture(FIXTURE, definitions, prefix="synara-kwin-human-guard-test-")
 
 

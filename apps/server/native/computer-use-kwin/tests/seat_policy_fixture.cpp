@@ -306,12 +306,13 @@ struct SynaraComputerUsePlugin {
     QList<quint32> m_pressedKeys;
     double m_directAxisRemainderH = 0, m_directAxisRemainderV = 0;
     int m_directInjectionDepth = 0;
-    // Serial concealment has its own fixture (human_guard); here it only has
-    // to happen once per outermost burst.
+    // The agent's serial ranges have their own fixture (activation_token);
+    // here a burst is recorded once, at the outermost exit, with everything
+    // it minted, the hand-back included.
     quint32 m_burstStartSerial = 0;
-    int conceals = 0;
+    std::vector<std::pair<quint32, quint32>> bursts;
     quint32 displaySerial() const { return server.displayObject.serial; }
-    void concealAgentSerials() { ++conceals; }
+    void noteAgentBurst(quint32 after, quint32 last) { bursts.push_back({after, last}); }
     SeatInterface* m_seat = nullptr;
     xkb_state agentXkb;
     xkb_state* m_xkbState = &agentXkb;
@@ -442,6 +443,9 @@ void pointerSharedSibling() {
     check(d.X.pointerEntered == &d.A, "the object must name the human's surface again once the call is over");
     const Event& restored = d.X.pointerLog.back();
     check(restored.serial == 100, "the human's enter must be re-sent with the serial KWin recorded for it");
+    check(d.plugin.bursts.size() == 1 && d.plugin.bursts[0].second == server.displayObject.serial
+              && d.plugin.bursts[0].first < d.plugin.bursts[0].second,
+          "one burst is recorded, covering every serial the call minted");
     check(restored.x == 10 && restored.y == 10, "the human's enter must be re-sent at the human's pointer position");
     check(d.plugin.m_directPointerSurface.isNull(), "a handed-back object leaves no enter outstanding");
     check(d.Y.pointerLog.empty(), "another client must not hear a thing");

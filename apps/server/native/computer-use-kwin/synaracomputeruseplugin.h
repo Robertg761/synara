@@ -49,6 +49,16 @@ struct SynaraKeyStroke
 QDBusArgument &operator<<(QDBusArgument &argument, const SynaraKeyStroke &stroke);
 const QDBusArgument &operator>>(const QDBusArgument &argument, SynaraKeyStroke &stroke);
 
+/**
+ * The display serials one burst of agent input minted: every serial after
+ * `after`, up to and including `last`, compared with wrap-around.
+ */
+struct SynaraSerialBurst
+{
+    quint32 after = 0;
+    quint32 last = 0;
+};
+
 class CaptureTargetPool;
 class ClientConnection;
 class ImageItem;
@@ -60,6 +70,7 @@ class RenderLoop;
 class SeatInterface;
 class SurfaceInterface;
 class Window;
+class XdgActivationV1Interface;
 class XdgPopupInterface;
 
 /**
@@ -317,10 +328,16 @@ private:
     // The outermost DirectInjectionScope's exit: hands back every seat0 object
     // the human's seat is using in the agent's clients and nothing is held on.
     void restoreHumanDelivery();
-    // The outermost scope's other exit duty: no serial the burst minted may
-    // pass for the human's interaction (see the .cpp).
+    // The outermost scope's other exit duty: the serials the burst minted are
+    // recorded as the agent's, so no client can quote one as the human's
+    // interaction (see installActivationTokenCreator in the .cpp).
     quint32 displaySerial() const;
-    void concealAgentSerials();
+    void noteAgentBurst(quint32 after, quint32 last);
+    bool agentMintedSerial(quint32 serial) const;
+    // xdg_activation tokens: KWin's own rule, minus the agent's serials.
+    void installActivationTokenCreator();
+    void restoreActivationTokenCreator();
+    QString createActivationToken(ClientConnection *client, SurfaceInterface *surface, uint serial, SeatInterface *seat, const QString &appId);
     // The human's own next event of that class, from the spy, before KWin
     // delivers it: releases what the agent holds on a shared object and hands
     // it back.
@@ -335,7 +352,6 @@ private:
     void dismissAgentPopups(const std::function<bool(const Window *)> &shouldDismiss);
     // Who pressed into which client last, for attributing the next popup.
     void noteAgentPress(const Window *window);
-    void noteAgentSerial(quint32 serial);
     void handleHumanPointerPress(const QPointF &position);
     void handleHumanKeyPress();
     void watchHumanSeat();
@@ -488,10 +504,15 @@ private:
     QElapsedTimer m_lastAgentPress;
     const ClientConnection *m_lastHumanPressClient = nullptr;
     QElapsedTimer m_lastHumanPress;
-    // Serials of the agent's recent presses, on either path: a popup grab
-    // quoting one of them was opened by the agent.
-    std::array<quint32, 64> m_agentSerials = {};
-    size_t m_agentSerialNext = 0;
+    // Every serial the agent's recent bursts minted, on either path, as a ring
+    // of ranges: an activation token or a popup grab quoting one of them
+    // comes from the agent's input, never the human's.
+    std::array<SynaraSerialBurst, 512> m_agentBursts = {};
+    size_t m_agentBurstNext = 0;
+    size_t m_agentBurstCount = 0;
+    // xdg_activation, while this instance's token creator is installed on it.
+    QPointer<XdgActivationV1Interface> m_activation;
+    quint64 m_activationTokensRefused = 0;
     // waitForSettle's clock (nanoseconds), each window's last damaged commit
     // and any window's, the agent's last input and the latest input a wait
     // settled on (-1 for none).
