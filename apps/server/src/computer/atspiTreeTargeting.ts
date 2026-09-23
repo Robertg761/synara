@@ -35,13 +35,27 @@ export interface AtspiRawNode {
   readonly label: string | null;
   readonly value: string | null;
   readonly description: string | null;
-  /** AT-SPI reports these extents in the client coordinate space on Wayland. */
+  /**
+   * Extents relative to the window's own accessible (AT-SPI's WINDOW
+   * coordinates). "Screen" coordinates mean nothing on Wayland — GTK and
+   * Gecko report window-relative values under that name, Chromium its own
+   * guess at a global position — so the helper asks for the one convention
+   * every toolkit implements the same way, and fusing adds the window's
+   * position from the compositor.
+   */
   readonly frame: ComputerRect;
   readonly activationPoint?: ComputerPoint | null;
-  /** Child-index path from the window root, as the helper walked the tree. */
-  readonly path?: readonly number[];
+  /**
+   * This node's index among its parent's AT-SPI children (absent on the
+   * window root). The real index, not the emitted position: pruned or
+   * skipped siblings would otherwise shift every later address. Paths are
+   * rebuilt from these while fusing, which keeps them off the wire.
+   */
+  readonly i?: number;
   /** The accessible exposes the `EditableText` interface. */
   readonly editable?: boolean;
+  /** The walk stopped short under this node, so `children` is incomplete. */
+  readonly truncated?: boolean;
   readonly children: readonly AtspiRawNode[];
 }
 
@@ -60,6 +74,21 @@ export interface AtspiWindowTree {
   readonly windowId: ComputerWindowId;
   readonly clientSize: AtspiClientSize;
   readonly root: AtspiRawNode;
+  /**
+   * `partial` when the walk was cut short anywhere (node cap, deadline, a
+   * child that failed); `unavailable` when the window answered but exposes no
+   * usable tree, with `reason` saying why. Absent means complete.
+   */
+  readonly status?: "complete" | "partial" | "unavailable";
+  readonly truncated?: boolean;
+  readonly reason?: string;
+  /** Served from the helper's event-validated cache rather than walked. */
+  readonly cached?: boolean;
+}
+
+/** Whether a tree is anything less than a complete perception of its window. */
+export function atspiTreeIncomplete(tree: AtspiWindowTree): boolean {
+  return tree.status === "partial" || tree.status === "unavailable" || tree.truncated === true;
 }
 
 export interface DecorationOffset {
@@ -98,20 +127,53 @@ export function fuseAtspiWindowTree(input: {
   readonly tree: AtspiWindowTree;
   readonly screenSize?: ComputerScreenSize;
 }): ComputerUiNode {
-  // A fused node's frame is desktop-absolute, so the window's own origin is the
-  // one input this cannot do without: without it every AT-SPI coordinate would
-  // be frame-relative while claiming to be a desktop coordinate, which is the
-  // clamp bug the Tier 1 runs already produced once.
-  const bounds = requireWindowBounds(input.window, "accessibility-tree targeting");
-  const offset = decorationOffsetForClientSize(bounds, input.tree.clientSize);
-  return fuseNode(input.tree.root, {
+  const origin = atspiWindowOrigin(input.window, input.tree.clientSize);
+  const root = fuseNode(input.tree.root, [], {
     windowId: input.window.id,
-    origin: {
-      x: bounds.x + offset.x,
-      y: bounds.y + offset.y,
-    },
+    origin,
     ...(input.screenSize ? { screenSize: input.screenSize } : {}),
   });
+  if (input.tree.status !== "unavailable") return root;
+  // The window answered but exposes nothing to act on (Chromium without
+  // renderer accessibility): keep the frame so the window is still named, say
+  // why in its description, and mark it incomplete so nothing reads the
+  // empty children as "no controls".
+  return {
+    ...root,
+    description: root.description ?? clampNullableNodeText(input.tree.reason, NODE_TEXT_MAX_LENGTH),
+    truncated: true,
+    children: [],
+  };
+}
+
+/**
+ * Where a window's AT-SPI coordinates start, in the same space as its bounds.
+ *
+ * The one place window-relative accessibility extents become desktop
+ * coordinates: both fused trees and a node re-read at dispatch go through it,
+ * so they cannot disagree about the offset. A fused node's frame is
+ * desktop-absolute, so the window's own origin is the one input this cannot
+ * do without: without it every AT-SPI coordinate would be frame-relative while
+ * claiming to be a desktop coordinate, which is the clamp bug the Tier 1 runs
+ * already produced once.
+ */
+export function atspiWindowOrigin(
+  window: Pick<ComputerWindow, "id" | "bounds">,
+  clientSize: AtspiClientSize,
+): ComputerPoint {
+  const bounds = requireWindowBounds(window, "accessibility-tree targeting");
+  const offset = decorationOffsetForClientSize(bounds, clientSize);
+  return { x: bounds.x + offset.x, y: bounds.y + offset.y };
+}
+
+/** A window-relative AT-SPI rect placed in the window's coordinate space. */
+export function atspiFrameInWindow(
+  window: Pick<ComputerWindow, "id" | "bounds">,
+  clientSize: AtspiClientSize,
+  frame: ComputerRect,
+): ComputerRect {
+  const origin = atspiWindowOrigin(window, clientSize);
+  return { x: origin.x + frame.x, y: origin.y + frame.y, width: frame.width, height: frame.height };
 }
 
 /** Combine multiple fused window trees into the root consumed by uiTreeTargeting. */
@@ -119,12 +181,20 @@ export function fuseAtspiTrees(input: {
   readonly windows: readonly ComputerWindow[];
   readonly trees: readonly AtspiWindowTree[];
   readonly screenSize: ComputerScreenSize;
+  /**
+   * Something the read asked for is missing — a window with no tree, a reply
+   * cut at the helper's deadline. Marks the desktop root truncated, which is
+   * what tells a waiting caller that absence was not established.
+   */
+  readonly incomplete?: boolean;
 }): ComputerUiNode {
   const windowsById = new Map(input.windows.map((window) => [window.id, window]));
   const children: ComputerUiNode[] = [];
+  let incomplete = input.incomplete === true;
   for (const tree of input.trees) {
     const window = windowsById.get(tree.windowId);
     if (!window || !window.visible || window.minimized) continue;
+    if (atspiTreeIncomplete(tree)) incomplete = true;
     children.push(fuseAtspiWindowTree({ window, tree, screenSize: input.screenSize }));
   }
   return {
@@ -136,8 +206,21 @@ export function fuseAtspiTrees(input: {
     activationPoint: null,
     onScreen: true,
     windowId: null,
+    ...(incomplete ? { truncated: true } : {}),
     children,
   };
+}
+
+/**
+ * The address of a node the AT-SPI helper can find again — its window and
+ * child-index path — or `undefined` when the node did not come from a helper
+ * tree.
+ */
+export function atspiNodeAddress(node: ComputerUiNode): AtspiNodeAddress | undefined {
+  if (node.windowId === null || node.windowId === undefined) return undefined;
+  const path = node.nodePath;
+  if (!path || !path.every((index) => Number.isInteger(index) && index >= 0)) return undefined;
+  return { windowId: node.windowId, path: [...path] };
 }
 
 /**
@@ -146,16 +229,13 @@ export function fuseAtspiTrees(input: {
  * interface, no child-index path, or no owning window has to be typed into.
  */
 export function atspiTextWriteAddress(node: ComputerUiNode): AtspiNodeAddress | undefined {
-  if (node.editable !== true || node.windowId === null || node.windowId === undefined) {
-    return undefined;
-  }
-  const path = node.nodePath;
-  if (!path || !path.every((index) => Number.isInteger(index) && index >= 0)) return undefined;
-  return { windowId: node.windowId, path: [...path] };
+  if (node.editable !== true) return undefined;
+  return atspiNodeAddress(node);
 }
 
 function fuseNode(
   node: AtspiRawNode,
+  path: readonly number[] | undefined,
   input: {
     readonly windowId: ComputerWindowId;
     readonly origin: ComputerPoint;
@@ -183,9 +263,14 @@ function fuseNode(
     activationPoint,
     onScreen: isOnScreen(frame, input.screenSize),
     windowId: input.windowId,
-    ...(node.path ? { nodePath: [...node.path] } : {}),
+    ...(path ? { nodePath: [...path] } : {}),
     ...(node.editable === true ? { editable: true } : {}),
-    children: node.children.map((child) => fuseNode(child, input)),
+    ...(node.truncated === true ? { truncated: true } : {}),
+    // A child without its index cannot be addressed, and neither can
+    // anything under it.
+    children: node.children.map((child) =>
+      fuseNode(child, path && child.i !== undefined ? [...path, child.i] : undefined, input),
+    ),
   };
 }
 

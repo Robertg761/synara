@@ -27,9 +27,16 @@ import {
   type ComputerResolvedTarget,
 } from "./ComputerBackend.ts";
 import type { ClipboardCommandResult, ClipboardCommandSpec } from "./wlClipboard.ts";
-import type { AtspiTextWrite, AtspiTreeReader } from "./atspiClient.ts";
+import type {
+  AtspiNodeCheck,
+  AtspiNodeValidation,
+  AtspiReadOptions,
+  AtspiTextWrite,
+  AtspiTreeReader,
+} from "./atspiClient.ts";
 import { COMPUTER_SERVICE, KWIN_SERVICE, KWinDbusTimeoutError } from "./kwinDbus.ts";
-import type { AtspiWindowTree } from "./atspiTreeTargeting.ts";
+import type { AtspiRawNode, AtspiWindowTree } from "./atspiTreeTargeting.ts";
+import { resolveComputerSemanticTarget } from "./uiTreeTargeting.ts";
 import { GLIDE_FRAME_INTERVAL_MS } from "./pointerSequencing.ts";
 import { DesktopOperationQueue } from "./DesktopOperationQueue.ts";
 import { resolveInstallTarget } from "./kwinPluginProvisioning.ts";
@@ -3249,9 +3256,28 @@ function treeFor(windowId: string): AtspiWindowTree {
       value: null,
       description: null,
       frame: { x: 0, y: 0, width: 640, height: 480 },
-      path: [],
       children: [],
     },
+  };
+}
+
+/** A window tree holding one button at window-relative `frame`. */
+function buttonTree(
+  windowId: string,
+  frame: AtspiRawNode["frame"],
+  label = "Save",
+  extra: Partial<AtspiWindowTree> = {},
+): AtspiWindowTree {
+  const tree = treeFor(windowId);
+  return {
+    ...tree,
+    root: {
+      ...tree.root,
+      children: [
+        { role: "button", label, value: null, description: null, frame, i: 0, children: [] },
+      ],
+    },
+    ...extra,
   };
 }
 
@@ -4024,8 +4050,10 @@ describe("KWinComputerBackend perception", () => {
       },
     });
     await backend.availability();
+    await vi.waitFor(() =>
+      expect(backend.health().lastFailure?.message).toContain("python3 is not installed"),
+    );
     expect(probe).toHaveBeenCalledTimes(1);
-    expect(backend.health().lastFailure?.message).toContain("python3 is not installed");
     const failures = backend.health().consecutiveFailures;
 
     const state = await backend.getState({ includeTree: true });
@@ -4091,5 +4119,243 @@ describe("KWinComputerBackend perception", () => {
     });
     expect(writes).toEqual(["window-2", "window-2"]);
     await backend.dispose();
+  });
+
+  /**
+   * R3: availability is polled constantly. Probing on every call cleared the
+   * helper's unavailable latch and restart backoff each time, and made every
+   * caller — a lease handoff included — wait on the helper.
+   */
+  it("probes the helper once per connection without waiting for it", async () => {
+    const dbus = new FakeDbus();
+    const probe = vi.fn(() => new Promise<void>(() => undefined));
+    const backend = makeBackend(dbus, { atspi: { ...atspi, probe } });
+
+    for (let call = 0; call < 3; call += 1) {
+      await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    }
+    expect(probe).toHaveBeenCalledTimes(1);
+    await backend.dispose();
+  });
+
+  /**
+   * N6: AT-SPI extents are window-relative and window bounds are already in
+   * agent space. The tree used to be shifted by the workspace origin as well,
+   * which put every control a monitor away on a negative-origin layout.
+   */
+  it("fuses trees onto a negative-origin layout without shifting them twice", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.workspace = { x: -1920, y: -1080, width: 3840, height: 2160 };
+    dbus.plugin.windows = [
+      {
+        ...dbus.plugin.windows[0]!,
+        bounds: { x: -1800, y: -900, width: 648, height: 518 },
+      },
+    ];
+    const backend = makeBackend(dbus, {
+      glideDurationMs: 0,
+      atspi: {
+        ...atspi,
+        readTrees: async (windows) =>
+          windows.map((window) => buttonTree(window.id, { x: 10, y: 20, width: 100, height: 30 })),
+      },
+    });
+    await backend.availability();
+
+    const state = await backend.getState({ includeTree: true });
+    const save = state.root!.children[0]!.children[0]!;
+    // Agent-space window (120, 180) + decoration (4, 34) + widget (10, 20).
+    expect(save.frame).toEqual({ x: 134, y: 234, width: 100, height: 30 });
+    const { point } = resolveComputerSemanticTarget(state.root!, { label: "Save" });
+    await backend.click(point);
+    const move = dbus.plugin.calls.findLast((call) => call.method === "movePointer");
+    // Delivered in globals, on the left-hand monitor where the button is.
+    expect(move?.args).toEqual([184 - 1920, 249 - 1080]);
+    await backend.dispose();
+  });
+
+  /** R7: a walk cut short, or a window with nothing to read, is not "complete". */
+  it("reports truncated and unreadable windows as partial", async () => {
+    const dbus = new FakeDbus();
+    dbus.plugin.windows = [
+      dbus.plugin.windows[0]!,
+      {
+        ...dbus.plugin.windows[0]!,
+        id: "window-2",
+        title: "Claude",
+        bounds: { x: 0, y: 0, width: 800, height: 600 },
+      },
+    ];
+    let trees: (windows: readonly ComputerWindow[]) => AtspiWindowTree[] = (windows) =>
+      windows.map((window) => ({ ...treeFor(window.id), status: "partial", truncated: true }));
+    const backend = makeBackend(dbus, {
+      atspi: { ...atspi, readTrees: async (windows) => trees(windows) },
+    });
+    await backend.availability();
+
+    const truncated = await backend.getState({ includeTree: true });
+    expect(truncated.accessibility).toEqual({ status: "partial", unavailableWindowIds: [] });
+    expect(truncated.root?.truncated).toBe(true);
+
+    trees = (windows) =>
+      windows.map((window) =>
+        window.id === "window-2"
+          ? {
+              ...treeFor(window.id),
+              status: "unavailable",
+              reason: "This Chromium/Electron window exposes no accessibility tree",
+            }
+          : treeFor(window.id),
+      );
+    const chromium = await backend.getState({ includeTree: true });
+    expect(chromium.accessibility).toEqual({
+      status: "partial",
+      unavailableWindowIds: ["window-2"],
+    });
+    const frame = chromium.root?.children.find((node) => node.windowId === "window-2");
+    expect(frame).toMatchObject({ truncated: true, children: [] });
+    expect(frame?.description).toContain("Chromium");
+    await backend.dispose();
+  });
+
+  describe("recent trees and the dispatch check", () => {
+    function setup(
+      validate: (check: AtspiNodeCheck) => AtspiNodeValidation,
+      // One per read, the last repeating; null answers no tree at all.
+      frames: Array<AtspiRawNode["frame"] | null> = [{ x: 10, y: 20, width: 100, height: 30 }],
+    ) {
+      const dbus = new FakeDbus();
+      dbus.plugin.workspace = { x: 0, y: 0, width: 3840, height: 2160 };
+      const reads: Array<{ windows: string[]; options: AtspiReadOptions | undefined }> = [];
+      const checks: AtspiNodeCheck[] = [];
+      const backend = makeBackend(dbus, {
+        glideDurationMs: 0,
+        atspi: {
+          ...atspi,
+          readTrees: async (windows, options) => {
+            reads.push({ windows: windows.map((window) => window.id), options });
+            const frame = frames[Math.min(reads.length - 1, frames.length - 1)];
+            return frame ? windows.map((window) => buttonTree(window.id, frame)) : [];
+          },
+          setText: async () => true,
+          validateNode: async (check) => {
+            checks.push(check);
+            return validate(check);
+          },
+        },
+      });
+      const lastMove = () => dbus.plugin.calls.findLast((call) => call.method === "movePointer");
+      return { dbus, backend, reads, checks, lastMove };
+    }
+
+    async function resolveSave(backend: KWinComputerBackend) {
+      const state = await backend.getState({
+        includeTree: true,
+        reuseRecentTree: true,
+        windowId: "window-1",
+      });
+      return resolveComputerSemanticTarget(state.root!, { label: "Save" });
+    }
+
+    it("reuses a recent tree for internal resolution until input is sent", async () => {
+      const { backend, reads } = setup(() => ({
+        ok: true,
+        frame: { x: 10, y: 20, width: 100, height: 30 },
+        clientSize: { width: 640, height: 480 },
+        showing: true,
+      }));
+      await backend.availability();
+
+      await resolveSave(backend);
+      await resolveSave(backend);
+      expect(reads).toHaveLength(1);
+
+      // An agent-facing read is never served from this cache.
+      await backend.getState({ includeTree: true, windowId: "window-1" });
+      expect(reads).toHaveLength(2);
+
+      await backend.pressKey("Escape");
+      await resolveSave(backend);
+      expect(reads).toHaveLength(3);
+      // Straight after input the helper may not answer from its own cache.
+      expect(reads[2]!.options?.maxAgeMs).toBeLessThan(1_000);
+      await backend.dispose();
+    });
+
+    it("clicks where the control is now, not where the tree saw it", async () => {
+      const { backend, checks, lastMove } = setup(() => ({
+        ok: true,
+        frame: { x: 10, y: 60, width: 100, height: 30 },
+        clientSize: { width: 640, height: 480 },
+        showing: true,
+      }));
+      await backend.availability();
+
+      const { point } = await resolveSave(backend);
+      // Window (956, 1519) + decoration (4, 34) + widget (10, 20) → centre.
+      expect(point).toEqual({ x: 1_020, y: 1_588 });
+      await backend.click(point);
+
+      expect(checks).toEqual([
+        expect.objectContaining({ path: [0], role: "button", label: "Save" }),
+      ]);
+      expect(lastMove()?.args).toEqual([1_020, 1_628]);
+      // One check per resolution: a second click at the same point is the
+      // caller's own coordinate.
+      await backend.click(point);
+      expect(checks).toHaveLength(1);
+      await backend.dispose();
+    });
+
+    it("finds a control that moved in the tree again, or refuses", async () => {
+      const moved = setup(
+        () => ({ ok: false, reason: "node-changed" }),
+        [
+          { x: 10, y: 20, width: 100, height: 30 },
+          { x: 300, y: 20, width: 100, height: 30 },
+        ],
+      );
+      await moved.backend.availability();
+      const { point } = await resolveSave(moved.backend);
+      await moved.backend.click(point);
+      expect(moved.reads).toHaveLength(2);
+      expect(moved.lastMove()?.args).toEqual([1_310, 1_588]);
+      await moved.backend.dispose();
+
+      const gone = setup(
+        () => ({ ok: false, reason: "node-not-found" }),
+        [{ x: 10, y: 20, width: 100, height: 30 }, null],
+      );
+      await gone.backend.availability();
+      const resolved = await resolveSave(gone.backend);
+      const before = gone.dbus.plugin.calls.length;
+      await expect(gone.backend.click(resolved.point)).rejects.toThrow(
+        /changed after it was found, so nothing was sent/,
+      );
+      expect(
+        gone.dbus.plugin.calls.slice(before).filter((call) => call.method === "button"),
+      ).toEqual([]);
+      await gone.backend.dispose();
+    });
+
+    it("checks the node a set-value names before clicking it", async () => {
+      const { backend, checks, lastMove } = setup(() => ({
+        ok: true,
+        frame: { x: 20, y: 40, width: 200, height: 24 },
+        clientSize: { width: 640, height: 480 },
+        showing: true,
+      }));
+      await backend.availability();
+      const target = resolvedTarget({ editable: true });
+      const result = await backend.setValue(
+        { ...target, target: { ...target.target, windowId: "window-1" } },
+        "x",
+      );
+      expect(checks).toEqual([expect.objectContaining({ path: [1, 2], role: "entry" })]);
+      // Window (956, 1519) + decoration (4, 34) + (20 + 100, 40 + 12).
+      expect(result).toMatchObject({ point: { x: 1_080, y: 1_605 } });
+      expect(lastMove()?.args).toEqual([1_080, 1_605]);
+      await backend.dispose();
+    });
   });
 });

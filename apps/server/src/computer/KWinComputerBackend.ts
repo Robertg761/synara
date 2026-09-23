@@ -42,12 +42,8 @@ import {
 } from "./ComputerBackend.ts";
 import { resolveAppLaunchOnHost, type AppLaunchResolver } from "./appLaunchResolution.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
-import {
-  atspiTextWriteAddress,
-  fuseAtspiTrees,
-  type AtspiRawNode,
-  type AtspiWindowTree,
-} from "./atspiTreeTargeting.ts";
+import { AtspiPerception } from "./atspiPerception.ts";
+import { atspiTextWriteAddress } from "./atspiTreeTargeting.ts";
 import {
   alignRect,
   asRecord,
@@ -236,17 +232,6 @@ const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
 const KWIN_VERSION_PROBE_TIMEOUT_MS = 2_000;
 const MAX_PLUGIN_ID = /^SynaraComputerUsePlugin(?:V(\d+))?$/;
 const INSTALLED_PLUGIN_FILE = /^(SynaraComputerUsePluginV(\d+))\.so$/;
-/** Shifts every coordinate in an AT-SPI tree, preserving shape and identity. */
-function shiftTree(tree: AtspiWindowTree, dx: number, dy: number): AtspiWindowTree {
-  const shiftNode = (node: AtspiRawNode): AtspiRawNode => ({
-    ...node,
-    frame: shiftRect(node.frame, dx, dy),
-    ...(node.activationPoint ? { activationPoint: shiftPoint(node.activationPoint, dx, dy) } : {}),
-    children: node.children.map(shiftNode),
-  });
-  return { ...tree, root: shiftNode(tree.root) };
-}
-
 interface KWinHealth {
   readonly ok: boolean;
   readonly running: boolean;
@@ -464,6 +449,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly idleTimeoutMs: number;
   private readonly humanActiveGuardMs: number;
   private readonly atspi: AtspiTreeReader;
+  private readonly perception: AtspiPerception;
   private readonly dbusFactory: (context: KWinDbusConnectContext) => Promise<KWinComputerDbus>;
   private readonly installedPluginIds: () => Promise<readonly string[]>;
   private readonly busNamesHaveOwners: (names: readonly string[]) => Promise<readonly boolean[]>;
@@ -603,6 +589,15 @@ export class KWinComputerBackend implements ComputerBackend {
         parseHumanActiveGuardEnv(process.env.SYNARA_COMPUTER_HUMAN_ACTIVE_MS),
     );
     this.atspi = options.atspi ?? new AtspiHelperClient();
+    this.perception = new AtspiPerception({
+      reader: this.atspi,
+      now: () => this.now(),
+      reportUnavailable: (reason) => this.reportAtspiUnavailable(reason),
+      reportFailure: (error) => {
+        this.recordHealthFailure(error);
+        this.publishHealth();
+      },
+    });
     this.dbus = options.dbus;
     this.dbusFactory =
       options.dbusFactory ??
@@ -826,7 +821,7 @@ export class KWinComputerBackend implements ComputerBackend {
       if (health.releaseShortcut === null) {
         return { kind: "backend-unavailable", message: this.noReleaseShortcutMessage() };
       }
-      await this.probeAtspiOnce();
+      this.perception.probeForConnection(plugin);
       return { kind: "available", backend: COMPUTER_KWIN_BACKEND };
     } catch (error) {
       const failure = this.reportPluginFailure(error);
@@ -953,6 +948,7 @@ export class KWinComputerBackend implements ComputerBackend {
     readonly includeScreenshot?: boolean;
     readonly includeTree?: boolean;
     readonly windowId?: string;
+    readonly reuseRecentTree?: boolean;
   }): Promise<ComputerState> {
     await this.ensurePlugin({ start: false });
     // One enumeration feeds the windows, the size, the tree fusion, and the
@@ -974,43 +970,14 @@ export class KWinComputerBackend implements ComputerBackend {
         aimedWindowId: this.lastAimedWindowId,
         frontmostWindowId: frontmostWindowId(windows),
       };
-      const unavailable = this.atspi.unavailableReason?.();
-      if (unavailable !== undefined) {
-        this.reportAtspiUnavailable(unavailable);
-        accessibility = {
-          status: "unavailable",
-          unavailableWindowIds: requested.map((window) => window.id),
-        };
-      } else {
-        try {
-          // AT-SPI reports extents in global screen coordinates, so the trees
-          // shift into agent space with everything else before fusing.
-          const trees = (await this.atspi.readTrees(requested)).map((tree) =>
-            shiftTree(tree, -origin.x, -origin.y),
-          );
-          root = fuseAtspiTrees({ windows, trees, screenSize });
-          const answered = new Set(trees.map((tree) => tree.windowId));
-          const missing = requested
-            .filter((window) => !answered.has(window.id))
-            .map((window) => window.id);
-          accessibility = {
-            status: missing.length === 0 ? "complete" : "partial",
-            unavailableWindowIds: missing,
-          };
-        } catch (error) {
-          // AT-SPI is an optional perception source. KWin window state and
-          // coordinate actions stay usable when an application has no tree or
-          // the helper is temporarily restarting — but the caller is told,
-          // because a missing control and an absent one look the same in a
-          // tree that silently came back empty.
-          this.recordHealthFailure(error);
-          this.publishHealth();
-          accessibility = {
-            status: "unavailable",
-            unavailableWindowIds: requested.map((window) => window.id),
-          };
-        }
-      }
+      // Window bounds are in agent space and AT-SPI extents are relative to
+      // their window, so fusing needs no workspace-origin shift of its own.
+      ({ root, accessibility } = await this.perception.read({
+        windows,
+        requested,
+        screenSize,
+        reuseRecentTree: options.reuseRecentTree === true,
+      }));
     }
 
     const screenshot =
@@ -1032,20 +999,6 @@ export class KWinComputerBackend implements ComputerBackend {
       ...(screenshot ? { screenshot } : {}),
       capturedAt: new Date(this.now()).toISOString(),
     };
-  }
-
-  /**
-   * Runs the AT-SPI helper's self-check once per connection, so a machine
-   * with no `python3` or no PyGObject reports that at session start rather
-   * than on the first label-targeted action, and pays for it once instead of
-   * on every tree read.
-   */
-  private async probeAtspiOnce(): Promise<void> {
-    const probe = this.atspi.probe;
-    if (!probe) return;
-    await probe.call(this.atspi).catch(() => undefined);
-    const unavailable = this.atspi.unavailableReason?.();
-    if (unavailable !== undefined) this.reportAtspiUnavailable(unavailable);
   }
 
   private reportAtspiUnavailable(reason: string): void {
@@ -1237,9 +1190,13 @@ export class KWinComputerBackend implements ComputerBackend {
     return moved;
   }
 
-  async moveCursor(point: ComputerPoint): Promise<ComputerBackendActionResult> {
+  async moveCursor(target: ComputerPoint): Promise<ComputerBackendActionResult> {
     const plugin = await this.ensurePlugin();
     assertDesktopOperationActive();
+    // A point that is the activation point of a control internal resolution
+    // just found is checked against the live control first; see
+    // `AtspiPerception.pointForDispatch`.
+    const point = await this.perception.pointForDispatch(target, () => this.listWindows());
     const from = this.currentPoint ?? (await this.readPluginState(plugin)).position ?? point;
     await this.glidePointer(plugin, from, point, this.glideDurationMs);
     this.currentPoint = point;
@@ -1283,6 +1240,7 @@ export class KWinComputerBackend implements ComputerBackend {
     const plugin = await this.ensurePlugin();
     assertDesktopOperationActive();
     const moved = point ? await this.moveCursor(point) : {};
+    this.perception.noteInput();
     await this.pluginSuccess("axis", () => {
       assertDesktopOperationActive();
       return plugin.axis(deltaX, deltaY);
@@ -1415,7 +1373,10 @@ export class KWinComputerBackend implements ComputerBackend {
     }
     this.assertWriteScope(target, "computer_set_value");
     await this.guardHumanActiveWindow(await this.ensurePlugin(), target.node.windowId);
-    const clicked = await this.click(target.point);
+    const point = await this.perception.pointForNode(target.node, target.point, () =>
+      this.listWindows(),
+    );
+    const clicked = await this.click(point);
     if (!(await this.writeValueThroughAtspi(target, value))) {
       throw new ComputerBackendError(
         "Could not confirm that AT-SPI replaced the control's value. Read the control again before retrying; it may have changed.",
@@ -1423,7 +1384,7 @@ export class KWinComputerBackend implements ComputerBackend {
     }
     return {
       ...clicked,
-      point: target.point,
+      point,
       ...(target.node.windowId ? { windowId: target.node.windowId } : {}),
       value,
     };
@@ -1441,6 +1402,7 @@ export class KWinComputerBackend implements ComputerBackend {
         (candidate) => candidate.id === address.windowId,
       );
       if (!window) return false;
+      this.perception.noteInput();
       return await this.atspi.setText({
         window,
         path: address.path,
@@ -1460,10 +1422,13 @@ export class KWinComputerBackend implements ComputerBackend {
     if (action === "activate" || action === "click") {
       this.assertWriteScope(target, "computer_perform_action");
       await this.guardHumanActiveWindow(await this.ensurePlugin(), target.node.windowId);
-      const clicked = await this.click(target.point);
+      const point = await this.perception.pointForNode(target.node, target.point, () =>
+        this.listWindows(),
+      );
+      const clicked = await this.click(point);
       return {
         ...clicked,
-        point: target.point,
+        point,
         ...(target.node.windowId ? { windowId: target.node.windowId } : {}),
         value: action,
       };
@@ -2058,6 +2023,9 @@ export class KWinComputerBackend implements ComputerBackend {
    * already knows how to unload stale ids first.
    */
   async provision(): Promise<string> {
+    // An explicit set-up re-asks the AT-SPI helper too: a machine that just
+    // gained python-gi or an accessibility bus should not wait for a reconnect.
+    this.perception.resetProbes();
     this.explicitProvision ??= this.runExplicitProvision().finally(() => {
       this.explicitProvision = undefined;
     });
@@ -2410,6 +2378,9 @@ export class KWinComputerBackend implements ComputerBackend {
    * and leave translated into the global space the plugin drives.
    */
   private inputSink(plugin: KWinComputerPluginApi): ComputerInputSink {
+    // Every pointer and key stroke goes through a sink: a tree read before
+    // it may no longer describe the desktop.
+    this.perception.noteInput();
     return {
       movePointer: (x, y, operation) => {
         const origin = this.currentOrigin();

@@ -5,11 +5,14 @@ import { ComputerUiNode as ComputerUiNodeSchema } from "@synara/contracts";
 import type { ComputerUiNode } from "@synara/contracts";
 
 import {
+  atspiFrameInWindow,
+  atspiNodeAddress,
   atspiTextWriteAddress,
   clampNodeText,
   decorationOffsetForClientSize,
   fuseAtspiWindowTree,
   fuseAtspiTrees,
+  type AtspiRawNode,
 } from "./atspiTreeTargeting.ts";
 import { resolveComputerSemanticTarget } from "./uiTreeTargeting.ts";
 
@@ -68,43 +71,160 @@ describe("AT-SPI coordinate fusion", () => {
     expect(resolved.point).toEqual({ x: 1_020, y: 1_588 });
   });
 
-  it("carries the helper's child-index path and editable flag onto fused nodes", () => {
+  it("rebuilds child-index paths and carries the editable flag onto fused nodes", () => {
     const fused = fuseAtspiWindowTree({
       window: { id: "editor" as const, bounds: { x: 0, y: 0, width: 640, height: 480 } },
       tree: {
         windowId: "editor",
         clientSize: { width: 640, height: 480 },
-        root: {
-          role: "window",
-          label: "Editor",
-          value: null,
-          description: null,
-          frame: { x: 0, y: 0, width: 640, height: 480 },
-          path: [],
-          editable: false,
-          children: [
-            {
-              role: "entry",
-              label: "Name",
-              value: "",
-              description: null,
-              frame: { x: 10, y: 10, width: 200, height: 24 },
-              // The real AT-SPI index, which is not the emitted child position.
-              path: [3, 1],
-              editable: true,
-              children: [],
-            },
-          ],
-        },
+        root: rawNode("window", "Editor", { x: 0, y: 0, width: 640, height: 480 }, [
+          {
+            // The real AT-SPI index, which is not the emitted child position.
+            ...rawNode("panel", null, { x: 0, y: 0, width: 640, height: 480 }, [
+              {
+                ...rawNode("entry", "Name", { x: 10, y: 10, width: 200, height: 24 }),
+                i: 1,
+                editable: true,
+              },
+            ]),
+            i: 3,
+          },
+        ]),
       },
     });
 
     expect(fused.nodePath).toEqual([]);
     expect(fused.editable).toBeUndefined();
-    expect(atspiTextWriteAddress(fused.children[0]!)).toEqual({
+    expect(atspiTextWriteAddress(fused.children[0]!.children[0]!)).toEqual({
       windowId: "editor",
       path: [3, 1],
     });
+  });
+
+  it("leaves a node without its child index, and everything under it, unaddressed", () => {
+    const fused = fuseAtspiWindowTree({
+      window: { id: "editor" as const, bounds: { x: 0, y: 0, width: 640, height: 480 } },
+      tree: {
+        windowId: "editor",
+        clientSize: { width: 640, height: 480 },
+        root: rawNode("window", "Editor", { x: 0, y: 0, width: 640, height: 480 }, [
+          rawNode("panel", null, { x: 0, y: 0, width: 10, height: 10 }, [
+            { ...rawNode("entry", "Name", { x: 0, y: 0, width: 10, height: 10 }), i: 0 },
+          ]),
+        ]),
+      },
+    });
+
+    expect(atspiNodeAddress(fused.children[0]!)).toBeUndefined();
+    expect(atspiNodeAddress(fused.children[0]!.children[0]!)).toBeUndefined();
+  });
+
+  /**
+   * N6: the helper reports extents relative to the window (AT-SPI WINDOW
+   * coordinates), and the window's bounds are already in agent space. With a
+   * monitor left of and above the primary, the workspace origin is negative;
+   * the tree must land exactly where the window is, not a screen width off.
+   */
+  it("places a window's controls correctly when the workspace origin is negative", () => {
+    // The window sits at global (-1500, -300) on a workspace whose origin is
+    // (-1920, -1080); in agent space that is (420, 780).
+    const window = {
+      id: "left-monitor" as const,
+      title: "Editor",
+      bounds: { x: 420, y: 780, width: 648, height: 518 },
+      focused: true,
+      minimized: false,
+      visible: true,
+    };
+    const root = fuseAtspiTrees({
+      windows: [window],
+      trees: [
+        {
+          windowId: "left-monitor",
+          clientSize: { width: 640, height: 480 },
+          root: rawNode("frame", "Editor", { x: 0, y: 0, width: 640, height: 480 }, [
+            { ...rawNode("button", "Save", { x: 10, y: 20, width: 100, height: 30 }), i: 0 },
+          ]),
+        },
+      ],
+      screenSize: { width: 3_840, height: 2_160 },
+    });
+
+    const save = root.children[0]!.children[0]!;
+    expect(save.frame).toEqual({ x: 434, y: 834, width: 100, height: 30 });
+    expect(save.onScreen).toBe(true);
+    expect(resolveComputerSemanticTarget(root, { label: "Save" }).point).toEqual({
+      x: 484,
+      y: 849,
+    });
+    // A node re-read at dispatch is placed by the same rule.
+    expect(
+      atspiFrameInWindow(
+        window,
+        { width: 640, height: 480 },
+        { x: 10, y: 20, width: 100, height: 30 },
+      ),
+    ).toEqual(save.frame);
+  });
+
+  it("carries truncation onto the fused nodes and the desktop root", () => {
+    const window = {
+      id: "browser" as const,
+      title: "Browser",
+      bounds: { x: 0, y: 0, width: 640, height: 480 },
+      focused: true,
+      minimized: false,
+      visible: true,
+    };
+    const tree = {
+      windowId: "browser",
+      clientSize: { width: 640, height: 480 },
+      root: {
+        ...rawNode("frame", "Browser", { x: 0, y: 0, width: 640, height: 480 }),
+        truncated: true,
+      },
+      status: "partial" as const,
+      truncated: true,
+    };
+    const screenSize = { width: 1_920, height: 1_080 };
+
+    const root = fuseAtspiTrees({ windows: [window], trees: [tree], screenSize });
+
+    expect(root.truncated).toBe(true);
+    expect(root.children[0]?.truncated).toBe(true);
+    const complete = fuseAtspiTrees({
+      windows: [window],
+      trees: [
+        {
+          ...tree,
+          status: "complete",
+          truncated: false,
+          root: rawNode("frame", "B", tree.root.frame),
+        },
+      ],
+      screenSize,
+    });
+    expect(complete.truncated).toBeUndefined();
+    expect(
+      fuseAtspiTrees({ windows: [window], trees: [], screenSize, incomplete: true }).truncated,
+    ).toBe(true);
+  });
+
+  it("keeps an unavailable window's frame, with the reason and no children", () => {
+    const fused = fuseAtspiWindowTree({
+      window: { id: "chromium" as const, bounds: { x: 0, y: 0, width: 800, height: 600 } },
+      tree: {
+        windowId: "chromium",
+        clientSize: { width: 800, height: 600 },
+        root: rawNode("frame", "Claude", { x: 0, y: 0, width: 800, height: 600 }),
+        status: "unavailable",
+        reason: "renderer accessibility is off",
+      },
+    });
+
+    expect(fused.truncated).toBe(true);
+    expect(fused.children).toEqual([]);
+    expect(fused.description).toBe("renderer accessibility is off");
   });
 
   it("refuses a write address for anything it cannot re-resolve", () => {
@@ -221,3 +341,12 @@ describe("AT-SPI coordinate fusion", () => {
     expect(root.children).toHaveLength(0);
   });
 });
+
+function rawNode(
+  role: string,
+  label: string | null,
+  frame: AtspiRawNode["frame"],
+  children: readonly AtspiRawNode[] = [],
+): AtspiRawNode {
+  return { role, label, value: null, description: null, frame, children };
+}
