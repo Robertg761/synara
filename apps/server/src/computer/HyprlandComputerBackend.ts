@@ -37,6 +37,7 @@ import {
 } from "./hyprlandPluginHost.ts";
 import {
   buildHyprlandPluginFromSource,
+  detectHyprlandHeadersVersion,
   HYPRLAND_INSTALL_SCRIPT_PATH,
   hyprlandBuildToolingPresent,
   hyprlandInstallIsCurrent,
@@ -84,6 +85,8 @@ export interface HyprlandComputerBackendOptions {
   /** Whether a name is owned on the ambient session bus; the passive probe. */
   readonly busNameHasOwner?: (name: string) => Promise<boolean>;
   readonly provisionPlugin?: KWinComputerBackendOptions["provisionPlugin"];
+  /** The Hyprland the installed headers are for; replaced in tests. */
+  readonly headersVersion?: () => Promise<string | undefined>;
   readonly dbusFactory?: KWinComputerBackendOptions["dbusFactory"];
   readonly atspi?: KWinComputerBackendOptions["atspi"];
 }
@@ -154,6 +157,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
       }
       return versionMemo.promise;
     };
+    const headersVersion = options.headersVersion ?? detectHyprlandHeadersVersion;
     const innerDbusFactory =
       options.dbusFactory ??
       (async () =>
@@ -174,7 +178,9 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
       stateRoot,
       installStampPath: stampPath,
       runningKwinVersion: hyprlandVersion,
-      installedKwinVersion: hyprlandVersion,
+      // What a build compiles against: the headers, which run ahead of the
+      // compositor between a package upgrade and its restart.
+      installedKwinVersion: headersVersion,
       // hyprctl loads by absolute path into the live compositor; there is no
       // session-start search path a relogin would be needed for.
       compositorSeesPluginRoot: () => true,
@@ -198,6 +204,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
             pluginDirectory,
             listInstalled: () => readdir(pluginDirectory).catch(() => [] as string[]),
             hyprlandVersion,
+            headersVersion,
             // Provisioning runs again whenever connecting finds nothing
             // loadable — a failed first attempt, a Hyprland upgrade, a Synara
             // update — so "current" is read off the machine. Without it every

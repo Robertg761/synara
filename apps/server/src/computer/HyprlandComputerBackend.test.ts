@@ -59,6 +59,7 @@ async function makeBackend(
     },
     busNameHasOwner: async () => false,
     buildToolingPresent: () => false,
+    headersVersion: async () => undefined,
     provisionPlugin: async () => {
       throw new Error("provisioning must not run in this test");
     },

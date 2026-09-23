@@ -28,6 +28,7 @@
  * image, so every install must be a new file. Retiring old ones is the subtle
  * part — see `retireSupersededHyprlandPlugins`.
  */
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -234,6 +235,12 @@ export interface HyprlandProvisionDependencies {
   readonly listInstalled: () => Promise<readonly string[]>;
   /** The Hyprland actually running, or undefined if it cannot be read. */
   readonly hyprlandVersion: () => Promise<string | undefined>;
+  /**
+   * The Hyprland the installed development headers describe (`pkg-config
+   * --modversion hyprland`), which is what a build compiles against. Absent
+   * or unreadable, the build goes ahead as before.
+   */
+  readonly headersVersion?: () => Promise<string | undefined>;
   /** Whether an install for this exact Hyprland and these sources is in place. */
   readonly isCurrent: (hyprlandVersion: string | undefined) => Promise<boolean>;
   /** Builds against the local headers and resolves the built `.so`. */
@@ -285,6 +292,22 @@ async function provisionHyprlandPluginLocked(
       pluginDirectory,
       requiresRelogin: false,
       summary: "The computer-use plugin is installed and current.",
+    };
+  }
+
+  // R13: a Hyprland upgraded on disk but not restarted refuses a plugin
+  // built against the new headers, and building one costs minutes for a
+  // load that cannot succeed. Only the restart helps, so that is the answer.
+  const headers = await deps.headersVersion?.().catch(() => undefined);
+  if (headers !== undefined && version !== undefined && headers !== version) {
+    return {
+      action: "already-current" satisfies ProvisionAction,
+      pluginDirectory,
+      requiresRelogin: true,
+      summary:
+        `Hyprland ${headers} is installed, but Hyprland ${version} is still running, and a ` +
+        "plugin built now would only load into the new one. Restart Hyprland (log out and back " +
+        "in), then use the computer again.",
     };
   }
 
@@ -382,6 +405,25 @@ export async function retireSupersededHyprlandPlugins(options: {
     removed.push(path);
   }
   return { removed, stuck };
+}
+
+/**
+ * The Hyprland version the installed development headers describe, read the
+ * way the plugin's Makefile resolves them. A spawn of `pkg-config`, which
+ * reads files and touches no compositor; undefined when it cannot answer.
+ */
+export function detectHyprlandHeadersVersion(): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    execFile(
+      "pkg-config",
+      ["--modversion", "hyprland"],
+      { timeout: 5_000, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+      (error, stdout) => {
+        const version = stdout.trim();
+        resolve(error || !/^\d+(?:\.\d+)+$/.test(version) ? undefined : version);
+      },
+    );
+  });
 }
 
 /**

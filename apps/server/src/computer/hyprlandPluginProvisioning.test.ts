@@ -302,6 +302,28 @@ describe("provisioning", () => {
     );
   });
 
+  it("asks for a Hyprland restart instead of building for headers the running one refuses", async () => {
+    let built = 0;
+    const deps = await baseDeps({
+      headersVersion: async () => "0.57.0",
+      buildFromSource: async () => {
+        built += 1;
+        return "unused";
+      },
+    });
+
+    const result = await provisionHyprlandPlugin(deps);
+
+    expect(result).toMatchObject({ requiresRelogin: true });
+    expect(result.summary).toContain("Hyprland 0.56.2 is still running");
+    expect(built).toBe(0);
+    // Matching headers build as before.
+    const matching = await provisionHyprlandPlugin(
+      await baseDeps({ headersVersion: async () => "0.56.2" }),
+    );
+    expect(matching.action).toBe("installed-from-source");
+  });
+
   it("does nothing when the stamp says the install is already current", async () => {
     let built = 0;
     const deps = await baseDeps({
