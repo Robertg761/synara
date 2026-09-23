@@ -516,10 +516,11 @@ export function nestedSessionEnv(session: {
   readonly xAuthority?: string | undefined;
 }): Record<string, string> {
   return {
-    // KWin generates the nested Xwayland's cookie itself; an X11 client holding
-    // the human's XAUTHORITY instead is refused by the only X server it is
-    // allowed to reach. A plugin too old to report the file leaves whatever the
-    // caller's environment had, as before.
+    // A KWin that generates a cookie for its Xwayland refuses an X11 client
+    // holding the human's XAUTHORITY instead, so the plugin's report of that
+    // cookie wins. With no report — KWin started directly runs Xwayland without
+    // a cookie and admits its own user by si:localuser — the caller's value is
+    // left as it was.
     ...(session.xAuthority ? { XAUTHORITY: session.xAuthority } : {}),
     ...(session.runtimeDirectory ? { XDG_RUNTIME_DIR: session.runtimeDirectory } : {}),
     WAYLAND_DISPLAY: session.waylandDisplay,

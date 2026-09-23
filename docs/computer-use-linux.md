@@ -263,9 +263,12 @@ is enabled only through the compositor's environment, set by
 `nestedKWinSession.ts`, never by a D-Bus method.
 
 Launched applications get the session's runtime directory, the nested
-`WAYLAND_DISPLAY`, the private bus, and the nested Xwayland's `DISPLAY` and
-`XAUTHORITY` (the cookie KWin generated, as the plugin reports it in
-`healthJson.xAuthority`) on top of the scrubbed application environment.
+`WAYLAND_DISPLAY`, the private bus, and the nested Xwayland's `DISPLAY` on top
+of the scrubbed application environment, plus `XAUTHORITY` when the plugin
+reports a cookie in `healthJson.xAuthority`. A `kwin_wayland` started directly
+(KWin 6.7) runs Xwayland without a cookie and admits its own user through
+`si:localuser`, so X11 clients connect either way and other users' clients do
+not.
 The compositor, the bus, Xwayland and every launched application are children
 of the server (`supervisedProcess.ts`). `dispose()` ends them as process trees,
 and a synchronous `exit` hook SIGKILLs them when the server dies by an uncaught
@@ -329,7 +332,16 @@ The nested-only variables (`SYNARA_COMPUTER_NESTED*`,
 ### Testing
 
 `nestedKWinSession.integration.test.ts` runs behind `SYNARA_NESTED_KWIN_TEST=1`
-and boots a real private bus and `kwin_wayland --virtual`. The unit tests cover
+and boots a real private bus and `kwin_wayland --virtual`. Beyond the plugin
+load, geometry, capture, clipboard and crash cases, it checks that nothing is
+activatable on the private bus, that the bus, Xwayland and accessibility
+launcher carry none of the host's display variables or Synara's secrets, that
+an X11 client launched into the session connects, that `org.a11y.Bus` comes up
+inside the session, that an idle desktop shuts down and reboots on the next
+use, and that building a backend sweeps the desktop of a SIGKILLed server. Run
+it outside any sandbox that kills `kwin_wayland` (for example under
+`systemd-run --user`) with a scrubbed environment and a private
+`XDG_RUNTIME_DIR`, since the sweep case reaps every stale marker there. The unit tests cover
 mode and size parsing, environment construction, load planning, dormancy and
 the status read with fake spawners and the shared plugin doubles.
 
