@@ -164,7 +164,9 @@ export interface KWinComputerPluginApi {
    * delivered; it stops at the first that was not, and a refusal of the first
    * is an error exactly as from `key`.
    */
-  readonly keys?: (strokes: readonly (readonly [code: number, pressed: boolean])[]) => Promise<unknown>;
+  readonly keys?: (
+    strokes: readonly (readonly [code: number, pressed: boolean])[],
+  ) => Promise<unknown>;
   /**
    * Interface version 2, feature `waitForSettle`: answers `[settled,
    * elapsedMs]` once the window (any window for `""`) has committed new

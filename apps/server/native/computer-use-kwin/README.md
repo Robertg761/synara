@@ -131,15 +131,15 @@ that this build implements. The server calls one only when its feature is
 listed and otherwise keeps using the version 1 methods, so an installed older
 plugin keeps working with a newer server. Every version 1 method is unchanged.
 
-- `windowsStateJson() -> s` (feature `windowsStateJson`): `{"windows":
-  <windowsJson's array>, "targetWindowId": <id or null>, "workspace": {x, y,
-  width, height}, "locked": <bool>}`, replacing a `stateJson` and `windowsJson`
-  pair with one call. While the session is locked it answers with no windows
-  and a null target instead of refusing.
-- `captureWindowEx(s windowId, u maxDimension, u flags) -> (ay image, s mime)`
-  and `captureRegionEx(i x, i y, u width, u height, u maxDimension, u flags)
-  -> (ay image, s mime)` (feature `captureEx`): the version 1 captures with
-  flags. `1` is passive, an observer's frame such as the preview: it is not
+- `windowsStateJson() -> s` (feature `windowsStateJson`) replaces a
+  `stateJson` and `windowsJson` pair with one call. It answers an object with
+  `windows` (the `windowsJson` array), `targetWindowId` (an id or null),
+  `workspace` (`x`, `y`, `width`, `height`) and `locked`. While the session is
+  locked it answers with no windows and a null target instead of refusing.
+- `captureWindowEx(s windowId, u maxDimension, u flags)` and
+  `captureRegionEx(i x, i y, u width, u height, u maxDimension, u flags)`
+  (feature `captureEx`) answer `(ay image, s mime)`: the version 1 captures
+  with flags. `1` is passive, an observer's frame such as the preview: it is not
   agent activity, so it neither resets the idle deadline nor brings the badge
   back, and an open preview can no longer keep an abandoned session alive.
   `2` encodes JPEG at quality 85 (`image/jpeg`), `4` raw 8-bit luma
@@ -148,17 +148,18 @@ plugin keeps working with a newer server. Every version 1 method is unchanged.
   same PNG as the version 1 methods (`image/png`). JPEG and luma are flattened
   onto black, since neither has alpha. Unknown bits are ignored, and every
   refusal and error is exactly the version 1 methods', as on Hyprland.
-- `keys(a(ub) strokes) -> u` (feature `keys`): up to 256 `(keyCode, pressed)`
-  strokes in order, each checked exactly as `key` checks one (target, path,
-  reachability, the human-active guard with its release exemption). It stops
+- `keys(a(ub) strokes)` (feature `keys`) answers `u`: up to 256
+  `(keyCode, pressed)` strokes in order, each checked exactly as `key` checks
+  one (target, path, reachability, the human-active guard with its release
+  exemption). It stops
   at the first stroke that is not delivered and returns how many were; a
   refusal of the first stroke is the same D-Bus error `key` sends. One call is
   one burst: the human's own events cannot land between two strokes, so a
   borrowed seat0 object is handed back once, at the end.
-- `waitForSettle(s windowId, u quietMs, u timeoutMs) -> (b settled, u
-  elapsedMs)` (feature `waitForSettle`): replaces a fixed sleep between an
-  action and the observation of it. It replies once the window (any window,
-  for an empty id) has committed new content after the agent's last input and
+- `waitForSettle(s windowId, u quietMs, u timeoutMs)` (feature
+  `waitForSettle`) answers `(b settled, u elapsedMs)`. It replaces a fixed
+  sleep between an action and the observation of it. It replies once the
+  window (any window, for an empty id) has committed new content after the agent's last input and
   then stayed quiet for `quietMs`, and with `settled` false at `timeoutMs`
   (clamped to 30 seconds) or when the window closes, and at once when no
   session is running or the id names no usable window. "New content" is
