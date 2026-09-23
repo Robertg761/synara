@@ -339,6 +339,9 @@ describe("startNestedKWinSession", () => {
     );
     const runtime = session.runtimeDirectory!;
     expect(runtime.startsWith(harness.stateDirectoryPathForTest())).toBe(true);
+    // Short enough for a socket path under a home cache directory, and never
+    // a generic name that could be the human's display.
+    expect(session.waylandDisplay).toMatch(/^synara-[0-9a-f]{8}$/);
     expect((await stat(runtime)).mode & 0o777).toBe(0o700);
     expect(harness.spawns[0]?.env.XDG_RUNTIME_DIR).toBe(runtime);
     expect(harness.spawns[1]?.env.XDG_RUNTIME_DIR).toBe(runtime);

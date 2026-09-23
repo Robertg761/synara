@@ -223,7 +223,11 @@ export async function startNestedKWinSession(
   const hostEnv = options.hostEnv ?? process.env;
   const size = normalizeNestedSize(options.size);
   const sessionId = newNestedSessionId();
-  const waylandDisplay = options.socketName ?? `synara-nested-${sessionId}`;
+  // Short, because a Unix socket path has 107 bytes and this one sits three
+  // directories deep in a home cache on hosts without a runtime directory; and
+  // never a generic `wayland-0`, so a consumer that forgets the session's
+  // runtime directory finds nothing rather than the human's display.
+  const waylandDisplay = options.socketName ?? `synara-${sessionId.split("-").at(-1)}`;
   const children: SupervisedProcess[] = [];
   const launchedApps = new Set<ChildProcess>();
   // Resolved from the ambient runtime directory, before this session invents
