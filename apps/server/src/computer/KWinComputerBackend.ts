@@ -1528,8 +1528,10 @@ export class KWinComputerBackend implements ComputerBackend {
     // Never unhandled, whichever way the question below goes.
     quiet?.catch(() => undefined);
     const [changed] = await wait(0, 0);
-    const misses = this.settleMisses.plugin === plugin ? this.settleMisses.count : 0;
-    this.settleMisses = { plugin, count: changed ? 0 : misses + 1 };
+    // "Nothing changed" is this path's ordinary answer (a click on something
+    // inert, a key the focused field ignored), not a sign the plugin is blind:
+    // only a repaint moves the miss count, back to zero.
+    if (changed) this.settleMisses = { plugin, count: 0 };
     if (!changed) return { settled: true, waitedMs };
     if (!quiet) return { settled: false, waitedMs };
     const [settled, quietWaitMs] = await quiet;

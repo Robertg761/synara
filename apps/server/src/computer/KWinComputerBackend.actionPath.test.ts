@@ -570,14 +570,21 @@ describe("compositor-observed settle", () => {
       expect(backend.waitForSettle).toBeDefined();
     });
 
-    it("gives the fixed wait back after three settles in a row saw no repaint", async () => {
+    it("keeps observing through any run of actions that changed nothing", async () => {
+      // "Unchanged" is the ordinary answer to an inert click, not a blind
+      // plugin: counting it gave the fixed wait back after three of them.
       const plugin = new FakePlugin();
       plugin.features = ["waitForSettle"];
       answeringSettle(plugin, { first: [false, 300], changed: false });
       const backend = makeBackend(plugin);
       await backend.availability();
-      for (let miss = 0; miss < 3; miss += 1) await backend.waitForSettle!(options);
-      expect(backend.waitForSettle).toBeUndefined();
+      for (let settle = 0; settle < 5; settle += 1) {
+        await expect(backend.waitForSettle!(options)).resolves.toEqual({
+          settled: true,
+          waitedMs: 300,
+        });
+      }
+      expect(backend.waitForSettle).toBeDefined();
     });
 
     it("waits the bound blind for a window the compositor is not painting", async () => {
