@@ -428,7 +428,18 @@ export function computerGuidanceProfile(
   };
 }
 
-/** Provider-side contract shared by real display backends and the CI fake. */
+/**
+ * Provider-side contract shared by real display backends and the CI fake.
+ *
+ * Optional members are read by presence, on every use. The manager may be
+ * built on a `SwitchableComputerBackend` slot, a Proxy that resolves each
+ * member against whichever backend occupies it at that moment, and backends
+ * may also expose a member through a getter that comes and goes (a method
+ * offered only while the connected desktop supports it). So a caller checks
+ * `backend.member !== undefined` where it is about to use the member, never
+ * caches the verdict across awaits, and when one use spans awaits, binds the
+ * member once and keeps that reference (`backend.member?.bind(backend)`).
+ */
 export interface ComputerBackend {
   /**
    * The vocabulary this desktop speaks, for the tool descriptions that differ
