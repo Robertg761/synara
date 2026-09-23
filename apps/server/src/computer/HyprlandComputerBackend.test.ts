@@ -551,3 +551,44 @@ describe("HyprlandComputerBackend across compositor restarts (R6)", () => {
     }
   });
 });
+
+describe("HyprlandComputerBackend plugin upgrade under a running session (N5)", () => {
+  it("keeps the loaded plugin rather than replacing it with a build for the newer Hyprland", async () => {
+    const dir = await temp();
+    const pluginDirectory = await installedPluginDirectory(
+      "SynaraComputerUsePluginV2.so",
+      "SynaraComputerUsePluginV3.so",
+    );
+    const stampPath = join(dir, "install.stamp");
+    // The headers moved on to 0.57 and V3 was built against them; the running
+    // compositor is still 0.56, which refuses V3.
+    await writeFile(
+      stampPath,
+      "plugin_id=SynaraComputerUsePluginV3\nhyprland_version=0.57.0\nsource_hash=abc\n",
+    );
+    const dbus = fakeDbus({
+      nameOwner: async () => ":1.42",
+      listLoadedPluginIds: async () => ["SynaraComputerUsePluginV2"],
+    });
+    const unloads: string[] = [];
+    const backend = await makeBackend({
+      pluginDirectory,
+      installStampPath: stampPath,
+      runHyprctl: async (args) => {
+        if (args.join(" ") === "-j version") return JSON.stringify({ version: "0.56.0" });
+        throw new Error(`no hyprctl in tests: ${args.join(" ")}`);
+      },
+      dbusFactory: async () => ({
+        ...dbus,
+        unloadPlugin: async (pluginId: string) => {
+          unloads.push(pluginId);
+          return true;
+        },
+      }),
+    });
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(unloads).toEqual([]);
+    expect(dbus.loads).toEqual([]);
+    await backend.dispose();
+  });
+});

@@ -183,6 +183,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
       pluginDirectories: [pluginDirectory],
       stateRoot,
       installStampPath: stampPath,
+      installStampVersionKey: "hyprland_version",
       runningKwinVersion: hyprlandVersion,
       // What a build compiles against: the headers, which run ahead of the
       // compositor between a package upgrade and its restart.
