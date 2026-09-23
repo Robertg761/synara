@@ -100,7 +100,11 @@ describe("connectPlugin owner pinning", () => {
   // it next, so a squatter or stale generation taking the name after the
   // backend's ownership check would receive every input and capture call.
   // These pin the proxy's destination to the unique name resolved at connect.
-  function fakeBus(options: { readonly owner?: string; readonly kwinOwner?: string }) {
+  function fakeBus(options: {
+    readonly owner?: string;
+    readonly kwinOwner?: string;
+    readonly methods?: Readonly<Record<string, unknown>>;
+  }) {
     const proxied: string[] = [];
     const bus = {
       proxied,
@@ -125,6 +129,7 @@ describe("connectPlugin owner pinning", () => {
             RequestName: async () => 1,
             GetId: async () => `test-${process.pid}`,
             authenticate: async () => "test-instance",
+            ...options.methods,
           }),
         });
       },
@@ -197,6 +202,41 @@ describe("connectPlugin owner pinning", () => {
     });
     expect(bus.proxied).not.toContain(":1.99");
     await dbus.close();
+  });
+
+  it("gives waitForSettle its own timeout plus a margin, and the Ex captures a capture's", async () => {
+    const never = () => new Promise(() => undefined);
+    const bus = fakeBus({
+      owner: ":1.42",
+      methods: { waitForSettle: never, captureRegionEx: never, keys: never },
+    });
+    const dbus = await createSessionKWinComputerDbus({
+      dbusModule: { sessionBus: () => bus as never },
+    });
+    const plugin = await dbus.connectPlugin();
+    vi.useFakeTimers();
+    try {
+      const deadlines = new Map<string, number>();
+      const watch = (name: string, call: Promise<unknown>) => {
+        const startedAt = Date.now();
+        call.catch((error: unknown) => {
+          if (error instanceof KWinDbusTimeoutError) deadlines.set(name, Date.now() - startedAt);
+        });
+      };
+      watch("waitForSettle", plugin.waitForSettle!("window", 100, 20_000));
+      // The plugin clamps a wait to 30 s, and so does the deadline.
+      watch("longSettle", plugin.waitForSettle!("window", 100, 120_000));
+      watch("captureRegionEx", plugin.captureRegionEx!(0, 0, 100, 100, 1_536, 1));
+      watch("keys", plugin.keys!([[30, true]]));
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(deadlines.get("keys")).toBe(KWIN_DBUS_DEFAULT_TIMEOUT_MS);
+      expect(deadlines.get("captureRegionEx")).toBe(captureTimeoutMs(100 * 100));
+      expect(deadlines.get("waitForSettle")).toBe(20_000 + KWIN_DBUS_DEFAULT_TIMEOUT_MS);
+      expect(deadlines.get("longSettle")).toBe(30_000 + KWIN_DBUS_DEFAULT_TIMEOUT_MS);
+    } finally {
+      vi.useRealTimers();
+      await dbus.close();
+    }
   });
 
   it("refuses to connect when nothing owns the service name", async () => {
