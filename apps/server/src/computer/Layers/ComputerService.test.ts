@@ -452,6 +452,43 @@ describe("ComputerServiceLive startup selection", () => {
     );
   });
 
+  it("swaps the re-selected tier in between operations, never inside one", async () => {
+    let hyprlandLive = true;
+    const hyprland = new FakeComputerBackend();
+    const nested = new FakeComputerBackend();
+    await withLinuxService(
+      {
+        busNameHasOwner: async () => false,
+        hyprlandSessionPresent: () => hyprlandLive,
+        backends: { hyprland: () => hyprland, nested: () => nested },
+      },
+      async (service) => {
+        const manager = service.manager;
+        const targeted = Promise.withResolvers<void>();
+        const resume = Promise.withResolvers<void>();
+        const action = manager.withAgentActivity("thread-1", async () => {
+          await manager.moveCursor("thread-1", { x: 5, y: 5 });
+          targeted.resolve();
+          await resume.promise;
+          return await manager.click("thread-1", { x: 10, y: 10 });
+        });
+        await targeted.promise;
+
+        hyprlandLive = false;
+        hyprland.emitDesktopGone("The Hyprland instance exited.");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        // Selection has answered, and the swap is waiting for the action.
+        expect(hyprland.callsFor("dispose")).toHaveLength(0);
+        resume.resolve();
+
+        await expect(action).rejects.toMatchObject({ retryable: true });
+        await vi.waitFor(() => expect(hyprland.callsFor("dispose")).toHaveLength(1));
+        expect(nested.callsFor("click")).toHaveLength(0);
+        expect(hyprland.callsFor("click")).toHaveLength(0);
+      },
+    );
+  });
+
   it("never re-selects a tier an explicit override named", async () => {
     const hyprland = new FakeComputerBackend();
     const nested = new FakeComputerBackend();

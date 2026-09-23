@@ -141,6 +141,9 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
       // backend is chosen — for the lifetime of the service, registered again
       // whenever the Linux slot takes a different backend, and cleared only if
       // it is still the one this service registered.
+      // Every occupant change from here on is a desktop operation of its own:
+      // see `ComputerManager.replaceDesktop`.
+      linux?.serializeSwaps((swap) => manager.replaceDesktop(swap));
       let guidanceProfile = manager.guidanceProfile;
       setActiveComputerGuidanceProfile(guidanceProfile);
       linux?.onBackendChanged(() => {
@@ -220,6 +223,8 @@ class LinuxBackendStartup {
   private readonly changeListeners = new Set<() => void>();
   private reselecting = false;
   private stopped = false;
+  /** How a swap reaches the slot once the manager exists; see `serializeSwaps`. */
+  private runSwap: (swap: () => Promise<void>) => Promise<void> = (swap) => swap();
 
   static async begin(plan: LinuxBackendPlan, budgetMs: number): Promise<LinuxBackendStartup> {
     const deadline = performance.now() + budgetMs;
@@ -254,6 +259,15 @@ class LinuxBackendStartup {
         });
   }
 
+  /**
+   * Routes every later occupant change through `run` — the manager's desktop
+   * operation queue — so a swap never lands in the middle of an action. Until
+   * the manager exists nothing can be running, and swaps apply directly.
+   */
+  serializeSwaps(run: (swap: () => Promise<void>) => Promise<void>): void {
+    this.runSwap = run;
+  }
+
   onBackendChanged(listener: () => void): void {
     this.changeListeners.add(listener);
   }
@@ -283,7 +297,7 @@ class LinuxBackendStartup {
     options?: { readonly desktopChanged?: boolean },
   ): Promise<void> {
     this.current = selected;
-    await this.slot.swap(selected.backend, options);
+    await this.runSwap(() => this.slot.swap(selected.backend, options));
     for (const listener of this.changeListeners) listener();
   }
 
