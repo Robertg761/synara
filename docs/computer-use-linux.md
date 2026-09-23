@@ -149,6 +149,11 @@ drops the caller when the server name changes owner.
   it.
 - Captures render offscreen at the next safe compositor point; the agent's
   cursor is painted in, the human's never is.
+- `healthJson` reports `interfaceVersion` 2 and `features`, the optional
+  methods on top of the version 1 set (`windowsStateJson`). The server uses a
+  feature only when it is listed, so an installed older plugin keeps working.
+  `healthJson.xAuthority` names the cookie file of the compositor's own
+  Xwayland, which X11 apps launched into a nested session need.
 - Text selection is refused up front (`textRangeSelection: false`): AT-SPI
   exposes no settable selection this backend can read back, and nothing
   approximates it.

@@ -95,6 +95,13 @@ public:
     Q_INVOKABLE QString healthJson() const;
     Q_INVOKABLE QString stateJson() const;
     Q_INVOKABLE QString windowsJson() const;
+    /**
+     * windowsJson, the explicit target, the workspace geometry and the lock
+     * state in one reply, so a desktop operation reads them in one round trip
+     * instead of a stateJson and windowsJson pair. Locked, it answers rather
+     * than refusing, with no windows and no target: "locked" is the answer.
+     */
+    Q_INVOKABLE QString windowsStateJson() const;
     Q_INVOKABLE bool start();
     Q_INVOKABLE bool stop();
     Q_INVOKABLE bool setIdleTimeout(uint milliseconds);
@@ -165,6 +172,8 @@ private:
     static QString toJson(const QJsonObject &object);
     static QString toJson(const QJsonArray &array);
     static QString stopReasonName(StopReason reason);
+    // The windowsJson array: every client window, topmost first.
+    QJsonArray windowsArray() const;
 
     void stopSession(StopReason reason);
     bool recordStop(StopReason reason);

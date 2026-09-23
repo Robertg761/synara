@@ -123,6 +123,25 @@ Service `org.synara.ComputerUse`, path `/org/synara/ComputerUse`, interface
 reason `request`, `idle-timeout`, `user-release`, or `session-locked`. The
 interface is described in `org.synara.ComputerUse.xml`.
 
+### Interface version 2
+
+`healthJson` reports `interfaceVersion` (2; absent on older builds, which are
+version 1) and `features`, the optional methods on top of the version 1 set
+that this build implements. The server calls one only when its feature is
+listed and otherwise keeps using the version 1 methods, so an installed older
+plugin keeps working with a newer server. Every version 1 method is unchanged.
+
+- `windowsStateJson() -> s` (feature `windowsStateJson`): `{"windows":
+  <windowsJson's array>, "targetWindowId": <id or null>, "workspace": {x, y,
+  width, height}, "locked": <bool>}`, replacing a `stateJson` and `windowsJson`
+  pair with one call. While the session is locked it answers with no windows
+  and a null target instead of refusing.
+
+`healthJson` also carries `xAuthority`: the cookie file of the Xwayland this
+compositor started, read from KWin's own environment the same way `xDisplay`
+is. It is absent when there is none. A nested session needs it to launch X11
+clients, since the `XAUTHORITY` in the server's environment is the human's.
+
 `resetInputDelivery()` is what the server calls whenever the desktop lease
 changes owner: it clears the explicit target, releases every held button and
 key, withdraws every direct-injection enter and hands the shared seat0 objects

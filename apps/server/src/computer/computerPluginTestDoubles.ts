@@ -63,8 +63,14 @@ export class FakePlugin implements KWinComputerPluginApi {
     },
   ];
 
+  /**
+   * Interface version 2 features to advertise; empty keeps the fake a version
+   * 1 plugin, so a suite opts in to the newer methods one feature at a time.
+   */
+  features: readonly string[] = [];
   healthJson = async () =>
     JSON.stringify({
+      ...(this.features.length > 0 ? { interfaceVersion: 2, features: this.features } : {}),
       ok: true,
       running: this.running,
       capture: this.capture,
@@ -92,6 +98,16 @@ export class FakePlugin implements KWinComputerPluginApi {
       ...this.humanState,
     });
   windowsJson = async () => JSON.stringify(this.windows);
+  locked = false;
+  windowsStateJson = async () => {
+    this.calls.push({ method: "windowsStateJson", args: [] });
+    return JSON.stringify({
+      windows: this.locked ? [] : this.windows,
+      targetWindowId: this.locked ? null : this.targetWindowId,
+      workspace: this.workspace ?? { x: 0, y: 0, width: 1920, height: 1080 },
+      locked: this.locked,
+    });
+  };
   start = async () => {
     this.calls.push({ method: "start", args: [] });
     if (this.releasedByUser) {

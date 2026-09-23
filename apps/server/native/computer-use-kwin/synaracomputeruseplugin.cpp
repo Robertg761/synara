@@ -57,6 +57,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPen>
+#include <QStringList>
 #include <QThreadPool>
 
 #include <wayland-server-core.h>
@@ -85,6 +86,12 @@ static const QString s_gitHash = QStringLiteral(SYNARA_COMPUTER_USE_GIT_HASH);
 static const QString s_buildTimestamp = QStringLiteral(SYNARA_COMPUTER_USE_BUILD_TIMESTAMP);
 static const QString s_kwinVersion = QStringLiteral(SYNARA_COMPUTER_USE_KWIN_VERSION);
 static const QString s_agentCursorName = QStringLiteral("synara-agent");
+// healthJson's interface generation and the optional methods on top of the
+// version 1 set; see the XML for what each feature names.
+static constexpr int s_interfaceVersion = 2;
+static const QStringList s_interfaceFeatures = {
+    QStringLiteral("windowsStateJson"),
+};
 static const QString s_captureErrorName = QStringLiteral("org.synara.ComputerUse.Error.CaptureFailed");
 static const QString s_releasedErrorName = QStringLiteral("org.synara.ComputerUse.Error.ControlReleased");
 // A window whose application never bound the agent seat. Distinct from every
@@ -1274,6 +1281,12 @@ QString SynaraComputerUsePlugin::healthJson() const
         // into this session needs the answer, and guessing it races every other
         // Xwayland on the machine.
         {QStringLiteral("xDisplay"), qEnvironmentVariable("DISPLAY")},
+        // The interface generation and the optional methods this build
+        // implements. A server uses a feature only when it is listed here and
+        // falls back to the version 1 methods otherwise, so an older plugin
+        // keeps working with a newer server.
+        {QStringLiteral("interfaceVersion"), s_interfaceVersion},
+        {QStringLiteral("features"), QJsonArray::fromStringList(s_interfaceFeatures)},
         {QStringLiteral("effects"), effects != nullptr},
         {QStringLiteral("capture"), effects && effects->isOpenGLCompositing() && effects->openglContext()},
         {QStringLiteral("idleTimeoutMs"), double(m_idleTimeoutMs)},
@@ -1297,6 +1310,14 @@ QString SynaraComputerUsePlugin::healthJson() const
     if (Workspace::self()) {
         health.insert(QStringLiteral("workspaceGeometry"),
                      rectToJson(RectF(Workspace::self()->geometry())));
+    }
+    // The cookie file of the Xwayland this compositor started, which KWin
+    // publishes the same way as the display: setenv on itself once Xwayland is
+    // up. An X11 client launched into a nested session needs it, and the one
+    // in the server's own environment is the human's. Absent without Xwayland.
+    const QString xAuthority = qEnvironmentVariable("XAUTHORITY");
+    if (!xAuthority.isEmpty()) {
+        health.insert(QStringLiteral("xAuthority"), xAuthority);
     }
     return toJson(health);
 }
@@ -1400,9 +1421,32 @@ QString SynaraComputerUsePlugin::windowsJson() const
     if (!m_auth.permits(*this)) return {};
     // Window titles are the desktop's contents in words; locked hides them too.
     if (refuseIfSessionLocked()) return {};
+    return toJson(windowsArray());
+}
+
+QString SynaraComputerUsePlugin::windowsStateJson() const
+{
+    if (!m_auth.permits(*this)) return {};
+    const bool locked = sessionLocked();
+    QJsonObject state{
+        // Locked hides the windows and the target exactly as windowsJson and
+        // stateJson refuse them; the geometry is public in healthJson anyway.
+        {QStringLiteral("windows"), locked ? QJsonArray() : windowsArray()},
+        {QStringLiteral("targetWindowId"),
+         !locked && m_targetWindow ? QJsonValue(m_targetWindow->internalId().toString(QUuid::WithoutBraces)) : QJsonValue()},
+        {QStringLiteral("locked"), locked},
+    };
+    if (Workspace::self()) {
+        state.insert(QStringLiteral("workspace"), rectToJson(RectF(Workspace::self()->geometry())));
+    }
+    return toJson(state);
+}
+
+QJsonArray SynaraComputerUsePlugin::windowsArray() const
+{
     QJsonArray windows;
     if (!Workspace::self()) {
-        return toJson(windows);
+        return windows;
     }
 
     // Emitted topmost-first so `stackingIndex` reads as depth, and so each
@@ -1464,7 +1508,7 @@ QString SynaraComputerUsePlugin::windowsJson() const
             covering.append({id, bounds});
         }
     }
-    return toJson(windows);
+    return windows;
 }
 
 bool SynaraComputerUsePlugin::start()

@@ -19,6 +19,12 @@
     org.synara.ComputerUse.Error.SeatUnsupported the client holds no input object
     org.synara.ComputerUse.Error.ControlReleased latched by the panic shortcut
     org.synara.ComputerUse.Error.CaptureFailed   a capture could not be rendered
+
+  Interface versions. healthJson carries "interfaceVersion" (2 for this file;
+  absent means 1) and "features", the optional methods below the version 1
+  set that this build implements. A server calls one only when its feature is
+  listed and falls back to the version 1 methods otherwise:
+    windowsStateJson   windowsStateJson
 -->
 <node name="/org/synara/ComputerUse">
   <interface name="org.synara.ComputerUse1">
@@ -36,6 +42,13 @@
       <arg name="json" type="s" direction="out"/>
     </method>
     <method name="windowsJson">
+      <arg name="json" type="s" direction="out"/>
+    </method>
+    <!-- Feature windowsStateJson: {"windows": <windowsJson's array>,
+         "targetWindowId": <id or null>, "workspace": {x, y, width, height},
+         "locked": <bool>} in one call. Locked, it answers with no windows and
+         a null target instead of refusing. -->
+    <method name="windowsStateJson">
       <arg name="json" type="s" direction="out"/>
     </method>
 

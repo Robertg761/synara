@@ -75,6 +75,7 @@ export const COMPUTER_PLUGIN_METHOD_SIGNATURES: Readonly<
   healthJson: { in: "", out: "s" },
   stateJson: { in: "", out: "s" },
   windowsJson: { in: "", out: "s" },
+  windowsStateJson: { in: "", out: "s" },
   start: { in: "", out: "b" },
   stop: { in: "", out: "b" },
   setIdleTimeout: { in: "u", out: "b" },
@@ -99,6 +100,12 @@ export interface KWinComputerPluginApi {
   readonly healthJson: () => Promise<unknown>;
   readonly stateJson: () => Promise<unknown>;
   readonly windowsJson: () => Promise<unknown>;
+  /**
+   * Interface version 2, feature `windowsStateJson`: `{windows, targetWindowId,
+   * workspace, locked}` in one call, answering rather than refusing while
+   * locked. Call only when `healthJson().features` lists it.
+   */
+  readonly windowsStateJson?: () => Promise<unknown>;
   readonly start: () => Promise<unknown>;
   readonly stop: () => Promise<unknown>;
   readonly setIdleTimeout: (milliseconds: number) => Promise<unknown>;
@@ -549,6 +556,7 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
     healthJson: () => invoke(iface, "healthJson"),
     stateJson: () => invoke(iface, "stateJson"),
     windowsJson: () => invoke(iface, "windowsJson"),
+    windowsStateJson: () => invoke(iface, "windowsStateJson"),
     start: () => invoke(iface, "start"),
     stop: () => invoke(iface, "stop"),
     setIdleTimeout: (milliseconds) => invoke(iface, "setIdleTimeout", milliseconds),
