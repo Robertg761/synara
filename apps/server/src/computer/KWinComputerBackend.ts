@@ -165,6 +165,14 @@ export const COMPOSITOR_GONE_AFTER_MS = 60_000;
  * good frame forever is a lie the health report has to correct.
  */
 const STILL_FAILURE_LIMIT = 5;
+/**
+ * How soon a stream whose capture was called broken asks the plugin again,
+ * doubling up to the ceiling. The pane must come back on its own after
+ * whatever broke capture passed — nothing else re-reads health while only a
+ * pane is watching.
+ */
+const CAPTURE_RECOVERY_BASE_MS = 1_000;
+const CAPTURE_RECOVERY_MAX_MS = 30_000;
 /** How long a passive availability answer stays good. */
 const PROBE_MEMO_MS = 3_000;
 /**
@@ -549,6 +557,9 @@ export class KWinComputerBackend implements ComputerBackend {
   private livenessProbe: Promise<void> | undefined;
   /** Consecutive still-frame captures that failed. */
   private stillFailures = 0;
+  /** The pending re-read of health after capture was called broken; see `noteStillFailure`. */
+  private captureRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private captureRecoveryDelayMs = CAPTURE_RECOVERY_BASE_MS;
   /** The last window explicitly aimed or raised by a caller. */
   private lastAimedWindowId: string | undefined;
   /** The last lock state the plugin reported; see `noteSessionLock`. */
@@ -1576,6 +1587,8 @@ export class KWinComputerBackend implements ComputerBackend {
     this.streamListener = listener;
     this.stillFailures = 0;
     this.stillDedupe.reset();
+    // A pane opened onto a capture path already called broken asks again.
+    if (this.pluginHealth?.capture === false) this.scheduleCaptureRecovery();
     await this.publishStillFrame();
     // A replacement or detach can also arrive during the first capture.
     if (this.disposed || generation !== this.streamGeneration) return;
@@ -1587,6 +1600,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async detachStream(): Promise<void> {
     this.streamGeneration += 1;
+    this.cancelCaptureRecovery();
     this.stillDedupe.reset();
     this.streamListener = undefined;
     if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
@@ -2677,7 +2691,7 @@ export class KWinComputerBackend implements ComputerBackend {
       readPngDimensions(data, { source: this.captureSource });
       if (this.disposed || generation !== this.streamGeneration || this.streamListener !== listener)
         return;
-      this.stillFailures = 0;
+      this.noteStillSuccess();
       if (!this.stillDedupe.shouldPublish(data, this.stillDedupe.takeForce(false))) return;
       // Delivered once, to the stream listener the manager attached. The
       // manager is the only consumer of stills; emitting the same frame a
@@ -2692,18 +2706,75 @@ export class KWinComputerBackend implements ComputerBackend {
         data,
       });
     } catch (error) {
-      // One failed still is a frame the compositor was busy for and must not
-      // tear down the stream. A run of them is a capture path that is gone,
-      // and the pane showing its last good frame forever would hide that.
-      this.stillFailures += 1;
-      if (this.stillFailures === STILL_FAILURE_LIMIT) {
-        this.recordHealthFailure(error);
-        if (this.pluginHealth) this.pluginHealth = { ...this.pluginHealth, capture: false };
-        this.publishHealth();
-      }
+      this.noteStillFailure(error);
     } finally {
       this.stillInFlight = false;
     }
+  }
+
+  private noteStillSuccess(): void {
+    this.stillFailures = 0;
+    this.captureRecoveryDelayMs = CAPTURE_RECOVERY_BASE_MS;
+  }
+
+  /**
+   * One failed still is a frame the compositor was busy for and must not tear
+   * down the stream. A run of them is a capture path that is gone, and the
+   * pane showing its last good frame forever would hide that — so capture is
+   * reported unavailable, and health is re-read with backoff until the plugin
+   * captures again (R4).
+   *
+   * A locked session and a capture that timed out are not counted: the plugin
+   * refuses capture while locked, and with the outputs off (DPMS) nothing
+   * renders to capture. Both end on their own, and a pane latched off by them
+   * stayed frozen after the human came back.
+   */
+  private noteStillFailure(error: unknown): void {
+    if (isSessionLockedFailure(error) || isCaptureTimeout(error)) return;
+    this.stillFailures += 1;
+    if (this.stillFailures !== STILL_FAILURE_LIMIT) return;
+    this.recordHealthFailure(error);
+    if (this.pluginHealth) this.pluginHealth = { ...this.pluginHealth, capture: false };
+    this.publishHealth();
+    this.scheduleCaptureRecovery();
+  }
+
+  private scheduleCaptureRecovery(): void {
+    if (this.captureRecoveryTimer !== undefined || this.disposed || !this.streamListener) return;
+    const delayMs = this.captureRecoveryDelayMs;
+    this.captureRecoveryDelayMs = Math.min(CAPTURE_RECOVERY_MAX_MS, delayMs * 2);
+    this.captureRecoveryTimer = setTimeout(() => {
+      this.captureRecoveryTimer = undefined;
+      void this.recoverCapture();
+    }, delayMs);
+    this.captureRecoveryTimer.unref?.();
+  }
+
+  private cancelCaptureRecovery(): void {
+    if (this.captureRecoveryTimer !== undefined) clearTimeout(this.captureRecoveryTimer);
+    this.captureRecoveryTimer = undefined;
+    this.captureRecoveryDelayMs = CAPTURE_RECOVERY_BASE_MS;
+  }
+
+  /**
+   * Asks the live plugin whether it captures again; never connects or starts
+   * anything, since only a pane is watching. A connection that is gone is the
+   * reconnect loop's, whose fresh health read answers this too.
+   */
+  private async recoverCapture(): Promise<void> {
+    if (this.disposed || !this.streamListener) return;
+    if (this.pluginHealth?.capture === true) {
+      this.stillFailures = 0;
+      return;
+    }
+    const plugin = this.connectedPlugin();
+    const health = plugin ? await this.readPluginHealth(plugin).catch(() => undefined) : undefined;
+    if (health?.capture === true) {
+      this.stillFailures = 0;
+      await this.publishStillFrame();
+      return;
+    }
+    this.scheduleCaptureRecovery();
   }
 
   private async pressButton(code: number): Promise<void> {
@@ -2988,6 +3059,21 @@ function synthesizeStrokes<T extends QwertyKeyStroke | readonly QwertyKeyStroke[
     }
     throw error;
   }
+}
+
+/** The plugin's refusal while the session is locked, as `reportPluginFailure` maps it. */
+function isSessionLockedFailure(error: unknown): boolean {
+  if (dbusErrorType(error) === SESSION_LOCKED_ERROR_TYPE) return true;
+  if (error instanceof Error && error.message.startsWith(`${SESSION_LOCKED_REFUSAL}:`)) return true;
+  const cause = errorCause(error);
+  return cause !== undefined && cause !== error ? isSessionLockedFailure(cause) : false;
+}
+
+/** A capture call that never answered, however deep in the cause chain. */
+function isCaptureTimeout(error: unknown): boolean {
+  if (error instanceof KWinDbusTimeoutError) return isCaptureMethod(error.methodName);
+  const cause = errorCause(error);
+  return cause !== undefined && cause !== error ? isCaptureTimeout(cause) : false;
 }
 
 function isAbortError(error: unknown): boolean {

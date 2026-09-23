@@ -3770,6 +3770,66 @@ describe("KWinComputerBackend supervision", () => {
     }
   });
 
+  it("comes back by itself once capture works again (R4)", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      dbus.plugin.captureBytes = pngOfSize(2, 2);
+      const backend = makeBackend(dbus, { stillIntervalMs: 100 });
+      await backend.availability();
+      const frames: unknown[] = [];
+      await backend.attachStream((frame) => frames.push(frame));
+      dbus.plugin.captureFailure = dbusError(
+        "org.synara.ComputerUse.Error.CaptureFailed",
+        "no GL context",
+      );
+      await vi.advanceTimersByTimeAsync(600);
+      expect(backend.health().captureAvailable).toBe(false);
+
+      // Nothing but the pane is watching: no agent call re-reads health.
+      dbus.plugin.captureFailure = undefined;
+      dbus.plugin.captureBytes = pngOfSize(3, 3);
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(backend.health().captureAvailable).toBe(true);
+      expect(frames.length).toBeGreaterThan(1);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not call capture broken over a locked session or outputs that stopped rendering (R4)", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      dbus.plugin.captureBytes = pngOfSize(2, 2);
+      const backend = makeBackend(dbus, { stillIntervalMs: 100 });
+      await backend.availability();
+      const frames: unknown[] = [];
+      await backend.attachStream((frame) => frames.push(frame));
+
+      dbus.plugin.captureFailure = dbusError(
+        "org.synara.ComputerUse.Error.SessionLocked",
+        "the session is locked",
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(backend.health().captureAvailable).toBe(true);
+      dbus.plugin.captureFailure = new KWinDbusTimeoutError("captureRegion", 10_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(backend.health().captureAvailable).toBe(true);
+
+      // Unlocked, outputs on: the next tick publishes without anyone asking.
+      dbus.plugin.captureFailure = undefined;
+      dbus.plugin.captureBytes = pngOfSize(3, 3);
+      const before = frames.length;
+      await vi.advanceTimersByTimeAsync(200);
+      expect(frames.length).toBeGreaterThan(before);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drops a queued capture whose operation was cancelled before its turn", async () => {
     const dbus = new FakeDbus();
     const backend = makeBackend(dbus);
