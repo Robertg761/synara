@@ -119,7 +119,9 @@
     <!-- Version 2: (keyCode, pressed) strokes in order, each with every check
          `key` makes. A refusal of the first stroke is the call's error,
          exactly as `key` answers it; after that the call stops at the first
-         stroke not delivered and returns how many were. At most 256 strokes
+         stroke not delivered and returns how many were. A batch that stops
+         early does not release the keys its delivered strokes pressed: the
+         caller knows which they are and releases them. At most 256 strokes
          (org.freedesktop.DBus.Error.InvalidArgs beyond). -->
     <method name="keys">
       <arg name="strokes" type="a(ub)" direction="in"/>
