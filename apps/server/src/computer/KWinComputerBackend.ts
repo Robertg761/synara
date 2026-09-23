@@ -46,7 +46,11 @@ import {
   type ComputerResolvedTarget,
   type ComputerTextRange,
 } from "./ComputerBackend.ts";
-import { resolveAppLaunchOnHost, type AppLaunchResolver } from "./appLaunchResolution.ts";
+import {
+  resolveAppLaunchOnHost,
+  type AppLaunchResolution,
+  type AppLaunchResolver,
+} from "./appLaunchResolution.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
 import { AtspiPerception } from "./atspiPerception.ts";
 import { isPaneInput } from "./paneInput.ts";
@@ -1493,12 +1497,6 @@ export class KWinComputerBackend implements ComputerBackend {
       throw launchAppError(app, error);
     }
 
-    const result = {
-      computerId: this.computerId,
-      app,
-      resolvedCommand: launch.command,
-      window: null,
-    } as ComputerLaunchAppResult;
     await new Promise<void>((resolve, reject) => {
       const timers: ReturnType<typeof setTimeout>[] = [];
       const cleanup = () => {
@@ -1548,7 +1546,18 @@ export class KWinComputerBackend implements ComputerBackend {
         onError(error instanceof Error ? error : new Error(String(error)));
       }
     });
-    return result;
+    // What the launch established, for the manager's window readiness: the
+    // process it started, and — when that process may only be a launcher
+    // handing the window on — the app identity its windows will report.
+    const appId = launchedAppId(launch);
+    return {
+      computerId: this.computerId,
+      app,
+      resolvedCommand: launch.command,
+      ...(isProcessId(child.pid) ? { pid: child.pid } : {}),
+      ...(appId ? { appId } : {}),
+      window: null,
+    } as ComputerLaunchAppResult;
   }
 
   async click(
@@ -3947,6 +3956,29 @@ export function installStampIsCurrent(
 function pluginVersion(id: string): number {
   const match = id.match(MAX_PLUGIN_ID);
   return match?.[1] ? Number(match[1]) : 0;
+}
+
+function isProcessId(pid: number | undefined): pid is number {
+  return pid !== undefined && Number.isInteger(pid) && pid > 0 && pid <= 0x7fff_ffff;
+}
+
+/**
+ * The app identity a launch's windows report as `appName`, when the launch
+ * may hand its window to another process: a desktop entry (run directly, or
+ * through `gio launch`) is named by its file, which is what KWin reports as the
+ * window's desktop file name and what Wayland toolkits set as their app id,
+ * and a flatpak export is named by the flatpak's app id. A plain executable
+ * names nothing, and its window is matched by pid alone.
+ */
+function launchedAppId(launch: AppLaunchResolution): string | undefined {
+  const file =
+    launch.desktopFile ?? (launch.via === "flatpak-export" ? launch.command : undefined);
+  const name = file
+    ?.split("/")
+    .at(-1)
+    ?.replace(/\.desktop$/i, "")
+    .trim();
+  return name ? name : undefined;
 }
 
 function launchAppError(app: string, error: unknown): ComputerBackendError {

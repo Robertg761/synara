@@ -3,12 +3,15 @@
  * do and do not advertise the interface-version-2 features: every newer path
  * has an older plugin's fallback beside it, and both are pinned here.
  */
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { KWinComputerBackend, type KWinComputerBackendOptions } from "./KWinComputerBackend.ts";
+import type { AppLaunchResolution } from "./appLaunchResolution.ts";
 import type { AtspiTreeReader } from "./atspiClient.ts";
 import { FakeDbus, FakePlugin, pngOfSize } from "./computerPluginTestDoubles.ts";
 import { withPaneInput } from "./paneInput.ts";
@@ -580,5 +583,80 @@ describe("luma capture", () => {
       "cannot capture raw luma",
     );
     expect(callsOf(plugin, "captureWindowEx")).toBe(0);
+  });
+});
+
+/** A spawned process that starts at once under `pid`. */
+function spawnedAs(pid: number): () => ChildProcess {
+  return () => {
+    const child = Object.assign(new EventEmitter(), { pid, unref: () => undefined });
+    queueMicrotask(() => child.emit("spawn"));
+    return child as unknown as ChildProcess;
+  };
+}
+
+describe("launch results", () => {
+  it.each([
+    [
+      "a plain executable, matched by pid alone",
+      { command: "/usr/bin/kate", args: [], via: "path" },
+      undefined,
+    ],
+    [
+      "a desktop entry run through gio, named by its file",
+      {
+        command: "/usr/bin/gio",
+        args: ["launch", "/usr/share/applications/org.kde.kate.desktop"],
+        via: "desktop-entry-gio",
+        desktopFile: "/usr/share/applications/org.kde.kate.desktop",
+      },
+      "org.kde.kate",
+    ],
+    [
+      "a flatpak export, named by its app id",
+      { command: "/var/lib/flatpak/exports/bin/org.mozilla.firefox", args: [], via: "flatpak-export" },
+      "org.mozilla.firefox",
+    ],
+  ] as const)("reports the pid and app id of %s", async (_label, resolution, appId) => {
+    const plugin = new FakePlugin();
+    const backend = makeBackend(plugin, {
+      resolveApp: () => resolution as AppLaunchResolution,
+      spawnProcess: spawnedAs(4_242),
+    });
+    await backend.availability();
+    const result = await backend.launchApp("kate", []);
+    expect(result.pid).toBe(4_242);
+    expect(result.appId).toBe(appId);
+  });
+
+  it("lets the manager find a launched window whose app name differs from the launch name", async () => {
+    const plugin = new FakePlugin();
+    plugin.windows = [
+      {
+        id: "kate-window",
+        title: "Untitled — Kate",
+        appName: "org.kde.kate",
+        pid: 4_242,
+        bounds: { x: 100, y: 100, width: 800, height: 600 },
+        focused: false,
+        minimized: false,
+        visible: true,
+      },
+    ];
+    const backend = makeBackend(plugin, { spawnProcess: spawnedAs(4_242) });
+    const manager = new (await import("./ComputerManager.ts")).ComputerManager({
+      backend,
+      actionSettleMs: 0,
+    });
+    try {
+      await backend.availability();
+      const result = await manager.withAgentActivity("thread-a", () =>
+        manager.launchApp("thread-a", "kate", [], 2_000),
+      );
+      expect(result.windowStatus).toBe("ready");
+      expect(result.window?.id).toBe("kate-window");
+    } finally {
+      await manager.dispose();
+    }
   });
 });
