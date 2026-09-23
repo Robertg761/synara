@@ -57,6 +57,7 @@ import {
   KWinComputerBackend,
   PluginProvisioningError,
   defaultPluginDirectories,
+  parseIdleMinutesEnv,
   localBuildToolingPresent,
   prebuiltPluginRoot,
   scanInstalledPluginIds,
@@ -204,11 +205,7 @@ export interface NestedComputerBackendOptions {
  * extreme.
  */
 export function parseNestedIdleShutdownEnv(value: string | undefined): number {
-  const fallback = DEFAULT_IDLE_SHUTDOWN_MINUTES * 60_000;
-  if (value === undefined || value.trim() === "") return fallback;
-  const minutes = Number(value.trim());
-  if (!Number.isFinite(minutes) || minutes < 0) return fallback;
-  return Math.round(minutes * 60_000);
+  return parseIdleMinutesEnv(value, DEFAULT_IDLE_SHUTDOWN_MINUTES);
 }
 
 /** Mutable box shared with the closures handed to the base constructor. */
