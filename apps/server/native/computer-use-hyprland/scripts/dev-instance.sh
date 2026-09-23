@@ -120,37 +120,68 @@ if (( SUPERVISE )); then
 
     # A private bus, so the nested plugin's org.synara.ComputerUse cannot
     # collide with — or be mistaken for — one running on the human's session.
-    dbus-daemon --session --fork \
+    # Its own minimal configuration rather than the stock session.conf: no
+    # service directories, so nothing the nested session calls (a portal, a
+    # notification daemon, the accessibility bus) is ever activated by it -
+    # an activated service starts outside this scrubbed environment and could
+    # reach the human's display.
+    cat >"$STATE_DIR/bus.conf" <<BUSCONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:dir=$STATE_DIR</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+BUSCONF
+    dbus-daemon --config-file="$STATE_DIR/bus.conf" --fork \
         --print-address=3 --print-pid=4 \
         3>"$STATE_DIR/bus-address" 4>"$STATE_DIR/bus-pid"
     DBUS_SESSION_BUS_ADDRESS="$(cat "$STATE_DIR/bus-address")"
     export DBUS_SESSION_BUS_ADDRESS
     [[ -n "$DBUS_SESSION_BUS_ADDRESS" ]] || die "dbus-daemon printed no address."
 
-    cat >"$STATE_DIR/hyprland.conf" <<EOF
-monitor = , ${WIDTH}x${HEIGHT}@60, 0x0, 1
-# Nothing here is for a human to look at, and nothing may pop up on the host.
-misc {
-    disable_hyprland_logo = true
-    disable_splash_rendering = true
-    force_default_wallpaper = 0
-    disable_autoreload = true
-}
-animations {
-    enabled = false
-}
-EOF
+    # A configuration of its own, in Lua: Hyprland prefers a Lua config over a
+    # `-c` hyprlang file, and would otherwise load the user's own
+    # ~/.config/hypr/hyprland.lua - autostarting the human's desktop shell,
+    # clipboard watchers and the rest into this instance, where they share
+    # the human's state files. XDG_CONFIG_HOME keeps kwin_wayland's kwinrc
+    # and every client's configuration here too.
+    export XDG_CONFIG_HOME="$STATE_DIR/config"
+    mkdir -p "$XDG_CONFIG_HOME/hypr"
+    cat >"$XDG_CONFIG_HOME/hypr/hyprland.lua" <<LUA
+hl.monitor({ output = "", mode = "${WIDTH}x${HEIGHT}@60", position = "0x0", scale = 1 })
+-- Nothing here is for a human to look at, and nothing may pop up on the host.
+hl.config({
+    misc = {
+        disable_hyprland_logo    = true,
+        disable_splash_rendering = true,
+        force_default_wallpaper  = 0,
+        disable_autoreload       = true,
+    },
+    animations = {
+        enabled = false,
+    },
+})
+LUA
 
     # Hyprland is the client kwin_wayland runs, so it inherits the parent's
-    # WAYLAND_DISPLAY and never sees the host's.
+    # WAYLAND_DISPLAY and never sees the host's. The socket is named apart
+    # from $STATE_DIR, which is $XDG_RUNTIME_DIR/$UNIT: a socket of the same
+    # name cannot be bound there, and kwin_wayland crashes on the failure.
     exec kwin_wayland \
         --virtual \
         --xwayland \
         --no-global-shortcuts \
-        --socket "$UNIT" \
+        --socket "$UNIT-parent" \
         --width "$WIDTH" \
         --height "$HEIGHT" \
-        -- Hyprland -c "$STATE_DIR/hyprland.conf"
+        -- Hyprland -c "$XDG_CONFIG_HOME/hypr/hyprland.lua"
 fi
 
 # --- the controlling side --------------------------------------------------
@@ -172,6 +203,7 @@ case "$ACTION" in
             [[ -n "$signature" ]] && rm -rf -- "$RUNTIME_DIR/hypr/$signature"
         fi
         rm -rf -- "$STATE_DIR"
+        rm -f -- "$RUNTIME_DIR/$UNIT-parent" "$RUNTIME_DIR/$UNIT-parent.lock"
         log "stopped"
         exit 0
         ;;
