@@ -1513,6 +1513,52 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
+  it("leaves a loaded plugin alone when it refuses this server's authentication", async () => {
+    const dbus = new FakeDbus();
+    dbus.loaded = ["SynaraComputerUsePluginV10"];
+    dbus.connectPlugin = async () => {
+      dbus.calls.push({ method: "connectPlugin", args: [] });
+      throw dbusError("org.synara.ComputerUse.Error.Unauthorized", "token mismatch");
+    };
+    const provisionPlugin = vi.fn(async () => {
+      throw new Error("must not rebuild for a refused token");
+    });
+    const backend = makeBackend(dbus, { provisionPlugin });
+
+    await expect(backend.availability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("did not accept this server"),
+    });
+    expect(provisionPlugin).not.toHaveBeenCalled();
+    expect(dbus.calls.filter((call) => call.method === "UnloadPlugin")).toEqual([]);
+    // One attempt, not the in-call ladder's three.
+    expect(dbus.calls.filter((call) => call.method === "connectPlugin")).toHaveLength(1);
+    await backend.dispose();
+  });
+
+  it("rebuilds a plugin too old to authenticate once, and not again after that failed", async () => {
+    const dbus = new FakeDbus();
+    dbus.loaded = ["SynaraComputerUsePluginV10"];
+    dbus.connectPlugin = async () => {
+      throw dbusError("org.freedesktop.DBus.Error.UnknownMethod", "No such method authenticate");
+    };
+    const provisionPlugin = vi.fn(async () => {
+      throw new Error("cmake: KWin headers missing");
+    });
+    const backend = makeBackend(dbus, { provisionPlugin });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(backend.availability()).resolves.toMatchObject({
+        kind: "backend-unavailable",
+        message: expect.stringContaining("KWin headers missing"),
+      });
+    }
+    expect(provisionPlugin).toHaveBeenCalledTimes(1);
+    expect(provisionPlugin).toHaveBeenCalledWith(expect.objectContaining({ force: true }));
+    expect(dbus.calls.filter((call) => call.method === "UnloadPlugin")).toEqual([]);
+    await backend.dispose();
+  });
+
   /**
    * The pre-fix memo replayed a failed provision forever: one transient
    * failure (an OOM-killed compiler, a full disk) and every future connect

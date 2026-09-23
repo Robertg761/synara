@@ -75,6 +75,7 @@ import {
 } from "./desktopAppEnvironment.ts";
 import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./humanActivity.ts";
 import {
+  COMPUTER_AUTH_THROTTLED_ERROR,
   COMPUTER_SERVICE,
   createSessionKWinComputerDbus,
   isCaptureMethod,
@@ -514,6 +515,8 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly clipboardToolsPresent: () => boolean;
   private readonly provisionClipboardTools: () => Promise<string>;
   private explicitProvision: Promise<string> | undefined;
+  /** A forced rebuild for an old plugin build that failed; see `assertAuthenticationRebuildHelps`. */
+  private authenticationRebuildFailure: PluginProvisioningError | undefined;
   private readonly readInstallStamp: () => Promise<string | undefined>;
   private readonly runningKwinVersion: (() => Promise<string | undefined>) | undefined;
   private readonly installedKwinVersion: () => Promise<string | undefined>;
@@ -1957,13 +1960,13 @@ export class KWinComputerBackend implements ComputerBackend {
     // every pointer, key, and capture call this server sends, and could serve
     // forged state and screenshots an agent then acts on.
     const ownerBefore = await dbus.nameOwner(COMPUTER_SERVICE);
-    let authenticationFailed = false;
+    let authenticationFailure: { readonly error: unknown } | undefined;
     const instanceBefore = ownerBefore
       ? await dbus
           .connectPlugin()
           .then((plugin) => plugin.instanceId)
-          .catch(() => {
-            authenticationFailed = true;
+          .catch((error: unknown) => {
+            authenticationFailure = { error };
             return undefined;
           })
       : undefined;
@@ -2003,11 +2006,15 @@ export class KWinComputerBackend implements ComputerBackend {
       );
     }
     let plan = await this.planPluginLoad(loaded);
-    if (ownerBefore && authenticationFailed) {
+    if (ownerBefore && authenticationFailure) {
+      this.assertAuthenticationRebuildHelps(authenticationFailure.error);
       const installed = await this.provisionOnce(false, true).catch((error: unknown) => {
-        throw new PluginProvisioningError(describeErrorMessage(error, "the installer failed"), {
-          cause: error,
-        });
+        const failure = new PluginProvisioningError(
+          describeErrorMessage(error, "the installer failed"),
+          { cause: error },
+        );
+        this.authenticationRebuildFailure = failure;
+        throw failure;
       });
       if (installed.requiresRelogin) throw new PluginProvisioningError(installed.summary);
       plan = resolveSynaraPluginLoad({ loaded: [], installed: await this.installedPluginIds() });
@@ -2097,6 +2104,36 @@ export class KWinComputerBackend implements ComputerBackend {
     // waiting for the next login is not superseded, it is pending.
     if (plan.kind === "replace") await this.pruneOlderBuilds(plan.pluginId);
     return connected;
+  }
+
+  /**
+   * A plugin that is loaded but would not authenticate this server. Only a
+   * build that predates `authenticate` (UnknownMethod) is fixed by a forced
+   * source rebuild; anything else — a server in a sandbox that cannot share
+   * the plugin's session token, a refused token — is not, and rebuilding for
+   * it unloaded a working plugin on every connect attempt. A rebuild that
+   * already failed is not repeated until Set up.
+   */
+  private assertAuthenticationRebuildHelps(error: unknown): void {
+    // Not a verdict on this server at all: a bus fault, a plugin asking to
+    // wait out its cooldown, an owner that vanished before it could answer.
+    if (
+      isConnectionLevelFailure(error) ||
+      dbusErrorType(error) === COMPUTER_AUTH_THROTTLED_ERROR ||
+      (dbusErrorType(error) === undefined && !/authentication failed/i.test(dbusErrorText(error)))
+    ) {
+      throw error;
+    }
+    if (!isUnknownMethodDbusError(error)) {
+      throw new PluginProvisioningError(
+        `The loaded Synara ${this.integrationName} plugin did not accept this server ` +
+          `(${describeErrorMessage(error, "authentication failed")}), so it was left loaded and ` +
+          "nothing was rebuilt. A server running in a sandbox (a Flatpak, a service with a private " +
+          "/tmp) cannot share the plugin's session token; run it inside the desktop session.",
+        { cause: error },
+      );
+    }
+    if (this.authenticationRebuildFailure) throw this.authenticationRebuildFailure;
   }
 
   /** What a use is told when no compositor instance is running at all. */
@@ -2209,6 +2246,7 @@ export class KWinComputerBackend implements ComputerBackend {
     // An explicit set-up re-asks the AT-SPI helper too: a machine that just
     // gained python-gi or an accessibility bus should not wait for a reconnect.
     this.perception.resetProbes();
+    this.authenticationRebuildFailure = undefined;
     this.explicitProvision ??= this.runExplicitProvision().finally(() => {
       this.explicitProvision = undefined;
     });
