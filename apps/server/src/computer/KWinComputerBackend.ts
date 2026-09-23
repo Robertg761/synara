@@ -72,7 +72,11 @@ import {
 } from "./computerGeometry.ts";
 import { asarUnpackedPath } from "../platform/asarUnpackedPath.ts";
 import { ComputerHealthState } from "./computerHealthState.ts";
-import { desktopApplicationEnvironment } from "./desktopAppEnvironment.ts";
+import {
+  AGENT_ACCESSIBILITY_ENVIRONMENT,
+  desktopApplicationEnvironment,
+  withAgentAccessibilityArguments,
+} from "./desktopAppEnvironment.ts";
 import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./humanActivity.ts";
 import {
   COMPUTER_SERVICE,
@@ -1124,14 +1128,16 @@ export class KWinComputerBackend implements ComputerBackend {
     // The last moment to refuse: after this the process exists whatever the
     // caller does with the cancellation.
     assertDesktopOperationActive();
-    const launch = this.resolveApp(app, args);
+    // An app the agent launches is one it will read: accessibility on from
+    // the start (the environment below, and Chromium's switch when known).
+    const launch = withAgentAccessibilityArguments(this.resolveApp(app, args));
     let child: ChildProcess;
     try {
       // The application gets the desktop session's environment and nothing of
       // the server's — no auth token, no Electron control variables — and
       // starts in the user's home, not wherever the server happens to run.
       child = this.spawnProcess(launch.command, launch.args, {
-        env: desktopApplicationEnvironment(this.env),
+        env: desktopApplicationEnvironment(this.env, AGENT_ACCESSIBILITY_ENVIRONMENT),
         cwd: this.env.HOME || homedir(),
       });
     } catch (error) {

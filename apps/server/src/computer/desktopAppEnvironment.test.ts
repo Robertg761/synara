@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { desktopApplicationEnvironment } from "./desktopAppEnvironment.ts";
+import {
+  AGENT_ACCESSIBILITY_ENVIRONMENT,
+  CHROMIUM_ACCESSIBILITY_ARGUMENT,
+  desktopApplicationEnvironment,
+  withAgentAccessibilityArguments,
+} from "./desktopAppEnvironment.ts";
 
 describe("desktopApplicationEnvironment", () => {
   const base: NodeJS.ProcessEnv = {
@@ -73,5 +78,68 @@ describe("desktopApplicationEnvironment", () => {
   it("drops undefined base entries rather than copying them through", () => {
     const environment = desktopApplicationEnvironment({ HOME: undefined, PATH: "/bin" });
     expect(environment).toEqual({ PATH: "/bin" });
+  });
+});
+
+describe("agent launch accessibility", () => {
+  it("turns accessibility on in the environment and keeps it through a second scrub", () => {
+    const once = desktopApplicationEnvironment(
+      { PATH: "/usr/bin" },
+      AGENT_ACCESSIBILITY_ENVIRONMENT,
+    );
+    expect(once).toMatchObject({
+      ACCESSIBILITY_ENABLED: "1",
+      QT_LINUX_ACCESSIBILITY_ALWAYS_ON: "1",
+    });
+    // The nested session scrubs the backend's environment again.
+    expect(desktopApplicationEnvironment(once)).toMatchObject({
+      ACCESSIBILITY_ENABLED: "1",
+      QT_LINUX_ACCESSIBILITY_ALWAYS_ON: "1",
+    });
+  });
+
+  it.each([
+    ["/usr/bin/chromium", ["https://example.com"]],
+    ["/opt/google/chrome/google-chrome", []],
+    ["/usr/bin/code", ["--new-window"]],
+    ["/usr/lib/electron37/electron", []],
+    ["/usr/bin/electron37", ["/usr/lib/app"]],
+    ["/var/lib/flatpak/exports/bin/com.google.Chrome", []],
+  ])("adds Chromium's accessibility switch for %s", (command, args) => {
+    expect(withAgentAccessibilityArguments({ command, args }).args).toEqual([
+      ...args,
+      CHROMIUM_ACCESSIBILITY_ARGUMENT,
+    ]);
+  });
+
+  it("adds the switch after the app id of a flatpak run, and before a --", () => {
+    expect(
+      withAgentAccessibilityArguments({
+        command: "/usr/bin/flatpak",
+        args: ["run", "--branch=stable", "--command=chrome", "com.google.Chrome", "--", "x"],
+      }).args,
+    ).toEqual([
+      "run",
+      "--branch=stable",
+      "--command=chrome",
+      "com.google.Chrome",
+      CHROMIUM_ACCESSIBILITY_ARGUMENT,
+      "--",
+      "x",
+    ]);
+  });
+
+  it.each([
+    ["/usr/bin/firefox", ["https://example.com"]],
+    ["/usr/bin/gio", ["launch", "/usr/share/applications/chromium.desktop"]],
+    ["/usr/bin/flatpak", ["run", "org.mozilla.firefox"]],
+    ["/usr/bin/kate", []],
+  ])("leaves %s alone", (command, args) => {
+    expect(withAgentAccessibilityArguments({ command, args }).args).toEqual(args);
+  });
+
+  it("never adds the switch twice", () => {
+    const launch = { command: "/usr/bin/chromium", args: [CHROMIUM_ACCESSIBILITY_ARGUMENT] };
+    expect(withAgentAccessibilityArguments(launch)).toBe(launch);
   });
 });

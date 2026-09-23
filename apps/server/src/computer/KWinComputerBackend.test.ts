@@ -2684,6 +2684,39 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
+  /** Q6: an app the agent launches is one it will read, so accessibility is on. */
+  it("launches agent apps with accessibility on, and Chromium with its switch", async () => {
+    const dbus = new FakeDbus();
+    const spawned: Array<{ app: string; args: readonly string[]; env: NodeJS.ProcessEnv }> = [];
+    const backend = makeBackend(dbus, {
+      env: { PATH: "/usr/bin", HOME: "/home/user", SYNARA_AUTH_TOKEN: "secret" },
+      resolveApp: (app, args) => ({ command: `/usr/bin/${app}`, args: [...args], via: "path" }),
+      spawnProcess: (app, args, options) => {
+        const child = new FakeChild();
+        spawned.push({ app, args, env: options.env });
+        queueMicrotask(() => child.emit("spawn"));
+        return child as unknown as ChildProcess;
+      },
+    });
+    await backend.availability();
+
+    await backend.launchApp("chromium", ["https://example.com"]);
+    await backend.launchApp("kate", []);
+
+    expect(spawned.map(({ app, args }) => ({ app, args }))).toEqual([
+      { app: "/usr/bin/chromium", args: ["https://example.com", "--force-renderer-accessibility"] },
+      { app: "/usr/bin/kate", args: [] },
+    ]);
+    for (const { env } of spawned) {
+      expect(env).toMatchObject({
+        ACCESSIBILITY_ENABLED: "1",
+        QT_LINUX_ACCESSIBILITY_ALWAYS_ON: "1",
+      });
+      expect(env.SYNARA_AUTH_TOKEN).toBeUndefined();
+    }
+    await backend.dispose();
+  });
+
   it("maps eased pointer input, evdev buttons, scroll, text, and hotkeys", async () => {
     const dbus = new FakeDbus();
     const backend = makeBackend(dbus, { glideDurationMs: 0 });
@@ -3706,7 +3739,13 @@ describe("KWinComputerBackend supervision", () => {
       expect(spawned).toEqual([
         {
           cwd: "/home/tester",
-          env: { HOME: "/home/tester", PATH: "/usr/bin", WAYLAND_DISPLAY: "wayland-0" },
+          env: {
+            HOME: "/home/tester",
+            PATH: "/usr/bin",
+            WAYLAND_DISPLAY: "wayland-0",
+            ACCESSIBILITY_ENABLED: "1",
+            QT_LINUX_ACCESSIBILITY_ALWAYS_ON: "1",
+          },
         },
       ]);
       await backend.dispose();

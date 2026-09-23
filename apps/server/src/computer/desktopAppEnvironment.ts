@@ -31,6 +31,9 @@ const DESKTOP_ENVIRONMENT_NAMES: ReadonlySet<string> = new Set([
   "WAYLAND_DISPLAY",
   "DISPLAY",
   "XAUTHORITY",
+  // Kept so the accessibility switch below survives a second scrub (the
+  // nested session re-scrubs what the backend already did).
+  "ACCESSIBILITY_ENABLED",
 ]);
 
 /** Variable-name prefixes a desktop application is entitled to. */
@@ -61,4 +64,127 @@ export function desktopApplicationEnvironment(
     else environment[name] = value;
   }
   return environment;
+}
+
+/**
+ * Accessibility switched on for applications the agent launches — never for
+ * the human's own, which this module never touches. Perception reads the
+ * AT-SPI tree, and toolkits that build theirs lazily have none until an
+ * assistive technology asks: Chromium and Electron expose one empty frame, and
+ * Qt only bridges when told to. `ACCESSIBILITY_ENABLED` is what Chromium and
+ * GTK's bridge check; the Qt variable forces Qt's.
+ */
+export const AGENT_ACCESSIBILITY_ENVIRONMENT: Readonly<Record<string, string>> = {
+  ACCESSIBILITY_ENABLED: "1",
+  QT_LINUX_ACCESSIBILITY_ALWAYS_ON: "1",
+};
+
+/** Chromium's switch for building the web-content tree from the start. */
+export const CHROMIUM_ACCESSIBILITY_ARGUMENT = "--force-renderer-accessibility";
+
+/**
+ * Executables and Flatpak ids known to be Chromium or Electron, so they take
+ * Chromium switches. Deliberately a list rather than a guess: an unknown
+ * program handed an unknown switch may refuse to start.
+ */
+const CHROMIUM_FAMILY_EXECUTABLES: ReadonlySet<string> = new Set([
+  "chromium",
+  "chromium-browser",
+  "ungoogled-chromium",
+  "chrome",
+  "google-chrome",
+  "google-chrome-stable",
+  "google-chrome-beta",
+  "google-chrome-unstable",
+  "brave",
+  "brave-browser",
+  "brave-browser-stable",
+  "microsoft-edge",
+  "microsoft-edge-stable",
+  "microsoft-edge-beta",
+  "microsoft-edge-dev",
+  "vivaldi",
+  "vivaldi-stable",
+  "opera",
+  "electron",
+  "code",
+  "code-insiders",
+  "code-oss",
+  "codium",
+  "vscodium",
+  "cursor",
+  "slack",
+  "discord",
+  "signal-desktop",
+  "obsidian",
+  "element-desktop",
+  "teams-for-linux",
+]);
+
+const CHROMIUM_FAMILY_FLATPAKS: ReadonlySet<string> = new Set([
+  "org.chromium.Chromium",
+  "io.github.ungoogled_software.ungoogled_chromium",
+  "com.google.Chrome",
+  "com.google.ChromeDev",
+  "com.brave.Browser",
+  "com.microsoft.Edge",
+  "com.vivaldi.Vivaldi",
+  "com.opera.Opera",
+  "com.visualstudio.code",
+  "com.vscodium.codium",
+  "com.slack.Slack",
+  "com.discordapp.Discord",
+  "org.signal.Signal",
+  "md.obsidian.Obsidian",
+  "im.riot.Riot",
+  "com.github.IsmaelMartinez.teams_for_linux",
+]);
+
+/** `electron`, `electron37` and the like: versioned Electron runtimes. */
+const VERSIONED_ELECTRON = /^electron\d+$/;
+
+/** What a launch resolved to: the program spawned and its arguments. */
+export interface AgentLaunch {
+  readonly command: string;
+  readonly args: readonly string[];
+}
+
+/**
+ * The launch with Chromium's accessibility switch added when the program is a
+ * known Chromium or Electron build, run directly or through `flatpak run`.
+ * Anything else — including `gio launch`, which forwards only files — is
+ * returned unchanged.
+ */
+export function withAgentAccessibilityArguments<T extends AgentLaunch>(launch: T): T {
+  if (launch.args.includes(CHROMIUM_ACCESSIBILITY_ARGUMENT)) return launch;
+  if (!isChromiumFamilyLaunch(launch)) return launch;
+  // Before a `--`: after it the switch would be a file name.
+  const end = launch.args.indexOf("--");
+  const args =
+    end === -1
+      ? [...launch.args, CHROMIUM_ACCESSIBILITY_ARGUMENT]
+      : [...launch.args.slice(0, end), CHROMIUM_ACCESSIBILITY_ARGUMENT, ...launch.args.slice(end)];
+  return { ...launch, args };
+}
+
+function isChromiumFamilyLaunch(launch: AgentLaunch): boolean {
+  const program = basename(launch.command);
+  if (program === "flatpak") {
+    // `flatpak run [options] <app-id> [args]`: the first bare word after
+    // `run` is the application.
+    const run = launch.args.indexOf("run");
+    const appId =
+      run === -1 ? undefined : launch.args.slice(run + 1).find((arg) => !arg.startsWith("-"));
+    return appId !== undefined && CHROMIUM_FAMILY_FLATPAKS.has(appId);
+  }
+  return (
+    CHROMIUM_FAMILY_EXECUTABLES.has(program) ||
+    VERSIONED_ELECTRON.test(program) ||
+    CHROMIUM_FAMILY_FLATPAKS.has(program)
+  );
+}
+
+function basename(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash === -1 ? path : path.slice(slash + 1);
 }
