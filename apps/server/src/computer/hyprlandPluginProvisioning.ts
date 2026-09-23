@@ -436,13 +436,34 @@ export function detectHyprlandHeadersVersion(): Promise<string | undefined> {
     execFile(
       "pkg-config",
       ["--modversion", "hyprland"],
-      { timeout: 5_000, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+      {
+        timeout: 5_000,
+        // A scrubbed environment, but not one that forgets where this
+        // machine's .pc files are: a Hyprland built into a prefix is found
+        // only through these, the same way the Makefile's pkg-config finds it.
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          ...pickDefined(process.env, ["PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR"]),
+        },
+      },
       (error, stdout) => {
         const version = stdout.trim();
         resolve(error || !/^\d+(?:\.\d+)+$/.test(version) ? undefined : version);
       },
     );
   });
+}
+
+function pickDefined(
+  env: NodeJS.ProcessEnv,
+  names: readonly string[],
+): Record<string, string> {
+  const picked: Record<string, string> = {};
+  for (const name of names) {
+    const value = env[name];
+    if (value !== undefined) picked[name] = value;
+  }
+  return picked;
 }
 
 /**

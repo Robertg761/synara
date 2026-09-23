@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  detectHyprlandHeadersVersion,
   buildHyprlandPluginFromSource,
   hyprlandBuildToolingPresent,
   hyprlandInstallIsCurrent,
@@ -572,5 +573,28 @@ describe("buildHyprlandPluginFromSource", () => {
       // signalled it, so its exit is the cancellation, not a build failure.
       await expect(pending).rejects.toThrow("setup cancelled");
     });
+  });
+});
+
+describe("detectHyprlandHeadersVersion", () => {
+  it("keeps the pkg-config search path, so a Hyprland in a prefix is found", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "synara-pkgconfig-"));
+    // A stand-in pkg-config that only knows Hyprland through the custom path.
+    await writeFile(
+      join(directory, "pkg-config"),
+      '#!/bin/sh\n[ "$PKG_CONFIG_PATH" = "/opt/hypr/lib/pkgconfig" ] && echo 0.56.0 && exit 0\nexit 1\n',
+    );
+    await chmod(join(directory, "pkg-config"), 0o755);
+    const saved = { PATH: process.env.PATH, PKG_CONFIG_PATH: process.env.PKG_CONFIG_PATH };
+    process.env.PATH = `${directory}:${saved.PATH ?? ""}`;
+    process.env.PKG_CONFIG_PATH = "/opt/hypr/lib/pkgconfig";
+    try {
+      await expect(detectHyprlandHeadersVersion()).resolves.toBe("0.56.0");
+    } finally {
+      process.env.PATH = saved.PATH;
+      if (saved.PKG_CONFIG_PATH === undefined) delete process.env.PKG_CONFIG_PATH;
+      else process.env.PKG_CONFIG_PATH = saved.PKG_CONFIG_PATH;
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
