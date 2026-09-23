@@ -660,3 +660,53 @@ describe("launch results", () => {
     }
   });
 });
+
+describe("paste-once clipboard", () => {
+  it("puts the human's clipboard back as soon as the paste has read the offer", async () => {
+    const plugin = new FakePlugin();
+    const commands: string[] = [];
+    const pasted = Promise.withResolvers<void>();
+    const backend = makeBackend(plugin, {
+      runClipboardCommand: async (spec) => {
+        commands.push([spec.command, ...spec.args, spec.input ?? ""].join(" ").trim());
+        if (spec.command === "wl-paste") {
+          return { outcome: "exited", code: 0, stdout: "human text", stderr: "" };
+        }
+        return {
+          outcome: "exited",
+          code: 0,
+          stdout: "",
+          stderr: "",
+          ...(spec.args.includes("--paste-once") ? { forkExited: pasted.promise } : {}),
+        };
+      },
+    });
+    // The target reads the offer the moment Ctrl+V goes down.
+    const key = plugin.key;
+    plugin.key = async (code, pressed) => {
+      if (code === 47 && pressed) queueMicrotask(() => pasted.resolve());
+      return key(code, pressed);
+    };
+    const manager = new (await import("./ComputerManager.ts")).ComputerManager({
+      backend,
+      actionSettleMs: 0,
+    });
+    try {
+      await backend.availability();
+      const startedAt = Date.now();
+      const result = await manager.withAgentActivity("thread-a", () =>
+        manager.paste("thread-a", "agent text"),
+      );
+      expect(result.clipboardRestored).toBe(true);
+      expect(commands).toEqual([
+        "wl-paste --no-newline --type text",
+        "wl-copy --paste-once --type text/plain agent text",
+        "wl-copy --type text/plain human text",
+      ]);
+      // Neither the fixed 250 ms nor the 2 s bound was waited out.
+      expect(Date.now() - startedAt).toBeLessThan(200);
+    } finally {
+      await manager.dispose();
+    }
+  });
+});

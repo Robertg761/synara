@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   wlClipboardToolsPresent,
   spawnClipboardCommand,
+  writeWlClipboardForPaste,
+  type ClipboardCommandResult,
   type ClipboardCommandSpec,
 } from "./wlClipboard.ts";
 
@@ -100,6 +102,29 @@ describe("spawnClipboardCommand", () => {
     }
   });
 
+  it("reports when a watched forked child has exited", async () => {
+    // The grandchild keeps our stderr for 300 ms, as wl-copy's paste-once
+    // child does until the paste (or a replacement) arrives.
+    const startedAt = Date.now();
+    const result = await node(
+      [
+        "require('node:child_process').spawn(process.execPath,",
+        "  ['-e', 'setTimeout(() => {}, 300)'], { stdio: ['ignore', 'ignore', 2] }).unref();",
+        "process.exit(0);",
+      ].join(" "),
+      { forks: true, observeFork: true },
+    );
+    expect(result).toMatchObject({ outcome: "exited", code: 0 });
+    expect(Date.now() - startedAt).toBeLessThan(250);
+    await result.forkExited;
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
+  });
+
+  it("watches nothing unless asked", async () => {
+    const result = await node("process.exit(0)", { forks: true });
+    expect(result.forkExited).toBeUndefined();
+  });
+
   it("kills a command that passes the output cap", async () => {
     await expect(
       node("process.stdout.write('a'.repeat(64)); setTimeout(() => {}, 4000);", {
@@ -119,6 +144,43 @@ describe("spawnClipboardCommand", () => {
     await expect(
       spawnClipboardCommand({ command: "synara-absent-clipboard-binary", args: [] }),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+describe("writeWlClipboardForPaste", () => {
+  it("offers the text for one paste and hands back the offer's end", async () => {
+    const specs: ClipboardCommandSpec[] = [];
+    const ended = Promise.withResolvers<void>();
+    const offer = await writeWlClipboardForPaste(async (spec): Promise<ClipboardCommandResult> => {
+      specs.push(spec);
+      return { outcome: "exited", code: 0, stdout: "", stderr: "", forkExited: ended.promise };
+    }, "agent text");
+    expect(specs).toEqual([
+      {
+        command: "wl-copy",
+        args: ["--paste-once", "--type", "text/plain"],
+        input: "agent text",
+        forks: true,
+        observeFork: true,
+      },
+    ]);
+    let consumed = false;
+    void offer.consumed.then(() => {
+      consumed = true;
+    });
+    await Promise.resolve();
+    expect(consumed).toBe(false);
+    ended.resolve();
+    await offer.consumed;
+  });
+
+  it("fails like an ordinary write when wl-copy fails", async () => {
+    await expect(
+      writeWlClipboardForPaste(
+        async () => ({ outcome: "exited", code: 1, stdout: "", stderr: "no seat\n" }),
+        "x",
+      ),
+    ).rejects.toThrow("wl-copy failed to write the desktop clipboard: no seat");
   });
 });
 

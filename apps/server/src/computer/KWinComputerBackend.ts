@@ -41,6 +41,7 @@ import {
   type ComputerBackendActionResult,
   type ComputerBackendEventListener,
   type ComputerCaptureRequest,
+  type ComputerClipboardPasteOffer,
   type ComputerFrameListener,
   type ComputerLumaCapture,
   type ComputerResolvedTarget,
@@ -133,6 +134,7 @@ import {
   readWlClipboard,
   spawnClipboardCommand,
   writeWlClipboard,
+  writeWlClipboardForPaste,
   wlClipboardToolsPresent,
   type ClipboardCommandRunner,
 } from "./wlClipboard.ts";
@@ -1830,6 +1832,16 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async writeClipboard(text: string): Promise<void> {
     await writeWlClipboard(this.runClipboardCommand, text);
+  }
+
+  /**
+   * Paste's single-use offer (`wl-copy --paste-once`): `consumed` settles when
+   * the target has read it or anything replaced it, which is when the manager
+   * puts the human's clipboard back — instead of after a fixed 250 ms a slow
+   * application could miss. The restore itself replaces an unread offer.
+   */
+  async writeClipboardForPaste(text: string): Promise<ComputerClipboardPasteOffer> {
+    return await writeWlClipboardForPaste(this.runClipboardCommand, text);
   }
 
   /** Replace the complete value through EditableText; insertion is a separate operation. */

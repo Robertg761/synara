@@ -31,6 +31,12 @@ const MAX_CLIPBOARD_STDERR_BYTES = 8 * 1024;
  * hold the pipe open indefinitely. The deadline bounds what that costs a turn.
  */
 const CLIPBOARD_TIMEOUT_MS = 5_000;
+/**
+ * How long a paste-once offer is watched before its pipe is let go. An offer
+ * ends when it is pasted or replaced, and paste always replaces it with the
+ * human's clipboard within seconds; this only bounds a restore that failed.
+ */
+const PASTE_OFFER_WATCH_MS = 30_000;
 
 const WL_COPY = "wl-copy";
 const WL_PASTE = "wl-paste";
@@ -73,6 +79,13 @@ export interface ClipboardCommandSpec {
    * for the next clipboard change. Only the parent's exit is awaited.
    */
   readonly forks?: boolean;
+  /**
+   * For a forking command: keep the stderr pipe the background child inherits
+   * and report, as `forkExited`, when it closes — that is, when the child has
+   * exited. wl-copy's child points stdin and stdout at /dev/null but keeps
+   * stderr, so this is the only handle on it.
+   */
+  readonly observeFork?: boolean;
   readonly maxOutputBytes?: number;
   readonly timeoutMs?: number;
 }
@@ -83,6 +96,8 @@ export interface ClipboardCommandResult {
   readonly code: number | null;
   readonly stdout: string;
   readonly stderr: string;
+  /** Settles when a forked child has exited; see `ClipboardCommandSpec.observeFork`. */
+  readonly forkExited?: Promise<void>;
 }
 
 export type ClipboardCommandRunner = (
@@ -131,6 +146,42 @@ export async function writeWlClipboard(run: ClipboardCommandRunner, text: string
     forks: true,
   });
   if (result.outcome === "exited" && result.code === 0) return;
+  throw new ComputerBackendError(
+    `${WL_COPY} failed to write the desktop clipboard: ${describeFailure(result)}`,
+    { retryable: result.outcome === "timed-out" },
+  );
+}
+
+/**
+ * Offers `text` on the seat0 clipboard for exactly one paste, and says when
+ * that paste has read it.
+ *
+ * `wl-copy --paste-once` serves a single request and exits, and it also exits
+ * when anything else takes the clipboard — so `consumed` settles when the
+ * target has read the payload or the offer was replaced, and the caller puts
+ * the human's clipboard back then rather than after a guessed delay. Resolves,
+ * like `writeWlClipboard`, once the payload is on the clipboard.
+ */
+export async function writeWlClipboardForPaste(
+  run: ClipboardCommandRunner,
+  text: string,
+): Promise<{ readonly consumed: Promise<void> }> {
+  assertComputerClipboardWriteFits(text);
+  const result = await runClipboardCommand(run, {
+    command: WL_COPY,
+    args: ["--paste-once", "--type", CLIPBOARD_WRITE_TYPE],
+    input: text,
+    forks: true,
+    observeFork: true,
+  });
+  if (result.outcome === "exited" && result.code === 0) {
+    const consumed =
+      result.forkExited ??
+      Promise.reject(new Error(`${WL_COPY} gave no handle on its paste-once offer.`));
+    // The caller may never look (a shortcut that failed before the paste).
+    consumed.catch(() => undefined);
+    return { consumed };
+  }
   throw new ComputerBackendError(
     `${WL_COPY} failed to write the desktop clipboard: ${describeFailure(result)}`,
     { retryable: result.outcome === "timed-out" },
@@ -193,6 +244,7 @@ export function spawnClipboardCommand(
     const stderr = new ChunkBuffer(MAX_CLIPBOARD_STDERR_BYTES);
     let outcome: ClipboardCommandResult["outcome"] = "exited";
     let settled = false;
+    const observeFork = spec.forks === true && spec.observeFork === true;
 
     const timer = setTimeout(() => {
       outcome = "timed-out";
@@ -205,9 +257,12 @@ export function spawnClipboardCommand(
       settled = true;
       clearTimeout(timer);
       // A forking wl-copy leaves its background child holding these pipes, so
-      // they are released here rather than waited on.
+      // they are released here rather than waited on — except stderr when the
+      // caller watches the child through it.
       child.stdout.destroy();
-      child.stderr.destroy();
+      const forkExited =
+        observeFork && outcome === "exited" && code === 0 ? watchForkExit(child) : undefined;
+      if (!forkExited) child.stderr.destroy();
       // An output-limit run has no usable stdout — the buffer refuses to
       // pretend its truncated prefix is the real thing.
       const readStdout = () => {
@@ -217,7 +272,13 @@ export function spawnClipboardCommand(
           return "";
         }
       };
-      resolve({ outcome, code, stdout: readStdout(), stderr: stderr.diagnostic() });
+      resolve({
+        outcome,
+        code,
+        stdout: readStdout(),
+        stderr: stderr.diagnostic(),
+        ...(forkExited ? { forkExited } : {}),
+      });
     };
 
     child.on("error", (error) => {
@@ -241,6 +302,33 @@ export function spawnClipboardCommand(
     // exit status rather than as an unhandled stdin error.
     child.stdin.on("error", () => undefined);
     child.stdin.end(spec.input ?? "");
+  });
+}
+
+/**
+ * Settles when the forked child holding `child`'s stderr pipe has exited: the
+ * pipe's last writer is gone. Bounded, so a child nothing ever ends does not
+ * hold the pipe for the life of the server.
+ */
+function watchForkExit(child: ReturnType<typeof spawn>): Promise<void> {
+  const stream = child.stderr;
+  if (!stream || stream.destroyed || stream.readableEnded) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      stream.destroy();
+      reject(new Error(`${WL_COPY}'s paste-once offer was still open after ${PASTE_OFFER_WATCH_MS}ms.`));
+    }, PASTE_OFFER_WATCH_MS);
+    timer.unref?.();
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    stream.once("close", done);
+    stream.once("end", done);
+    // Drained so the child can never block on a full pipe; the text is not read.
+    stream.resume();
+    // The watch must not keep the server alive on its own.
+    (stream as { unref?: () => void }).unref?.();
   });
 }
 
