@@ -346,7 +346,7 @@ describe("HyprlandComputerBackend inherited plugin contract", () => {
     await backend.pressKey("Enter");
     expect(dbus.plugin.calls.filter((call) => call.method === "key").length).toBeGreaterThan(0);
 
-    dbus.plugin.keyboardLayout = "us(intl)";
+    dbus.plugin.keyboardLayout = "us(altgr-intl)";
     dbus.plugin.calls.length = 0;
     await backend.typeText("ok");
     expect(dbus.plugin.calls.filter((call) => call.method === "key")).toHaveLength(4);
