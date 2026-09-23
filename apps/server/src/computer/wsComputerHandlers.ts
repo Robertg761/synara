@@ -72,6 +72,18 @@ function attempt<A>(
   });
 }
 
+/**
+ * `attempt` for input the human sends from the pane: every such route runs
+ * inside `withPaneInput`, so a backend asking `isPaneInput()` gets the same
+ * answer for a key as for a click. The one place that marks pane input.
+ */
+function paneInput<A>(
+  promise: () => Promise<A>,
+  fallbackMessage: string,
+): Effect.Effect<A, WsRpcError> {
+  return attempt(() => withPaneInput(promise), fallbackMessage);
+}
+
 export interface WsComputerHandlers {
   readonly [COMPUTER_WS_METHODS.setControlEnabled]: (
     input: ComputerSetControlEnabledInput,
@@ -259,81 +271,75 @@ export function makeWsComputerHandlers(
         "Failed to launch computer application",
       ),
     [COMPUTER_WS_METHODS.click]: (input) =>
-      attempt(
-        () => withPaneInput(() => manager.click(undefined, input)),
+      paneInput(
+        () => manager.click(undefined, input),
         "Failed to click on computer",
       ),
     [COMPUTER_WS_METHODS.doubleClick]: (input) =>
-      attempt(
-        () => withPaneInput(() => manager.doubleClick(undefined, input)),
+      paneInput(
+        () => manager.doubleClick(undefined, input),
         "Failed to double-click on computer",
       ),
     [COMPUTER_WS_METHODS.rightClick]: (input) =>
-      attempt(
-        () => withPaneInput(() => manager.rightClick(undefined, input)),
+      paneInput(
+        () => manager.rightClick(undefined, input),
         "Failed to right-click on computer",
       ),
     [COMPUTER_WS_METHODS.moveCursor]: (input) =>
-      attempt(
-        () => withPaneInput(() => manager.moveCursor(undefined, input)),
+      paneInput(
+        () => manager.moveCursor(undefined, input),
         "Failed to move computer cursor",
       ),
     [COMPUTER_WS_METHODS.drag]: (input) =>
-      attempt(
+      paneInput(
         () =>
-          withPaneInput(() =>
-            manager.drag(undefined, input.from, input.to, input.durationMs ?? 250),
-          ),
+          manager.drag(undefined, input.from, input.to, input.durationMs ?? 250),
         "Failed to drag on computer",
       ),
     [COMPUTER_WS_METHODS.scroll]: (input) =>
-      attempt(
+      paneInput(
         () =>
-          withPaneInput(() =>
-            manager.scroll(undefined, scrollTarget(input), input.deltaX, input.deltaY),
-          ),
+          manager.scroll(undefined, scrollTarget(input), input.deltaX, input.deltaY),
         "Failed to scroll on computer",
       ),
     [COMPUTER_WS_METHODS.typeText]: (input) =>
-      attempt(() => manager.typeText(undefined, input.text), "Failed to type on computer"),
+      paneInput(() => manager.typeText(undefined, input.text), "Failed to type on computer"),
     [COMPUTER_WS_METHODS.pressKey]: (input) =>
-      attempt(() => manager.pressKey(undefined, input.key), "Failed to press computer key"),
+      paneInput(() => manager.pressKey(undefined, input.key), "Failed to press computer key"),
     [COMPUTER_WS_METHODS.hotkey]: (input) =>
-      attempt(() => manager.hotkey(undefined, input.keys), "Failed to send computer hotkey"),
+      paneInput(() => manager.hotkey(undefined, input.keys), "Failed to send computer hotkey"),
     [COMPUTER_WS_METHODS.setValue]: (input) =>
-      attempt(
+      paneInput(
         () => manager.setValue(undefined, input, input.value),
         "Failed to set computer value",
       ),
     [COMPUTER_WS_METHODS.performAction]: (input) =>
-      attempt(
+      paneInput(
         () => manager.performAction(undefined, input, input.action),
         "Failed to perform computer action",
       ),
     [COMPUTER_WS_METHODS.selectText]: (input) =>
-      attempt(
+      paneInput(
         () => manager.selectText(undefined, input, { start: input.start, length: input.length }),
         "Failed to select computer text",
       ),
     [COMPUTER_WS_METHODS.getThreadState]: (input) =>
       attempt(() => manager.getThreadState(input.threadId), "Failed to read computer state"),
     [COMPUTER_WS_METHODS.inputClick]: (input) =>
-      attempt(
-        () => withPaneInput(() => userInputClick(manager, input)),
+      paneInput(
+        () => userInputClick(manager, input),
         "Failed to click on computer",
       ),
     [COMPUTER_WS_METHODS.inputScroll]: (input) =>
-      attempt(
+      paneInput(
         () =>
-          withPaneInput(() =>
-            manager.withUserPointTarget({ x: input.x, y: input.y }, (target) =>
-              manager.scroll(undefined, target, input.deltaX, input.deltaY),
-            ),
+          manager.withUserPointTarget({ x: input.x, y: input.y }, (target) =>
+            manager.scroll(undefined, target, input.deltaX, input.deltaY),
           ),
         "Failed to scroll on computer",
       ),
     [COMPUTER_WS_METHODS.inputKey]: (input) =>
-      attempt(() => userInputKey(manager, input), "Failed to press computer key"),
+      paneInput(() => userInputKey(manager, input), "Failed to press computer key"),
   };
 }
 
