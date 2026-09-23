@@ -411,16 +411,80 @@ describe("compositor-observed settle", () => {
         await manager.pressKey("thread-a", "enter");
         await manager.captureActionScreenshot("window-1");
       });
-      expect(plugin.calls).toContainEqual({
-        method: "waitForSettle",
-        args: ["window-1", 100, 1_500],
-      });
+      // Quiet, looked for as long as the old fixed wait; it came at once.
+      expect(plugin.calls.filter((call) => call.method === "waitForSettle")).toEqual([
+        { method: "waitForSettle", args: ["window-1", 100, 300] },
+      ]);
       // No blind 300 ms timer ran beside it.
       expect(timers.mock.calls.some((call) => call[1] === 300)).toBe(false);
     } finally {
       timers.mockRestore();
       await manager.dispose();
     }
+  });
+
+  it.each([
+    [
+      "photographs an animating window when quiet does not come, as the fixed wait did",
+      // Never quiet within 300 ms; it has repainted, so the check answers at once.
+      [
+        [false, 300],
+        [true, 0],
+      ],
+      { settled: true, waitedMs: 300 },
+    ],
+    [
+      "gives a window that has not repainted yet the rest of the cap for its first frame",
+      [
+        [false, 300],
+        [true, 540],
+      ],
+      { settled: true, waitedMs: 840 },
+    ],
+    [
+      "gives up at the cap on a window that never repaints",
+      [
+        [false, 300],
+        [false, 1_200],
+      ],
+      { settled: false, waitedMs: 1_500 },
+    ],
+  ] as const)("%s", async (_label, replies, expected) => {
+    const plugin = new FakePlugin();
+    plugin.features = ["waitForSettle"];
+    const answers = [...replies];
+    plugin.waitForSettle = async (windowId, quietMs, timeoutMs) => {
+      plugin.calls.push({ method: "waitForSettle", args: [windowId, quietMs, timeoutMs] });
+      return answers.shift()!;
+    };
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    await expect(
+      backend.waitForSettle!({
+        windowId: "window-1",
+        quietMs: 100,
+        timeoutMs: 1_500,
+        quietWithinMs: 300,
+      }),
+    ).resolves.toEqual(expected);
+    expect(plugin.calls.filter((call) => call.method === "waitForSettle")).toEqual([
+      { method: "waitForSettle", args: ["window-1", 100, 300] },
+      { method: "waitForSettle", args: ["window-1", 0, 1_200] },
+    ]);
+  });
+
+  it("waits for real quiet when the caller sets no bound (an explicit wait)", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["waitForSettle"];
+    plugin.settleAnswer = [true, 640];
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    await expect(
+      backend.waitForSettle!({ windowId: "window-1", quietMs: 300, timeoutMs: 10_000 }),
+    ).resolves.toEqual({ settled: true, waitedMs: 640 });
+    expect(plugin.calls.filter((call) => call.method === "waitForSettle")).toEqual([
+      { method: "waitForSettle", args: ["window-1", 300, 10_000] },
+    ]);
   });
 
   it("keeps the fixed post-action wait on a plugin without waitForSettle", async () => {

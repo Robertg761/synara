@@ -353,11 +353,16 @@ const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
 const WINDOW_SNAPSHOT_TTL_MS = 75;
 /**
  * The post-action settle on a plugin that answers `waitForSettle` from surface
- * commits: the target has repainted after the input and then stayed quiet
- * this long, capped for a window that never stops repainting (a video, a
- * spinner). Most of a click used to be the fixed 300 ms guess this replaces.
+ * commits: the target has repainted since the input and then stayed quiet
+ * this long. Quiet is looked for only as long as the fixed 300 ms guess this
+ * replaces used to wait: an animation (GTK's overlay scrollbar under any
+ * pointer motion, a button transition) repaints every frame and never goes
+ * quiet, and it is photographed then, as before. A window that has not
+ * repainted at all by then gets up to the cap for its first frame — a slow
+ * application is no longer photographed before it updates.
  */
 const PLUGIN_SETTLE_QUIET_MS = 100;
+const PLUGIN_SETTLE_QUIET_WITHIN_MS = 300;
 const PLUGIN_SETTLE_TIMEOUT_MS = 1_500;
 /**
  * Interface-version-2 capabilities a plugin advertises in `healthJson`. A
@@ -585,6 +590,7 @@ export class KWinComputerBackend implements ComputerBackend {
   readonly actionSettle = {
     quietMs: PLUGIN_SETTLE_QUIET_MS,
     timeoutMs: PLUGIN_SETTLE_TIMEOUT_MS,
+    quietWithinMs: PLUGIN_SETTLE_QUIET_WITHIN_MS,
   } as const;
 
   protected readonly integrationName: string;
@@ -1381,7 +1387,12 @@ export class KWinComputerBackend implements ComputerBackend {
 
   /**
    * Waits for `windowId` to repaint after the agent's last input and then
-   * stay quiet for `quietMs`, bounded by `timeoutMs`. Pure observation: no
+   * stay quiet for `quietMs`, bounded by `timeoutMs`. With `quietWithinMs`,
+   * quiet is waited for only that long; then a second wait with no quiet
+   * window answers at once for a window that has repainted since the input
+   * (it is animating) and otherwise waits out the rest of `timeoutMs` for its
+   * first repaint. A settled wait is what retires the input in the plugin, so
+   * the second wait still measures from the action. Pure observation: no
    * input, no session start. A plugin that cannot observe the window at all
    * (it is gone, or no session is running) answers unsettled at once; that
    * gets the blind wait the plugin could not replace rather than none.
@@ -1390,6 +1401,7 @@ export class KWinComputerBackend implements ComputerBackend {
     readonly windowId: string;
     readonly timeoutMs: number;
     readonly quietMs: number;
+    readonly quietWithinMs?: number;
   }): Promise<{ readonly settled: boolean; readonly waitedMs: number }> {
     const plugin = await this.ensurePlugin({ start: false });
     const waitForSettle = this.pluginFeature("waitForSettle") ? plugin.waitForSettle : undefined;
@@ -1398,14 +1410,26 @@ export class KWinComputerBackend implements ComputerBackend {
         `The loaded Synara ${this.integrationName} plugin cannot observe a window settling.`,
       );
     }
+    const wait = async (quietMs: number, timeoutMs: number) =>
+      readSettleReply(
+        await this.pluginValue(() => waitForSettle(options.windowId, quietMs, timeoutMs)),
+      );
     const timeoutMs = clampMilliseconds(options.timeoutMs);
     const quietMs = Math.min(clampMilliseconds(options.quietMs), timeoutMs);
-    const [settled, elapsedMs] = readSettleReply(
-      await this.pluginValue(() => waitForSettle(options.windowId, quietMs, timeoutMs)),
-    );
-    if (settled || elapsedMs > 0 || quietMs === 0) return { settled, waitedMs: elapsedMs };
-    await this.sleep(quietMs);
-    return { settled: false, waitedMs: quietMs };
+    const quietBound =
+      options.quietWithinMs === undefined
+        ? timeoutMs
+        : Math.min(clampMilliseconds(options.quietWithinMs), timeoutMs);
+    const [quiet, quietWaitMs] = await wait(quietMs, quietBound);
+    if (quiet) return { settled: true, waitedMs: quietWaitMs };
+    if (quietWaitMs === 0 && quietMs > 0) {
+      await this.sleep(quietMs);
+      return { settled: false, waitedMs: quietMs };
+    }
+    const remaining = timeoutMs - quietWaitMs;
+    if (remaining <= 0) return { settled: false, waitedMs: quietWaitMs };
+    const [changed, changeWaitMs] = await wait(0, remaining);
+    return { settled: changed, waitedMs: quietWaitMs + changeWaitMs };
   }
 
   private reportAtspiUnavailable(reason: string): void {
