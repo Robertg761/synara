@@ -567,6 +567,8 @@ export class KWinComputerBackend implements ComputerBackend {
   private pluginId: string | undefined;
   private pluginHealth: KWinHealth | undefined;
   private disconnect: (() => void) | undefined;
+  /** Closes of dropped connections still in flight; see `connectOnce`. */
+  private closingDbus: Promise<void> = Promise.resolve();
   private unsubscribeOwnerChanges: (() => void) | undefined;
   private connectPromise: Promise<KWinComputerPluginApi> | undefined;
   private connectAutomatic = false;
@@ -1950,6 +1952,12 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   private async connectOnce(automatic: boolean): Promise<KWinComputerPluginApi> {
+    if (!this.dbus) {
+      // The connection being replaced still holds this server's bus name
+      // until its close lands, and a new one asking for the name first is
+      // told another Synara server owns the desktop.
+      await this.closingDbus;
+    }
     const dbus = this.dbus ?? (this.dbus = await this.dbusFactory({ automatic }));
     if (!this.disconnect) {
       this.disconnect = dbus.onDisconnect(() => {
@@ -2453,7 +2461,12 @@ export class KWinComputerBackend implements ComputerBackend {
     this.disconnect = undefined;
     this.unsubscribeOwnerChanges?.();
     this.unsubscribeOwnerChanges = undefined;
-    void dbus?.close().catch(() => undefined);
+    if (dbus) {
+      const previous = this.closingDbus;
+      this.closingDbus = Promise.all([previous, dbus.close().catch(() => undefined)]).then(
+        () => undefined,
+      );
+    }
   }
 
   /**

@@ -4289,6 +4289,42 @@ describe("KWinComputerBackend reconnect timer", () => {
     }
   });
 
+  it("connects again only once the dropped connection has closed", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      let finishClose: (() => void) | undefined;
+      dbus.close = () =>
+        finishClose
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => {
+              finishClose = resolve;
+            });
+      let dials = 0;
+      const backend = makeBackend(dbus, {
+        random: () => 1,
+        dbusFactory: async () => {
+          dials += 1;
+          return dbus;
+        },
+      });
+      await backend.availability();
+      const before = dials;
+
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(1_000);
+      // Still releasing the server's bus name: asking for it now would fail.
+      expect(dials).toBe(before);
+      finishClose?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(dials).toBe(before + 1);
+      await vi.waitFor(() => expect(backend.health().status).toBe("connected"));
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("halves the delay at the low end of the jitter range", async () => {
     vi.useFakeTimers();
     try {
