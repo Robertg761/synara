@@ -79,6 +79,29 @@ describe("nested session environment", () => {
     ).toMatchObject({ DISPLAY: "" });
   });
 
+  it("hands X11 clients the nested Xwayland's own cookie when the plugin reports it", async () => {
+    const harness = new NestedHarness();
+    harness.dbus.xAuthority = "/run/user/1000/synara-nested-sessions/1-0a1b2c3d/xauth_abc";
+    const session = await startNestedKWinSession(harness.options());
+    expect(session.xAuthority).toBe(harness.dbus.xAuthority);
+    expect(nestedSessionEnv(session)).toMatchObject({
+      DISPLAY: ":9",
+      XAUTHORITY: harness.dbus.xAuthority,
+    });
+    session.spawnApp("xterm", [], {
+      env: { PATH: "/usr/bin", XAUTHORITY: "/home/human/.Xauthority" },
+      cwd: "/home/agent",
+    });
+    expect(harness.apps[0]?.env.XAUTHORITY).toBe(harness.dbus.xAuthority);
+    await session.dispose();
+  });
+
+  it("leaves XAUTHORITY alone for a plugin too old to report the cookie", () => {
+    expect(
+      nestedSessionEnv({ busAddress: BUS_ADDRESS, waylandDisplay: "synara-nested-1", xDisplay: ":9" }),
+    ).not.toHaveProperty("XAUTHORITY");
+  });
+
   it("is opt-in through the environment, which also names the mode", () => {
     expect(nestedSessionMode({})).toBeUndefined();
     expect(nestedSessionMode({ SYNARA_COMPUTER_NESTED: "" })).toBeUndefined();
@@ -801,11 +824,16 @@ class FakeDbus implements KWinComputerDbus {
     return true;
   };
   xDisplay: string | undefined = ":9";
+  xAuthority: string | undefined;
   connectPlugin = async () => {
     this.calls.push("connectPlugin");
     return {
       healthJson: async () =>
-        JSON.stringify({ ok: true, ...(this.xDisplay ? { xDisplay: this.xDisplay } : {}) }),
+        JSON.stringify({
+          ok: true,
+          ...(this.xDisplay ? { xDisplay: this.xDisplay } : {}),
+          ...(this.xAuthority ? { xAuthority: this.xAuthority } : {}),
+        }),
     } as KWinComputerPluginApi;
   };
   onDisconnect = () => () => undefined;

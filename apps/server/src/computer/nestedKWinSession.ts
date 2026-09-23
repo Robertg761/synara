@@ -170,6 +170,11 @@ export interface NestedKWinSession {
    */
   readonly xDisplay: string | undefined;
   /**
+   * The cookie file KWin wrote for that Xwayland, so X11 clients can
+   * authenticate to it. Undefined when the loaded plugin does not report one.
+   */
+  readonly xAuthority?: string | undefined;
+  /**
    * Whether the session runs its own accessibility bus. Without one, nothing
    * answers `org.a11y.Bus` on the private bus — no service is ever activated
    * there — so AT-SPI perception must not be attempted at all.
@@ -323,10 +328,10 @@ export async function startNestedKWinSession(
 
     const dbus = await connectDbus(busAddress);
     let pluginId: string;
-    let xDisplay: string | undefined;
+    let xServer: NestedXServer;
     try {
       pluginId = await loadNestedPlugin(dbus, await installedPluginIds());
-      xDisplay = await readXDisplay(dbus);
+      xServer = await readXServer(dbus);
     } finally {
       await dbus.close().catch(() => undefined);
     }
@@ -336,7 +341,7 @@ export async function startNestedKWinSession(
       if (basename(readProcessCommand(pid)?.split(" ")[0] ?? "") === XWAYLAND_COMMAND)
         marker.record(pid, "xwayland");
     }
-    const coordinates = { runtimeDirectory, busAddress, waylandDisplay, xDisplay };
+    const coordinates = { runtimeDirectory, busAddress, waylandDisplay, ...xServer };
     const accessibility = options.accessibility
       ? await startAccessibilityBus({
           launcher:
@@ -466,8 +471,14 @@ export function nestedSessionEnv(session: {
   readonly busAddress: string;
   readonly waylandDisplay: string;
   readonly xDisplay?: string | undefined;
+  readonly xAuthority?: string | undefined;
 }): Record<string, string> {
   return {
+    // KWin generates the nested Xwayland's cookie itself; an X11 client holding
+    // the human's XAUTHORITY instead is refused by the only X server it is
+    // allowed to reach. A plugin too old to report the file leaves whatever the
+    // caller's environment had, as before.
+    ...(session.xAuthority ? { XAUTHORITY: session.xAuthority } : {}),
     ...(session.runtimeDirectory ? { XDG_RUNTIME_DIR: session.runtimeDirectory } : {}),
     WAYLAND_DISPLAY: session.waylandDisplay,
     DBUS_SESSION_BUS_ADDRESS: session.busAddress,
@@ -722,22 +733,34 @@ export function parseNestedSizeEnv(value: string | undefined): NestedSize | unde
  * loaded. `resolveSynaraPluginLoad` owns the unload-all-then-load-newest
  * doctrine; this only adds the nested session's error sentences.
  */
+/** The nested Xwayland, as the plugin inside the compositor reports it. */
+interface NestedXServer {
+  readonly xDisplay: string | undefined;
+  readonly xAuthority: string | undefined;
+}
+
 /**
- * The nested Xwayland's display name, which only the plugin can answer.
+ * The nested Xwayland's display name and cookie file, which only the plugin
+ * can answer.
  *
- * KWin picks the number for the Xwayland it starts and publishes it by setenv
- * on itself: nothing appears on the bus and nothing usable appears in its
- * output. The plugin runs inside that process, so it reads the variable and
- * reports it. A failure here is not fatal - Wayland clients do not need it.
+ * KWin picks the number for the Xwayland it starts, generates the cookie
+ * file, and publishes both by setenv on itself: nothing appears on the bus and
+ * nothing usable appears in its output. The plugin runs inside that process,
+ * so it reads the variables and reports them. A failure here is not fatal -
+ * Wayland clients need neither.
  */
-async function readXDisplay(dbus: KWinComputerDbus): Promise<string | undefined> {
+async function readXServer(dbus: KWinComputerDbus): Promise<NestedXServer> {
   try {
     const plugin = await dbus.connectPlugin();
-    const display = asRecord(parseJsonPayload(await plugin.healthJson())).xDisplay;
-    return typeof display === "string" && display.length > 0 ? display : undefined;
+    const health = asRecord(parseJsonPayload(await plugin.healthJson()));
+    return { xDisplay: nonEmptyString(health.xDisplay), xAuthority: nonEmptyString(health.xAuthority) };
   } catch {
-    return undefined;
+    return { xDisplay: undefined, xAuthority: undefined };
   }
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 async function loadNestedPlugin(

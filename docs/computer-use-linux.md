@@ -262,8 +262,10 @@ human-activity guard is off because no human sits in that compositor. The mode
 is enabled only through the compositor's environment, set by
 `nestedKWinSession.ts`, never by a D-Bus method.
 
-Launched applications get the nested `WAYLAND_DISPLAY`, the private bus and
-the nested Xwayland `DISPLAY` on top of the scrubbed application environment.
+Launched applications get the session's runtime directory, the nested
+`WAYLAND_DISPLAY`, the private bus, and the nested Xwayland's `DISPLAY` and
+`XAUTHORITY` (the cookie KWin generated, as the plugin reports it in
+`healthJson.xAuthority`) on top of the scrubbed application environment.
 The compositor, the bus, Xwayland and every launched application form one
 process group tied to the server's lifetime (`supervisedProcess.ts`); teardown
 runs from `dispose()` and the server's signal handlers, and a startup sweep
