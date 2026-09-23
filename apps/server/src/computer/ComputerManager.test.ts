@@ -1427,7 +1427,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
       setEnv("SYNARA_CUA_CONDITIONAL_SETTLE", undefined);
       const backend = new ProvenBackend({ waitForSettle: true });
       Object.assign(backend, {
-        actionSettle: { quietMs: 25, timeoutMs: 1_500, quietWithinMs: 250 },
+        actionSettle: { quietMs: 25, timeoutMs: 1_500, quietWithinMs: 250, changeWithinMs: 200 },
       });
       const manager = new ComputerManager({ backend, actionSettleMs: 60 });
       await pressThenObserveWindow(manager);
@@ -1436,6 +1436,7 @@ describe("ComputerManager and FakeComputerBackend", () => {
         timeoutMs: 1_500,
         quietMs: 25,
         quietWithinMs: 250,
+        changeWithinMs: 200,
       });
       // The configured settle stays a ceiling on the quiet window.
       Object.assign(backend, { actionSettle: { quietMs: 500, timeoutMs: 1_500 } });
