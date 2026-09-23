@@ -2347,10 +2347,22 @@ std::string windowsJson() {
 std::string windowsStateJson() {
     const std::string windows = windowsJson();
     const auto        target  = g.targetWindow.lock();
+    // Each monitor's logical rect, so the server can photograph the one the
+    // agent is working on instead of every screen squeezed into one image.
+    std::string outputs = "[";
+    for (const auto& mon : State::monitorState()->monitors()) {
+        if (!mon)
+            continue;
+        if (outputs.size() > 1)
+            outputs += ",";
+        outputs += rectJson(mon->logicalBox());
+    }
+    outputs += "]";
     return JsonObj{}
         .raw("windows", windows)
         .raw("targetWindowId", target ? "\"" + jsonEscape(windowId(target)) + "\"" : "null")
         .raw("workspace", rectJson(workspaceGeometry()))
+        .raw("outputs", outputs)
         .boolean("locked", sessionLocked())
         .build();
 }
