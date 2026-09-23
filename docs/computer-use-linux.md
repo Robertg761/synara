@@ -64,7 +64,7 @@ which keeps its behaviour exactly:
   screenshots stay PNG. `StillFramePublisher` capture callbacks return
   `{ data, mimeType }` for a non-PNG still.
 - The `desktop-gone` backend event: the desktop the backend was bound to has
-  ended for good (a Hyprland instance exited). The service re-runs selection
+  ended for good (its compositor exited). The service re-runs selection
   and swaps in a different tier; an explicit override is never re-selected.
 
 ## Backend selection
