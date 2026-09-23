@@ -443,7 +443,11 @@ export function detectHyprlandHeadersVersion(): Promise<string | undefined> {
         // only through these, the same way the Makefile's pkg-config finds it.
         env: {
           PATH: process.env.PATH ?? "/usr/bin:/bin",
-          ...pickDefined(process.env, ["PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR"]),
+          ...pickDefined(process.env, [
+            "PKG_CONFIG_PATH",
+            "PKG_CONFIG_LIBDIR",
+            "PKG_CONFIG_SYSROOT_DIR",
+          ]),
         },
       },
       (error, stdout) => {
@@ -454,10 +458,7 @@ export function detectHyprlandHeadersVersion(): Promise<string | undefined> {
   });
 }
 
-function pickDefined(
-  env: NodeJS.ProcessEnv,
-  names: readonly string[],
-): Record<string, string> {
+function pickDefined(env: NodeJS.ProcessEnv, names: readonly string[]): Record<string, string> {
   const picked: Record<string, string> = {};
   for (const name of names) {
     const value = env[name];

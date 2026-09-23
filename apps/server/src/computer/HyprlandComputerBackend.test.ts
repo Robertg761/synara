@@ -597,8 +597,9 @@ describe("HyprlandComputerBackend with several live instances", () => {
   it("never calls the desktop gone while instances are running, only ambiguous", async () => {
     vi.useFakeTimers();
     try {
-      let resolution: Awaited<ReturnType<NonNullable<HyprlandComputerBackendOptions["resolveInstance"]>>> =
-        "test-instance";
+      let resolution: Awaited<
+        ReturnType<NonNullable<HyprlandComputerBackendOptions["resolveInstance"]>>
+      > = "test-instance";
       let dropConnection: (() => void) | undefined;
       const backend = await makeBackend({
         resolveInstance: async () => resolution,
