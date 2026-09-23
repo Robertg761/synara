@@ -1,16 +1,27 @@
 import { describe, expect, it } from "vitest";
 
-import { EVDEV_BUTTON_CODES, EVDEV_KEY_CODES, keyStrokeForKey } from "./evdevInput.ts";
+import {
+  EVDEV_BUTTON_CODES,
+  EVDEV_KEY_CODES,
+  keyStrokeForKey,
+  qwertyTextKeyStrokes,
+} from "./evdevInput.ts";
 import {
   BUTTON_HOLD_MS,
   GLIDE_FRAME_INTERVAL_MS,
   glidePointerToDeadline,
+  keysHeldAfter,
+  keyStrokeEvents,
   POINTER_SEQUENCE_OPERATIONS,
   pointerGlideSteps,
   pressButtonOnce,
   pressHotkeyStrokes,
   pressKeyStroke,
+  TYPING_BATCH_MAX_EVENTS,
+  typeStrokesInBatches,
+  typingBatches,
   type ComputerInputSink,
+  type KeyEvent,
 } from "./pointerSequencing.ts";
 
 /** Records every event a sequence emits, in order, with its operation name. */
@@ -362,4 +373,104 @@ describe("input cleanup failures", () => {
       expect(calls.at(-1)).toBe(POINTER_SEQUENCE_OPERATIONS.buttonRelease);
     },
   );
+});
+
+describe("batched typing", () => {
+  const SHIFT = EVDEV_KEY_CODES.LeftShift;
+
+  it("wraps a shifted stroke in Shift and leaves a plain one bare", () => {
+    const [upper, lower] = qwertyTextKeyStrokes("Aa");
+    expect(keyStrokeEvents(upper!)).toEqual([
+      [SHIFT, true],
+      [upper!.code, true],
+      [upper!.code, false],
+      [SHIFT, false],
+    ]);
+    expect(keyStrokeEvents(lower!)).toEqual([
+      [lower!.code, true],
+      [lower!.code, false],
+    ]);
+  });
+
+  it("batches a word per call, bounded, never splitting a character", () => {
+    const text = "Hello world, " + "x".repeat(40);
+    const characters = [...text];
+    const batches = typingBatches(characters, qwertyTextKeyStrokes(text));
+    const texts: string[] = [];
+    let at = 0;
+    for (const batch of batches) {
+      texts.push(characters.slice(at, at + batch.length).join(""));
+      at += batch.length;
+      const events = batch.flatMap(keyStrokeEvents).length;
+      expect(events).toBeLessThanOrEqual(TYPING_BATCH_MAX_EVENTS);
+    }
+    expect(texts).toEqual(["Hello ", "world, ", "x".repeat(16), "x".repeat(16), "x".repeat(8)]);
+  });
+
+  it("names the keys a cut-short batch left held, newest first", () => {
+    const events: KeyEvent[] = [
+      [SHIFT, true],
+      [30, true],
+      [30, false],
+      [SHIFT, false],
+    ];
+    expect(keysHeldAfter(events, 2)).toEqual([30, SHIFT]);
+    expect(keysHeldAfter(events, 3)).toEqual([SHIFT]);
+    expect(keysHeldAfter(events, 4)).toEqual([]);
+  });
+
+  it("releases what a refused batch left held and reports the characters that landed", async () => {
+    const text = "ab CD";
+    const { sink, calls } = recordingSink();
+    const batches: KeyEvent[][] = [];
+    const progress: number[] = [];
+    const refusal = new Error("refused");
+    const error = await typeStrokesInBatches({
+      sink: {
+        key: sink.key,
+        // The first word lands; the second stops after C's key press.
+        keys: async (events) => {
+          batches.push([...events]);
+          return batches.length === 1 ? events.length : 6;
+        },
+      },
+      characters: [...text],
+      strokes: qwertyTextKeyStrokes(text),
+      onProgress: (typed) => progress.push(typed),
+      refused: () => refusal,
+    }).catch((caught: unknown) => caught);
+    expect(error).toBe(refusal);
+    expect(batches).toHaveLength(2);
+    // "ab " landed, then C in full (4 events) and D's Shift and press (2).
+    expect(progress).toEqual([3, 4]);
+    const d = qwertyTextKeyStrokes("D")[0]!.code;
+    expect(calls).toEqual([
+      `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${d} false`,
+      `${POINTER_SEQUENCE_OPERATIONS.keyRelease} ${SHIFT} false`,
+    ]);
+  });
+
+  it("stops between words when the operation is cancelled", async () => {
+    const text = "one two three";
+    let sent = 0;
+    const cancelled = new Error("cancelled");
+    const error = await typeStrokesInBatches({
+      sink: {
+        key: async () => undefined,
+        keys: async (events) => {
+          sent += 1;
+          return events.length;
+        },
+      },
+      characters: [...text],
+      strokes: qwertyTextKeyStrokes(text),
+      beforeBatch: () => {
+        if (sent === 2) throw cancelled;
+      },
+      onProgress: () => undefined,
+      refused: () => new Error("refused"),
+    }).catch((caught: unknown) => caught);
+    expect(error).toBe(cancelled);
+    expect(sent).toBe(2);
+  });
 });

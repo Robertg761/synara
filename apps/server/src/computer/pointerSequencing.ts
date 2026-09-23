@@ -217,6 +217,120 @@ export async function pressHotkeyStrokes(options: {
   if (releaseError !== undefined) throw releaseError;
 }
 
+/** One key event as a batched sink takes it: evdev code, and pressed or released. */
+export type KeyEvent = readonly [code: number, pressed: boolean];
+
+/**
+ * Most events one typing batch carries. A word is typically well under it; a
+ * longer one is split at a character boundary. It bounds how much text lands
+ * between two cancellation checks, which is what Stop waits for.
+ */
+export const TYPING_BATCH_MAX_EVENTS = 32;
+
+/** The events one stroke is, in order: shift around the key when it needs it. */
+export function keyStrokeEvents(stroke: QwertyKeyStroke): readonly KeyEvent[] {
+  const key: readonly KeyEvent[] = [
+    [stroke.code, true],
+    [stroke.code, false],
+  ];
+  if (!stroke.shift) return key;
+  return [[EVDEV_KEY_CODES.LeftShift, true], ...key, [EVDEV_KEY_CODES.LeftShift, false]];
+}
+
+/**
+ * Text strokes grouped for batched delivery: a batch ends after a whitespace
+ * character (one word per call) or before it would pass
+ * `TYPING_BATCH_MAX_EVENTS`, and one character's events are never split
+ * across two batches. `characters[i]` is what `strokes[i]` types.
+ */
+export function typingBatches(
+  characters: readonly string[],
+  strokes: readonly QwertyKeyStroke[],
+): readonly (readonly QwertyKeyStroke[])[] {
+  const batches: QwertyKeyStroke[][] = [];
+  let batch: QwertyKeyStroke[] = [];
+  let events = 0;
+  strokes.forEach((stroke, index) => {
+    const size = keyStrokeEvents(stroke).length;
+    if (batch.length > 0 && events + size > TYPING_BATCH_MAX_EVENTS) {
+      batches.push(batch);
+      batch = [];
+      events = 0;
+    }
+    batch.push(stroke);
+    events += size;
+    if (/\s/.test(characters[index] ?? "")) {
+      batches.push(batch);
+      batch = [];
+      events = 0;
+    }
+  });
+  if (batch.length > 0) batches.push(batch);
+  return batches;
+}
+
+/**
+ * The keys the first `delivered` of `events` left held, in release order
+ * (newest first): a batch the display server stopped part-way through may
+ * have pressed a key, or Shift, whose release never went out.
+ */
+export function keysHeldAfter(events: readonly KeyEvent[], delivered: number): readonly number[] {
+  const held: number[] = [];
+  for (const [code, pressed] of events.slice(0, delivered)) {
+    const index = held.lastIndexOf(code);
+    if (pressed) held.push(code);
+    else if (index !== -1) held.splice(index, 1);
+  }
+  return held.toReversed();
+}
+
+/**
+ * Types text in batches through a sink that delivers several key events per
+ * call and answers how many it delivered (stopping at the first it could
+ * not). Before every batch `beforeBatch` runs, so a cancelled operation stops
+ * at a word boundary. A batch cut short has whatever it left held released,
+ * one event at a time, before `refused()` is thrown; `onProgress` has by then
+ * been told how many characters landed in full, which is what a caller
+ * reports instead of retrying the whole text.
+ */
+export async function typeStrokesInBatches(options: {
+  readonly sink: Pick<ComputerInputSink, "key"> & {
+    keys(events: readonly KeyEvent[]): Promise<number>;
+  };
+  readonly characters: readonly string[];
+  readonly strokes: readonly QwertyKeyStroke[];
+  readonly beforeBatch?: () => void;
+  readonly onProgress: (characters: number) => void;
+  readonly refused: () => Error;
+}): Promise<void> {
+  let typed = 0;
+  for (const batch of typingBatches(options.characters, options.strokes)) {
+    options.beforeBatch?.();
+    const events = batch.flatMap(keyStrokeEvents);
+    const delivered = Math.max(0, Math.min(events.length, await options.sink.keys(events)));
+    if (delivered === events.length) {
+      typed += batch.length;
+      options.onProgress(typed);
+      continue;
+    }
+    // Every release is attempted; the refusal, the earlier failure, is what
+    // surfaces, as in `pressKeyStroke`.
+    await firstFailureOf(
+      keysHeldAfter(events, delivered).map(
+        (code) => () => options.sink.key(code, false, POINTER_SEQUENCE_OPERATIONS.keyRelease),
+      ),
+    );
+    let covered = 0;
+    for (const stroke of batch) {
+      covered += keyStrokeEvents(stroke).length;
+      if (covered > delivered) break;
+      typed += 1;
+    }
+    options.onProgress(typed);
+    throw options.refused();
+  }
+}
+
 /** One button press held for long enough to register, released even on failure. */
 export async function pressButtonOnce(options: {
   readonly sink: Pick<ComputerInputSink, "button">;

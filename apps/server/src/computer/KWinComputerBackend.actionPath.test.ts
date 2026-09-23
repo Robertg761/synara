@@ -439,3 +439,84 @@ describe("compositor-observed settle", () => {
     }
   });
 });
+
+describe("batched typing through keys", () => {
+  it("types a word per keys call when the plugin advertises it", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["keys"];
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const text = "The quick brown fox jumps over the lazy dog. ".repeat(4).slice(0, 180);
+    await expect(backend.typeText(text)).resolves.toEqual({ value: text });
+    expect(callsOf(plugin, "key")).toBe(0);
+    const batches = plugin.calls
+      .filter((call) => call.method === "keys")
+      .map((call) => call.args[0] as readonly (readonly [number, boolean])[]);
+    // One call per word, where single keys took 2-4 calls a character.
+    expect(batches.length).toBe(text.split(" ").filter(Boolean).length);
+    expect(batches.every((batch) => batch.length <= 32)).toBe(true);
+    const presses = batches.flat().filter(([, pressed]) => pressed).length;
+    expect(presses).toBeGreaterThanOrEqual(text.length);
+  });
+
+  it("reports the partial result and releases what a cut-short batch left held", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["keys"];
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    let call = 0;
+    plugin.keys = async (strokes) => {
+      plugin.calls.push({ method: "keys", args: [strokes] });
+      call += 1;
+      // "hello " lands; "World" stops after W's Shift and press.
+      return call === 1 ? strokes.length : 2;
+    };
+    const error = await backend.typeText("hello World").catch((caught: unknown) => caught);
+    expect(String(error)).toContain("Typing stopped after 6 of 11 characters");
+    expect(String(error)).toContain('"hello "');
+    // W's key, then Shift, released one by one.
+    const releases = plugin.calls
+      .filter((entry) => entry.method === "key")
+      .map((entry) => entry.args);
+    expect(releases).toEqual([
+      [17, false],
+      [42, false],
+    ]);
+  });
+
+  it("throws the plugin's own refusal when nothing was typed", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["keys"];
+    const refusal = Object.assign(new Error("human is typing"), {
+      type: "org.synara.ComputerUse.Error.HumanActive",
+    });
+    plugin.inputFailure = { method: "keys", error: refusal };
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const error = await backend.typeText("abc").catch((caught: unknown) => caught);
+    expect(String(error)).toContain("computer_human_active");
+    expect(String(error)).not.toContain("Typing stopped");
+  });
+
+  it("restarts a session that stopped under it and resends the batch once", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["keys"];
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    await backend.moveCursor({ x: 1, y: 1 });
+    // The idle deadline expired between two actions.
+    plugin.running = false;
+    await expect(backend.typeText("ok")).resolves.toEqual({ value: "ok" });
+    expect(callsOf(plugin, "start")).toBe(2);
+    expect(callsOf(plugin, "keys")).toBe(2);
+  });
+
+  it("keeps single key calls on a plugin without keys", async () => {
+    const plugin = new FakePlugin();
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    await backend.typeText("Hi");
+    expect(callsOf(plugin, "keys")).toBe(0);
+    expect(callsOf(plugin, "key")).toBe(6);
+  });
+});

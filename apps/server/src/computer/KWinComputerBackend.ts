@@ -119,7 +119,9 @@ import {
   pressButtonOnce,
   pressHotkeyStrokes,
   pressKeyStroke,
+  typeStrokesInBatches,
   type ComputerInputSink,
+  type KeyEvent,
 } from "./pointerSequencing.ts";
 import {
   CLIPBOARD_SETUP_INCOMPLETE_MESSAGE,
@@ -1665,28 +1667,83 @@ export class KWinComputerBackend implements ComputerBackend {
     );
     const sink = this.inputSink(plugin);
     const characters = [...text];
+    const keys = this.pluginFeature("keys") ? plugin.keys : undefined;
     let delivered = 0;
-    for (const stroke of strokes) {
-      try {
-        assertDesktopOperationActive();
-        await pressKeyStroke({ sink, stroke });
-      } catch (error) {
-        // A refusal after the first stroke is not "nothing was delivered":
-        // some of the text is in the application. Retrying the whole call
-        // would type it twice, so the partial result is reported as its own
-        // failure and the caller decides what the remainder is worth.
-        if (delivered === 0) throw error;
-        throw new ComputerBackendError(
-          `Typing stopped after ${delivered} of ${characters.length} characters were delivered ` +
-            `(${JSON.stringify(characters.slice(0, delivered).join(""))} landed): ` +
-            `${describeErrorMessage(error, "the plugin refused the next key")}. ` +
-            "Read the control before retrying; do not resend the whole text.",
-          { cause: error },
-        );
+    try {
+      if (keys) {
+        // A word per call instead of two to four calls per character. Every
+        // stroke is still checked by the plugin exactly as `key` checks one,
+        // and cancellation is checked between words.
+        await typeStrokesInBatches({
+          sink: { key: sink.key, keys: (events) => this.sendKeyBatch(keys, events) },
+          characters,
+          strokes,
+          beforeBatch: () => {
+            assertDesktopOperationActive();
+            this.noteInput();
+          },
+          onProgress: (typed) => {
+            delivered = typed;
+          },
+          refused: () => this.keyRefusedError(),
+        });
+      } else {
+        for (const stroke of strokes) {
+          assertDesktopOperationActive();
+          await pressKeyStroke({ sink, stroke });
+          delivered += 1;
+        }
       }
-      delivered += 1;
+    } catch (error) {
+      // A refusal after the first stroke is not "nothing was delivered":
+      // some of the text is in the application. Retrying the whole call
+      // would type it twice, so the partial result is reported as its own
+      // failure and the caller decides what the remainder is worth.
+      if (delivered === 0) throw error;
+      throw new ComputerBackendError(
+        `Typing stopped after ${delivered} of ${characters.length} characters were delivered ` +
+          `(${JSON.stringify(characters.slice(0, delivered).join(""))} landed): ` +
+          `${describeErrorMessage(error, "the plugin refused the next key")}. ` +
+          "Read the control before retrying; do not resend the whole text.",
+        { cause: error },
+      );
     }
     return { value: text };
+  }
+
+  /**
+   * One `keys` batch. The plugin answers how many events it delivered and
+   * stops at the first it could not; none at all is either a session that
+   * stopped under us (restarted and retried once, as `pluginSuccess` does
+   * for a single key) or a refusal.
+   */
+  private async sendKeyBatch(
+    keys: NonNullable<KWinComputerPluginApi["keys"]>,
+    events: readonly KeyEvent[],
+  ): Promise<number> {
+    const send = async () =>
+      readDeliveredCount(
+        await this.pluginValue(() => {
+          assertDesktopOperationActive();
+          this.noteDesktopChange();
+          return keys(events);
+        }),
+        events.length,
+      );
+    const delivered = await send();
+    if (delivered > 0) return delivered;
+    if (await this.restartAfterExternalStop()) {
+      const retried = await send();
+      if (retried > 0) return retried;
+    }
+    throw this.keyRefusedError();
+  }
+
+  private keyRefusedError(): ComputerBackendError {
+    return new ComputerBackendError(`Synara ${this.integrationName} plugin rejected key.`, {
+      retryable: true,
+      rejectedOperation: POINTER_SEQUENCE_OPERATIONS.keyPress,
+    });
   }
 
   async pressKey(key: string): Promise<ComputerBackendActionResult> {
@@ -4038,6 +4095,15 @@ function readByteArray(value: unknown): Uint8Array {
     return Uint8Array.from(unwrapped as number[]);
   }
   throw new ComputerBackendError("Synara computer capture returned invalid PNG bytes.");
+}
+
+/** `keys`'s `u` reply: how many of `sent` events the plugin delivered. */
+function readDeliveredCount(value: unknown, sent: number): number {
+  const delivered = unwrapDbusValue(value);
+  if (typeof delivered !== "number" || !Number.isInteger(delivered) || delivered < 0) {
+    throw new ComputerBackendError("Synara computer keys returned an invalid count.");
+  }
+  return Math.min(delivered, sent);
 }
 
 /** `waitForSettle`'s `(bu)` reply: settled, and how long the plugin waited. */
