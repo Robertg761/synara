@@ -331,18 +331,69 @@ describe("newestPluginId", () => {
   });
 });
 
-describe("localBuildToolingPresent", () => {
-  it("needs both KWin's cmake config and a cmake on the path", () => {
-    const present = new Set(["/usr/lib64/cmake/KWin/KWinConfig.cmake", "/usr/bin/cmake"]);
-    const exists = (path: string) => present.has(path);
-    const env = { PATH: "/usr/local/bin:/usr/bin" };
+/** An `exists` probe that answers yes for exactly these paths. */
+function onDisk(files: readonly string[]): (path: string) => boolean {
+  const present = new Set(files);
+  return (path) => present.has(path);
+}
 
-    expect(localBuildToolingPresent(exists, env)).toBe(true);
-    // The headers without a compiler, and the compiler without the headers,
-    // are both machines where a source build would fail — and reporting one as
-    // buildable would trade a truthful "not available" for a broken toggle.
-    expect(localBuildToolingPresent(exists, { PATH: "/opt/bin" })).toBe(false);
-    expect(localBuildToolingPresent((path) => path === "/usr/bin/cmake", env)).toBe(false);
+describe("localBuildToolingPresent", () => {
+  const env = { PATH: "/usr/local/bin:/usr/bin" };
+  /** Everything the plugin's configure resolves, laid out the Arch way. */
+  const archHost = [
+    "/usr/bin/cmake",
+    "/usr/bin/ninja",
+    "/usr/bin/pkg-config",
+    "/usr/bin/c++",
+    "/usr/lib/cmake/KWin/KWinConfig.cmake",
+    "/usr/lib/cmake/Qt6/Qt6Config.cmake",
+    "/usr/lib/cmake/Qt6Quick/Qt6QuickConfig.cmake",
+    "/usr/lib/cmake/KF6Config/KF6ConfigConfig.cmake",
+    "/usr/lib/cmake/KF6CoreAddons/KF6CoreAddonsConfig.cmake",
+    "/usr/lib/cmake/KF6GlobalAccel/KF6GlobalAccelConfig.cmake",
+    "/usr/lib/cmake/KF6WindowSystem/KF6WindowSystemConfig.cmake",
+    "/usr/lib/libvulkan.so",
+    "/usr/share/ECM/cmake/ECMConfig.cmake",
+    "/usr/include/vulkan/vulkan.h",
+    "/usr/include/epoxy/gl.h",
+    "/usr/include/xf86drm.h",
+    "/usr/include/wayland-server.h",
+    "/usr/include/xkbcommon/xkbcommon.h",
+  ];
+
+  it("says yes when everything the configure step resolves is present", () => {
+    expect(localBuildToolingPresent(onDisk(archHost), env)).toBe(true);
+    // Fedora's lib64 and Debian's multiarch roots count the same.
+    for (const root of ["/usr/lib64", "/usr/lib/x86_64-linux-gnu"]) {
+      const moved = archHost.map((path) =>
+        path.startsWith("/usr/lib/") ? `${root}/${path.slice("/usr/lib/".length)}` : path,
+      );
+      expect(localBuildToolingPresent(onDisk(moved), env)).toBe(true);
+    }
+  });
+
+  it("says no on a host missing Vulkan's header, which KWinConfig.cmake needs", () => {
+    // cmake and KWin's own config are both here: the old probe said yes, and
+    // configure then failed in find_dependency(Vulkan).
+    const withoutVulkanHeader = archHost.filter((path) => path !== "/usr/include/vulkan/vulkan.h");
+    expect(localBuildToolingPresent(onDisk(withoutVulkanHeader), env)).toBe(false);
+  });
+
+  it("says no when any single requirement is missing", () => {
+    for (const missing of archHost) {
+      expect(
+        localBuildToolingPresent(onDisk(archHost.filter((path) => path !== missing)), env),
+        missing,
+      ).toBe(false);
+    }
+    // The headers without a compiler on the path are still a machine where a
+    // source build would fail.
+    expect(localBuildToolingPresent(onDisk(archHost), { PATH: "/opt/bin" })).toBe(false);
+  });
+
+  it("accepts any C++ compiler driver CMake would find", () => {
+    const withGpp = archHost.map((path) => (path === "/usr/bin/c++" ? "/usr/bin/g++" : path));
+    expect(localBuildToolingPresent(onDisk(withGpp), env)).toBe(true);
   });
 });
 

@@ -128,6 +128,12 @@ import {
 } from "./provisioning/linuxDistribution.ts";
 import { buildPluginFromSource } from "./provisioning/sourceBuild.ts";
 import {
+  commandOnPath,
+  libraryRootFilePresent,
+  systemHeaderPresent,
+  type PathExists,
+} from "./provisioning/buildToolingProbe.ts";
+import {
   kwinDistributionSetupProblem,
   kwinVersionSetupProblem,
 } from "./provisioning/kwinCompatibility.ts";
@@ -237,16 +243,43 @@ const NO_PLUGIN_ANYWHERE_MESSAGE =
   "the bundled builds matches the running KWin, and the cmake and KWin development headers needed " +
   `to build one are not present. Install them, or build the plugin with ${INSTALL_SCRIPT_PATH}.`;
 /**
- * Where a distribution puts `find_package(KWin)`'s config file, which is the
- * one part of the development headers a source build cannot do without. The
- * lib64/lib split and the Debian multiarch directories are packaging choices,
- * so all of them are probed rather than derived.
+ * What a configure of the plugin's CMakeLists.txt fails without, as files a
+ * probe can stat. `find_package(KWin)` alone pulls in more than KWin's own
+ * development package: KWinConfig.cmake `find_dependency`s ECM, Qt6
+ * Core/Gui/Quick, KF6 Config/CoreAddons/WindowSystem, Wayland's server
+ * library, epoxy, libdrm and, in current releases (6.7 included), Vulkan; the
+ * plugin itself adds Qt6 DBus/Widgets, KF6GlobalAccel and xkbcommon. Vulkan's
+ * headers and its unversioned loader symlink ship in packages kwin-devel does
+ * not always pull in, which made "cmake is here and KWin's config is here" say
+ * yes on hosts whose configure then failed two seconds in.
  */
-const KWIN_CMAKE_CONFIG_PATHS = [
-  "/usr/lib64/cmake/KWin/KWinConfig.cmake",
-  "/usr/lib/cmake/KWin/KWinConfig.cmake",
-  "/usr/lib/x86_64-linux-gnu/cmake/KWin/KWinConfig.cmake",
-  "/usr/lib/aarch64-linux-gnu/cmake/KWin/KWinConfig.cmake",
+const KWIN_SOURCE_BUILD_COMMANDS = ["cmake", "ninja", "pkg-config"] as const;
+/** CMake looks for `c++` first, then the named drivers; any of them will do. */
+const KWIN_SOURCE_BUILD_COMPILERS = ["c++", "g++", "clang++"] as const;
+/** Under a library root; the lib64/lib split and Debian multiarch are all probed. */
+const KWIN_SOURCE_BUILD_LIBRARY_FILES = [
+  "cmake/KWin/KWinConfig.cmake",
+  "cmake/Qt6/Qt6Config.cmake",
+  "cmake/Qt6Quick/Qt6QuickConfig.cmake",
+  "cmake/KF6Config/KF6ConfigConfig.cmake",
+  "cmake/KF6CoreAddons/KF6CoreAddonsConfig.cmake",
+  "cmake/KF6GlobalAccel/KF6GlobalAccelConfig.cmake",
+  "cmake/KF6WindowSystem/KF6WindowSystemConfig.cmake",
+  // FindVulkan needs the library as well as the header.
+  "libvulkan.so",
+] as const;
+/** ECM is architecture-independent, so it lives under share/, not a library root. */
+const ECM_CMAKE_CONFIG_PATHS = [
+  "/usr/share/ECM/cmake/ECMConfig.cmake",
+  "/usr/local/share/ECM/cmake/ECMConfig.cmake",
+] as const;
+/** The headers the find modules behind KWin's dependencies (and xkbcommon) look for. */
+const KWIN_SOURCE_BUILD_HEADERS = [
+  "vulkan/vulkan.h",
+  "epoxy/gl.h",
+  "xf86drm.h",
+  "wayland-server.h",
+  "xkbcommon/xkbcommon.h",
 ] as const;
 const ENABLE_REBUILD_SCRIPT_PATH = "apps/server/native/computer-use-kwin/systemd/enable.sh";
 const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
@@ -3171,25 +3204,30 @@ export function prebuiltPluginRoot(
 }
 
 /**
- * Whether this machine could compile the plugin, decided by the two things a
- * source build cannot proceed without: cmake on the path, and KWin's own cmake
- * config file, which is the marker for the development headers.
+ * Whether this machine could compile the plugin: the build commands on the
+ * path, and every cmake config and header the plugin's configure resolves
+ * through `find_package(KWin)` and its own `find_package` calls (see
+ * KWIN_SOURCE_BUILD_LIBRARY_FILES).
  *
- * Deliberately not a build attempt, and deliberately not exhaustive — Qt, KF6,
- * ECM and ninja are all needed too. This runs inside a probe that must stay
- * free, and its only job is to tell "a machine where turning computer use on
- * will plausibly work" from "a machine with no compiler in sight". The install
- * script does the real check, with a message per missing package.
+ * Deliberately not a build attempt: this runs inside a probe that must stay
+ * free, so it only stats files (about a hundred at worst, no process, no
+ * read). A broken install can still fool it; the install script does the
+ * real check with a message per missing package. The Vulkan requirement is
+ * applied to every KWin version, which reports an older KWin whose config
+ * does not need Vulkan as unbuildable on a host without its headers; those
+ * versions are the ones the bundled prebuilds cover.
  */
 export function localBuildToolingPresent(
-  exists: (path: string) => boolean = existsSync,
+  exists: PathExists = existsSync,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  if (!KWIN_CMAKE_CONFIG_PATHS.some((path) => exists(path))) return false;
-  return (env.PATH ?? "")
-    .split(":")
-    .filter(Boolean)
-    .some((directory) => exists(join(directory, "cmake")));
+  return (
+    KWIN_SOURCE_BUILD_LIBRARY_FILES.every((file) => libraryRootFilePresent(file, exists)) &&
+    ECM_CMAKE_CONFIG_PATHS.some((path) => exists(path)) &&
+    KWIN_SOURCE_BUILD_HEADERS.every((header) => systemHeaderPresent(header, exists)) &&
+    KWIN_SOURCE_BUILD_COMMANDS.every((command) => commandOnPath(command, exists, env)) &&
+    KWIN_SOURCE_BUILD_COMPILERS.some((compiler) => commandOnPath(compiler, exists, env))
+  );
 }
 
 async function listPluginFiles(directories: readonly string[]): Promise<readonly string[]> {

@@ -38,6 +38,12 @@ BUILD_LOCK_FILE="$STATE_ROOT/build.lock"
 # Must match s_service in synaracomputeruseplugin.cpp and COMPUTER_SERVICE in
 # the server's kwinDbus.ts: it is the name the health check pins an owner for.
 SERVICE_NAME="org.synara.ComputerUse"
+# Where a distribution puts KWin's library and its cmake config: the lib64/lib
+# split and the Debian multiarch directories, in the order HOST_LIBRARY_ROOTS
+# in apps/server/src/computer/provisioning/hostToolchain.ts probes them. The
+# overrides (colon-separated) exist for the script's tests.
+IFS=: read -r -a KWIN_LIBRARY_ROOTS <<< "${SYNARA_KWIN_LIBRARY_ROOTS:-/usr/lib64:/usr/lib:/usr/lib/x86_64-linux-gnu:/usr/lib/aarch64-linux-gnu}"
+IFS=: read -r -a SYSTEM_INCLUDE_ROOTS <<< "${SYNARA_KWIN_INCLUDE_ROOTS:-/usr/include:/usr/local/include}"
 
 FORCE=0
 BUILD_ONLY=0
@@ -153,7 +159,84 @@ take_build_lock() {
 
 BUILT_PLUGIN_RELATIVE="kwin/plugins/${PLUGIN_PREFIX}.so"
 
+# The directories the compiler and CMake's find modules search for a header:
+# the system roots, then any prefix the caller pointed CMake or the compiler at.
+header_present() {
+    local root prefix
+    for root in "${SYSTEM_INCLUDE_ROOTS[@]}"; do
+        [[ -n "$root" && -f "$root/$1" ]] && return 0
+    done
+    local prefixes=()
+    IFS=: read -r -a prefixes <<< "${CMAKE_PREFIX_PATH:-}"
+    for prefix in "${prefixes[@]}"; do
+        [[ -n "$prefix" && -f "$prefix/include/$1" ]] && return 0
+    done
+    IFS=: read -r -a prefixes <<< "${CPATH:-}"
+    for prefix in "${prefixes[@]}"; do
+        [[ -n "$prefix" && -f "$prefix/$1" ]] && return 0
+    done
+    return 1
+}
+
+library_present() {
+    local root
+    for root in "${KWIN_LIBRARY_ROOTS[@]}"; do
+        [[ -n "$root" && -e "$root/$1" ]] && return 0
+    done
+    return 1
+}
+
+# KWin's cmake config find_dependency()s more than every distribution's
+# kwin-devel pulls in (Vulkan's headers are the usual gap), and a header
+# missing there fails the configure deep inside a find module with a message
+# that names neither the file nor the package. So the dependencies this KWin's
+# config actually declares are read off it and checked by name first, together
+# with the plugin's own xkbcommon, and every gap is reported in one go. The
+# server's localBuildToolingPresent() probes the same files.
+check_build_dependencies() {
+    local root config="" dependency
+    local missing=()
+    for root in "${KWIN_LIBRARY_ROOTS[@]}"; do
+        if [[ -n "$root" && -f "$root/cmake/KWin/KWinConfig.cmake" ]]; then
+            config="$root/cmake/KWin/KWinConfig.cmake"
+            break
+        fi
+    done
+    [[ -n "$config" ]] ||
+        die "KWin's development files are not installed: no cmake/KWin/KWinConfig.cmake under ${KWIN_LIBRARY_ROOTS[*]}. Install kwin-devel (kwin-dev on Debian/Ubuntu, kwin6-devel on openSUSE, kwin on Arch)."
+
+    header_present xkbcommon/xkbcommon.h ||
+        missing+=("xkbcommon/xkbcommon.h (libxkbcommon-devel / libxkbcommon-dev)")
+    while IFS= read -r dependency; do
+        case "$dependency" in
+            Vulkan)
+                header_present vulkan/vulkan.h ||
+                    missing+=("vulkan/vulkan.h (vulkan-headers / libvulkan-dev)")
+                library_present libvulkan.so ||
+                    missing+=("libvulkan.so (vulkan-loader-devel / libvulkan-dev / vulkan-icd-loader)")
+                ;;
+            epoxy)
+                header_present epoxy/gl.h ||
+                    missing+=("epoxy/gl.h (libepoxy-devel / libepoxy-dev)")
+                ;;
+            Libdrm)
+                header_present xf86drm.h ||
+                    missing+=("xf86drm.h (libdrm-devel / libdrm-dev)")
+                ;;
+            Wayland)
+                header_present wayland-server.h ||
+                    missing+=("wayland-server.h (wayland-devel / libwayland-dev)")
+                ;;
+        esac
+    done < <(sed -n 's/^[[:space:]]*find_dependency([[:space:]]*\([A-Za-z0-9_]*\).*/\1/p' "$config")
+
+    if (( ${#missing[@]} )); then
+        die "cannot build the plugin: KWin's cmake config ($config) needs development files that are not installed: $(printf '%s; ' "${missing[@]}" | sed 's/; $//'). Install them and run this again."
+    fi
+}
+
 build_plugin() {
+    check_build_dependencies
     take_build_lock
     log "configuring the plugin build in $BUILD_DIR"
     cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
