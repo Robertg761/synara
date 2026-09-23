@@ -7,6 +7,7 @@ import { join } from "node:path";
 
 import {
   detectRunningHyprlandVersion,
+  hyprlandInstanceEnvironment,
   hyprlandInstancePresent,
   hyprlandInstanceSignature,
   hyprlandSessionPresent,
@@ -135,6 +136,49 @@ describe("hyprlandSessionPresent", () => {
     expect(await hyprlandInstancePresent("../../../etc", env, () => true)).toBe(false);
     expect(await hyprlandInstancePresent("a/b", env, () => true)).toBe(false);
     expect(await hyprlandInstancePresent("nested", env, () => true)).toBe(true);
+  });
+});
+
+describe("hyprlandInstanceEnvironment", () => {
+  const env = {
+    XDG_RUNTIME_DIR: "/run/user/1000",
+    HYPRLAND_INSTANCE_SIGNATURE: "old",
+    WAYLAND_DISPLAY: "wayland-1",
+    DISPLAY: ":0",
+  };
+  const locks = (files: Record<string, string>) => async (path: string) => {
+    const content = files[path];
+    if (content === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return content;
+  };
+
+  it("keeps the inherited display for the instance this process was started in", async () => {
+    const read = locks({ "/run/user/1000/hypr/old/hyprland.lock": "1789\nwayland-1\n" });
+    await expect(hyprlandInstanceEnvironment("old", env, read)).resolves.toEqual({
+      HYPRLAND_INSTANCE_SIGNATURE: "old",
+      WAYLAND_DISPLAY: "wayland-1",
+    });
+  });
+
+  it("points at the socket of the instance that replaced it, and drops the dead Xwayland", async () => {
+    const read = locks({ "/run/user/1000/hypr/new/hyprland.lock": "2042\nwayland-2\n" });
+    await expect(hyprlandInstanceEnvironment("new", env, read)).resolves.toEqual({
+      HYPRLAND_INSTANCE_SIGNATURE: "new",
+      WAYLAND_DISPLAY: "wayland-2",
+      DISPLAY: undefined,
+    });
+  });
+
+  it("never falls back to the inherited socket for another instance", async () => {
+    // A pinned dev-test instance whose lock cannot be read: no display at
+    // all, rather than the human's.
+    for (const read of [locks({}), locks({ "/run/user/1000/hypr/new/hyprland.lock": "1\n../x\n" })]) {
+      await expect(hyprlandInstanceEnvironment("new", env, read)).resolves.toEqual({
+        HYPRLAND_INSTANCE_SIGNATURE: "new",
+        WAYLAND_DISPLAY: undefined,
+        DISPLAY: undefined,
+      });
+    }
   });
 });
 

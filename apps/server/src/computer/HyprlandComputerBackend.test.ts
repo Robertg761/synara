@@ -432,6 +432,46 @@ describe("HyprlandComputerBackend across compositor restarts (R6)", () => {
     }
   }
 
+  class SessionProbe extends HyprlandComputerBackend {
+    sessionEnvironment() {
+      return this.desktopSessionEnvironment();
+    }
+  }
+
+  it("gives launched apps and the clipboard the live instance, not the inherited one", async () => {
+    const runtime = await temp();
+    await mkdir(join(runtime, "hypr", "second"), { recursive: true });
+    await writeFile(join(runtime, "hypr", "second", "hyprland.lock"), "2042\nwayland-2\n");
+    let instance: string | undefined = "first";
+    const dir = await temp();
+    const backend = new SessionProbe({
+      platform: "linux",
+      env: {
+        XDG_RUNTIME_DIR: runtime,
+        HYPRLAND_INSTANCE_SIGNATURE: "first",
+        WAYLAND_DISPLAY: "wayland-1",
+        DISPLAY: ":0",
+      },
+      resolveInstance: async () => instance,
+      pluginDirectory: join(dir, "plugins"),
+      installStampPath: join(dir, "install.stamp"),
+      busNameHasOwner: async () => false,
+      dbusFactory: async () => fakeDbus(),
+    });
+    await expect(backend.sessionEnvironment()).resolves.toEqual({
+      HYPRLAND_INSTANCE_SIGNATURE: "first",
+    });
+    // Restarted: the old socket is dead and the old Xwayland with it.
+    instance = "second";
+    await expect(backend.sessionEnvironment()).resolves.toEqual({
+      HYPRLAND_INSTANCE_SIGNATURE: "second",
+      WAYLAND_DISPLAY: "wayland-2",
+      DISPLAY: undefined,
+    });
+    instance = undefined;
+    await expect(backend.sessionEnvironment()).rejects.toThrow("No Hyprland session");
+  });
+
   it("follows the live instance, reloads into a new one and reads its version afresh", async () => {
     vi.useFakeTimers();
     try {

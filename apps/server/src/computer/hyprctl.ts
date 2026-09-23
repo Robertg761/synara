@@ -18,7 +18,7 @@
  * cannot tell the server which installed `.so` is the one answering the bus.
  */
 import { execFile } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 
@@ -75,10 +75,52 @@ export async function hyprlandInstancePresent(
   env: NodeJS.ProcessEnv = process.env,
   connects: (path: string) => boolean | Promise<boolean> = socketAcceptsConnections,
 ): Promise<boolean> {
-  if (!signature || !isSignature(signature)) return false;
+  const directory = hyprlandInstanceDirectory(signature, env);
+  return directory === undefined ? false : connects(join(directory, ".socket.sock"));
+}
+
+/** `$XDG_RUNTIME_DIR/hypr/<signature>`, when both are there to name it. */
+function hyprlandInstanceDirectory(
+  signature: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  if (!signature || !isSignature(signature)) return undefined;
   const runtimeDir = env.XDG_RUNTIME_DIR?.trim();
-  if (!runtimeDir) return false;
-  return connects(join(runtimeDir, "hypr", signature, ".socket.sock"));
+  return runtimeDir ? join(runtimeDir, "hypr", signature) : undefined;
+}
+
+/**
+ * The environment a process started for `signature` needs to land on that
+ * compositor: its signature, and the Wayland socket Hyprland records on the
+ * second line of the instance's `hyprland.lock` (what `hyprctl instances`
+ * reports as `wl_socket`).
+ *
+ * The inherited `WAYLAND_DISPLAY` and `DISPLAY` are right only for the
+ * instance this process was started in. For another one — the compositor that
+ * replaced it after a restart, or a pinned dev-test instance — they name a
+ * dead socket or, worse, the human's own desktop, where a launched window
+ * must never appear. So for another instance `WAYLAND_DISPLAY` comes from its
+ * lock or is removed, and `DISPLAY` (whose Xwayland no file names) is removed:
+ * an X11-only app then fails to start rather than opening somewhere else.
+ */
+export async function hyprlandInstanceEnvironment(
+  signature: string,
+  env: NodeJS.ProcessEnv = process.env,
+  read: (path: string) => Promise<string> = (path) => readFile(path, "utf8"),
+): Promise<Readonly<Record<string, string | undefined>>> {
+  const directory = hyprlandInstanceDirectory(signature, env);
+  const lock = directory
+    ? await read(join(directory, "hyprland.lock")).catch(() => undefined)
+    : undefined;
+  const socket = lock?.split("\n")[1]?.trim();
+  const waylandDisplay = socket && !socket.includes("/") ? socket : undefined;
+  if (env[HYPRLAND_SIGNATURE_ENV]?.trim() === signature) {
+    return {
+      [HYPRLAND_SIGNATURE_ENV]: signature,
+      ...(waylandDisplay ? { WAYLAND_DISPLAY: waylandDisplay } : {}),
+    };
+  }
+  return { [HYPRLAND_SIGNATURE_ENV]: signature, WAYLAND_DISPLAY: waylandDisplay, DISPLAY: undefined };
 }
 
 export interface LiveHyprlandInstanceOptions {

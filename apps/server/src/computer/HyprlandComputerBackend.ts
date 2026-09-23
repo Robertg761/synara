@@ -24,8 +24,10 @@ import { readdir } from "node:fs/promises";
 
 import { COMPUTER_HYPRLAND_BACKEND, type ComputerAvailability } from "@synara/contracts";
 
+import { ComputerBackendError } from "./ComputerBackend.ts";
 import {
   detectRunningHyprlandVersion,
+  hyprlandInstanceEnvironment,
   makeHyprctlRunner,
   resolveLiveHyprlandInstance,
   unloadHyprlandPlugin,
@@ -108,6 +110,7 @@ interface HyprlandDbusRef {
 export class HyprlandComputerBackend extends KWinComputerBackend {
   private readonly ref: HyprlandDbusRef;
   private readonly hyprlandPlatform: string;
+  private readonly hyprlandEnv: NodeJS.ProcessEnv;
   private readonly resolveInstance: () => Promise<string | undefined>;
   private readonly hyprlandBusNameHasOwner: (name: string) => Promise<boolean>;
   private readonly pluginDirectory: string;
@@ -242,6 +245,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
         }),
     });
     this.ref = ref;
+    this.hyprlandEnv = env;
     this.hyprlandPlatform = options.platform ?? process.platform;
     this.resolveInstance = resolveInstance;
     this.hyprlandBusNameHasOwner =
@@ -303,6 +307,22 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
 
   protected override get compositorMissingMessage(): string {
     return NO_HYPRLAND_MESSAGE;
+  }
+
+  /**
+   * Launched apps and wl-clipboard go to the instance this backend drives —
+   * the one resolved now, not the one this process inherited — so after a
+   * Hyprland restart they reach the new compositor, and with a pinned
+   * dev-test instance they never reach the human's.
+   */
+  protected override async desktopSessionEnvironment(): Promise<
+    Readonly<Record<string, string | undefined>>
+  > {
+    const instance = await this.resolveInstance();
+    if (instance === undefined) {
+      throw new ComputerBackendError(NO_HYPRLAND_MESSAGE, { retryable: true });
+    }
+    return await hyprlandInstanceEnvironment(instance, this.hyprlandEnv);
   }
 
   /**
