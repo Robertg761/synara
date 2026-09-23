@@ -903,6 +903,19 @@ class SemanticAddressTest(unittest.TestCase):
         self.assertEqual(self.set_text(path=[2], text="x", label=label), {"ok": True})
         self.assertEqual(self.field.text, "x")
 
+    def test_clamps_in_the_client_unit_so_a_long_emoji_name_still_matches(self):
+        # 🙂 is two UTF-16 units: the tree must carry no more units than the
+        # client's bound, or the client cuts it again and the label it sends
+        # back never matches this side's clamp of the live name.
+        self.field.name = "🙂" * HELPER.MAX_TEXT_CHARS
+        tree = read(self.session, self.requested)["trees"][0]
+        label = tree["root"]["children"][1]["label"]
+
+        self.assertEqual(len(label.encode("utf-16-le")) // 2, HELPER.MAX_TEXT_CHARS)
+        self.assertEqual(self.set_text(path=[2], text="x", label=label), {"ok": True})
+        self.assertEqual(HELPER.clamp_text("a🙂b", 2), "a")
+        self.assertEqual(HELPER.clamp_text("a🙂b", 3), "a🙂")
+
     def test_compares_labels_the_way_the_client_matches_them(self):
         # Non-breaking spaces fold to plain spaces and composed/decomposed
         # forms are equal, but whitespace is never trimmed: a trailing space

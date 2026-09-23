@@ -310,6 +310,29 @@ describe("AT-SPI coordinate fusion", () => {
     expect(split.includes("�")).toBe(false);
   });
 
+  it("passes a label the helper clamped through unchanged, astral characters included", () => {
+    // The helper clamps in UTF-16 units, as this side counts: a label at its
+    // bound must arrive whole, or the label sent back to validateNode (the
+    // tree's) no longer matches the helper's clamp of the live name.
+    const label = "🙂".repeat(512);
+    const fused = fuseAtspiWindowTree({
+      window: { id: "emoji" as const, bounds: { x: 0, y: 0, width: 640, height: 480 } },
+      tree: {
+        windowId: "emoji",
+        clientSize: { width: 640, height: 480 },
+        root: {
+          role: "window",
+          label,
+          value: null,
+          description: null,
+          frame: { x: 0, y: 0, width: 640, height: 480 },
+          children: [],
+        },
+      },
+    });
+    expect(fused.label).toBe(label);
+  });
+
   it("drops minimized windows from the fused desktop tree", () => {
     const root = fuseAtspiTrees({
       windows: [

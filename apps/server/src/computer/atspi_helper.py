@@ -413,15 +413,24 @@ def call_failure(error):
 
 
 def clamp_text(value, limit):
-    """Cut to `limit` characters without splitting a surrogate pair.
+    """Cut to `limit` UTF-16 code units, never inside a character.
 
-    Python strings are sequences of code points, so plain slicing never lands
-    inside a surrogate pair — the hazard the TypeScript side guards against does
-    not exist here. `None` passes through untouched.
+    The unit is the client's: its schema bounds are JavaScript string lengths,
+    where a character outside the Basic Multilingual Plane (most emoji) counts
+    two. Clamped here in code points, such a label came back longer than the
+    client's bound, the client cut it again (with a marker), and the label it
+    later sent to validate_node or set_text no longer matched this side's
+    clamp of the live name: the control was refused as changed. `None`
+    passes through untouched.
     """
-    if not isinstance(value, str) or len(value) <= limit:
+    if not isinstance(value, str) or len(value) * 2 <= limit:
         return value
-    return value[:limit]
+    units = 0
+    for index, char in enumerate(value):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units > limit:
+            return value[:index]
+    return value
 
 
 def text_or_none(value):
