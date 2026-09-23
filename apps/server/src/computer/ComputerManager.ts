@@ -3670,7 +3670,9 @@ export class ComputerManager {
         // the agent's text into the next paste the human makes.
         if (previous !== undefined) {
           await timedComputerLeg("settle", () =>
-            pasteConsumed(consumedBeforeShortcut ? { consumed: new Promise(() => undefined) } : offer),
+            pasteConsumed(
+              consumedBeforeShortcut ? { consumed: new Promise(() => undefined) } : offer,
+            ),
           );
           restored = await write(previous).then(
             () => true,

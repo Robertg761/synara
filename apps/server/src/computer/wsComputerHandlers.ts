@@ -271,35 +271,21 @@ export function makeWsComputerHandlers(
         "Failed to launch computer application",
       ),
     [COMPUTER_WS_METHODS.click]: (input) =>
-      paneInput(
-        () => manager.click(undefined, input),
-        "Failed to click on computer",
-      ),
+      paneInput(() => manager.click(undefined, input), "Failed to click on computer"),
     [COMPUTER_WS_METHODS.doubleClick]: (input) =>
-      paneInput(
-        () => manager.doubleClick(undefined, input),
-        "Failed to double-click on computer",
-      ),
+      paneInput(() => manager.doubleClick(undefined, input), "Failed to double-click on computer"),
     [COMPUTER_WS_METHODS.rightClick]: (input) =>
-      paneInput(
-        () => manager.rightClick(undefined, input),
-        "Failed to right-click on computer",
-      ),
+      paneInput(() => manager.rightClick(undefined, input), "Failed to right-click on computer"),
     [COMPUTER_WS_METHODS.moveCursor]: (input) =>
-      paneInput(
-        () => manager.moveCursor(undefined, input),
-        "Failed to move computer cursor",
-      ),
+      paneInput(() => manager.moveCursor(undefined, input), "Failed to move computer cursor"),
     [COMPUTER_WS_METHODS.drag]: (input) =>
       paneInput(
-        () =>
-          manager.drag(undefined, input.from, input.to, input.durationMs ?? 250),
+        () => manager.drag(undefined, input.from, input.to, input.durationMs ?? 250),
         "Failed to drag on computer",
       ),
     [COMPUTER_WS_METHODS.scroll]: (input) =>
       paneInput(
-        () =>
-          manager.scroll(undefined, scrollTarget(input), input.deltaX, input.deltaY),
+        () => manager.scroll(undefined, scrollTarget(input), input.deltaX, input.deltaY),
         "Failed to scroll on computer",
       ),
     [COMPUTER_WS_METHODS.typeText]: (input) =>
@@ -326,10 +312,7 @@ export function makeWsComputerHandlers(
     [COMPUTER_WS_METHODS.getThreadState]: (input) =>
       attempt(() => manager.getThreadState(input.threadId), "Failed to read computer state"),
     [COMPUTER_WS_METHODS.inputClick]: (input) =>
-      paneInput(
-        () => userInputClick(manager, input),
-        "Failed to click on computer",
-      ),
+      paneInput(() => userInputClick(manager, input), "Failed to click on computer"),
     [COMPUTER_WS_METHODS.inputScroll]: (input) =>
       paneInput(
         () =>
