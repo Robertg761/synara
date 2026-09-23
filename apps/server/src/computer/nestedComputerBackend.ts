@@ -102,6 +102,7 @@ const MIN_IDLE_CHECK_INTERVAL_MS = 250;
  * parked desktop without booting it (see the overrides below).
  */
 const NESTED_DESKTOP_USES = [
+  "captureLuma",
   "captureRegion",
   "captureScreenshot",
   "captureWindow",
