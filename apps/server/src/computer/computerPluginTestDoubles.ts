@@ -252,6 +252,11 @@ export class FakeDbus implements KWinComputerDbus {
    * every freshly loaded generation registers under a new unique name.
    */
   serviceOwner: string | undefined;
+  /**
+   * The running compositor instance; left unset, the fake does not answer
+   * `compositorInstance` at all, as an adapter that cannot tell.
+   */
+  compositorInstance?: () => Promise<string | undefined>;
   /** Answer to a liveness ping; undefined means the fake offers no ping. */
   pingAnswer: boolean | undefined = true;
   private ownerCounter = 42;

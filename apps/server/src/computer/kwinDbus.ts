@@ -253,6 +253,14 @@ export interface KWinComputerDbus {
    * one to load today.
    */
   readonly kwinVersion?: () => Promise<string | undefined>;
+  /**
+   * Which compositor instance is running right now — KWin's unique bus name,
+   * the live Hyprland instance — or `undefined` when none is. A plugin gone
+   * from an instance that is still the same one was unloaded on purpose, and
+   * is not loaded again behind the human's back; one gone with its instance
+   * is reloaded into the new one.
+   */
+  readonly compositorInstance?: () => Promise<string | undefined>;
   readonly close: () => Promise<void>;
 }
 
@@ -536,6 +544,8 @@ export async function createSessionKWinComputerDbus(
         );
         return typeof info === "string" ? parseKwinSupportVersion(info) : undefined;
       },
+      // A restarted KWin re-registers under a new unique name on the same bus.
+      compositorInstance: () => session.nameOwner(KWIN_SERVICE),
       close: session.close,
     };
   } catch (error) {

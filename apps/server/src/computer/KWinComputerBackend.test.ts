@@ -4082,6 +4082,62 @@ describe("KWinComputerBackend reconnect timer", () => {
   });
 });
 
+describe("KWinComputerBackend plugin unloaded by someone (R12)", () => {
+  function unloadEverything(dbus: FakeDbus): void {
+    dbus.loaded = [];
+    dbus.serviceOwner = undefined;
+    dbus.changeServiceOwner(undefined);
+  }
+
+  it("does not load it back into the same compositor on its own", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      dbus.compositorInstance = async () => ":1.7";
+      const backend = makeBackend(dbus, { random: () => 1 });
+      await backend.listWindows();
+      const loadsBefore = dbus.calls.filter((call) => call.method === "LoadPlugin").length;
+
+      unloadEverything(dbus);
+      await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS * 4);
+      expect(dbus.calls.filter((call) => call.method === "LoadPlugin")).toHaveLength(loadsBefore);
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+
+      // A real use is the human's (or the agent's) say-so: it loads again.
+      await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+      expect(dbus.calls.filter((call) => call.method === "LoadPlugin")).toHaveLength(
+        loadsBefore + 1,
+      );
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reloads it into a compositor that restarted", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      let kwin = ":1.7";
+      dbus.compositorInstance = async () => kwin;
+      const backend = makeBackend(dbus, { random: () => 1 });
+      await backend.listWindows();
+      const loadsBefore = dbus.calls.filter((call) => call.method === "LoadPlugin").length;
+
+      kwin = ":1.99";
+      unloadEverything(dbus);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(dbus.calls.filter((call) => call.method === "LoadPlugin")).toHaveLength(
+        loadsBefore + 1,
+      );
+      expect(backend.health().status).toBe("connected");
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("KWinComputerBackend perception", () => {
   it("walks the accessibility tree when the caller asks for it, scoped to a window", async () => {
     const dbus = new FakeDbus();

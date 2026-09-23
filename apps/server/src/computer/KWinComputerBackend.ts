@@ -515,6 +515,12 @@ export class KWinComputerBackend implements ComputerBackend {
    */
   private connectedAt: number | undefined;
   private connectionProven = false;
+  /**
+   * The compositor instance the newest connection was made to (see
+   * `KWinComputerDbus.compositorInstance`). A plugin missing from that same
+   * instance was unloaded by someone, and the reconnect loop leaves it so.
+   */
+  private connectedCompositor: string | undefined;
   /** A retry is pending or running, which is what `reconnecting` reports. */
   private reconnecting = false;
   /**
@@ -1877,6 +1883,12 @@ export class KWinComputerBackend implements ComputerBackend {
         );
       });
     }
+    const compositor = dbus.compositorInstance
+      ? await dbus.compositorInstance().catch((error: unknown) => {
+          if (isConnectionLevelFailure(error)) throw error;
+          return undefined;
+        })
+      : undefined;
     // Who owns the well-known service name *before* anything is loaded. The
     // plugin is addressed by that name, so without pinning the owner, a stale
     // duplicate Synara instance — or any same-session squatter — would receive
@@ -1904,11 +1916,29 @@ export class KWinComputerBackend implements ComputerBackend {
       try {
         assertServiceOwnerPresent(await dbus.nameOwner(COMPUTER_SERVICE));
         const plugin = await dbus.connectPlugin();
-        return await this.finishPluginConnection(plugin, undefined);
+        return await this.finishPluginConnection(plugin, undefined, compositor);
       } catch (fallbackError) {
         if (isConnectionLevelFailure(fallbackError)) throw fallbackError;
         loaded = [];
       }
+    }
+    // R12: the reconnect loop never loads a plugin into the compositor it was
+    // connected to. If nothing of ours is loaded there any more, someone
+    // unloaded it — the human, or their script — and putting it back within a
+    // quarter second overrides that decision. The next real use, or Set up,
+    // loads it; a new compositor instance (a restart) gets it automatically.
+    if (
+      automatic &&
+      compositor !== undefined &&
+      compositor === this.connectedCompositor &&
+      !loaded.some(isSynaraPluginId)
+    ) {
+      throw new ComputerBackendError(
+        `The Synara ${this.integrationName} plugin was unloaded from the running compositor, so ` +
+          "it is left unloaded. It is loaded again the next time the agent uses the desktop, or " +
+          "with Set up.",
+        { dormant: true, retryable: true },
+      );
     }
     let plan = resolveSynaraPluginLoad({ loaded, installed: await this.installedPluginIds() });
     if (ownerBefore && authenticationFailed) {
@@ -1983,7 +2013,7 @@ export class KWinComputerBackend implements ComputerBackend {
       );
     }
     this.refusedInstance = undefined;
-    const connected = await this.finishPluginConnection(plugin, plan.pluginId);
+    const connected = await this.finishPluginConnection(plugin, plan.pluginId, compositor);
     // Superseded builds are removed only now, after the replacement loaded and
     // passed its health check. Removing them earlier — as provisioning once
     // did — deleted the working library before a load that was then refused,
@@ -2184,6 +2214,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private async finishPluginConnection(
     plugin: KWinComputerPluginApi,
     pluginId: string | undefined,
+    compositor: string | undefined,
   ): Promise<KWinComputerPluginApi> {
     if (this.disposed) {
       await plugin.stop().catch(() => undefined);
@@ -2197,6 +2228,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.plugin = plugin;
     this.pluginId = pluginId;
     this.pluginHealth = health;
+    this.connectedCompositor = compositor;
     // The backoff is not reset here: a connection that is lost again at once
     // proved nothing. See `scheduleReconnect`.
     this.connectedAt = this.now();
