@@ -16,7 +16,12 @@ import {
   readStringArray,
   COMPUTER_AUTH_THROTTLED_ERROR,
   COMPUTER_SERVICE_OWNER_MISMATCH_ERROR,
+  waitForSessionBusName,
 } from "./kwinDbus.ts";
+import { ComputerBackendError } from "./ComputerBackend.ts";
+import { withFakeDbusTransport } from "./computerPluginTestDoubles.ts";
+import { DbusConnectionClosedError } from "./dbusPlumbing.ts";
+import { isConnectionLevelFailure } from "./KWinComputerBackend.ts";
 
 describe("KWin D-Bus calls", () => {
   it("times out ordinary and capture calls at their separate limits", async () => {
@@ -203,6 +208,8 @@ describe("connectPlugin owner pinning", () => {
   });
 });
 
+const never = () => new Promise<never>(() => undefined);
+
 describe("session bus lifetime", () => {
   /** A bus that is a real emitter, so an unhandled `error` really throws. */
   function emitterBus(options: { readonly owner?: string } = {}) {
@@ -216,8 +223,11 @@ describe("session bus lifetime", () => {
     };
     const daemon = new EventEmitter();
     Object.assign(daemon, {
+      // The plugin registers on KWin's own connection, so both names share it.
       GetNameOwner: async (name: string) =>
-        name === COMPUTER_SERVICE && options.owner ? options.owner : ":0.0",
+        (name === COMPUTER_SERVICE || name === "org.kde.KWin") && options.owner
+          ? options.owner
+          : ":0.0",
       RequestName: async () => 1,
       GetId: async () => `test-${process.pid}`,
       authenticate: async () => "test-instance",
@@ -303,6 +313,63 @@ describe("session bus lifetime", () => {
     await dbus.close();
   });
 
+  describe("when the bus daemon goes away", () => {
+    async function connectedOverTransport() {
+      const bus = withFakeDbusTransport(emitterBus({ owner: ":1.42" }));
+      const stateJson = vi.fn(never);
+      Object.assign(bus.daemon, { stateJson, healthJson: never });
+      const dbus = await createSessionKWinComputerDbus({
+        dbusModule: { sessionBus: () => bus as never },
+      });
+      const plugin = await dbus.connectPlugin();
+      return { bus, dbus, plugin, stateJson };
+    }
+
+    it("fails a waiting plugin call at once, as connection-level, and says so once", async () => {
+      vi.useFakeTimers();
+      try {
+        const { bus, dbus, plugin, stateJson } = await connectedOverTransport();
+        const disconnected = vi.fn();
+        dbus.onDisconnect(disconnected);
+        const waiting = plugin.healthJson().catch((error: unknown) => error);
+
+        // No timer advances: before this change the call sat out its timeout.
+        bus.dropTransport();
+        const error = await waiting;
+        expect(error).toBeInstanceOf(DbusConnectionClosedError);
+        expect(isConnectionLevelFailure(error)).toBe(true);
+        expect(disconnected).toHaveBeenCalledTimes(1);
+
+        // A call made after the drop is never written to the dead socket.
+        await expect(plugin.stateJson()).rejects.toBeInstanceOf(DbusConnectionClosedError);
+        expect(stateJson).not.toHaveBeenCalled();
+        bus.emit("error", new Error("Tried to write a message to a closed stream"));
+        expect(disconnected).toHaveBeenCalledTimes(1);
+        await dbus.close();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("fails a waiting call on close without calling it a dropped bus", async () => {
+      const { bus, dbus, plugin } = await connectedOverTransport();
+      const disconnected = vi.fn();
+      dbus.onDisconnect(disconnected);
+      const waiting = plugin.healthJson().catch((error: unknown) => error);
+
+      await dbus.close();
+      bus.dropTransport();
+
+      const error = await waiting;
+      // The closer is already replacing this connection: a failure read as
+      // connection-level would tear down the replacement as well.
+      expect(error).toBeInstanceOf(ComputerBackendError);
+      expect(error).toMatchObject({ retryable: true });
+      expect(isConnectionLevelFailure(error)).toBe(false);
+      expect(disconnected).not.toHaveBeenCalled();
+    });
+  });
+
   it("reads the running KWin version out of the compositor's support information", async () => {
     const bus = emitterBus({ owner: ":1.42" });
     Object.assign(bus.daemon, {
@@ -329,5 +396,40 @@ describe("capture deadlines", () => {
   it("reads the KWin version line and ignores the rest", () => {
     expect(parseKwinSupportVersion("Qt Version: 6.9.1\nKWin version: 6.8.0\n")).toBe("6.8.0");
     expect(parseKwinSupportVersion("nothing here")).toBeUndefined();
+  });
+});
+
+describe("waiting for a bus name", () => {
+  it("rejects as soon as the bus dies instead of polling out the timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const bus = withFakeDbusTransport(new EventEmitter());
+      const nameHasOwner = vi.fn(async () => false);
+      const disconnect = vi.fn();
+      Object.assign(bus, {
+        getProxyObject: async () => ({ getInterface: () => ({ NameHasOwner: nameHasOwner }) }),
+        disconnect,
+      });
+      const waiting = waitForSessionBusName({
+        busAddress: "unix:path=/nonexistent",
+        name: "org.kde.KWin",
+        timeoutMs: 60_000,
+        pollMs: 10_000,
+        dbusModule: { sessionBus: () => bus as never },
+      }).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nameHasOwner).toHaveBeenCalledTimes(1);
+
+      // Mid-sleep, long before the next poll or the deadline.
+      bus.dropTransport();
+      await expect(waiting).resolves.toBeInstanceOf(DbusConnectionClosedError);
+      expect(nameHasOwner).toHaveBeenCalledTimes(1);
+      expect(disconnect).toHaveBeenCalledTimes(1);
+      // The bus keeps its error listener after the wait: a late socket error
+      // on it is not an uncaught exception.
+      expect(() => bus.emit("error", new Error("read ECONNRESET"))).not.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

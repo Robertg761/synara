@@ -2471,12 +2471,14 @@ export class KWinComputerBackend implements ComputerBackend {
 
   /**
    * Drops the live connection without disposing the backend, for a subclass
-   * that ends its desktop on purpose (the nested idle shutdown). Nothing is
-   * rescheduled: the next use connects afresh through `dbusFactory`.
+   * whose desktop ended — on purpose (the nested idle shutdown) or by itself
+   * (`reason`, which health then reports). Nothing is rescheduled: the next
+   * use connects afresh through `dbusFactory`.
    */
-  protected releaseConnection(): void {
+  protected releaseConnection(reason?: unknown): void {
     this.standDownReconnect();
     this.invalidateConnection();
+    if (reason !== undefined) this.recordHealthFailure(reason);
     this.dormant = true;
     this.publishHealth();
   }

@@ -12,9 +12,10 @@
  * and "there is no bus" lead to different messages and different tiers.
  */
 import { createRequire } from "node:module";
-import type { EventEmitter } from "node:events";
 
 import type dbusModule from "dbus-next";
+
+import { type DbusConnectionClosedError, watchDbusConnection } from "./dbusPlumbing.ts";
 
 import {
   DBUS_INTERFACE,
@@ -81,10 +82,13 @@ export async function readSessionBusProperty(
 /**
  * Runs one operation on a throwaway session-bus connection.
  *
- * The `error`/`disconnect` listeners are the load-bearing part: dbus-next emits
+ * The watch's `error` listener is the load-bearing part: dbus-next emits
  * connection failures on the bus object itself, and an unhandled `error` event
  * takes the whole process down. A probe that can crash the server the first
- * time it runs on a host with no session bus is worse than no probe.
+ * time it runs on a host with no session bus is worse than no probe. The watch
+ * is also what ends the operation when the bus dies under it: dbus-next leaves
+ * a call on a dead socket waiting forever, so without it the probe would sit
+ * out its whole timeout.
  */
 async function withSessionBus<T>(
   options: KWinComputerDbusOptions,
@@ -95,25 +99,25 @@ async function withSessionBus<T>(
   const require = createRequire(import.meta.url);
   const dbus = options.dbusModule ?? (require("dbus-next") as typeof dbusModule);
   const bus = dbus.sessionBus();
-  const eventBus = bus as unknown as EventEmitter;
-  let connectionError: unknown;
-  const onError = (error: unknown) => {
-    connectionError ??= error;
-  };
-  eventBus.on("error", onError);
-  eventBus.on("disconnect", onError);
+  const connection = watchDbusConnection(bus);
+  let dropped: DbusConnectionClosedError | undefined;
+  connection.onClosed((error) => {
+    dropped = error;
+  });
   try {
-    return await operation(bus);
+    return await connection.guard(() => operation(bus));
   } catch (error) {
-    throw asError(connectionError ?? error);
+    // The bus's own failure is the answer worth reporting: the call it broke
+    // only says that it broke.
+    throw asError(dropped?.cause ?? dropped ?? error);
   } finally {
     // Disconnecting can itself surface as an 'error' event on the bus
     // (ECONNRESET during close is routine), so the handlers stay attached
     // through it — removing them first would turn that into an unhandled
     // 'error' on a bare EventEmitter, which crashes the process.
+    connection.release(() => new Error("The session-bus probe is over."));
     bus.disconnect();
-    eventBus.off("error", onError);
-    eventBus.off("disconnect", onError);
+    connection.detach();
   }
 }
 

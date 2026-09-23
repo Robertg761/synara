@@ -4,7 +4,13 @@ import type { EventEmitter } from "node:events";
 import type dbusModule from "dbus-next";
 import type { ProxyObject as DbusProxyObject } from "dbus-next";
 
-import { unwrapDbusValue, withDbusTimeout } from "./dbusPlumbing.ts";
+import { ComputerBackendError } from "./ComputerBackend.ts";
+import {
+  type DbusConnectionWatch,
+  unwrapDbusValue,
+  watchDbusConnection,
+  withDbusTimeout,
+} from "./dbusPlumbing.ts";
 import { COMPUTER_SERVER_OWNER, createComputerSessionAuth } from "./computerSessionAuth.ts";
 
 export const KWIN_SERVICE = "org.kde.KWin";
@@ -306,10 +312,11 @@ async function authenticateWithCooldown(
   plugin: unknown,
   token: string,
   sleep: (milliseconds: number) => Promise<void>,
+  call: DbusInvoke,
 ): Promise<unknown> {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return unwrapDbusValue(await invoke(plugin, "authenticate", token));
+      return unwrapDbusValue(await call(plugin, "authenticate", token));
     } catch (error) {
       if (attempt >= AUTH_THROTTLE_MAX_ATTEMPTS || !isThrottledAuthError(error)) throw error;
       await sleep(AUTH_THROTTLE_RETRY_DELAY_MS);
@@ -347,6 +354,17 @@ export interface ComputerSessionBus {
 export async function openComputerSessionBus(
   options: KWinComputerDbusOptions = {},
 ): Promise<ComputerSessionBus> {
+  return (await openWatchedSessionBus(options)).session;
+}
+
+/**
+ * `openComputerSessionBus`, plus the watch on its connection, for a host in
+ * this module whose own calls on the bus must fail with it too.
+ */
+async function openWatchedSessionBus(options: KWinComputerDbusOptions): Promise<{
+  readonly session: ComputerSessionBus;
+  readonly call: DbusInvoke;
+}> {
   // Keep the optional Linux runtime out of test imports. The production path
   // resolves it only when the backend has passed the Linux/Wayland gate.
   const require = createRequire(import.meta.url);
@@ -362,49 +380,54 @@ export async function openComputerSessionBus(
     : dbus.sessionBus();
   let closed = false;
   const disconnectListeners = new Set<() => void>();
-  const onDisconnectEvent = () => {
+  // The watch's listeners stay attached for the life of the bus object,
+  // including through `disconnect()`. dbus-next emits a failure on the bus
+  // object itself, and a bus with no `error` listener turns that into an
+  // uncaught exception that ends the server process. The window this closes is
+  // real: a release write from a `finally` after a timed-out call lands on the
+  // socket after `close()` has run, and the ECONNRESET it produces arrives
+  // after close.
+  const connection = watchDbusConnection(bus);
+  connection.onClosed(() => {
     for (const listener of disconnectListeners) listener();
-  };
-  const eventBus = bus as unknown as EventEmitter;
-  // Both listeners stay attached for the life of the bus object, including
-  // through `disconnect()`. dbus-next emits a failure on the bus object itself,
-  // and a bus with no `error` listener turns that into an uncaught exception
-  // that ends the server process. The window this closes is real: a release
-  // write from a `finally` after a timed-out call lands on the socket after
-  // `close()` has run, and the ECONNRESET it produces arrives after close.
-  eventBus.on("disconnect", onDisconnectEvent);
-  eventBus.on("error", onDisconnectEvent);
-  let busDaemon: DbusProxyObject;
-  try {
-    busDaemon = await withTimeout(
-      Promise.resolve(bus.getProxyObject(DBUS_SERVICE, DBUS_OBJECT_PATH)),
+  });
+  const call: DbusInvoke = (iface, methodName, ...args) =>
+    invokeKWinDbusMethodOn(connection, iface, methodName, ...args);
+  const proxyObject = (service: string, path: string) =>
+    withTimeout(
+      connection.guard(() => bus.getProxyObject(service, path)),
       KWIN_DBUS_DEFAULT_TIMEOUT_MS,
       "getProxyObject",
     );
-  } catch (error) {
+  const abandon = () => {
+    connection.release(() => releasedConnectionError());
     bus.disconnect();
+  };
+  let busDaemon: DbusProxyObject;
+  try {
+    busDaemon = await proxyObject(DBUS_SERVICE, DBUS_OBJECT_PATH);
+  } catch (error) {
+    abandon();
     throw error;
   }
   const daemon = busDaemon.getInterface(DBUS_INTERFACE);
   let authentication: Awaited<ReturnType<typeof createComputerSessionAuth>>;
   try {
-    const ownership = unwrapDbusValue(
-      await invoke(daemon, "RequestName", COMPUTER_SERVER_OWNER, 4),
-    );
+    const ownership = unwrapDbusValue(await call(daemon, "RequestName", COMPUTER_SERVER_OWNER, 4));
     if (ownership !== 1)
       throw new Error(
         "Another Synara server owns this desktop. Stop its computer session before using this server.",
       );
     authentication = await createComputerSessionAuth(
-      String(unwrapDbusValue(await invoke(daemon, "GetId"))),
+      String(unwrapDbusValue(await call(daemon, "GetId"))),
     );
   } catch (error) {
-    bus.disconnect();
+    abandon();
     throw error;
   }
   const resolveNameOwner = async (name: string): Promise<string | undefined> => {
     try {
-      const owner = await invoke(daemon, "GetNameOwner", name);
+      const owner = await call(daemon, "GetNameOwner", name);
       return typeof unwrapDbusValue(owner) === "string"
         ? (unwrapDbusValue(owner) as string)
         : undefined;
@@ -428,7 +451,7 @@ export async function openComputerSessionBus(
     if (!Message) return true;
     try {
       await withTimeout(
-        Promise.resolve(
+        connection.guard(() =>
           bus.call(
             new Message({
               destination: owner,
@@ -446,13 +469,8 @@ export async function openComputerSessionBus(
       return false;
     }
   };
-  return {
-    getProxyObject: (service, path) =>
-      withTimeout(
-        Promise.resolve(bus.getProxyObject(service, path)),
-        KWIN_DBUS_DEFAULT_TIMEOUT_MS,
-        "getProxyObject",
-      ),
+  const session: ComputerSessionBus = {
+    getProxyObject: proxyObject,
     nameOwner: resolveNameOwner,
     pingOwner,
     onServiceOwnerChanged: (listener) => {
@@ -474,16 +492,12 @@ export async function openComputerSessionBus(
           `Nothing on the session bus owns ${COMPUTER_SERVICE}, so the plugin cannot be connected.`,
         );
       }
-      const object = await withTimeout(
-        Promise.resolve(bus.getProxyObject(owner, COMPUTER_OBJECT_PATH)),
-        KWIN_DBUS_DEFAULT_TIMEOUT_MS,
-        "getProxyObject",
-      );
+      const object = await proxyObject(owner, COMPUTER_OBJECT_PATH);
       const plugin = object.getInterface(COMPUTER_INTERFACE);
-      const instanceId = await authenticateWithCooldown(plugin, authentication.token, sleep);
+      const instanceId = await authenticateWithCooldown(plugin, authentication.token, sleep, call);
       if (typeof instanceId !== "string" || instanceId.length === 0)
         throw new Error("Computer plugin authentication failed; rebuild the plugin.");
-      return { ...makePluginApi(plugin), instanceId, owner };
+      return { ...makePluginApi(plugin, connection), instanceId, owner };
     },
     onDisconnect: (listener) => {
       disconnectListeners.add(listener);
@@ -496,10 +510,27 @@ export async function openComputerSessionBus(
       disconnectListeners.clear();
       ownerListeners.clear();
       daemonEvents.off?.("NameOwnerChanged", onNameOwnerChanged);
+      // Settled now, before anything awaits: a call still waiting on this
+      // connection must not outlive it into whatever connection replaces it.
+      connection.release(() => releasedConnectionError());
       await authentication.close();
       bus.disconnect();
     },
   };
+  return { session, call };
+}
+
+/**
+ * What a call still waiting on a connection this side closed rejects with.
+ * Retryable, and deliberately not connection-level: the closer is already
+ * replacing the connection, and a late failure read as a dropped bus would
+ * tear down the replacement too.
+ */
+function releasedConnectionError(): ComputerBackendError {
+  return new ComputerBackendError(
+    "The D-Bus call was abandoned: Synara released the connection it was waiting on.",
+    { retryable: true },
+  );
 }
 
 /**
@@ -508,7 +539,7 @@ export async function openComputerSessionBus(
 export async function createSessionKWinComputerDbus(
   options: KWinComputerDbusOptions = {},
 ): Promise<KWinComputerDbus> {
-  const session = await openComputerSessionBus(options);
+  const { session, call } = await openWatchedSessionBus(options);
   try {
     const pluginsObject = await session.getProxyObject(KWIN_SERVICE, KWIN_PLUGINS_PATH);
     const plugins = pluginsObject.getInterface(KWIN_PLUGINS_INTERFACE);
@@ -525,19 +556,19 @@ export async function createSessionKWinComputerDbus(
       nameOwner: session.nameOwner,
       listLoadedPluginIds: async () => {
         const result = properties
-          ? await invoke(properties, "Get", KWIN_PLUGINS_INTERFACE, "LoadedPlugins")
-          : await invoke(plugins, "loadedPlugins");
+          ? await call(properties, "Get", KWIN_PLUGINS_INTERFACE, "LoadedPlugins")
+          : await call(plugins, "loadedPlugins");
         return readStringArray(result);
       },
       loadPlugin: async (pluginId) => {
-        const result = await invoke(plugins, "LoadPlugin", pluginId);
+        const result = await call(plugins, "LoadPlugin", pluginId);
         return readBoolean(result);
       },
       unloadPlugin: async (pluginId) => {
         // KWin's UnloadPlugin reply differs by version: older builds answer
         // `b`, newer ones are void. A void reply means the call succeeded, so
         // only an explicit `false` reports "was not loaded".
-        const result = await invoke(plugins, "UnloadPlugin", pluginId);
+        const result = await call(plugins, "UnloadPlugin", pluginId);
         return readOptionalBoolean(result) ?? true;
       },
       connectPlugin: async () => {
@@ -566,7 +597,7 @@ export async function createSessionKWinComputerDbus(
       kwinVersion: async () => {
         const object = await session.getProxyObject(KWIN_SERVICE, KWIN_OBJECT_PATH);
         const info = unwrapDbusValue(
-          await invoke(object.getInterface(KWIN_INTERFACE), "supportInformation"),
+          await call(object.getInterface(KWIN_INTERFACE), "supportInformation"),
         );
         return typeof info === "string" ? parseKwinSupportVersion(info) : undefined;
       },
@@ -590,7 +621,9 @@ export function parseKwinSupportVersion(info: string): string | undefined {
  *
  * One connection polls `NameHasOwner` rather than reconnecting per attempt: a
  * connect/disconnect cycle per poll would churn the bus, and a failed connect
- * can emit a late error on a bus nobody is listening to any more.
+ * can emit a late error on a bus nobody is listening to any more. A bus that
+ * dies during the wait — the daemon it is waiting on crashed — rejects at once
+ * with `DbusConnectionClosedError`, not at the end of the timeout.
  */
 export async function waitForSessionBusName(options: {
   readonly busAddress: string;
@@ -599,20 +632,18 @@ export async function waitForSessionBusName(options: {
   readonly pollMs?: number;
   /** Ends the wait early, for a caller that knows the name will never appear. */
   readonly abort?: () => boolean;
+  /** Tests inject a fake here; production resolves the real dbus-next. */
+  readonly dbusModule?: KWinComputerDbusOptions["dbusModule"];
 }): Promise<boolean> {
   const require = createRequire(import.meta.url);
-  const dbus = require("dbus-next") as typeof dbusModule;
+  const dbus = options.dbusModule ?? (require("dbus-next") as typeof dbusModule);
   const bus = dbus.sessionBus({ busAddress: options.busAddress });
-  const eventBus = bus as unknown as EventEmitter;
-  let connectionError: unknown;
-  const onError = (error: unknown) => {
-    connectionError ??= error;
-  };
-  eventBus.on("error", onError);
-  eventBus.on("disconnect", onError);
+  // Never detached: the bus is dropped after this, and a late socket error on
+  // a bus with no `error` listener would be an uncaught exception.
+  const connection = watchDbusConnection(bus);
   try {
     const daemon = await withTimeout(
-      Promise.resolve(bus.getProxyObject(DBUS_SERVICE, DBUS_OBJECT_PATH)),
+      connection.guard(() => bus.getProxyObject(DBUS_SERVICE, DBUS_OBJECT_PATH)),
       KWIN_DBUS_DEFAULT_TIMEOUT_MS,
       "getProxyObject",
     );
@@ -620,17 +651,19 @@ export async function waitForSessionBusName(options: {
     const deadline = Date.now() + options.timeoutMs;
     for (;;) {
       if (options.abort?.() === true) return false;
-      if (connectionError !== undefined) throw connectionError;
-      if ((await invoke(iface, "NameHasOwner", options.name)) === true) return true;
+      const owned = await invokeKWinDbusMethodOn(connection, iface, "NameHasOwner", options.name);
+      if (owned === true) return true;
       if (Date.now() >= deadline) return false;
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, options.pollMs ?? DBUS_NAME_POLL_MS);
-        timer.unref?.();
-      });
+      await connection.guard(
+        () =>
+          new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, options.pollMs ?? DBUS_NAME_POLL_MS);
+            timer.unref?.();
+          }),
+      );
     }
   } finally {
-    eventBus.off("error", onError);
-    eventBus.off("disconnect", onError);
+    connection.release(() => new Error("The bus-name wait is over."));
     bus.disconnect();
   }
 }
@@ -648,7 +681,18 @@ function isUnownedNameError(error: unknown): boolean {
   return text.includes("NameHasNoOwner") || text.includes("ServiceUnknown");
 }
 
-function makePluginApi(iface: unknown): KWinComputerPluginApi {
+function makePluginApi(
+  iface: unknown,
+  connection: DbusConnectionWatch | undefined,
+): KWinComputerPluginApi {
+  const invoke: DbusInvoke = (target, methodName, ...args) =>
+    invokeKWinDbusMethodOn(connection, target, methodName, ...args);
+  const invokeWithTimeout = (
+    target: unknown,
+    methodName: string,
+    timeoutMs: number,
+    ...args: readonly unknown[]
+  ) => invokeOn(connection, target, methodName, timeoutMs, args);
   return {
     healthJson: () => invoke(iface, "healthJson"),
     stateJson: () => invoke(iface, "stateJson"),
@@ -714,24 +758,46 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
   };
 }
 
+/** A method call on a proxy interface, with its deadline and, if bound, its connection's. */
+type DbusInvoke = (
+  iface: unknown,
+  methodName: string,
+  ...args: readonly unknown[]
+) => Promise<unknown>;
+
 export async function invokeKWinDbusMethod(
   iface: unknown,
   methodName: string,
   ...args: readonly unknown[]
 ): Promise<unknown> {
-  return await invokeWithTimeout(
+  return await invokeKWinDbusMethodOn(undefined, iface, methodName, ...args);
+}
+
+/**
+ * `invokeKWinDbusMethod` on a watched connection: the call also rejects the
+ * moment that connection ends, rather than at its deadline.
+ */
+export async function invokeKWinDbusMethodOn(
+  connection: DbusConnectionWatch | undefined,
+  iface: unknown,
+  methodName: string,
+  ...args: readonly unknown[]
+): Promise<unknown> {
+  return await invokeOn(
+    connection,
     iface,
     methodName,
     isCaptureMethod(methodName) ? KWIN_DBUS_CAPTURE_TIMEOUT_MS : KWIN_DBUS_DEFAULT_TIMEOUT_MS,
-    ...args,
+    args,
   );
 }
 
-async function invokeWithTimeout(
+async function invokeOn(
+  connection: DbusConnectionWatch | undefined,
   iface: unknown,
   methodName: string,
   timeoutMs: number,
-  ...args: readonly unknown[]
+  args: readonly unknown[],
 ): Promise<unknown> {
   if (typeof iface !== "object" || iface === null) {
     throw new Error(`D-Bus interface ${methodName} is unavailable.`);
@@ -740,11 +806,10 @@ async function invokeWithTimeout(
   if (typeof method !== "function") {
     throw new Error(`D-Bus method ${methodName} is unavailable.`);
   }
-  const result = (method as (...callArgs: readonly unknown[]) => Promise<unknown>)(...args);
-  return await withTimeout(Promise.resolve(result), timeoutMs, methodName);
+  const start = (): unknown => Reflect.apply(method, iface, args);
+  const result = connection ? connection.guard(start) : Promise.resolve(start());
+  return await withTimeout(result, timeoutMs, methodName);
 }
-
-const invoke = invokeKWinDbusMethod;
 
 export function isCaptureMethod(methodName: string): boolean {
   return (

@@ -7,6 +7,8 @@
  * here is what stops the Hyprland suite from growing a second copy that drifts
  * away from the interface the first one tracks.
  */
+import { EventEmitter } from "node:events";
+
 import type { ComputerWindow } from "@synara/contracts";
 
 import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
@@ -330,4 +332,24 @@ export function dbusError(type: string, message: string): Error {
   error.name = "DBusError";
   error.type = type;
   return error;
+}
+
+/**
+ * The transport under a `dbus-next` bus, as the connection watch sees it: the
+ * `_connection` emitter that reports EOF as `end`, and its socket's `close`.
+ * `dropTransport` is the bus daemon going away — which dbus-next itself never
+ * reports as `disconnect`.
+ */
+export function withFakeDbusTransport<T extends object>(
+  bus: T,
+): T & { readonly _connection: EventEmitter; readonly dropTransport: () => void } {
+  const stream = new EventEmitter();
+  const connection = Object.assign(new EventEmitter(), { stream });
+  return Object.assign(bus, {
+    _connection: connection,
+    dropTransport: () => {
+      connection.emit("end");
+      stream.emit("close");
+    },
+  });
 }

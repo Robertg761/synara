@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { KWinComputerDbusOptions } from "./kwinDbus.ts";
 import { DBUS_INTERFACE, DBUS_OBJECT_PATH, DBUS_SERVICE } from "./kwinDbus.ts";
 import { sessionBusNameHasOwner, sessionBusNamesHaveOwners } from "./sessionBusNames.ts";
+import { withFakeDbusTransport } from "./computerPluginTestDoubles.ts";
+import { DbusConnectionClosedError } from "./dbusPlumbing.ts";
 
 type NameHasOwner = (name: string) => Promise<unknown>;
 
@@ -97,6 +99,27 @@ describe("sessionBusNamesHaveOwners", () => {
     await expect(
       sessionBusNamesHaveOwners(["org.kde.KWin"], { dbusModule: fake.dbusModule }),
     ).rejects.toBeInstanceOf(Error);
+  });
+
+  it("rejects at once when the bus daemon goes away under a waiting call", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = fakeSessionBus(() => new Promise(() => undefined));
+      const bus = withFakeDbusTransport(fake.bus);
+      const probe = sessionBusNamesHaveOwners(["org.kde.KWin"], {
+        dbusModule: fake.dbusModule,
+      }).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.nameHasOwner).toHaveBeenCalledTimes(1);
+
+      // dbus-next fails nothing on EOF; the call would otherwise sit out its
+      // five-second timeout. No timer advances here.
+      bus.dropTransport();
+      await expect(probe).resolves.toBeInstanceOf(DbusConnectionClosedError);
+      expect(fake.disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the error listener attached while disconnecting", async () => {
