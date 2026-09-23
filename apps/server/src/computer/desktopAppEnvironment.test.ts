@@ -5,6 +5,8 @@ import {
   CHROMIUM_ACCESSIBILITY_ARGUMENT,
   desktopApplicationEnvironment,
   withAgentAccessibilityArguments,
+  singleInstanceLaunch,
+  withIsolatedProfile,
 } from "./desktopAppEnvironment.ts";
 
 describe("desktopApplicationEnvironment", () => {
@@ -141,5 +143,66 @@ describe("agent launch accessibility", () => {
   it("never adds the switch twice", () => {
     const launch = { command: "/usr/bin/chromium", args: [CHROMIUM_ACCESSIBILITY_ARGUMENT] };
     expect(withAgentAccessibilityArguments(launch)).toBe(launch);
+  });
+});
+
+describe("single-instance launches", () => {
+  it("recognises Chromium, Electron and LibreOffice however they are started", () => {
+    expect(singleInstanceLaunch({ command: "/usr/bin/chromium", args: [] })).toEqual({
+      family: "chromium",
+      name: "chromium",
+    });
+    expect(singleInstanceLaunch({ command: "/usr/bin/code", args: ["."] })).toMatchObject({
+      family: "chromium",
+    });
+    expect(
+      singleInstanceLaunch({ command: "flatpak", args: ["run", "com.google.Chrome"] }),
+    ).toEqual({ family: "chromium", name: "com.google.Chrome", flatpakAppId: "com.google.Chrome" });
+    expect(
+      singleInstanceLaunch({
+        command: "/var/lib/flatpak/exports/bin/org.libreoffice.LibreOffice",
+        args: [],
+      }),
+    ).toMatchObject({ family: "libreoffice", flatpakAppId: "org.libreoffice.LibreOffice" });
+    expect(singleInstanceLaunch({ command: "/usr/bin/soffice", args: ["--writer"] })).toEqual({
+      family: "libreoffice",
+      name: "soffice",
+    });
+    expect(
+      singleInstanceLaunch({
+        command: "/usr/bin/gio",
+        args: ["launch", "/usr/share/applications/chromium.desktop"],
+      }),
+    ).toEqual({ family: "chromium", name: "chromium", desktopEntry: true });
+    expect(singleInstanceLaunch({ command: "/usr/bin/kcalc", args: [] })).toBeUndefined();
+    expect(singleInstanceLaunch({ command: "/usr/bin/firefox", args: [] })).toBeUndefined();
+  });
+
+  it("binds the launch to the given profile, replacing one the caller named", () => {
+    const chromium = { command: "/usr/bin/chromium", args: [] };
+    expect(
+      withIsolatedProfile(
+        {
+          ...chromium,
+          args: ["--user-data-dir=/home/u/.config/chromium", "https://x", "--", "--file"],
+        },
+        { family: "chromium", name: "chromium" },
+        "/run/nested/profiles/chromium",
+      ).args,
+    ).toEqual(["https://x", "--user-data-dir=/run/nested/profiles/chromium", "--", "--file"]);
+    expect(
+      withIsolatedProfile(
+        { ...chromium, args: ["--user-data-dir", "/home/u/.config/chromium", "https://x"] },
+        { family: "chromium", name: "chromium" },
+        "/p",
+      ).args,
+    ).toEqual(["https://x", "--user-data-dir=/p"]);
+    expect(
+      withIsolatedProfile(
+        { command: "/usr/bin/soffice", args: ["-env:UserInstallation=file:///home/u", "--calc"] },
+        { family: "libreoffice", name: "soffice" },
+        "/run/nested/profiles/soffice",
+      ).args,
+    ).toEqual(["--calc", "-env:UserInstallation=file:///run/nested/profiles/soffice"]);
   });
 });

@@ -17,6 +17,7 @@
  *
  * @module computer/desktopAppEnvironment
  */
+import { pathToFileURL } from "node:url";
 
 /** Exact variable names a desktop application is entitled to. */
 const DESKTOP_ENVIRONMENT_NAMES: ReadonlySet<string> = new Set([
@@ -167,14 +168,117 @@ export function withAgentAccessibilityArguments<T extends AgentLaunch>(launch: T
   return { ...launch, args };
 }
 
+/**
+ * A launch of a program that keeps one running instance per profile and hands
+ * any second launch over to it — through a socket or pipe found via the
+ * profile directory or the user's temp directory, not the session bus. Two
+ * families are known: Chromium and Electron builds (their profile singleton),
+ * and LibreOffice (its per-installation IPC pipe). `name` is the program or
+ * Flatpak id; `flatpakAppId` is set when it runs inside Flatpak's sandbox,
+ * which sees only its own `~/.var/app/<id>`. `desktopEntry` is a `gio launch`
+ * of such a program's desktop entry, which takes no arguments at all.
+ */
+export interface SingleInstanceLaunch {
+  readonly family: "chromium" | "libreoffice";
+  readonly name: string;
+  readonly flatpakAppId?: string;
+  readonly desktopEntry?: boolean;
+}
+
+const LIBREOFFICE_EXECUTABLES: ReadonlySet<string> = new Set([
+  "soffice",
+  "libreoffice",
+  "lowriter",
+  "localc",
+  "loimpress",
+  "lodraw",
+  "lomath",
+  "lobase",
+  "loweb",
+]);
+const LIBREOFFICE_FLATPAK = "org.libreoffice.LibreOffice";
+
+function singleInstanceFamily(name: string): SingleInstanceLaunch["family"] | undefined {
+  if (
+    CHROMIUM_FAMILY_EXECUTABLES.has(name) ||
+    VERSIONED_ELECTRON.test(name) ||
+    CHROMIUM_FAMILY_FLATPAKS.has(name)
+  ) {
+    return "chromium";
+  }
+  if (LIBREOFFICE_EXECUTABLES.has(name) || name === LIBREOFFICE_FLATPAK) return "libreoffice";
+  // Desktop entries name LibreOffice's modules `libreoffice-writer` and the like.
+  if (name.startsWith("libreoffice-") || name.startsWith(`${LIBREOFFICE_FLATPAK}.`)) {
+    return "libreoffice";
+  }
+  return undefined;
+}
+
+/** What `launch` is, when it is a single-instance program; see `SingleInstanceLaunch`. */
+export function singleInstanceLaunch(launch: AgentLaunch): SingleInstanceLaunch | undefined {
+  const program = basename(launch.command);
+  if (program === "flatpak") {
+    const appId = flatpakRunAppId(launch.args);
+    const family = appId === undefined ? undefined : singleInstanceFamily(appId);
+    return family && appId ? { family, name: appId, flatpakAppId: appId } : undefined;
+  }
+  if (program === "gio" && launch.args[0] === "launch" && launch.args[1] !== undefined) {
+    const entry = basename(launch.args[1]).replace(/\.desktop$/, "");
+    const family = singleInstanceFamily(entry);
+    return family ? { family, name: entry, desktopEntry: true } : undefined;
+  }
+  const family = singleInstanceFamily(program);
+  if (!family) return undefined;
+  // A Flatpak export is a wrapper named after the app id.
+  return CHROMIUM_FAMILY_FLATPAKS.has(program) || program === LIBREOFFICE_FLATPAK
+    ? { family, name: program, flatpakAppId: program }
+    : { family, name: program };
+}
+
+/**
+ * `launch` bound to the profile in `directory`, so it can only ever reach an
+ * instance started with that same profile: `--user-data-dir` for Chromium and
+ * Electron, `-env:UserInstallation` for LibreOffice. A profile the caller
+ * named itself is replaced, not kept: it is how a launch would reach the
+ * human's running instance. Inserted before a `--`, after which it would be a
+ * file name.
+ */
+export function withIsolatedProfile(
+  launch: AgentLaunch,
+  program: SingleInstanceLaunch,
+  directory: string,
+): AgentLaunch {
+  const chromium = program.family === "chromium";
+  const flag = chromium ? "--user-data-dir" : "-env:UserInstallation";
+  const value = chromium ? directory : pathToFileURL(directory).href;
+  const end = launch.args.indexOf("--");
+  const head = end === -1 ? launch.args : launch.args.slice(0, end);
+  const tail = end === -1 ? [] : launch.args.slice(end);
+  const kept: string[] = [];
+  for (let index = 0; index < head.length; index += 1) {
+    const arg = head[index];
+    if (arg === undefined || arg.startsWith(`${flag}=`)) continue;
+    if (arg === flag) {
+      // The separate-value spelling: the value goes with it.
+      index += 1;
+      continue;
+    }
+    kept.push(arg);
+  }
+  return { ...launch, args: [...kept, `${flag}=${value}`, ...tail] };
+}
+
+function flatpakRunAppId(args: readonly string[]): string | undefined {
+  // `flatpak run [options] <app-id> [args]`: the first bare word after `run`
+  // is the application.
+  const run = args.indexOf("run");
+  return run === -1 ? undefined : args.slice(run + 1).find((arg) => !arg.startsWith("-"));
+}
+
 function isChromiumFamilyLaunch(launch: AgentLaunch): boolean {
   const program = basename(launch.command);
   if (program === "flatpak") {
-    // `flatpak run [options] <app-id> [args]`: the first bare word after
-    // `run` is the application.
-    const run = launch.args.indexOf("run");
-    const appId =
-      run === -1 ? undefined : launch.args.slice(run + 1).find((arg) => !arg.startsWith("-"));
+    const appId = flatpakRunAppId(launch.args);
     return appId !== undefined && CHROMIUM_FAMILY_FLATPAKS.has(appId);
   }
   return (
