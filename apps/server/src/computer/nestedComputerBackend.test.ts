@@ -387,6 +387,8 @@ describe("idle shutdown", () => {
       expect(harness.disposedSessions).toEqual([]);
       await vi.advanceTimersByTimeAsync(IDLE_MS);
       expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
+      // Idle, not lost: the manager keeps the desktop available off this.
+      expect(harness.backend.health()).toMatchObject({ status: "unavailable", dormant: true });
 
       // Parked, not dead: the settings card and every state publish read it
       // without booting it, and nobody is told to click Set up.
@@ -410,6 +412,7 @@ describe("idle shutdown", () => {
       await harness.backend.getState({});
       expect(harness.sessionStarts).toHaveLength(2);
       expect(harness.backend.health().status).toBe("connected");
+      expect(harness.backend.health().dormant).toBeUndefined();
       await harness.backend.dispose();
     });
   });
