@@ -39,6 +39,7 @@ import type { AtspiRawNode, AtspiWindowTree } from "./atspiTreeTargeting.ts";
 import { resolveComputerSemanticTarget } from "./uiTreeTargeting.ts";
 import { GLIDE_FRAME_INTERVAL_MS } from "./pointerSequencing.ts";
 import { DesktopOperationQueue } from "./DesktopOperationQueue.ts";
+import { ComputerManager } from "./ComputerManager.ts";
 import { resolveInstallTarget } from "./kwinPluginProvisioning.ts";
 import {
   dbusError,
@@ -3352,9 +3353,9 @@ describe("KWinComputerBackend dormant desktop", () => {
       await backend.listWindows();
       dbus.disconnect();
       await vi.advanceTimersByTimeAsync(1000);
-      const realUse = backend.listWindows();
+      const realUse = backend.moveCursor({ x: 1, y: 1 });
       rejectAutomatic(new ComputerBackendError("Dormant", { dormant: true, retryable: true }));
-      await expect(realUse).resolves.toMatchObject([{ id: "window-1" }]);
+      await expect(realUse).resolves.toMatchObject({ point: { x: 1, y: 1 } });
       expect(modes).toEqual([true, false]);
     } finally {
       await backend.dispose();
@@ -3429,7 +3430,11 @@ describe("KWinComputerBackend dormant desktop", () => {
       expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
       expect(published.at(-1)).toMatchObject({ status: "unavailable", dormant: true });
 
-      await backend.listWindows();
+      // A panel read answers from what was known, without connecting.
+      await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+
+      await backend.moveCursor({ x: 1, y: 1 });
       expect(backend.health().status).toBe("connected");
       expect(backend.health().dormant).toBeUndefined();
     } finally {
@@ -4547,8 +4552,14 @@ describe("KWinComputerBackend plugin unloaded by someone (R12)", () => {
       expect(dbus.calls.filter((call) => call.method === "LoadPlugin")).toHaveLength(loadsBefore);
       expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
 
+      // Panel reads (a thread switch publishes all three) do not load it.
+      await backend.availability();
+      await backend.listWindows();
+      await backend.getScreenSize();
+      expect(dbus.calls.filter((call) => call.method === "LoadPlugin")).toHaveLength(loadsBefore);
+
       // A real use is the human's (or the agent's) say-so: it loads again.
-      await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+      await backend.moveCursor({ x: 1, y: 1 });
       expect(dbus.calls.filter((call) => call.method === "LoadPlugin")).toHaveLength(
         loadsBefore + 1,
       );
@@ -4617,8 +4628,13 @@ describe("KWinComputerBackend compositor gone", () => {
       await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS * 4);
       expect(factoryCalls).toBe(callsWhenGone);
 
+      // A panel read lists no windows of a desktop that is gone.
+      await expect(backend.listWindows()).resolves.toEqual([]);
+      expect(factoryCalls).toBe(callsWhenGone);
+
       // A real use still asks, and a compositor that came back is used.
       kwin = ":1.8";
+      await backend.moveCursor({ x: 1, y: 1 });
       await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
       expect(gone).toHaveLength(1);
       await backend.dispose();
@@ -5109,6 +5125,89 @@ describe("KWinComputerBackend idle release (S9)", () => {
       await vi.advanceTimersByTimeAsync(IDLE_MS * 2);
       expect(released.count).toBe(1);
       await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("KWinComputerBackend panel reads of a released desktop", () => {
+  const IDLE_MS = 60_000;
+
+  it("leaves the desktop to a second server that took it after the idle release", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      let dials = 0;
+      let secondServer = false;
+      const backend = makeBackend(dbus, {
+        idleReleaseMs: IDLE_MS,
+        busNamesHaveOwners: async (names) => names.map(() => true),
+        dbusFactory: async () => {
+          dials += 1;
+          // Asking for org.synara.ComputerUse.Server now would contend with
+          // the dev server that took this desktop over.
+          if (secondServer) throw new Error("Another Synara server owns this desktop.");
+          return dbus;
+        },
+      });
+      const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+      await manager.listWindows();
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 2);
+      expect(backend.health()).toMatchObject({ dormant: true });
+      secondServer = true;
+      const before = dials;
+
+      // Thread switches and publishes: every read the panel makes.
+      const first = await manager.getThreadState("thread-a");
+      const second = await manager.getThreadState("thread-b");
+      await manager.availability();
+      await manager.getScreenSize();
+      expect(dials).toBe(before);
+      expect(first.availability).toMatchObject({ kind: "available" });
+      expect(second.availability).toMatchObject({ kind: "available" });
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+      await manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not load back a plugin the human unloaded when they switch threads", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      dbus.compositorInstance = async () => ":1.7";
+      const backend = makeBackend(dbus, {
+        random: () => 1,
+        provisionPlugin: async () => ({
+          action: "already-current",
+          pluginDirectory: "/tmp/synara-test-plugins",
+          pluginId: "SynaraComputerUsePluginV10",
+          requiresRelogin: false,
+          summary: "The computer-use plugin is already installed.",
+        }),
+      });
+      const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+      await manager.getThreadState("thread-a");
+      await manager.listWindows();
+      const loads = () => dbus.calls.filter((call) => call.method === "LoadPlugin").length;
+      const loadsBefore = loads();
+
+      unloadEverything(dbus);
+      await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS * 4);
+      expect(backend.health()).toMatchObject({ dormant: true });
+
+      await manager.getThreadState("thread-b");
+      await manager.getThreadState("thread-a");
+      expect(loads()).toBe(loadsBefore);
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+
+      // Set up is the human asking for it back.
+      await manager.provision();
+      expect(loads()).toBe(loadsBefore + 1);
+      expect(backend.health().status).toBe("connected");
+      await manager.dispose();
     } finally {
       vi.useRealTimers();
     }

@@ -723,6 +723,12 @@ export class KWinComputerBackend implements ComputerBackend {
    */
   private dormant = false;
   /**
+   * What the last window read and screen-size read answered, for the reads a
+   * released desktop answers without connecting; see `answersPassively`.
+   */
+  private lastWindows: readonly ComputerWindow[] = [];
+  private lastScreenSize: ComputerScreenSize | undefined;
+  /**
    * Whether a plugin connection has ever been established. The supervision
    * timer only runs after one has: before that, a failure is a setup problem
    * — nothing installed, a refused load, a missing compositor — and retrying
@@ -1101,22 +1107,36 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async availability(): Promise<ComputerAvailability> {
+    return await this.readAvailability({ explicit: false });
+  }
+
+  /**
+   * `availability`, and with `explicit` the establishing read Set up makes:
+   * it connects even out of a released or dormant state, with the agent's
+   * kind of connect, which is what loads back a plugin the human unloaded or
+   * boots a nested desktop they closed. Only Set up asks for that.
+   */
+  protected async readAvailability(options: {
+    readonly explicit: boolean;
+  }): Promise<ComputerAvailability> {
     if (this.platform !== "linux") {
       return { kind: "unsupported-platform", platform: this.platform };
     }
     if (this.sessionType.toLowerCase() !== "wayland") {
       return { kind: "backend-unavailable", message: WAYLAND_REQUIRED_MESSAGE };
     }
-    // Released for being idle: every state publish and settings poll reads
-    // this, and reconnecting for them would take the desktop back from a
-    // second server the release made room for. The passive probe answers
-    // what a connect would find; the next real use connects.
-    if (this.idleReleased) return await this.probeAvailability();
+    // Released or dormant: every state publish and settings poll reads this,
+    // and connecting for them would undo the release (see
+    // `answersPassively`). The passive probe answers what a connect would
+    // find; the next real use connects.
+    if (!options.explicit && this.answersPassively()) return await this.probeAvailability();
     // R14: a status read during an install answers at once, with where the
     // install is, rather than joining a wait that can last minutes.
     if (this.provisionPromises.size > 0) return this.provisioningAvailability();
     try {
-      const plugin = await this.ensurePlugin({ start: false });
+      const plugin = options.explicit
+        ? await this.ensurePlugin({ start: false })
+        : await this.ensurePluginForPanelRead();
       const health = await this.readPluginHealth(plugin);
       // A plugin with no emergency release shortcut is a plugin the human
       // cannot take the desktop back from at a keystroke, which is the one
@@ -1201,8 +1221,37 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async listWindows(): Promise<readonly ComputerWindow[]> {
+    if (this.answersPassively()) return this.lastWindows;
+    if (!this.connectedPlugin()) await this.ensurePluginForPanelRead();
     const [windows] = await this.readWindows();
     return windows;
+  }
+
+  /**
+   * Whether the reads every state publish and settings poll makes —
+   * `availability`, `listWindows`, `getScreenSize` — must answer without
+   * connecting: the connection was let go on purpose and nobody has taken it
+   * back. That is an idle release (S9), which made room for a second server
+   * that may hold this desktop now, and every dormant state: a plugin the
+   * human unloaded (R12), a desktop gone, a nested desktop parked. A connect
+   * for those reads would undo each of them because a panel refreshed or the
+   * human switched threads. They answer from what was last known; agent
+   * actions, the pane attaching or sending input, and Set up connect.
+   */
+  private answersPassively(): boolean {
+    return (this.idleReleased || this.dormant) && !this.connectedPlugin();
+  }
+
+  /**
+   * The connection a panel read may make when it is not answered passively.
+   * Once a connection has existed, it is the reconnect loop's kind of
+   * connect (`automatic`), with nobody behind it: a lost connection publishes
+   * health, the panel re-reads at once, and a connect of the agent's kind
+   * from there would skip the loop's R12 check and load back a plugin the
+   * human unloaded a moment ago (or boot a nested desktop the human closed).
+   */
+  private async ensurePluginForPanelRead(): Promise<KWinComputerPluginApi> {
+    return await this.ensurePlugin({ start: false, automatic: this.hasEverConnected });
   }
 
   /**
@@ -1276,6 +1325,8 @@ export class KWinComputerBackend implements ComputerBackend {
       // action and per publish — buys nothing. The focus target rides along
       // because it decides `focused` without appearing in that document.
       this.windowChanges.observe(windowsPayloadFingerprint(payload, targetWindowId), windows);
+      this.lastWindows = windows;
+      this.lastScreenSize = { width: rect.width, height: rect.height, scale: 1 };
       return [windows, origin];
     } catch (error) {
       throw this.reportPluginFailure(error);
@@ -1337,9 +1388,18 @@ export class KWinComputerBackend implements ComputerBackend {
    * a plugin that did not report one, and `workspaceRect` still uses it.
    */
   async getScreenSize(): Promise<ComputerScreenSize> {
-    await this.ensurePlugin({ start: false });
+    if (this.answersPassively() && this.lastScreenSize) return this.lastScreenSize;
+    if (this.answersPassively()) {
+      throw new ComputerBackendError(
+        `The ${this.integrationName} desktop is not connected; its size is read on its next use.`,
+        { retryable: true },
+      );
+    }
+    await this.ensurePluginForPanelRead();
     const rect = await this.workspaceRect();
-    return { width: rect.width, height: rect.height, scale: 1 };
+    const size = { width: rect.width, height: rect.height, scale: 1 };
+    this.lastScreenSize = size;
+    return size;
   }
 
   async getState(options: {
@@ -2800,6 +2860,8 @@ export class KWinComputerBackend implements ComputerBackend {
     if (automatic && this.hasEverConnected && now - since >= COMPOSITOR_GONE_AFTER_MS) {
       if (!this.desktopGoneReported) {
         this.desktopGoneReported = true;
+        // Its windows went with it: a panel read must not keep listing them.
+        this.lastWindows = [];
         this.emit({ type: "desktop-gone", message });
       }
       return new ComputerBackendError(message, { dormant: true, retryable: true });
@@ -2904,6 +2966,12 @@ export class KWinComputerBackend implements ComputerBackend {
 
   private async runExplicitProvision(): Promise<string> {
     const summary = (await this.provisionOnce()).summary;
+    // Set up is the human asking for the desktop. Before any connection the
+    // status read after it connects; once one has existed, that read connects
+    // only the reconnect loop's way (see `ensurePluginForPanelRead`), which
+    // leaves a plugin the human unloaded, or a released desktop, alone. So
+    // Set up connects itself, the agent's way; the status read reports it.
+    if (this.hasEverConnected) await this.readAvailability({ explicit: true });
     if (this.clipboardToolsPresent()) return summary;
     const clipboard = await this.provisionClipboardTools();
     if (!this.clipboardToolsPresent()) {
@@ -3093,7 +3161,11 @@ export class KWinComputerBackend implements ComputerBackend {
   protected releaseConnection(reason?: unknown): void {
     this.standDownReconnect();
     this.invalidateConnection();
-    if (reason !== undefined) this.recordHealthFailure(reason);
+    if (reason !== undefined) {
+      this.recordHealthFailure(reason);
+      // The desktop ended, and its windows with it.
+      this.lastWindows = [];
+    }
     this.dormant = true;
     this.publishHealth();
   }
