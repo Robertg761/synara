@@ -608,6 +608,17 @@ describe("provisioning", () => {
     ).toBe("from source");
   });
 
+  it("reports each stage it reaches (R14)", async () => {
+    const stages: string[] = [];
+    await provisionKWinPlugin(
+      await baseDeps({
+        kwinVersion: async () => "6.9.9",
+        onStage: (stage) => stages.push(stage),
+      }),
+    );
+    expect(stages).toEqual(["waiting-for-lock", "installing", "building"]);
+  });
+
   it("builds from source rather than using another distro's matching KWin", async () => {
     const dir = await temp();
     const prebuiltRoot = join(dir, "prebuilt");

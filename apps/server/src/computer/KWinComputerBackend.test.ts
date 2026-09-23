@@ -1561,6 +1561,49 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
+  it("answers a status read during an install with where the install is (R14)", async () => {
+    const dbus = new FakeDbus();
+    let installed: readonly string[] = [];
+    let finishBuild!: () => void;
+    let reportStage!: (stage: "waiting-for-lock" | "installing" | "building") => void;
+    const building = new Promise<void>((resolve) => {
+      finishBuild = resolve;
+    });
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => installed,
+      provisionPlugin: async ({ onStage }) => {
+        reportStage = (stage) => onStage?.(stage);
+        reportStage("waiting-for-lock");
+        await building;
+        installed = ["SynaraComputerUsePluginV1"];
+        return {
+          action: "installed-from-source",
+          pluginId: "SynaraComputerUsePluginV1",
+          pluginDirectory: "/tmp/synara-test-plugins",
+          requiresRelogin: false,
+          summary: "The computer-use plugin is installed and ready.",
+        };
+      },
+    });
+
+    const establishing = backend.availability();
+    await vi.waitFor(() => expect(reportStage).toBeDefined());
+    await expect(backend.availability()).resolves.toEqual({
+      kind: "checking",
+      message: expect.stringContaining("waiting for another Synara setup"),
+    });
+    reportStage("building");
+    await expect(backend.availability()).resolves.toMatchObject({
+      kind: "checking",
+      message: expect.stringContaining("can take a few minutes"),
+    });
+
+    finishBuild();
+    await expect(establishing).resolves.toMatchObject({ kind: "available" });
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    await backend.dispose();
+  });
+
   /**
    * The pre-fix memo replayed a failed provision forever: one transient
    * failure (an OOM-killed compiler, a full disk) and every future connect

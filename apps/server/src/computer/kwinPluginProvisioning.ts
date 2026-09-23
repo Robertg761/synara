@@ -531,6 +531,13 @@ export async function writeInstallStamp(
 
 export type ProvisionAction = "already-current" | "installed-prebuilt" | "installed-from-source";
 
+/**
+ * Where a provisioning run is, for a status read made while it runs (R14):
+ * waiting behind another process's install, installing, or compiling — the
+ * one stage that takes minutes.
+ */
+export type ProvisionStage = "waiting-for-lock" | "installing" | "building";
+
 const LOGIN_NEEDED =
   "Log out and back in once to finish enabling it — " +
   "KWin only reads the plugin path when your session starts.";
@@ -620,6 +627,8 @@ export interface ProvisionDependencies {
    * plugin never loads into.
    */
   readonly compositorSeesPluginRoot?: () => boolean;
+  /** Told each stage as the run reaches it; see `ProvisionStage`. */
+  readonly onStage?: (stage: ProvisionStage) => void;
   readonly now?: () => Date;
 }
 
@@ -637,8 +646,12 @@ export interface ProvisionDependencies {
 export async function provisionKWinPlugin(deps: ProvisionDependencies): Promise<ProvisionResult> {
   return withProvisioningFileLock(
     join(deps.target.pluginDirectory, ".synara-provision.lock"),
-    (signal) => provisionKWinPluginLocked({ ...deps, signal }),
+    (signal) => {
+      deps.onStage?.("installing");
+      return provisionKWinPluginLocked({ ...deps, signal });
+    },
     deps.signal,
+    { onLockRequested: () => deps.onStage?.("waiting-for-lock") },
   );
 }
 
@@ -709,6 +722,7 @@ async function provisionKWinPluginLocked(deps: ProvisionDependencies): Promise<P
     bytes = verified;
     action = "installed-prebuilt";
   } else {
+    deps.onStage?.("building");
     bytes = await readFile(await deps.buildFromSource(deps.signal));
     action = "installed-from-source";
   }

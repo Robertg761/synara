@@ -104,6 +104,7 @@ import {
   selectPrebuilt,
   type ProvisionAction,
   type ProvisionResult,
+  type ProvisionStage,
 } from "./kwinPluginProvisioning.ts";
 import {
   glidePointerToDeadline,
@@ -477,6 +478,7 @@ export interface KWinComputerBackendOptions {
     readonly signal?: AbortSignal;
     readonly allowPrebuilt: boolean;
     readonly force: boolean;
+    readonly onStage?: (stage: ProvisionStage) => void;
   }) => Promise<ProvisionResult>;
   /**
    * Removes plugin builds older than the one that just loaded and passed its
@@ -561,6 +563,7 @@ export class KWinComputerBackend implements ComputerBackend {
     readonly signal?: AbortSignal;
     readonly allowPrebuilt: boolean;
     readonly force: boolean;
+    readonly onStage?: (stage: ProvisionStage) => void;
   }) => Promise<ProvisionResult>;
   /**
    * Memoized so the reconnect loop cannot start a second install - or a second
@@ -575,6 +578,8 @@ export class KWinComputerBackend implements ComputerBackend {
    * answers "already current" without saying what is current.
    */
   private lastInstallAction: Exclude<ProvisionAction, "already-current"> | undefined;
+  /** The stage the running provisioning reported last; see `provisioningAvailability`. */
+  private provisionStage: ProvisionStage | undefined;
   private readonly pruneSuperseded: ((loadedPluginId: string) => Promise<void>) | undefined;
 
   /**
@@ -761,8 +766,9 @@ export class KWinComputerBackend implements ComputerBackend {
     this.linuxDistribution = options.linuxDistribution ?? detectLinuxDistribution;
     this.provisionPlugin =
       options.provisionPlugin ??
-      (({ allowPrebuilt, force }) =>
+      (({ allowPrebuilt, force, onStage }) =>
         provisionKWinPlugin({
+          ...(onStage ? { onStage } : {}),
           signal: this.provisionAbort.signal,
           target: resolveInstallTarget(SYSTEM_QT_PLUGIN_ROOTS),
           force,
@@ -950,6 +956,9 @@ export class KWinComputerBackend implements ComputerBackend {
     // second server the release made room for. The passive probe answers
     // what a connect would find; the next real use connects.
     if (this.idleReleased) return await this.probeAvailability();
+    // R14: a status read during an install answers at once, with where the
+    // install is, rather than joining a wait that can last minutes.
+    if (this.provisionPromises.size > 0) return this.provisioningAvailability();
     try {
       const plugin = await this.ensurePlugin({ start: false });
       const health = await this.readPluginHealth(plugin);
@@ -1003,6 +1012,18 @@ export class KWinComputerBackend implements ComputerBackend {
     }
     this.noteSessionLock(health.locked);
     return health;
+  }
+
+  private provisioningAvailability(): ComputerAvailability {
+    const plugin = `the Synara ${this.integrationName} plugin`;
+    const message =
+      this.provisionStage === "waiting-for-lock"
+        ? `Setting up ${plugin}: waiting for another Synara setup on this machine to finish.`
+        : this.provisionStage === "building"
+          ? `Setting up ${plugin}: building it against this ${this.integrationName}, which can ` +
+            "take a few minutes."
+          : `Setting up ${plugin}.`;
+    return { kind: "checking", message };
   }
 
   private noReleaseShortcutMessage(): string {
@@ -2299,6 +2320,9 @@ export class KWinComputerBackend implements ComputerBackend {
       allowPrebuilt,
       force,
       signal: this.provisionAbort.signal,
+      onStage: (stage) => {
+        this.provisionStage = stage;
+      },
     }).then((result) => {
       if (result.action !== "already-current") this.lastInstallAction = result.action;
       return result;
@@ -2308,6 +2332,7 @@ export class KWinComputerBackend implements ComputerBackend {
       if (this.provisionPromises.get(key) === pending) {
         this.provisionPromises.delete(key);
       }
+      if (this.provisionPromises.size === 0) this.provisionStage = undefined;
     };
     // Both branches handled together, so the derived promise never rejects
     // unobserved; the caller gets the original rejection from the await below.
