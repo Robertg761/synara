@@ -5050,6 +5050,44 @@ describe("KWinComputerBackend idle release (S9)", () => {
     }
   });
 
+  it("does not count a pane attach that failed as watching", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      const released = { count: 0 };
+      let refuse = false;
+      const backend = makeBackend(dbus, {
+        idleReleaseMs: IDLE_MS,
+        busNamesHaveOwners: async (names) => names.map(() => true),
+        dbusFactory: async () => {
+          if (refuse) throw new Error("no session bus yet");
+          return dbus;
+        },
+        atspi: {
+          ...atspi,
+          release: async () => {
+            released.count += 1;
+          },
+        },
+      });
+      await backend.listWindows();
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 2);
+      expect(released.count).toBe(1);
+
+      // The pane opens while the bus is gone: nothing is attached.
+      refuse = true;
+      await expect(backend.attachStream(() => undefined)).rejects.toThrow();
+      refuse = false;
+      await backend.moveCursor({ x: 5, y: 5 });
+
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 2);
+      expect(released.count).toBe(2);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps the connection while a lease is held or the pane watches", async () => {
     vi.useFakeTimers();
     try {

@@ -774,6 +774,8 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly stills: StillFramePublisher;
   /** Whether a pane is attached to `stills`: watching holds off the idle release. */
   private streamAttached = false;
+  /** Bumped by every attach and detach; see `attachStream`. */
+  private streamAttachments = 0;
   /**
    * Desktop operations this backend served, with when it last heard from
    * each, so stills can wait while one runs; see `stillsShouldWait`.
@@ -2190,12 +2192,21 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async attachStream(listener: ComputerFrameListener): Promise<void> {
     // Watching counts as use for the idle release (S9) from the moment the
-    // pane asks, before the first still is even captured.
+    // pane asks, before the first still is even captured. An attach that
+    // fails (no plugin to connect to) leaves nothing watching, so the flag
+    // goes back unless a later attach or detach has taken over since.
+    const attempt = ++this.streamAttachments;
     this.streamAttached = true;
-    await this.stills.attach(listener);
+    try {
+      await this.stills.attach(listener);
+    } catch (error) {
+      if (attempt === this.streamAttachments) this.streamAttached = false;
+      throw error;
+    }
   }
 
   async detachStream(): Promise<void> {
+    this.streamAttachments += 1;
     this.lastPluginUseAt = this.now();
     this.streamAttached = false;
     this.cancelCaptureRecovery();
