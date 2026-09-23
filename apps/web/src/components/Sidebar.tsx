@@ -1,3 +1,4 @@
+import { useProjectImportDialogStore } from "~/projectImport/projectImportDialogStore";
 // FILE: Sidebar.tsx
 // Purpose: Renders the project/thread sidebar, including row status, sorting, and thread actions.
 // Exports: Sidebar
@@ -182,6 +183,7 @@ import { useLatestProjectStore } from "../latestProjectStore";
 import { resolveThreadEnvironmentPresentation } from "../lib/threadEnvironment";
 import { dispatchThreadRename } from "../lib/threadRename";
 import { quotePosixShellArgument } from "../lib/shellQuote";
+import { useStableValue } from "~/hooks/useStableValue";
 import { DEFAULT_THREAD_TERMINAL_ID, type SidebarThreadSummary, type Thread } from "../types";
 import {
   applyAutomationEvent,
@@ -224,6 +226,7 @@ import {
   type SidebarThreadTerminalStatus,
 } from "./SidebarThreadRowContent";
 import { RenameDialog } from "./RenameDialog";
+import { RelocateProjectDialog } from "./RelocateProjectDialog";
 import { RenameThreadDialog } from "./RenameThreadDialog";
 import ReleaseHistoryDialog from "./ReleaseHistoryDialog";
 import { WHATS_NEW_ENTRIES } from "../whatsNew/entries";
@@ -367,6 +370,7 @@ import {
   resolveThreadHandoffBadgeLabel,
 } from "../lib/threadHandoff";
 import { isTerminalFocused } from "../lib/terminalFocus";
+import { beginThreadDrag, endThreadDrag } from "../lib/threadDrag";
 import { useDiffRouteSearch } from "../hooks/useDiffRouteSearch";
 import { normalizeSettingsSection } from "../settingsNavigation";
 import {
@@ -389,7 +393,6 @@ import {
 import { ENVIRONMENT_PANEL_SURFACE_CLASS_NAME } from "./chat/composerPickerStyles";
 import { selectSplitView, useSplitViewStore } from "../splitViewStore";
 import { useRightDockStore } from "../rightDockStore";
-import { THREAD_DRAG_MIME } from "./chat-drop-overlay/ChatPaneDropOverlay";
 import { useTemporaryThreadStore } from "../temporaryThreadStore";
 import { useThreadActivationController } from "../hooks/useThreadActivationController";
 import {
@@ -403,10 +406,11 @@ import { useThreadDetailPrewarm } from "../threadDetailPrewarm";
 import { hasThreadDetailResumeCursor } from "../threadDetailResumeCursors";
 import { retainThreadDetailSubscription } from "../threadDetailSubscriptionRetention";
 import { useWorkspacePathsStore } from "../workspacePathsStore";
-import type {
-  SidebarSearchAction,
-  SidebarSearchProject,
-  SidebarSearchThread,
+import {
+  areSidebarSearchThreadListsEqual,
+  type SidebarSearchAction,
+  type SidebarSearchProject,
+  type SidebarSearchThread,
 } from "./SidebarSearchPalette.logic";
 import { useFocusedChatContext } from "../focusedChatContext";
 import { waitForRecoverableProjectInReadModel } from "../lib/projectCreateRecovery";
@@ -492,6 +496,7 @@ type ProjectContextMenuId =
   | "open-in-finder"
   | "open-in-kanban"
   | "copy-path"
+  | "relocate"
   | "start-dev"
   | "stop-dev"
   | "open-dev-server"
@@ -615,7 +620,7 @@ function threadRowStatusSlotClassName(isSubagentThread: boolean, toneClassName?:
     "flex w-[15px] shrink-0 items-center justify-center leading-none tabular-nums",
     sidebarHoverRevealHideClassName("thread-row"),
     isSubagentThread
-      ? "text-[10px]"
+      ? "text-ui-xs"
       : // Nudge the timestamp a hair above the meta scale while still tracking the user's
         // typography setting (the CSS var is always set; the 11px is just an SSR fallback).
         "text-[length:calc(var(--app-font-size-ui-meta,11px)+0.5px)]",
@@ -768,7 +773,7 @@ function ProjectSortMenu({
       />
       <ComposerPickerMenuPopup align="end" side="bottom" className="min-w-44">
         <MenuGroup>
-          <div className="px-2 py-1 sm:text-xs font-medium text-muted-foreground">
+          <div className="px-2 py-1 sm:text-ui leading-snug font-medium text-muted-foreground">
             Sort projects
           </div>
           <MenuRadioGroup
@@ -779,7 +784,11 @@ function ProjectSortMenu({
           >
             {(Object.entries(SIDEBAR_SORT_LABELS) as Array<[SidebarProjectSortOrder, string]>).map(
               ([value, label]) => (
-                <MenuRadioItem key={value} value={value} className="min-h-7 py-1 sm:text-xs">
+                <MenuRadioItem
+                  key={value}
+                  value={value}
+                  className="min-h-7 py-1 sm:text-ui leading-snug"
+                >
                   {label}
                 </MenuRadioItem>
               ),
@@ -787,7 +796,7 @@ function ProjectSortMenu({
           </MenuRadioGroup>
         </MenuGroup>
         <MenuGroup>
-          <div className="px-2 pt-2 pb-1 sm:text-xs font-medium text-muted-foreground">
+          <div className="px-2 pt-2 pb-1 sm:text-ui leading-snug font-medium text-muted-foreground">
             Sort threads
           </div>
           <ThreadSortMenuItems
@@ -842,7 +851,9 @@ function SidebarHelpMenu({
         />
         <ComposerPickerMenuPopup align="end" side="top" className="w-64 min-w-64">
           <MenuGroup>
-            <div className="px-2 py-1 sm:text-xs font-medium text-muted-foreground">What’s new</div>
+            <div className="px-2 py-1 sm:text-ui leading-snug font-medium text-muted-foreground">
+              What’s new
+            </div>
             {HELP_MENU_RELEASE_ENTRIES.map((entry) => (
               <MenuItem
                 key={entry.version}
@@ -922,7 +933,7 @@ function ThreadSortMenuItems({
     >
       {(Object.entries(SIDEBAR_THREAD_SORT_LABELS) as Array<[SidebarThreadSortOrder, string]>).map(
         ([value, label]) => (
-          <MenuRadioItem key={value} value={value} className="min-h-7 py-1 sm:text-xs">
+          <MenuRadioItem key={value} value={value} className="min-h-7 py-1 sm:text-ui leading-snug">
             {label}
           </MenuRadioItem>
         ),
@@ -949,7 +960,9 @@ function ChatSortMenu({
       />
       <ComposerPickerMenuPopup align="end" side="bottom" className="min-w-44">
         <MenuGroup>
-          <div className="px-2 py-1 sm:text-xs font-medium text-muted-foreground">Sort chats</div>
+          <div className="px-2 py-1 sm:text-ui leading-snug font-medium text-muted-foreground">
+            Sort chats
+          </div>
           <ThreadSortMenuItems
             threadSortOrder={threadSortOrder}
             onThreadSortOrderChange={onThreadSortOrderChange}
@@ -1020,7 +1033,7 @@ function SidebarPrimaryAction({
         <span className="truncate">{label}</span>
         {badge ? (
           <span
-            className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-md bg-muted px-1 text-[10px] font-medium text-muted-foreground"
+            className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-md bg-muted px-1 text-ui-xs font-medium text-muted-foreground"
             aria-label={badge.accessibleLabel}
             title={badge.accessibleLabel}
           >
@@ -1256,8 +1269,8 @@ function SidebarActivityBellButton({
       >
         {onboardingVisible ? (
           <div className="text-left">
-            <div className="text-xs font-semibold">Activity</div>
-            <div className="mt-0.5 text-[11px] leading-4 text-white/85">
+            <div className="text-ui leading-snug font-semibold">Activity</div>
+            <div className="mt-0.5 text-ui-sm leading-4 text-white/85">
               See running tasks, completed work, and anything that needs your attention.
             </div>
           </div>
@@ -1338,10 +1351,10 @@ export function SidebarSurfacePicker({
                 className="items-center rounded-[10px] data-checked:bg-[var(--color-background-button-secondary-hover)]"
               >
                 <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <span className="text-[13px] font-medium leading-none text-foreground">
+                  <span className="text-ui-lg font-medium leading-none text-foreground">
                     {copy.title}
                   </span>
-                  <span className="text-[11px] leading-snug text-muted-foreground">
+                  <span className="text-ui-sm leading-snug text-muted-foreground">
                     {copy.description}
                   </span>
                 </span>
@@ -1600,6 +1613,7 @@ export default function Sidebar() {
   const projectAdditionLockRef = useRef(false);
   const [renameDialogThreadId, setRenameDialogThreadId] = useState<ThreadId | null>(null);
   const [renameProjectDialogId, setRenameProjectDialogId] = useState<ProjectId | null>(null);
+  const [relocateProjectDialogId, setRelocateProjectDialogId] = useState<ProjectId | null>(null);
   const [projectContextMenuState, setProjectContextMenuState] =
     useState<ProjectContextMenuState | null>(null);
   // "Show more" paging state: extra pages of THREAD_PREVIEW_PAGE_SIZE rows per project cwd.
@@ -3580,6 +3594,10 @@ export default function Sidebar() {
         await handleOpenProjectRunServer(projectId);
         return;
       }
+      if (clicked === "relocate") {
+        setRelocateProjectDialogId(projectId);
+        return;
+      }
       if (clicked === "rename") {
         setRenameProjectDialogId(projectId);
         return;
@@ -4524,6 +4542,8 @@ export default function Sidebar() {
           sourceProjectName={hoverMetadata.sourceProjectName}
           branch={hoverMetadata.branch}
           worktreeName={hoverMetadata.worktreeName}
+          pullRequest={prByThreadId.get(thread.id) ?? null}
+          onOpenPullRequest={openPrLink}
           model={resolveThreadModelSummary(thread.modelSelection)}
           status={hoverStatus}
         />
@@ -4672,7 +4692,7 @@ export default function Sidebar() {
                   // touching the worktree chip. It costs no space when the row is idle.
                   <span
                     className={cn(
-                      "max-w-[40%] shrink-0 truncate text-right text-[length:var(--app-font-size-ui-meta,10px)] text-muted-foreground/38 transition-[margin] duration-150 ease-out",
+                      "max-w-[40%] shrink-0 truncate text-right text-ui-meta text-muted-foreground/38 transition-[margin] duration-150 ease-out",
                       hasTrailingStatusGlyph && "mr-2",
                     )}
                   >
@@ -4791,22 +4811,8 @@ export default function Sidebar() {
                       }),
                 )}
                 draggable
-                onDragStart={(event) => {
-                  const dragImage = event.currentTarget as HTMLElement | null;
-                  event.dataTransfer.effectAllowed = "move";
-                  event.dataTransfer.setData(
-                    THREAD_DRAG_MIME,
-                    JSON.stringify({ threadId: thread.id }),
-                  );
-                  if (dragImage) {
-                    const rect = dragImage.getBoundingClientRect();
-                    event.dataTransfer.setDragImage(
-                      dragImage,
-                      Math.max(0, event.clientX - rect.left),
-                      Math.max(0, event.clientY - rect.top),
-                    );
-                  }
-                }}
+                onDragStart={(event) => beginThreadDrag(event, thread.id)}
+                onDragEnd={endThreadDrag}
                 onClick={(event) => {
                   handleThreadClick(event, thread.id, orderedProjectThreadIds);
                 }}
@@ -5000,7 +5006,7 @@ export default function Sidebar() {
               >
                 <span
                   className={cn(
-                    "min-w-0 flex-1 truncate font-system-ui text-[length:var(--app-font-size-ui,12px)] font-normal",
+                    "min-w-0 flex-1 truncate font-system-ui text-ui font-normal",
                     SIDEBAR_ROW_LABEL_TEXT_CLASS_NAME,
                   )}
                 >
@@ -5137,7 +5143,7 @@ export default function Sidebar() {
                         render={<button type="button" />}
                         data-thread-selection-safe
                         size="sm"
-                        className="h-7 flex-1 translate-x-0 justify-start rounded-lg pr-2 pl-8 text-left text-[length:var(--app-font-size-ui,12px)] text-muted-foreground/79 hover:bg-transparent hover:text-foreground active:bg-transparent active:text-foreground"
+                        className="h-7 flex-1 translate-x-0 justify-start rounded-lg pr-2 pl-8 text-left text-ui text-muted-foreground/79 hover:bg-transparent hover:text-foreground active:bg-transparent active:text-foreground"
                         onMouseDown={preventFocusOnMouseDown}
                         onClick={() => {
                           showMoreThreadsForProject(project.cwd, threadListExtraPages);
@@ -5152,7 +5158,7 @@ export default function Sidebar() {
                         data-thread-selection-safe
                         size="sm"
                         className={cn(
-                          "h-7 translate-x-0 justify-start rounded-lg text-left text-[length:var(--app-font-size-ui,12px)] text-muted-foreground/79 hover:bg-transparent hover:text-foreground active:bg-transparent active:text-foreground",
+                          "h-7 translate-x-0 justify-start rounded-lg text-left text-ui text-muted-foreground/79 hover:bg-transparent hover:text-foreground active:bg-transparent active:text-foreground",
                           // Keep the left indent when "Show less" is the only affordance left.
                           canShowMoreThreads ? "w-auto flex-none px-2" : "flex-1 pr-2 pl-8",
                         )}
@@ -5551,7 +5557,7 @@ export default function Sidebar() {
     desktopUpdateButtonPresentation.secondaryLabel !== null;
   const desktopUpdateDownloadPercent = getDesktopUpdateDownloadPercent(desktopUpdateState);
   const desktopUpdateRowButtonClasses = cn(
-    "inline-flex h-6 shrink-0 items-center justify-center gap-1.5 rounded-full bg-[var(--info)] px-2.5 font-system-ui text-[length:var(--app-font-size-ui-xs,10px)] font-medium leading-none text-white transition-colors",
+    "inline-flex h-6 shrink-0 items-center justify-center gap-1.5 rounded-full bg-[var(--info)] px-2.5 font-system-ui text-ui-xs font-medium leading-none text-white transition-colors",
     desktopUpdateButtonHasSecondaryLabel && "min-h-6 py-0.5",
     desktopUpdateButtonInteractivityClasses,
   );
@@ -5600,6 +5606,12 @@ export default function Sidebar() {
         keywords: ["folder", "repo", "repository", "open"],
         shortcutLabel: addProjectShortcutLabel,
         run: handleStartAddProject,
+      },
+      {
+        id: "import-projects",
+        label: "Import projects from…",
+        description: "Bring Codex and Claude Code projects and conversations into Synara.",
+        keywords: ["import", "projects", "codex", "claude", "conversations", "folders"],
       },
       {
         id: "import-thread",
@@ -5903,6 +5915,9 @@ export default function Sidebar() {
       {headerControls}
     </div>
   );
+  const relocateProjectDialogProject = relocateProjectDialogId
+    ? (projectById.get(relocateProjectDialogId) ?? null)
+    : null;
   const renameProjectDialogProject = renameProjectDialogId
     ? (projectById.get(renameProjectDialogId) ?? null)
     : null;
@@ -6050,7 +6065,7 @@ export default function Sidebar() {
                       <Button
                         variant="ghost"
                         size="sm"
-                        className="h-6 px-2 text-[length:var(--app-font-size-ui,12px)] text-primary hover:text-primary"
+                        className="h-6 px-2 text-ui text-primary hover:text-primary"
                         onClick={() => setIsCustomizingNav(false)}
                       >
                         Done
@@ -6154,7 +6169,7 @@ export default function Sidebar() {
                         renderThreadRow(row.thread, studioChatThreadIds, row.depth, true),
                       )
                     ) : (
-                      <div className="px-2 pt-4 text-center text-[length:var(--app-font-size-ui,12px)] text-muted-foreground/58">
+                      <div className="px-2 pt-4 text-center text-ui text-muted-foreground/58">
                         {threadsHydrated ? "No studio chats yet" : "Loading Studio..."}
                       </div>
                     )}
@@ -6300,7 +6315,7 @@ export default function Sidebar() {
                       aria-live="polite"
                       aria-label="Loading projects"
                     >
-                      <div className="text-center text-[length:var(--app-font-size-ui,12px)] text-muted-foreground/58">
+                      <div className="text-center text-ui text-muted-foreground/58">
                         Loading projects...
                       </div>
                       <div className="mx-auto grid w-full max-w-42 gap-1.5 opacity-70">
@@ -6348,7 +6363,7 @@ export default function Sidebar() {
                   }}
                 >
                   <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
-                    <span className="truncate font-system-ui text-[length:var(--app-font-size-ui,12px)] font-normal text-muted-foreground/79">
+                    <span className="truncate font-system-ui text-ui font-normal text-muted-foreground/79">
                       Chats
                     </span>
                     <DisclosureChevron
@@ -6395,9 +6410,7 @@ export default function Sidebar() {
                         ),
                       )
                     ) : (
-                      <div className="px-2 py-2 text-[length:var(--app-font-size-ui,12px)] text-muted-foreground/48">
-                        No chats yet
-                      </div>
+                      <div className="px-2 py-2 text-ui text-muted-foreground/48">No chats yet</div>
                     )}
                     {canShowMoreChatThreads || canShowLessChatThreads ? (
                       <SidebarMenuItem className="w-full">
@@ -6405,7 +6418,7 @@ export default function Sidebar() {
                           {canShowMoreChatThreads ? (
                             <SidebarMenuButton
                               size="sm"
-                              className="h-7 flex-1 justify-start rounded-lg pr-2 pl-8 text-left text-[length:var(--app-font-size-ui,12px)] font-normal text-muted-foreground/79 hover:bg-transparent hover:text-foreground active:bg-transparent active:text-foreground"
+                              className="h-7 flex-1 justify-start rounded-lg pr-2 pl-8 text-left text-ui font-normal text-muted-foreground/79 hover:bg-transparent hover:text-foreground active:bg-transparent active:text-foreground"
                               onMouseDown={preventFocusOnMouseDown}
                               onClick={() =>
                                 setChatThreadListExtraPages(chatThreadListEffectiveExtraPages + 1)
@@ -6418,7 +6431,7 @@ export default function Sidebar() {
                             <SidebarMenuButton
                               size="sm"
                               className={cn(
-                                "h-7 justify-start rounded-lg text-left text-[length:var(--app-font-size-ui,12px)] font-normal text-muted-foreground/79 hover:bg-transparent hover:text-foreground active:bg-transparent active:text-foreground",
+                                "h-7 justify-start rounded-lg text-left text-ui font-normal text-muted-foreground/79 hover:bg-transparent hover:text-foreground active:bg-transparent active:text-foreground",
                                 // Keep the left indent when "Show less" is the only affordance left.
                                 canShowMoreChatThreads
                                   ? "w-auto flex-none px-2"
@@ -6489,13 +6502,13 @@ export default function Sidebar() {
                               {desktopUpdateButtonPresentation.label}
                             </span>
                             {desktopUpdateButtonPresentation.secondaryLabel ? (
-                              <span className="min-w-0 truncate text-center text-[length:var(--app-font-size-ui-xs,10px)] text-white/80">
+                              <span className="min-w-0 truncate text-center text-ui-xs text-white/80">
                                 {desktopUpdateButtonPresentation.secondaryLabel}
                               </span>
                             ) : null}
                           </span>
                           {desktopUpdateDownloadPercent !== null ? (
-                            <span className="rounded-full bg-white/20 px-1.5 py-0.5 text-[9px] font-semibold tabular-nums text-white/95">
+                            <span className="rounded-full bg-white/20 px-1.5 py-0.5 text-ui-2xs font-semibold tabular-nums text-white/95">
                               {desktopUpdateDownloadPercent}%
                             </span>
                           ) : null}
@@ -6718,6 +6731,15 @@ export default function Sidebar() {
               <MenuItem
                 className={PROJECT_CONTEXT_MENU_ITEM_CLASS_NAME}
                 onClick={() =>
+                  void handleProjectContextMenuAction(projectContextMenuState.projectId, "relocate")
+                }
+              >
+                <ProjectContextMenuIcon icon={FolderOpenIcon} />
+                <span>Change project path…</span>
+              </MenuItem>
+              <MenuItem
+                className={PROJECT_CONTEXT_MENU_ITEM_CLASS_NAME}
+                onClick={() =>
                   void handleProjectContextMenuAction(
                     projectContextMenuState.projectId,
                     "toggle-pin",
@@ -6826,7 +6848,7 @@ export default function Sidebar() {
           <DialogPanel className="space-y-2">
             <label
               htmlFor="project-run-command-input"
-              className="block text-[length:var(--app-font-size-ui-xs,10px)] font-medium text-[var(--color-text-foreground-secondary)]"
+              className="block text-ui-xs font-medium text-[var(--color-text-foreground-secondary)]"
             >
               Command
             </label>
@@ -6849,9 +6871,7 @@ export default function Sidebar() {
               }}
             />
             {projectRunDialogCommandIsValid ? null : (
-              <p className="text-[length:var(--app-font-size-ui-sm,11px)] text-destructive">
-                Enter a command to run.
-              </p>
+              <p className="text-ui-sm text-destructive">Enter a command to run.</p>
             )}
           </DialogPanel>
           <DialogFooter>
@@ -6884,6 +6904,16 @@ export default function Sidebar() {
           void commitRename(target.id, newTitle, target.title);
         }}
       />
+
+      {relocateProjectDialogProject ? (
+        <RelocateProjectDialog
+          projectId={relocateProjectDialogProject.id}
+          workspaceRoot={relocateProjectDialogProject.cwd}
+          onOpenChange={(open) => {
+            if (!open) setRelocateProjectDialogId(null);
+          }}
+        />
+      ) : null}
 
       <RenameDialog
         open={renameProjectDialogId !== null && renameProjectDialogProject !== null}
@@ -6950,6 +6980,23 @@ export default function Sidebar() {
   );
 }
 
+// Message text projections keyed by the thread's message array, which the
+// store keeps reference-stable while that thread's messages are unchanged.
+const searchPaletteMessagesByThreadMessages = new WeakMap<
+  Thread["messages"],
+  SidebarSearchThread["messages"]
+>();
+
+function searchPaletteMessagesFor(thread: Thread): SidebarSearchThread["messages"] {
+  const cached = searchPaletteMessagesByThreadMessages.get(thread.messages);
+  if (cached) {
+    return cached;
+  }
+  const projected = thread.messages.map((message) => ({ text: message.text }));
+  searchPaletteMessagesByThreadMessages.set(thread.messages, projected);
+  return projected;
+}
+
 function SidebarSearchPaletteController(props: {
   open: boolean;
   mode: SidebarSearchPaletteMode;
@@ -6983,7 +7030,11 @@ function SidebarSearchPaletteController(props: {
   const importProviders: ReadonlyArray<ImportProviderKind> = (
     ["codex", "claudeAgent", "cursor", "opencode"] as const
   ).filter((provider, index) => supportsThreadImport(importProviderCapabilityQueries[index]?.data));
-  const searchPaletteThreads = useMemo<SidebarSearchThread[]>(() => {
+  // `threads` is rebuilt on every streamed store flush, so this projection is
+  // cheap by construction (message text is cached per thread-messages array
+  // below) and its result keeps the previous identity while nothing the
+  // palette shows has changed, sparing the palette a full rescore per token.
+  const rebuiltSearchPaletteThreads = useMemo<SidebarSearchThread[]>(() => {
     const threadById = new Map(threads.map((thread) => [thread.id, thread] as const));
     const searchProjectById = new Map(
       props.projects.map((project) => [project.id, project] as const),
@@ -7006,13 +7057,15 @@ function SidebarSearchPaletteController(props: {
           provider: thread.modelSelection.provider,
           createdAt: thread.createdAt,
           updatedAt: thread.updatedAt,
-          messages: thread.messages.map((message) => ({
-            text: message.text,
-          })),
+          messages: searchPaletteMessagesFor(thread),
         },
       ];
     });
   }, [props.projectById, props.projects, sidebarDisplayThreads, threads]);
+  const searchPaletteThreads = useStableValue(
+    rebuiltSearchPaletteThreads,
+    areSidebarSearchThreadListsEqual,
+  );
 
   return (
     <SidebarSearchPalette
@@ -7033,6 +7086,7 @@ function SidebarSearchPaletteController(props: {
       onOpenProject={props.onOpenProject}
       importProviders={importProviders}
       onImportThread={props.onImportThread}
+      onImportProjects={(providers) => useProjectImportDialogStore.getState().openDialog(providers)}
       onOpenThread={props.onOpenThread}
     />
   );
