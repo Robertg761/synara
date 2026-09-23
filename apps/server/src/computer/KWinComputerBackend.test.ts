@@ -11,6 +11,7 @@ import type { ComputerHealth, ComputerWindow } from "@synara/contracts";
 
 import {
   installStampIsCurrent,
+  COMPOSITOR_GONE_AFTER_MS,
   isConnectionLevelFailure,
   KWIN_RECONNECT_MAX_DELAY_MS,
   KWinComputerBackend,
@@ -4599,7 +4600,11 @@ describe("KWinComputerBackend compositor gone", () => {
     try {
       const dbus = new FakeDbus();
       let kwin: string | undefined = ":1.7";
-      dbus.compositorInstance = async () => kwin;
+      let looks = 0;
+      dbus.compositorInstance = async () => {
+        looks += 1;
+        return kwin;
+      };
       let factoryCalls = 0;
       const backend = makeBackend(dbus, {
         random: () => 1,
@@ -4624,19 +4629,30 @@ describe("KWinComputerBackend compositor gone", () => {
       expect(gone).toHaveLength(1);
       expect(gone[0]).toContain("No KWin compositor");
       expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
-      const callsWhenGone = factoryCalls;
-      await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS * 4);
-      expect(factoryCalls).toBe(callsWhenGone);
-
       // A panel read lists no windows of a desktop that is gone.
+      const callsWhenGone = factoryCalls;
       await expect(backend.listWindows()).resolves.toEqual([]);
       expect(factoryCalls).toBe(callsWhenGone);
 
-      // A real use still asks, and a compositor that came back is used.
+      // It keeps looking, at the supervision ceiling, and says gone only once.
+      const looksWhenGone = looks;
+      await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS * 4);
+      expect(looks - looksWhenGone).toBe(4);
+      expect(gone).toHaveLength(1);
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+
+      // A compositor that comes back is picked up without anyone asking.
       kwin = ":1.8";
-      await backend.moveCursor({ x: 1, y: 1 });
+      await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS);
+      expect(backend.health().status).toBe("connected");
       await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
       expect(gone).toHaveLength(1);
+
+      // Lost again for good, it is reported again.
+      kwin = undefined;
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(COMPOSITOR_GONE_AFTER_MS + KWIN_RECONNECT_MAX_DELAY_MS * 2);
+      expect(gone).toHaveLength(2);
       await backend.dispose();
     } finally {
       vi.useRealTimers();

@@ -697,6 +697,8 @@ export class KWinComputerBackend implements ComputerBackend {
   private connectPromise: Promise<KWinComputerPluginApi> | undefined;
   private connectAutomatic = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The next look for a desktop reported gone; see `watchForDesktop`. */
+  private desktopWatchTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectFailures = 0;
   /**
    * When the newest connection was established, and whether an input has gone
@@ -2477,6 +2479,8 @@ export class KWinComputerBackend implements ComputerBackend {
     await this.detachStream();
     if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    if (this.desktopWatchTimer !== undefined) clearTimeout(this.desktopWatchTimer);
+    this.desktopWatchTimer = undefined;
     this.reconnecting = false;
     const plugin = this.plugin;
     if (plugin) await plugin.stop().catch(() => undefined);
@@ -2851,7 +2855,8 @@ export class KWinComputerBackend implements ComputerBackend {
    * keeps trying through it; once the compositor has stayed away for
    * `COMPOSITOR_GONE_AFTER_MS` the desktop this backend was bound to is
    * reported gone — once, so the service can select another backend — and
-   * the loop stands down. A real use still asks again every time.
+   * the loop stands down to `watchForDesktop`'s slower look. A real use still
+   * asks again every time.
    */
   private compositorMissing(automatic: boolean): ComputerBackendError {
     const now = this.now();
@@ -2864,6 +2869,7 @@ export class KWinComputerBackend implements ComputerBackend {
         this.lastWindows = [];
         this.emit({ type: "desktop-gone", message });
       }
+      this.watchForDesktop();
       return new ComputerBackendError(message, { dormant: true, retryable: true });
     }
     return new ComputerBackendError(message, { retryable: true });
@@ -3233,6 +3239,29 @@ export class KWinComputerBackend implements ComputerBackend {
     }, delayMs);
     this.reconnectTimer.unref?.();
     this.publishHealth();
+  }
+
+  /**
+   * Looks for a desktop reported gone again after the supervision ceiling,
+   * with the reconnect loop's own (automatic) kind of connect, for as long as
+   * it stays gone. The service re-runs selection on `desktop-gone`, and when
+   * that picks this same tier again (a compositor slow to come back, a
+   * session between logins) the retry is this backend's to own: without it a
+   * desktop that returns later would only be found by the agent's next
+   * action. A compositor that comes back is a new instance, which gets its
+   * plugin loaded (R12 leaves only the same instance alone); one that stays
+   * away costs one session-bus handshake per interval.
+   */
+  private watchForDesktop(): void {
+    if (this.disposed || this.desktopWatchTimer !== undefined) return;
+    this.desktopWatchTimer = setTimeout(() => {
+      this.desktopWatchTimer = undefined;
+      if (this.disposed || this.connectedPlugin()) return;
+      // Still gone re-arms this through `compositorMissing`; any other
+      // failure is the reconnect loop's, and ensureConnectedPlugin routes it.
+      void this.ensurePlugin({ start: false, automatic: true }).catch(() => undefined);
+    }, KWIN_RECONNECT_MAX_DELAY_MS);
+    this.desktopWatchTimer.unref?.();
   }
 
   /**
