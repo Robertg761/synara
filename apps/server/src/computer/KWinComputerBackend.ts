@@ -146,6 +146,13 @@ const KWIN_RECONNECT_BASE_DELAY_MS = 250;
  */
 export const KWIN_RECONNECT_MAX_DELAY_MS = 30_000;
 /**
+ * How long a connection has to stay up before a loss of it starts the backoff
+ * over. A plugin that dies right after every connect must not be reconnected
+ * at the base delay forever: each attempt re-authenticates, scans the plugin
+ * directories and may reload the plugin into the compositor.
+ */
+export const KWIN_RECONNECT_HEALTHY_MS = 30_000;
+/**
  * How many consecutive still captures may fail before the stream stops
  * claiming capture works. One failure is a frame the compositor was busy for;
  * a run of them is a capture path that is gone, and a pane showing the last
@@ -501,6 +508,13 @@ export class KWinComputerBackend implements ComputerBackend {
   private connectAutomatic = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectFailures = 0;
+  /**
+   * When the newest connection was established, and whether an input has gone
+   * through it since. Either proves it healthy, which is what resets the
+   * backoff; read (and consumed) only when that connection is lost.
+   */
+  private connectedAt: number | undefined;
+  private connectionProven = false;
   /** A retry is pending or running, which is what `reconnecting` reports. */
   private reconnecting = false;
   /**
@@ -2183,7 +2197,10 @@ export class KWinComputerBackend implements ComputerBackend {
     this.plugin = plugin;
     this.pluginId = pluginId;
     this.pluginHealth = health;
-    this.reconnectFailures = 0;
+    // The backoff is not reset here: a connection that is lost again at once
+    // proved nothing. See `scheduleReconnect`.
+    this.connectedAt = this.now();
+    this.connectionProven = false;
     this.reconnecting = false;
     this.dormant = false;
     this.hasEverConnected = true;
@@ -2243,6 +2260,18 @@ export class KWinComputerBackend implements ComputerBackend {
    */
   private scheduleReconnect(): void {
     if (this.disposed || this.reconnectTimer !== undefined || !this.hasEverConnected) return;
+    // The first retry after losing a connection that had proved itself —
+    // healthy for a while, or carrying an input — starts from the base
+    // delay; one that died straight after connecting keeps climbing.
+    const connectedAt = this.connectedAt;
+    if (
+      this.connectionProven ||
+      (connectedAt !== undefined && this.now() - connectedAt >= KWIN_RECONNECT_HEALTHY_MS)
+    ) {
+      this.reconnectFailures = 0;
+    }
+    this.connectedAt = undefined;
+    this.connectionProven = false;
     const base = Math.min(
       KWIN_RECONNECT_MAX_DELAY_MS,
       KWIN_RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectFailures,
@@ -2578,9 +2607,15 @@ export class KWinComputerBackend implements ComputerBackend {
    * instead of the agent silently grabbing the desktop back.
    */
   private async pluginSuccess(operation: string, invoke: () => Promise<unknown>): Promise<void> {
-    if (readPluginBoolean(await this.pluginValue(invoke))) return;
+    if (readPluginBoolean(await this.pluginValue(invoke))) {
+      this.connectionProven = true;
+      return;
+    }
     if (await this.restartAfterExternalStop()) {
-      if (readPluginBoolean(await this.pluginValue(invoke))) return;
+      if (readPluginBoolean(await this.pluginValue(invoke))) {
+        this.connectionProven = true;
+        return;
+      }
     }
     throw new ComputerBackendError(`Synara ${this.integrationName} plugin rejected ${operation}.`, {
       retryable: true,

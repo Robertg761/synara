@@ -3956,6 +3956,55 @@ describe("KWinComputerBackend reconnect timer", () => {
     }
   });
 
+  it("keeps backing off from a plugin that dies right after every connect", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      let connects = 0;
+      const connectPlugin = dbus.connectPlugin;
+      dbus.connectPlugin = async () => {
+        connects += 1;
+        return connectPlugin();
+      };
+      const backend = makeBackend(dbus, { random: () => 1 });
+      await backend.availability();
+      const afterFirst = connects;
+
+      // Lost at once, reconnected at the base delay, lost at once again: the
+      // second retry waits twice as long rather than starting over.
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(backend.health().status).toBe("connected");
+      const afterSecond = connects;
+      expect(afterSecond).toBeGreaterThan(afterFirst);
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(499);
+      expect(connects).toBe(afterSecond);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(backend.health().status).toBe("connected");
+
+      // A connection that stayed up long enough proved itself: base delay.
+      await vi.advanceTimersByTimeAsync(30_000);
+      const afterHealthy = connects;
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(connects).toBeGreaterThan(afterHealthy);
+      expect(backend.health().status).toBe("connected");
+
+      // So did one an input went through, however short.
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(500);
+      await backend.moveCursor({ x: 10, y: 10 });
+      const afterInput = connects;
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(connects).toBeGreaterThan(afterInput);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("halves the delay at the low end of the jitter range", async () => {
     vi.useFakeTimers();
     try {
