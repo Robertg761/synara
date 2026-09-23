@@ -227,7 +227,7 @@ class FocusRegressionTest(unittest.TestCase):
             ("SSettleWait", "struct"), ("SCommitRecord", "struct"), ("SCommitTracking", "struct"),
             ("commitTracking", "variable"), ("MAX_SETTLE_TIMEOUT_MS", "variable"), ("MAX_SETTLE_WAITS", "variable"),
             "replySettleWait", "evaluateSettleWait", "evaluateSettleWaits", "onSettleTimer", "onSurfaceCommit",
-            "stopCommitTracking", "waitForSettle",
+            "failSettleWaits", "stopCommitTracking", "waitForSettle",
         ])
         compile_and_run("settle_fixture.cpp", production, "synara-settle-test-")
 

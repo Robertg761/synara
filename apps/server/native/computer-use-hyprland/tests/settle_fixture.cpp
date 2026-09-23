@@ -29,9 +29,14 @@ struct Error : std::runtime_error {
     Error(Name name, const std::string& message) : std::runtime_error(message), name(name.value) {}
 };
 // Records the one reply every call must get.
-struct Replies { int count = 0; bool settled = false; uint32_t elapsed = 0; };
+struct Replies { int count = 0; bool settled = false; uint32_t elapsed = 0; std::string error; };
 template <typename... R> struct Result {
     SP<Replies> replies = std::make_shared<Replies>();
+    void returnError(const Error& error) const {
+        check(replies->count == 0, "a wait was answered twice");
+        ++replies->count;
+        replies->error = error.name;
+    }
     void returnResults(bool settled, uint32_t elapsed) const {
         check(replies->count == 0, "a wait was answered twice");
         ++replies->count;
@@ -78,7 +83,12 @@ void advance(int64_t ms) {
 struct CWindow {};
 using PHLWINDOW    = SP<CWindow>;
 using PHLWINDOWREF = WP<CWindow>;
-struct CWLSurfaceResource { PHLWINDOW owner; };
+struct CRegion {
+    bool dirty = false;
+    bool empty() const { return !dirty; }
+};
+struct SSurfaceState { CRegion damage, bufferDamage; };
+struct CWLSurfaceResource { PHLWINDOW owner; SSurfaceState m_current; };
 using CHyprSignalListener = SP<void>;
 bool locked = false;
 void requireUnlockedSession() { if (locked) throw sdbus::Error(sdbus::Error::Name{ERR_SESSION_LOCKED}, "locked"); }
@@ -98,7 +108,13 @@ SP<sdbus::Replies> call(const std::string& id, uint32_t quiet, uint32_t timeout)
     waitForSettle(std::move(result), id, quiet, timeout);
     return replies;
 }
-void commit(const PHLWINDOW& window) { onSurfaceCommit(std::make_shared<CWLSurfaceResource>(CWLSurfaceResource{window})); }
+// A commit that damaged the window, or (frameOnly) one that only asked for the
+// next frame callback.
+void commit(const PHLWINDOW& window, bool frameOnly = false) {
+    auto surface = std::make_shared<CWLSurfaceResource>(CWLSurfaceResource{window, {}});
+    surface->m_current.bufferDamage.dirty = !frameOnly;
+    onSurfaceCommit(surface);
+}
 
 int main() {
     commitTracking.active = true;
@@ -153,6 +169,36 @@ int main() {
     try { call("editor", 10, 100); } catch (const sdbus::Error& error) { refused = error.name == ERR_SESSION_LOCKED; }
     check(refused, "wait admitted on a locked session");
     locked = false;
+
+    // A client that commits every frame without damage settles anyway, as on
+    // KWin: only damaged commits count.
+    g.lastAgentInputMs = clockMs;
+    advance(1);
+    auto k = call("editor", 30, 1000);
+    advance(5);
+    commit(editor);
+    for (int frame = 0; frame < 10; ++frame) {
+        advance(10);
+        commit(editor, true);
+    }
+    check(k->count == 1 && k->settled && k->elapsed == 35, "a commit without damage kept a wait from settling");
+
+    // The limit is the KWin plugin's.
+    std::vector<SP<sdbus::Replies>> many;
+    for (size_t n = 0; n < MAX_SETTLE_WAITS; ++n) many.push_back(call("", 10, 1000));
+    bool limited = false;
+    try { call("", 10, 1000); } catch (const sdbus::Error& error) { limited = error.name == "org.freedesktop.DBus.Error.LimitsExceeded"; }
+    check(MAX_SETTLE_WAITS == 16 && limited, "the pending-wait limit differs from KWin's 16");
+    stopCommitTracking();
+    commitTracking.active = true;
+
+    // Locking answers every pending wait SessionLocked, once.
+    auto l = call("editor", 10, 1000);
+    auto m = call("", 10, 1000);
+    failSettleWaits(ERR_SESSION_LOCKED, "session locked");
+    stopCommitTracking();
+    check(l->count == 1 && m->count == 1 && l->error == ERR_SESSION_LOCKED && m->error == ERR_SESSION_LOCKED, "a lock did not answer pending waits SessionLocked");
+    commitTracking.active = true;
 
     // The session stopping answers every wait still pending, once.
     auto h = call("editor", 10, 1000);

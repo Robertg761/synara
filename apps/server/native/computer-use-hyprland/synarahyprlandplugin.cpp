@@ -2580,8 +2580,12 @@ std::string windowsJson() {
 // from stateJson and healthJson next to it, in one round trip and one
 // compositor-thread pass, so the four can never disagree with each other.
 std::string windowsStateJson() {
-    const std::string windows = windowsJson();
-    const auto        target  = g.targetWindow.lock();
+    // Locked hides the windows and the target, as the KWin plugin does:
+    // titles are the desktop's contents in words, and "locked" is the answer.
+    // The geometry is public in healthJson anyway.
+    const bool        locked  = sessionLocked();
+    const std::string windows = locked ? "[]" : windowsJson();
+    const auto        target  = locked ? nullptr : g.targetWindow.lock();
     // Each monitor's logical rect, so the server can photograph the one the
     // agent is working on instead of every screen squeezed into one image.
     std::string outputs = "[";
@@ -2598,7 +2602,7 @@ std::string windowsStateJson() {
         .raw("targetWindowId", target ? "\"" + jsonEscape(windowId(target)) + "\"" : "null")
         .raw("workspace", rectJson(workspaceGeometry()))
         .raw("outputs", outputs)
-        .boolean("locked", sessionLocked())
+        .boolean("locked", locked)
         .build();
 }
 
@@ -2666,6 +2670,9 @@ bool focusWindow(const std::string& id) {
         return false;
     g.targetWindow    = w;
     g.targetRequested = true;
+    // Counted as the agent's input, as on KWin: a settle wait after a focus
+    // waits for what the window does about it.
+    g.lastAgentInputMs = nowMs();
     return true;
 }
 
@@ -2677,6 +2684,7 @@ bool raiseWindow(const std::string& id) {
     if (!usableWindow(w))
         return false;
     Desktop::windowState()->raise(w);
+    g.lastAgentInputMs = nowMs();
     return true;
 }
 
@@ -4052,7 +4060,7 @@ struct SCommitTracking {
 SCommitTracking commitTracking;
 
 constexpr uint32_t MAX_SETTLE_TIMEOUT_MS = 30 * 1000;
-constexpr size_t   MAX_SETTLE_WAITS      = 8;
+constexpr size_t   MAX_SETTLE_WAITS      = 16;
 
 // The window a surface belongs to: its own toplevel surface, a subsurface of
 // it at any depth, or a popup it opened (through the popup's first-tier
@@ -4131,7 +4139,11 @@ int onSettleTimer(void* /*data*/) {
     return 0;
 }
 
+// Damaged commits only, as KWin's Window::damaged: a client that commits every
+// frame only to ask for the next frame callback still reads as quiet.
 void onSurfaceCommit(const SP<CWLSurfaceResource>& surface) {
+    if (surface->m_current.damage.empty() && surface->m_current.bufferDamage.empty())
+        return;
     const auto window = windowOfSurface(surface);
     if (!window)
         return;
@@ -4176,6 +4188,26 @@ void startCommitTracking() {
         trackSurfaceCommits(surface);
     });
     PROTO::compositor->forEachSurface([](SP<CWLSurfaceResource> surface) { trackSurfaceCommits(surface); });
+}
+
+// Answers every pending wait with an error instead: SessionLocked when the
+// desktop locks, as the KWin plugin answers them.
+void failSettleWaits(const char* errorName, const std::string& message) {
+    std::vector<UP<SSettleWait>> waits;
+    waits.swap(commitTracking.waits);
+    for (const auto& wait : waits) {
+        if (wait->timer) {
+            wl_event_source_remove(wait->timer);
+            wait->timer = nullptr;
+        }
+        try {
+            wait->reply.returnError(sdbus::Error(sdbus::Error::Name{errorName}, message));
+        } catch (const sdbus::Error& e) {
+            Log::logger->log(Log::ERR, "[synara] waitForSettle reply failed: {}", e.what());
+        }
+    }
+    if (!waits.empty())
+        driveDbus();
 }
 
 // Answers every wait (not settled) and stops observing; on session stop and
@@ -4230,7 +4262,7 @@ void waitForSettle(sdbus::Result<bool, uint32_t>&& result, const std::string& wi
         wait->lastCommitMs = lastCommit;
     wait->timer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, onSettleTimer, nullptr);
     if (!wait->timer)
-        throw sdbus::Error(sdbus::Error::Name{ERR_CAPTURE}, "waitForSettle could not be scheduled");
+        throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.Failed"}, "waitForSettle could not be scheduled");
     if (evaluateSettleWait(*wait))
         return;
     commitTracking.waits.push_back(std::move(wait));
@@ -4458,6 +4490,8 @@ void onSessionStateChanged() {
     g.lockEpoch += 1;
     if (!sessionLocked())
         return;
+    // Before the stop, which would answer them unsettled.
+    failSettleWaits(ERR_SESSION_LOCKED, "session locked");
     if (g.running)
         stopSession(StopReason::SessionLocked);
     else

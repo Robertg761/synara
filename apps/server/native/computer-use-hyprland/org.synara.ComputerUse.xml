@@ -51,7 +51,8 @@
     <!-- Version 2: {"windows": <windowsJson's array>, "targetWindowId": <id or
          null>, "workspace": {x, y, width, height}, "outputs": [{x, y, width,
          height}, ...] (each monitor's logical rect), "locked": <bool>} in one
-         call. -->
+         call. Locked, it answers with no windows and a null target instead
+         of refusing. -->
     <method name="windowsStateJson">
       <arg name="json" type="s" direction="out"/>
     </method>
@@ -124,12 +125,20 @@
       <arg name="strokes" type="a(ub)" direction="in"/>
       <arg name="delivered" type="u" direction="out"/>
     </method>
-    <!-- Version 2: returns once the window (any window when windowId is
-         empty) has committed at least once after the last agent input (or
-         after this call, when no input is pending) and then stayed quiet for
-         quietMs, with settled=true; or at timeoutMs with settled=false.
-         settled=false at once when no session is running or windowId names
-         no usable window. elapsedMs is the time the call waited. -->
+    <!-- Version 2: replies once the window (any window, for an empty id) has
+         committed damaged content after the agent's last input (pointer,
+         keys, focusWindow, raiseWindow) - or after this call, when no input
+         is waiting for a settle - and then stayed quiet for quietMs. A commit
+         that damages nothing, a client only asking for its next frame, does
+         not count. settled is false at timeoutMs (clamped to 30 s), when the
+         window closes, and for every pending wait when the session stops or
+         the plugin unloads; at once when no session is running or windowId
+         names no usable window. elapsedMs is the time the call waited. A
+         delayed reply: the compositor never waits on it. Locking answers the
+         call, and every pending wait,
+         org.synara.ComputerUse.Error.SessionLocked. More than 16 waits in
+         flight answer org.freedesktop.DBus.Error.LimitsExceeded, and a wait
+         the plugin could not schedule org.freedesktop.DBus.Error.Failed. -->
     <method name="waitForSettle">
       <arg name="windowId" type="s" direction="in"/>
       <arg name="quietMs" type="u" direction="in"/>
