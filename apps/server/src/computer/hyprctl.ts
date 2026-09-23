@@ -120,7 +120,11 @@ export async function hyprlandInstanceEnvironment(
       ...(waylandDisplay ? { WAYLAND_DISPLAY: waylandDisplay } : {}),
     };
   }
-  return { [HYPRLAND_SIGNATURE_ENV]: signature, WAYLAND_DISPLAY: waylandDisplay, DISPLAY: undefined };
+  return {
+    [HYPRLAND_SIGNATURE_ENV]: signature,
+    WAYLAND_DISPLAY: waylandDisplay,
+    DISPLAY: undefined,
+  };
 }
 
 export interface LiveHyprlandInstanceOptions {

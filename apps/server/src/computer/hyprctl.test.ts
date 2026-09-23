@@ -172,7 +172,10 @@ describe("hyprlandInstanceEnvironment", () => {
   it("never falls back to the inherited socket for another instance", async () => {
     // A pinned dev-test instance whose lock cannot be read: no display at
     // all, rather than the human's.
-    for (const read of [locks({}), locks({ "/run/user/1000/hypr/new/hyprland.lock": "1\n../x\n" })]) {
+    for (const read of [
+      locks({}),
+      locks({ "/run/user/1000/hypr/new/hyprland.lock": "1\n../x\n" }),
+    ]) {
       await expect(hyprlandInstanceEnvironment("new", env, read)).resolves.toEqual({
         HYPRLAND_INSTANCE_SIGNATURE: "new",
         WAYLAND_DISPLAY: undefined,
