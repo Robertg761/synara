@@ -1,7 +1,18 @@
 #include <cstddef>
 #include "../capturetransform.h"
-#include <cassert>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+
+// A failed check exits with a status rather than aborting, so a failing run
+// dumps no core (see compile_and_run in focus_test.py).
+#define CHECK(condition)                                                                   \
+    do {                                                                                   \
+        if (!(condition)) {                                                                \
+            std::fprintf(stderr, "check failed at line %d: %s\n", __LINE__, #condition); \
+            std::exit(1);                                                                  \
+        }                                                                                  \
+    } while (0)
 int main() {
     // Non-square output, with a distinct marker at every pixel.
     const std::array<std::array<int, 6>, 8> expected = {{
@@ -13,10 +24,10 @@ int main() {
         for (int value = 1; value <= 6; ++value) pixels.insert(pixels.end(), 4, value);
         int width = 3, height = 2;
         transformCapturePixels(pixels, width, height, transform);
-        assert(width == ((transform & 1) ? 2 : 3));
-        assert(height == ((transform & 1) ? 3 : 2));
+        CHECK(width == ((transform & 1) ? 2 : 3));
+        CHECK(height == ((transform & 1) ? 3 : 2));
         for (int i = 0; i < 6; ++i) for (int channel = 0; channel < 4; ++channel)
-            assert(pixels[i * 4 + channel] == expected[transform][i]);
+            CHECK(pixels[i * 4 + channel] == expected[transform][i]);
     }
 
     // Reading back only a sub-rectangle: for every transform and every
@@ -33,15 +44,15 @@ int main() {
         for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x)
         for (int h = 1; y + h <= th; ++h) for (int w = 1; x + w <= tw; ++w) {
             const SPixelRect n = nativeRectForTransformed({x, y, w, h}, W, H, transform);
-            assert(n.x >= 0 && n.y >= 0 && n.x + n.w <= W && n.y + n.h <= H);
+            CHECK(n.x >= 0 && n.y >= 0 && n.x + n.w <= W && n.y + n.h <= H);
             std::vector<uint8_t> part;
             for (int ny = n.y; ny < n.y + n.h; ++ny)
                 part.insert(part.end(), native.begin() + (ny * W + n.x) * 4, native.begin() + (ny * W + n.x + n.w) * 4);
             int pw = n.w, ph = n.h;
             transformCapturePixels(part, pw, ph, transform);
-            assert(pw == w && ph == h);
+            CHECK(pw == w && ph == h);
             for (int py = 0; py < h; ++py) for (int px = 0; px < w; ++px)
-                assert(part[(py * w + px) * 4] == whole[((y + py) * tw + x + px) * 4]);
+                CHECK(part[(py * w + px) * 4] == whole[((y + py) * tw + x + px) * 4]);
         }
     }
 }

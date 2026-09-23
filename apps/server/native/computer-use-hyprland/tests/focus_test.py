@@ -105,6 +105,22 @@ def compile_and_run(fixture_name, production, prefix, packages=()):
     """
     fixture = (ROOT / "tests" / fixture_name).read_text()
     assert "// PRODUCTION_DEFINITIONS" in fixture, f"{fixture_name} has no splice point"
+    assert fixture.count("\nint main() {") == 1, f"{fixture_name} needs exactly one `int main() {{`"
+    # A failed check ends the fixture with an exit status, not an uncaught
+    # exception: std::terminate aborts, and an abort dumps core - which on a
+    # developer's desktop is a crash notification for every failing run.
+    fixture = fixture.replace("\nint main() {", "\nvoid fixtureMain() {") + (
+        "\n#include <cstdio>\n#include <exception>\n"
+        "int main() {\n"
+        "    try {\n"
+        "        fixtureMain();\n"
+        "        return 0;\n"
+        "    } catch (const std::exception& error) {\n"
+        "        std::fprintf(stderr, \"fixture check failed: %s\\n\", error.what());\n"
+        "        return 1;\n"
+        "    }\n"
+        "}\n"
+    )
     flags = []
     if packages:
         flags = subprocess.run(["pkg-config", "--cflags", "--libs", *packages], check=True, capture_output=True, text=True).stdout.split()
@@ -112,7 +128,7 @@ def compile_and_run(fixture_name, production, prefix, packages=()):
         cpp = Path(directory) / "fixture.cpp"
         cpp.write_text(fixture.replace("// PRODUCTION_DEFINITIONS", production))
         binary = Path(directory) / "fixture-test"
-        subprocess.run(["g++", STANDARD, "-Wall", "-Wextra", "-I", str(ROOT), str(cpp), "-o", str(binary), *flags], check=True)
+        subprocess.run(["g++", STANDARD, "-Wall", "-Wextra", "-Werror", "-I", str(ROOT), str(cpp), "-o", str(binary), *flags], check=True)
         subprocess.run([str(binary)], check=True)
 
 
