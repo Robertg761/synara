@@ -56,6 +56,7 @@
 #include <hyprland/src/protocols/core/Seat.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/protocols/core/Subcompositor.hpp>
+#include <hyprland/src/protocols/XDGShell.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/desktop/view/Popup.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
@@ -76,6 +77,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -336,6 +338,22 @@ struct SListeners {
     CHyprSignalListener touchCancel;
     CHyprSignalListener configReloaded;
     CHyprSignalListener keyboardFocusChange;
+    CHyprSignalListener viewCreate;
+};
+
+// The display serials one burst of agent input minted: every serial after
+// `after`, up to and including `last`, compared with wrap-around.
+struct SSerialBurst {
+    uint32_t after = 0;
+    uint32_t last  = 0;
+};
+
+// A popup whose grab request this plugin answers, and the handler Hyprland
+// installed for it, which human grabs are passed to and which goes back on
+// the popup at unload.
+struct SWatchedPopup {
+    WP<CXDGPopupResource>                                popup;
+    std::function<void(CXdgPopup*, wl_resource*, uint32_t)> hyprlandHandler;
 };
 
 // Releases the agent owes on a surface whose enter is stale while the human
@@ -535,6 +553,19 @@ struct SState {
     bool                                drivingDbus      = false;
 
     SListeners listeners;
+
+    // The serials the agent's recent bursts minted, on every path, as a ring
+    // of ranges (noteAgentBurst): a popup grab quoting one of them comes from
+    // the agent's input, never the human's.
+    std::array<SSerialBurst, 512> agentBursts{};
+    size_t                        agentBurstNext   = 0;
+    size_t                        agentBurstCount  = 0;
+    uint32_t                      burstStartSerial = 0;
+    // Popups whose grab this plugin answers (watchPopup), and those of them
+    // the agent opened, held without a grab, oldest first.
+    std::vector<SWatchedPopup>         watchedPopups;
+    std::vector<WP<CXDGPopupResource>> agentPopups;
+    uint64_t                           popupsDismissed = 0;
 
     // The release chord as registered with the keybind manager: the default
     // bind if this plugin installed it, and the label of whichever bind is in
@@ -1950,6 +1981,203 @@ void setCursorVisible(bool visible) {
     damageCursorArea();
 }
 
+// ---------------------------------------------------------------------------
+// Agent-opened popups: the KWin plugin's popup rule (watchPopups there), on
+// Hyprland.
+//
+// Hyprland honours every xdg_popup.grab it is sent, whatever the seat and the
+// serial (CXDGShellProtocol::addOrStartGrab), and its grab is the whole seat,
+// keyboard and pointer (CSeatManager::setGrab). So a menu the agent opened
+// with a direct click took the human's keyboard the moment it mapped -
+// measured on 0.56.2: keys the human typed into their own window went to the
+// agent's menu - and their next click, wherever it landed, was delivered to
+// the menu to dismiss it. When such a grab ends Hyprland refocuses the menu's
+// parent window under follow_mouse 0, 2 and 3, which is the agent's window.
+//
+// The plugin therefore answers every popup's grab request itself. The handler
+// is replaced when the popup is created - Hyprland builds the popup's view
+// inside the get_popup request, before the client can ask for a grab - and
+// the decision is made when the request arrives, with its serial: a grab
+// quoting a serial one of the agent's bursts minted, or asked for by a
+// submenu of an agent popup, is the agent's and goes no further; every other
+// grab is passed to Hyprland's own handler unchanged. An agent popup then
+// behaves as a popup without a grab: the human's keyboard and pointer stay
+// theirs and their clicks reach what they land on. What the grab did for the
+// agent is done here instead: a human press outside the agent's popups
+// dismisses them (and is delivered, not eaten), and so do an agent press
+// into another application and the session ending or changing hands. A popup
+// that never asks for a grab - a tooltip, an autocomplete list - belongs to
+// nobody and is left alone.
+// ---------------------------------------------------------------------------
+
+// CXDGPopupResource keeps its protocol object private, and CXdgPopup keeps its
+// request handlers in a private struct with no name; both are reached with
+// the explicit-instantiation exemption used for renderAllClientsForWorkspace.
+using PopupProtocolMember = SP<CXdgPopup> CXDGPopupResource::*;
+PopupProtocolMember popupProtocolMember();
+template <PopupProtocolMember M> struct SPopupProtocolAccess {
+    friend PopupProtocolMember popupProtocolMember() {
+        return M;
+    }
+};
+template struct SPopupProtocolAccess<&CXDGPopupResource::m_resource>;
+
+struct SXdgPopupRequestsTag {};
+auto xdgPopupRequestsMember(SXdgPopupRequestsTag);
+template <auto M> struct SXdgPopupRequestsAccess {
+    friend auto xdgPopupRequestsMember(SXdgPopupRequestsTag) {
+        return M;
+    }
+};
+template struct SXdgPopupRequestsAccess<&CXdgPopup::requests>;
+
+using PopupGrabHandler = std::function<void(CXdgPopup*, wl_resource*, uint32_t)>;
+
+// The grab handler stored on the popup's protocol object, or null.
+PopupGrabHandler* popupGrabHandler(const SP<CXDGPopupResource>& popup) {
+    CXdgPopup* protocol = popup ? (popup.get()->*popupProtocolMember()).get() : nullptr;
+    return protocol ? &(protocol->*xdgPopupRequestsMember(SXdgPopupRequestsTag{})).grab : nullptr;
+}
+
+uint32_t displaySerial() {
+    return g_pCompositor && g_pCompositor->m_wlDisplay ? wl_display_get_serial(g_pCompositor->m_wlDisplay) : 0;
+}
+
+bool serialInBurst(uint32_t serial, const SSerialBurst& burst) {
+    return uint32_t(serial - burst.after - 1) < uint32_t(burst.last - burst.after);
+}
+
+// Records the serials one burst minted as the agent's. A burst that follows
+// the previous one with nothing minted in between extends it, so a run of
+// typing costs one slot; the ring keeps the most recent 512.
+void noteAgentBurst(uint32_t after, uint32_t last) {
+    if (after == last)
+        return;
+    if (g.agentBurstCount > 0) {
+        auto& previous = g.agentBursts[(g.agentBurstNext + g.agentBursts.size() - 1) % g.agentBursts.size()];
+        if (previous.last == after) {
+            previous.last = last;
+            return;
+        }
+    }
+    g.agentBursts[g.agentBurstNext] = {after, last};
+    g.agentBurstNext                = (g.agentBurstNext + 1) % g.agentBursts.size();
+    g.agentBurstCount               = std::min(g.agentBurstCount + 1, g.agentBursts.size());
+}
+
+bool agentMintedSerial(uint32_t serial) {
+    for (size_t i = 0; i < g.agentBurstCount; ++i) {
+        if (serialInBurst(serial, g.agentBursts[i]))
+            return true;
+    }
+    return false;
+}
+
+bool isAgentPopup(const SP<CXDGPopupResource>& popup) {
+    return popup && std::ranges::any_of(g.agentPopups, [&](const WP<CXDGPopupResource>& agent) { return agent.lock() == popup; });
+}
+
+// The agent's grab: its serial, or a submenu of one of the agent's popups.
+bool agentGrab(const SP<CXDGPopupResource>& popup, uint32_t serial) {
+    const auto parent = popup->m_parent.lock();
+    return agentMintedSerial(serial) || (parent && isAgentPopup(parent->m_popup.lock()));
+}
+
+void handlePopupGrab(const WP<CXDGPopupResource>& weak, CXdgPopup* protocol, wl_resource* seat, uint32_t serial) {
+    const auto popup = weak.lock();
+    if (!popup)
+        return;
+    if (agentGrab(popup, serial)) {
+        std::erase_if(g.agentPopups, [](const WP<CXDGPopupResource>& p) { return p.expired(); });
+        g.agentPopups.push_back(popup);
+        return;
+    }
+    const auto watched = std::ranges::find_if(g.watchedPopups, [&](const SWatchedPopup& w) { return w.popup.lock() == popup; });
+    if (watched != g.watchedPopups.end() && watched->hyprlandHandler)
+        watched->hyprlandHandler(protocol, seat, serial);
+}
+
+// A new popup view: its grab request is answered here from now on.
+void watchPopup(const PHLVIEW& view) {
+    if (!view || view->type() != Desktop::View::VIEW_TYPE_POPUP)
+        return;
+    const auto surface = view->resource();
+    if (!surface || !surface->m_role || surface->m_role->role() != SURFACE_ROLE_XDG_SHELL)
+        return;
+    const auto xdg   = static_cast<CXDGSurfaceRole*>(surface->m_role.get())->m_xdgSurface.lock();
+    const auto popup = xdg ? xdg->m_popup.lock() : nullptr;
+    auto*      handler = popupGrabHandler(popup);
+    if (!handler || !*handler)
+        return;
+    std::erase_if(g.watchedPopups, [](const SWatchedPopup& w) { return w.popup.expired(); });
+    g.watchedPopups.push_back({popup, *handler});
+    const WP<CXDGPopupResource> weak = popup;
+    *handler = [weak](CXdgPopup* protocol, wl_resource* seat, uint32_t serial) { handlePopupGrab(weak, protocol, seat, serial); };
+}
+
+// At unload: every popup gets Hyprland's own handler back, because the one
+// installed here is code that is about to be unmapped.
+void unwatchPopups() {
+    for (const auto& watched : g.watchedPopups) {
+        if (auto* handler = popupGrabHandler(watched.popup.lock()))
+            *handler = watched.hyprlandHandler;
+    }
+    g.watchedPopups.clear();
+}
+
+// Newest first, so a submenu goes before the menu that opened it.
+void dismissAgentPopups(const std::function<bool(const SP<CXDGPopupResource>&)>& shouldDismiss) {
+    const auto popups = g.agentPopups;
+    for (auto it = popups.rbegin(); it != popups.rend(); ++it) {
+        const auto popup = it->lock();
+        if (!popup || !shouldDismiss(popup))
+            continue;
+        std::erase_if(g.agentPopups, [&](const WP<CXDGPopupResource>& p) { return p.lock() == popup; });
+        ++g.popupsDismissed;
+        popup->done();
+    }
+    std::erase_if(g.agentPopups, [](const WP<CXDGPopupResource>& p) { return p.expired(); });
+}
+
+void dismissAllAgentPopups() {
+    dismissAgentPopups([](const SP<CXDGPopupResource>&) { return true; });
+}
+
+bool popupContains(const SP<CXDGPopupResource>& popup, const Vector2D& point) {
+    const auto xdg     = popup ? popup->m_surface.lock() : nullptr;
+    const auto surface = xdg ? xdg->m_surface.lock() : nullptr;
+    const auto view    = surface ? Desktop::View::CWLSurface::fromResource(surface) : nullptr;
+    if (!view)
+        return false;
+    const auto box = view->getSurfaceBoxGlobal();
+    return box && box->containsPoint(point);
+}
+
+// The human pressed a button: the agent's popups close unless the press is
+// on one of them. The press itself goes on to wherever it was going.
+void handleHumanPointerPress() {
+    if (g.agentPopups.empty() || !g_pInputManager)
+        return;
+    const Vector2D at = g_pInputManager->getMouseCoordsInternal();
+    if (std::ranges::any_of(g.agentPopups, [&](const WP<CXDGPopupResource>& p) { return popupContains(p.lock(), at); }))
+        return;
+    dismissAllAgentPopups();
+}
+
+// The agent pressed into `client`: its popups in any other application close,
+// as its grab would have closed them.
+void handleAgentPress(wl_client* client) {
+    dismissAgentPopups([client](const SP<CXDGPopupResource>& popup) {
+        const auto xdg     = popup->m_surface.lock();
+        const auto surface = xdg ? xdg->m_surface.lock() : nullptr;
+        return !surface || surface->client() != client;
+    });
+}
+
+size_t agentPopupCount() {
+    return std::ranges::count_if(g.agentPopups, [](const WP<CXDGPopupResource>& p) { return !p.expired(); });
+}
+
 void emitSessionStopped(const std::string& reason) {
     if (!g.dbusObject)
         return;
@@ -1981,6 +2209,8 @@ void stopSession(StopReason reason) {
     g.keyboardWindow.reset();
     g.targetWindow.reset();
     g.targetRequested = false;
+    // A session that ended leaves nothing of the agent's open on the desktop.
+    dismissAllAgentPopups();
     g.stopReason      = stopReasonName(reason);
     // Only the human's panic switch latches. An idle timeout is routine, and an
     // explicit server stop ends the session the server itself owns, so both
@@ -2256,6 +2486,10 @@ std::string stateJson() {
     state.str("humanFocusWindowId", human ? windowId(human) : "");
     state.num("msSinceHumanInput", double(humanInputAgeMilliseconds()));
     state.num("humanActiveGuardMs", g.humanActiveGuardMs);
+    // The popup rule, as in the KWin plugin: agent popups open without a
+    // grab, and how many have been dismissed for the human or the agent.
+    state.num("agentPopupCount", double(agentPopupCount()));
+    state.num("agentPopupsDismissed", double(g.popupsDismissed));
     if (g.targetRequested && !usableWindow(g.targetWindow.lock()))
         state.boolean("targetLost", true);
     if (const auto w = g.targetWindow.lock()) {
@@ -2463,6 +2697,9 @@ bool resetInputDelivery() {
     clearFocusWindow();
     clearKeyboardDelivery();
     clearPointerDelivery();
+    // The next holder starts from nothing, and that includes a menu the last
+    // one left open.
+    dismissAllAgentPopups();
     return true;
 }
 
@@ -2476,13 +2713,16 @@ bool resetInputDelivery() {
 struct InputFocusHandback {
     static inline int depth = 0;
     InputFocusHandback() {
-        ++depth;
+        if (depth++ == 0)
+            g.burstStartSerial = displaySerial();
     }
     ~InputFocusHandback() {
         if (--depth > 0)
             return;
         returnKeyboardToSeat();
         returnPointerToSeat();
+        // Everything the burst minted, the hand-back included, is the agent's.
+        noteAgentBurst(g.burstStartSerial, displaySerial());
     }
     InputFocusHandback(const InputFocusHandback&)            = delete;
     InputFocusHandback& operator=(const InputFocusHandback&) = delete;
@@ -2551,9 +2791,10 @@ bool injectButton(uint32_t button, bool pressed) {
     updateKeyboardFocus();
 
     if (const auto surface = g.directPointerSurface.lock()) {
-        if (pressed)
+        if (pressed) {
             g.pressedButtons.insert(button);
-        else
+            handleAgentPress(surface->client());
+        } else
             g.pressedButtons.erase(button);
         directPointerButtonEvent(surface, button, pressed);
         g.lastAgentInputMs = nowMs();
@@ -4256,6 +4497,8 @@ void setupListeners() {
     g.listeners.mouseButton = Event::bus()->m_events.input.mouse.button.listen([](const IPointer::SButtonEvent& event, Event::SCallbackInfo&) {
         handBackPointerBeforeHumanEvent();
         noteHumanInput();
+        if (event.state == WL_POINTER_BUTTON_STATE_PRESSED)
+            handleHumanPointerPress();
         // This fires before the input manager drops the button from its held
         // list, so owed releases are settled from a timer that runs right
         // after the dispatch rather than here (P3).
@@ -4291,6 +4534,8 @@ void setupListeners() {
             g.humanHeldKeys.erase(event.keycode);
     });
     g.listeners.configReloaded = Event::bus()->m_events.config.reloaded.listen([] { registerReleaseShortcut(); });
+    // Popups are views, created inside the get_popup request.
+    g.listeners.viewCreate = Event::bus()->m_events.view.create.listen([](PHLVIEW view) { watchPopup(view); });
     if (g_pSeatManager) {
         g.seatPointerFocus            = g_pSeatManager->m_state.pointerFocus;
         g.listeners.pointerFocusChange = g_pSeatManager->m_events.pointerFocusChange.listen([] { onSeatPointerFocusChange(); });
@@ -4327,6 +4572,8 @@ void teardown() {
     }
     g.listeners.configReloaded.reset();
     g.listeners.keyboardFocusChange.reset();
+    g.listeners.viewCreate.reset();
+    unwatchPopups();
     g.listeners.renderStage.reset();
     g.listeners.mouseMove.reset();
     g.listeners.mouseButton.reset();

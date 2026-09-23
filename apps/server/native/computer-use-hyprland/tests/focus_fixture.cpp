@@ -80,6 +80,7 @@ struct {
     SModifierState agentModifiers;
     std::set<uint32_t> humanHeldKeys;
     int64_t lastAgentInputMs = -1;
+    uint32_t burstStartSerial = 0;
 } g;
 int64_t clockMs = 1;
 int64_t nowMs() { return clockMs; }
@@ -230,6 +231,14 @@ void xkb_state_update_key(xkb_state* s, uint32_t key, int direction) {
 }
 CBox workspaceGeometry() { return {}; }
 void damageCursorArea() {}
+// The popup rule's bookkeeping; its decisions have their own fixture.
+uint32_t displaySerialNow = 100;
+uint32_t displaySerial() { return ++displaySerialNow; }
+std::vector<std::pair<uint32_t, uint32_t>> agentBursts;
+void noteAgentBurst(uint32_t after, uint32_t last) { agentBursts.push_back({after, last}); }
+int popupDismissals = 0, agentPresses = 0;
+void dismissAllAgentPopups() { ++popupDismissals; }
+void handleAgentPress(wl_client*) { ++agentPresses; }
 
 // PRODUCTION_DEFINITIONS
 
@@ -272,7 +281,10 @@ int main() {
     check(movePointer(100, 100), "agent move stayed blocked after release");
     check(pointerEntered == human.get(), "motion did not return pointer");
 
+    agentBursts.clear();
     check(injectButton(272, true), "sibling click refused");
+    check(agentPresses == 1, "an agent press did not reach the popup rule");
+    check(agentBursts.size() == 1 && agentBursts[0].first < agentBursts[0].second, "a call is recorded as one burst of agent serials");
     check(pointerEntered == agent.get(), "held button lost pointer");
     check(keyboardEntered == human.get(), "click stole keyboard");
     check(movePointer(200, 200), "drag motion refused");
@@ -612,7 +624,9 @@ int main() {
     keyboardEntered = human.get();
     onSeatPointerFocusChange();
     onSeatKeyboardFocusChange();
+    const int dismissalsBefore = popupDismissals;
     check(resetInputDelivery(), "reset failed");
+    check(popupDismissals == dismissalsBefore + 1, "a lease reset left the agent's popups open");
     check(!g.targetRequested && g.targetWindow.expired(), "reset kept the target");
     check(g.pressedButtons.empty() && g.pressedKeys.empty() && g.deferredReleases.empty(), "reset kept held input");
     check(g.directPointerSurface.expired() && g.directKeyboardSurface.expired() && g.directPointerNeedsEnter && g.directKeyboardNeedsEnter, "reset kept enter bookkeeping");

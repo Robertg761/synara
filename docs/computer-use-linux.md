@@ -466,6 +466,17 @@ grab does. Every refusal (human active, unreachable client, lost target) is
 decided before any enter, leave or motion is sent. A `keys` batch hands back
 once, after the batch.
 
+A popup the agent opens never grabs, as on KWin. Hyprland honours every
+`xdg_popup.grab` whatever its serial and grabs the whole seat, so an agent's
+menu took the human's keyboard and ate their next click (measured on 0.56.2).
+The plugin answers every popup's grab request itself: a grab quoting a serial
+one of the agent's calls minted, or asked for by a submenu of an agent popup,
+is withheld; every other grab goes to Hyprland's own handler unchanged, and
+unloading the plugin puts that handler back. A human press outside the agent's
+popups closes them and is delivered; so do an agent press into another
+application and the session ending or the lease changing hands. `stateJson`
+reports `agentPopupCount` and `agentPopupsDismissed`.
+
 The ghost cursor is drawn with cairo, pixel-matched to the KWin item. Capture
 is an offscreen GPU render; only the pixels the window or region covers are
 read back, transform-aware, into a pixel-pack buffer behind a fence that a loop

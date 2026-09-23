@@ -26,8 +26,9 @@ mirror — the compositor's seat state is never touched; the seat's pointer focu
 is only observed, so an enter the human's seat sends to a sibling surface of the
 agent's target invalidates the agent's own enter and the next motion re-enters,
 and every agent action ends by handing the shared pointer/keyboard object back
-to the seat so the human's own scroll, motion, and typing stay in their window),
-and the capture
+to the seat so the human's own scroll, motion, and typing stay in their window;
+a popup the agent opens never takes the seat's grab, see "Agent-opened popups" in
+`synarahyprlandplugin.cpp`), and the capture
 pipeline (offscreen GPU render of a window snapshot or each monitor's full
 scene, read back and composited in cairo with the ghost cursor overlaid, so
 captures show the agent's pointer exactly where the human sees it; the human's

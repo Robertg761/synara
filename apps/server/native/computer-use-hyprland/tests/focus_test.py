@@ -97,13 +97,18 @@ def definitions(source, names):
     return "\n\n".join(parts)
 
 
-def compile_and_run(fixture_name, production, prefix, packages=()):
+def compile_and_run(fixture_name, production, prefix, packages=(), replacements=None):
     """Splices `production` into the fixture, builds it and runs it.
 
     `packages` are pkg-config names the fixture links for real (the codec
-    libraries), never anything of Hyprland's.
+    libraries), never anything of Hyprland's. `replacements` maps further
+    splice points to production text a fixture needs ahead of its own model
+    (the types its state is made of).
     """
     fixture = (ROOT / "tests" / fixture_name).read_text()
+    for placeholder, text in (replacements or {}).items():
+        assert placeholder in fixture, f"{fixture_name} has no {placeholder}"
+        fixture = fixture.replace(placeholder, text)
     assert "// PRODUCTION_DEFINITIONS" in fixture, f"{fixture_name} has no splice point"
     assert fixture.count("\nint main() {") == 1, f"{fixture_name} needs exactly one `int main() {{`"
     # A failed check ends the fixture with an exit status, not an uncaught
@@ -225,6 +230,15 @@ class FocusRegressionTest(unittest.TestCase):
             "stopCommitTracking", "waitForSettle",
         ])
         compile_and_run("settle_fixture.cpp", production, "synara-settle-test-")
+
+    def test_agent_popups_never_grab(self):
+        structs = definitions(self.source, [("SSerialBurst", "struct"), ("SWatchedPopup", "struct")])
+        production = definitions(self.source, [
+            "serialInBurst", "noteAgentBurst", "agentMintedSerial", "isAgentPopup", "agentGrab", "handlePopupGrab",
+            "watchPopup", "unwatchPopups", "dismissAgentPopups", "dismissAllAgentPopups", "popupContains",
+            "handleHumanPointerPress", "handleAgentPress", "agentPopupCount",
+        ])
+        compile_and_run("popup_fixture.cpp", production, "synara-popup-test-", replacements={"// PRODUCTION_STRUCTS": structs})
 
     def test_window_identity(self):
         production = definitions(self.source, [
