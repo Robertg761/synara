@@ -1918,6 +1918,10 @@ export class ComputerManager {
       }
       this.emitAction(threadId, "computer_launch_app");
       if (!result.window && result.windowStatus !== "no_usable_window" && waitForWindowMs > 0) {
+        // Read once: the backend may be a slot whose occupant changes, and a
+        // member re-read after the waits below may be another desktop's, or
+        // gone. The wait checks readiness where it started.
+        const checkInputReady = this.backend.checkInputReady?.bind(this.backend);
         const readiness = await waitForWindow(
           () => this.readWindows(),
           app,
@@ -1926,9 +1930,7 @@ export class ComputerManager {
           {
             ...(result.pid !== undefined ? { pid: result.pid } : {}),
             ...(result.appId !== undefined ? { appId: result.appId } : {}),
-            ...(this.backend.checkInputReady
-              ? { checkInputReady: (windowId: string) => this.backend.checkInputReady!(windowId) }
-              : {}),
+            ...(checkInputReady ? { checkInputReady } : {}),
           },
         ).catch(() => {
           assertDesktopOperationActive();
@@ -4193,7 +4195,9 @@ export class ComputerManager {
     windows: readonly ComputerWindow[],
     options: { readonly unscoped?: boolean } = {},
   ): Promise<void> {
-    if (!this.backend.checkInputReady) return;
+    // Read once, for the same reason as the launch wait's.
+    const checkInputReady = this.backend.checkInputReady?.bind(this.backend);
+    if (!checkInputReady) return;
     const observingThread = currentComputerTask()?.threadId;
     const observedWindow = windows.find((window) => window.id === windowId);
     const paused = [...this.threads.entries()].filter(
@@ -4223,7 +4227,7 @@ export class ComputerManager {
       generation: this.controlState.get(threadId).generation,
     }));
     try {
-      await this.backend.checkInputReady(windowId);
+      await checkInputReady(windowId);
     } catch {
       return; // Read-only perception remains available while input is paused.
     }

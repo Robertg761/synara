@@ -5093,3 +5093,40 @@ describe("paste clipboard restore", () => {
     expect(restoredAfter).toBeGreaterThanOrEqual(COMPUTER_PASTE_CONSUME_TIMEOUT_MS - 5);
   });
 });
+
+describe("ComputerManager backend members read once per use", () => {
+  it("keeps the readiness check it started a launch wait with", async () => {
+    const backend = new FakeComputerBackend();
+    const launch = backend.launchApp.bind(backend);
+    const ready: string[] = [];
+    let launched = false;
+    Object.assign(backend, {
+      checkInputReady: async (windowId: string) => {
+        ready.push(windowId);
+      },
+      // The window is not there yet when the launch returns.
+      launchApp: async (app: string, args: readonly string[]) => {
+        const result = await launch(app, args);
+        launched = true;
+        return { ...result, window: undefined, pid: result.window?.pid };
+      },
+    });
+    const listWindows = backend.listWindows.bind(backend);
+    Object.assign(backend, {
+      // The member goes away between the launch and the wait's first poll,
+      // as it does when the slot's occupant changes.
+      listWindows: async () => {
+        if (launched) Object.assign(backend, { checkInputReady: undefined });
+        return await listWindows();
+      },
+    });
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    try {
+      const result = await manager.launchApp("thread-1", "Editor", [], 1_000);
+      expect(result.windowStatus).toBe("ready");
+      expect(ready).toHaveLength(1);
+    } finally {
+      await manager.dispose();
+    }
+  });
+});
