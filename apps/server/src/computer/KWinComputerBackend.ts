@@ -546,6 +546,12 @@ export interface KWinComputerBackendOptions {
   readonly installStampPath?: string;
   readonly readInstallStamp?: () => Promise<string | undefined>;
   /**
+   * The stamp line naming the compositor version the installed plugin was
+   * built for: `kwin_version` (the default) or, on Hyprland, the
+   * `hyprland_version` its installer writes.
+   */
+  readonly installStampVersionKey?: string;
+  /**
    * The KWin version the compositor is running right now, read off the
    * compositor itself rather than off disk. Defaults to the loaded plugin's
    * report, then to KWin's `supportInformation`.
@@ -652,6 +658,7 @@ export class KWinComputerBackend implements ComputerBackend {
   /** A forced rebuild for an old plugin build that failed; see `assertAuthenticationRebuildHelps`. */
   private authenticationRebuildFailure: PluginProvisioningError | undefined;
   private readonly readInstallStamp: () => Promise<string | undefined>;
+  private readonly installStampVersionKey: string;
   private readonly runningKwinVersion: (() => Promise<string | undefined>) | undefined;
   private readonly installedKwinVersion: () => Promise<string | undefined>;
   protected readonly linuxDistribution: () => LinuxDistribution | undefined;
@@ -903,6 +910,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.clipboardToolsPresent = options.clipboardToolsPresent ?? wlClipboardToolsPresent;
     this.provisionClipboardTools = options.provisionClipboardTools ?? installClipboardSystemPackage;
     const stateRoot = options.stateRoot ?? defaultStateRoot();
+    this.installStampVersionKey = options.installStampVersionKey ?? "kwin_version";
     this.readInstallStamp =
       options.readInstallStamp ??
       (() => readInstallStamp(options.installStampPath ?? installStampPath(stateRoot)));
@@ -2894,7 +2902,7 @@ export class KWinComputerBackend implements ComputerBackend {
       this.readInstallStamp().catch(() => undefined),
       this.probeRunningKwinVersion(),
     ]);
-    const builtFor = stampKwinVersion(stamp);
+    const builtFor = stampCompositorVersion(stamp, this.installStampVersionKey);
     const stampedId = stampPluginId(stamp);
     if (stampedId !== plan.pluginId || !builtFor || !running || builtFor === running) return plan;
     return resolveSynaraPluginLoad({
@@ -3047,7 +3055,10 @@ export class KWinComputerBackend implements ComputerBackend {
     { readonly builtFor: string; readonly running: string } | undefined
   > {
     const [builtFor, running] = await Promise.all([
-      this.readInstallStamp().then(stampKwinVersion, () => undefined),
+      this.readInstallStamp().then(
+        (stamp) => stampCompositorVersion(stamp, this.installStampVersionKey),
+        () => undefined,
+      ),
       this.probeRunningKwinVersion(),
     ]);
     // Equal versions mean the refusal has some other cause, and a half-known
@@ -4242,10 +4253,13 @@ async function readInstallStamp(path: string): Promise<string | undefined> {
   return await readFile(path, "utf8").catch(() => undefined);
 }
 
-/** Reads the `kwin_version=` line the installer records for the built plugin. */
-function stampKwinVersion(stamp: string | undefined): string | undefined {
-  const line = stamp?.split("\n").find((entry) => entry.startsWith("kwin_version="));
-  return line ? (KWIN_VERSION_PATTERN.exec(line)?.[0] ?? undefined) : undefined;
+/**
+ * Reads the `<key>=` line the installer records for the compositor version the
+ * plugin was built against (`kwin_version`, or Hyprland's `hyprland_version`).
+ */
+function stampCompositorVersion(stamp: string | undefined, key: string): string | undefined {
+  const line = stamp?.split("\n").find((entry) => entry.startsWith(`${key}=`));
+  return line ? (KWIN_VERSION_PATTERN.exec(line.slice(key.length + 1))?.[0] ?? undefined) : undefined;
 }
 
 /** Reads the `plugin_id=` line both installers record. */
@@ -4285,7 +4299,7 @@ export function installStampIsCurrent(
     .find((line) => line.startsWith("linux_distribution="))
     ?.slice("linux_distribution=".length);
   if (!hostIdentity || installedIdentity !== hostIdentity) return false;
-  const builtFor = stampKwinVersion(stamp);
+  const builtFor = stampCompositorVersion(stamp, "kwin_version");
   if (builtFor && runningKwinVersion && builtFor !== runningKwinVersion) return false;
   return true;
 }
