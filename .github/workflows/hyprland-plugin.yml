@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          pacman -Syu --noconfirm gcc make pkgconf python git sdbus-cpp cairo libjpeg-turbo coreutils util-linux gawk grep
+          pacman -Syu --noconfirm gcc make pkgconf python git sdbus-cpp cairo libjpeg-turbo libpng coreutils util-linux gawk grep
 
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -85,7 +85,7 @@ jobs:
         continue-on-error: true
         run: |
           set -euxo pipefail
-          pacman -S --noconfirm hyprland cairo pixman libdrm libxkbcommon libjpeg-turbo
+          pacman -S --noconfirm hyprland cairo pixman libdrm libxkbcommon libjpeg-turbo libpng
           pkg-config --exists hyprland
 
       - name: Report the header gap

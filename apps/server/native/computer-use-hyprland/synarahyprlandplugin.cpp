@@ -61,6 +61,7 @@
 
 #include <cairo/cairo.h>
 #include "capturetransform.h"
+#include <png.h>
 #include "sessionauth.h"
 #include <poll.h>
 #include <sdbus-c++/sdbus-c++.h>
@@ -2884,19 +2885,88 @@ void drawGhostCursorOverlay(cairo_t* cr, const SGhostSnapshot& ghost, const CBox
     cairo_restore(cr);
 }
 
-std::vector<uint8_t> encodePng(cairo_surface_t* surface) {
-    std::vector<uint8_t>       png;
-    const cairo_status_t status = cairo_surface_write_to_png_stream(
-        surface,
-        [](void* closure, const unsigned char* data, unsigned int length) {
-            auto* out = static_cast<std::vector<uint8_t>*>(closure);
-            out->insert(out->end(), data, data + length);
-            return CAIRO_STATUS_SUCCESS;
+// PNG at zlib level 1 with the Sub filter only. Every preview tick and every
+// observation is one of these, and cairo's own writer has no level setting:
+// its default compression spent more time in zlib than the rest of a capture
+// together, for files a few percent smaller. Sub is the cheapest filter that
+// still flattens the gradients and anti-aliasing of desktop content.
+constexpr int PNG_COMPRESSION_LEVEL = 1;
+
+// libpng reports failure by longjmp, so the rows are written here, in a frame
+// that owns nothing with a destructor: everything the jump could skip lives
+// in the caller. `row` holds one output row.
+bool writePngRows(png_structp png, png_infop info, cairo_surface_t* surface, bool opaque, uint8_t* row) {
+    if (setjmp(png_jmpbuf(png)))
+        return false;
+    const int            w      = cairo_image_surface_get_width(surface);
+    const int            h      = cairo_image_surface_get_height(surface);
+    const int            stride = cairo_image_surface_get_stride(surface);
+    const unsigned char* data   = cairo_image_surface_get_data(surface);
+    png_set_IHDR(png, info, w, h, 8, opaque ? PNG_COLOR_TYPE_RGB : PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_set_compression_level(png, PNG_COMPRESSION_LEVEL);
+    png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_SUB);
+    png_write_info(png, info);
+    for (int y = 0; y < h; ++y) {
+        const auto* src = reinterpret_cast<const uint32_t*>(data + size_t(y) * stride);
+        uint8_t*    dst = row;
+        for (int x = 0; x < w; ++x) {
+            const uint32_t p = src[x];
+            const uint32_t a = p >> 24;
+            uint32_t       r = (p >> 16) & 0xff, g = (p >> 8) & 0xff, b = p & 0xff;
+            if (opaque) {
+                *dst++ = uint8_t(r);
+                *dst++ = uint8_t(g);
+                *dst++ = uint8_t(b);
+                continue;
+            }
+            // Cairo's pixels are premultiplied; PNG's are not.
+            if (a != 0 && a != 255) {
+                r = (r * 255 + a / 2) / a;
+                g = (g * 255 + a / 2) / a;
+                b = (b * 255 + a / 2) / a;
+            }
+            *dst++ = uint8_t(r);
+            *dst++ = uint8_t(g);
+            *dst++ = uint8_t(b);
+            *dst++ = uint8_t(a);
+        }
+        png_write_row(png, row);
+    }
+    png_write_end(png, nullptr);
+    return true;
+}
+
+// `opaque` drops the alpha channel: a region capture is painted onto black,
+// so every alpha is 255 and the channel would only cost a quarter more data.
+std::vector<uint8_t> encodePng(cairo_surface_t* surface, bool opaque) {
+    std::vector<uint8_t> out;
+    std::vector<uint8_t> row(size_t(cairo_image_surface_get_width(surface)) * (opaque ? 3 : 4));
+    png_structp          png  = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    png_infop            info = png ? png_create_info_struct(png) : nullptr;
+    if (!png || !info) {
+        png_destroy_write_struct(&png, &info);
+        captureFailed("PNG encoder could not be created");
+    }
+    out.reserve(row.size() * size_t(cairo_image_surface_get_height(surface)) / 4);
+    png_set_write_fn(
+        png, &out,
+        [](png_structp writer, png_bytep data, size_t length) {
+            auto* sink = static_cast<std::vector<uint8_t>*>(png_get_io_ptr(writer));
+            bool  ok   = true;
+            try {
+                sink->insert(sink->end(), data, data + length);
+            } catch (...) {
+                ok = false;
+            }
+            if (!ok)
+                png_error(writer, "out of memory");
         },
-        &png);
-    if (status != CAIRO_STATUS_SUCCESS || png.empty())
+        [](png_structp) {});
+    const bool written = writePngRows(png, info, surface, opaque, row.data());
+    png_destroy_write_struct(&png, &info);
+    if (!written || out.empty())
         captureFailed("PNG encoding failed");
-    return png;
+    return out;
 }
 
 // The capture flags of captureWindowEx and captureRegionEx, the same bits in
@@ -2977,7 +3047,7 @@ struct SEncodedImage {
     std::string          mime;
 };
 
-SEncodedImage encodeCaptureImage(cairo_surface_t* surface, CaptureFormat format) {
+SEncodedImage encodeCaptureImage(cairo_surface_t* surface, CaptureFormat format, bool opaque) {
     cairo_surface_flush(surface);
     switch (format) {
         case CaptureFormat::Jpeg: return {encodeJpeg(surface), "image/jpeg"};
@@ -2986,12 +3056,12 @@ SEncodedImage encodeCaptureImage(cairo_surface_t* surface, CaptureFormat format)
                     std::format("image/x-luma8; width={}; height={}", cairo_image_surface_get_width(surface), cairo_image_surface_get_height(surface))};
         case CaptureFormat::Png: break;
     }
-    return {encodePng(surface), "image/png"};
+    return {encodePng(surface, opaque), "image/png"};
 }
 
 // Downscales so the longest side fits maxDimension (0 = uncapped), then
 // encodes. Consumes the surface.
-SEncodedImage finishCapture(cairo_surface_t* surface, uint32_t maxDimension, CaptureFormat format) {
+SEncodedImage finishCapture(cairo_surface_t* surface, uint32_t maxDimension, CaptureFormat format, bool opaque) {
     const int w       = cairo_image_surface_get_width(surface);
     const int h       = cairo_image_surface_get_height(surface);
     const int largest = std::max(w, h);
@@ -3013,7 +3083,7 @@ SEncodedImage finishCapture(cairo_surface_t* surface, uint32_t maxDimension, Cap
     }
     SEncodedImage image;
     try {
-        image = encodeCaptureImage(surface, format);
+        image = encodeCaptureImage(surface, format, opaque);
     } catch (...) {
         cairo_surface_destroy(surface);
         throw;
@@ -3165,7 +3235,7 @@ void encodeCapture(SCaptureJob& job) {
     drawGhostCursorOverlay(cr, job.ghost, job.region, job.scale);
     cairo_destroy(cr);
     cairo_surface_flush(target);
-    job.image = finishCapture(target, job.maxDimension, job.format);
+    job.image = finishCapture(target, job.maxDimension, job.format, job.opaque);
 }
 
 void captureWorkerMain() {

@@ -155,7 +155,7 @@ need_command g++
 need_command pkg-config
 pkg-config --exists hyprland \
     || die "Hyprland development headers are not installed (pkg-config cannot find hyprland). On Arch they ship with the hyprland package itself; check that /usr/share/pkgconfig/hyprland.pc exists."
-for pkg in pixman-1 libdrm sdbus-c++ cairo xkbcommon libturbojpeg; do
+for pkg in pixman-1 libdrm sdbus-c++ cairo xkbcommon libturbojpeg libpng; do
     pkg-config --exists "$pkg" || die "Missing development package: $pkg (pkg-config cannot find it)."
 done
 

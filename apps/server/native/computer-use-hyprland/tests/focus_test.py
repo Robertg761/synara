@@ -190,9 +190,9 @@ class FocusRegressionTest(unittest.TestCase):
         production = definitions(self.source, [
             ("CAPTURE_FLAG_PASSIVE", "variable"), ("CAPTURE_FLAG_JPEG", "variable"), ("CAPTURE_FLAG_LUMA", "variable"),
             ("JPEG_QUALITY", "variable"), ("CaptureFormat", "enum"), "captureFormat",
-            "encodePng", "encodeJpeg", "encodeLuma", ("SEncodedImage", "struct"), "encodeCaptureImage",
+            ("PNG_COMPRESSION_LEVEL", "variable"), "writePngRows", "encodePng", "encodeJpeg", "encodeLuma", ("SEncodedImage", "struct"), "encodeCaptureImage",
         ])
-        compile_and_run("codec_fixture.cpp", production, "synara-codec-test-", packages=("cairo", "libturbojpeg"))
+        compile_and_run("codec_fixture.cpp", production, "synara-codec-test-", packages=("cairo", "libturbojpeg", "libpng"))
 
     def test_window_identity(self):
         production = definitions(self.source, [

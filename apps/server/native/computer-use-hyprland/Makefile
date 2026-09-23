@@ -15,13 +15,13 @@ CXX            ?= g++
 # that ships, and the differences (aggregate init, defaulted comparisons) are
 # exactly the kind that compile one way and not the other.
 CXXSTD         ?= c++26
-PKGS           := hyprland pixman-1 libdrm sdbus-c++ cairo xkbcommon libturbojpeg
+PKGS           := hyprland pixman-1 libdrm sdbus-c++ cairo xkbcommon libturbojpeg libpng
 CXXFLAGS       += -shared -fPIC --no-gnu-unique -std=$(CXXSTD) -O2 -g \
                   $(shell pkg-config --cflags $(PKGS)) \
                   -DSYNARA_CU_BUILD_ID='"hyprland-$(HYPR_VERSION)"' \
                   -DSYNARA_CU_GIT_HASH='"$(GIT_HASH)"' \
                   -DSYNARA_CU_BUILD_TS='"$(BUILD_TS)"'
-LDLIBS         := $(shell pkg-config --libs sdbus-c++ cairo xkbcommon libturbojpeg)
+LDLIBS         := $(shell pkg-config --libs sdbus-c++ cairo xkbcommon libturbojpeg libpng)
 
 OUT            := SynaraComputerUseHyprland.so
 
