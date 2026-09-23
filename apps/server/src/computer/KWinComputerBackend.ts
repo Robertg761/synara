@@ -1420,6 +1420,16 @@ export class KWinComputerBackend implements ComputerBackend {
       options.quietWithinMs === undefined
         ? timeoutMs
         : Math.min(clampMilliseconds(options.quietWithinMs), timeoutMs);
+    // A compositor does not paint a window nobody can see (another workspace,
+    // minimized), and a client paints on the compositor's frame callbacks, so
+    // there are no commits to observe: the blind wait, not the whole cap.
+    const [windows] = await this.readWindows();
+    const target = windows.find((window) => window.id === options.windowId);
+    if (target && (!target.visible || target.minimized)) {
+      const blindMs = options.quietWithinMs === undefined ? quietMs : quietBound;
+      await this.sleep(blindMs);
+      return { settled: false, waitedMs: blindMs };
+    }
     const [quiet, quietWaitMs] = await wait(quietMs, quietBound);
     if (quiet) return { settled: true, waitedMs: quietWaitMs };
     if (quietWaitMs === 0 && quietMs > 0) {

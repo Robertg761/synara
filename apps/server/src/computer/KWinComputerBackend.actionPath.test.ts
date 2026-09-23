@@ -473,6 +473,29 @@ describe("compositor-observed settle", () => {
     ]);
   });
 
+  it("waits blind rather than to the cap for a window the compositor is not painting", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["waitForSettle"];
+    plugin.windows = [{ ...plugin.windows[0]!, visible: false }];
+    const sleeps: number[] = [];
+    const backend = makeBackend(plugin, {
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+      },
+    });
+    await backend.availability();
+    await expect(
+      backend.waitForSettle!({
+        windowId: "window-1",
+        quietMs: 100,
+        timeoutMs: 1_500,
+        quietWithinMs: 300,
+      }),
+    ).resolves.toEqual({ settled: false, waitedMs: 300 });
+    expect(callsOf(plugin, "waitForSettle")).toBe(0);
+    expect(sleeps).toEqual([300]);
+  });
+
   it("waits for real quiet when the caller sets no bound (an explicit wait)", async () => {
     const plugin = new FakePlugin();
     plugin.features = ["waitForSettle"];
