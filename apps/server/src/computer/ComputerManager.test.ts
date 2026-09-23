@@ -604,7 +604,10 @@ describe("ComputerManager and FakeComputerBackend", () => {
     // An idle shutdown or release: the next use brings the desktop back, so
     // the panel keeps the verdict the last availability read gave.
     backend.emitHealthChanged({ ...idle, dormant: true });
-    expect((await manager.getStatus()).availability).toEqual({ kind: "available", backend: "fake" });
+    expect((await manager.getStatus()).availability).toEqual({
+      kind: "available",
+      backend: "fake",
+    });
     expect((await manager.getThreadState("thread-dormant")).availability.kind).toBe("available");
 
     // The same reading without the backend's marker is still a lost desktop,
