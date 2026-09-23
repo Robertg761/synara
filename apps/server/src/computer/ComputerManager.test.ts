@@ -3687,6 +3687,35 @@ it("clears an app pause only for the observing task and a ready same-pid sibling
   }
 });
 
+it("binds a launched app's window by its reported identity when the pid was a wrapper's", async () => {
+  class WrappedLaunchBackend extends FakeComputerBackend {
+    override async launchApp(app: string) {
+      // `flatpak run` reports its own pid, which never owns a window.
+      return { computerId: "desktop", app, pid: 999, appId: "org.kde.kate", window: null };
+    }
+  }
+  const kate: ComputerWindow = {
+    id: "kate-1",
+    title: "Untitled — Kate",
+    appName: "org.kde.kate",
+    pid: 4242,
+    bounds: { x: 0, y: 0, width: 800, height: 600 },
+    focused: false,
+    minimized: false,
+    visible: true,
+  };
+  const manager = new ComputerManager({ backend: new WrappedLaunchBackend({ windows: [kate] }) });
+  try {
+    expect(await manager.launchApp("owner", "kate", [], 2_000)).toMatchObject({
+      appId: "org.kde.kate",
+      window: { id: "kate-1" },
+      windowStatus: "ready",
+    });
+  } finally {
+    await manager.dispose();
+  }
+});
+
 it("reports a launched app with an unusable window without replaying launch", async () => {
   class LaunchBackend extends FakeComputerBackend {
     launches = 0;

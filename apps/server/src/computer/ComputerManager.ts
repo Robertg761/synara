@@ -1876,6 +1876,7 @@ export class ComputerManager {
           desktopOperationSignal(),
           {
             ...(result.pid !== undefined ? { pid: result.pid } : {}),
+            ...(result.appId !== undefined ? { appId: result.appId } : {}),
             ...(this.backend.checkInputReady
               ? { checkInputReady: (windowId: string) => this.backend.checkInputReady!(windowId) }
               : {}),

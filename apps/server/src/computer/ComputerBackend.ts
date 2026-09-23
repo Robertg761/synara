@@ -591,6 +591,16 @@ export interface ComputerBackend {
   setDrivingAgent?(name: string | null): Promise<void>;
   /** Cosmetic activity only: never activates a window or sends input. */
   setCursorActivity?(text: string | null): Promise<void>;
+  /**
+   * Start `app` and report what the launch established. `pid` is the process
+   * the launch started; window readiness matches it exactly unless the result
+   * also names `appId`, the app identity its windows report as `appName`
+   * (a desktop entry or flatpak id). A backend sets `appId` when its launch may
+   * hand the window to another process — a flatpak or `gio launch` wrapper, a
+   * single-instance app forwarding to its running copy — and readiness then
+   * accepts a window of that app, or of the launch name, when none carries the
+   * pid. Leaving it unset keeps the exact pid rule.
+   */
   launchApp(
     app: string,
     args: readonly string[],

@@ -923,6 +923,15 @@ export const ComputerLaunchAppResult = Schema.Struct({
    * that passed a flatpak app id or a .desktop id learns what actually ran.
    */
   resolvedCommand: Schema.optional(Schema.String.check(Schema.isMaxLength(4_096))),
+  /**
+   * The application identity the launch resolved to — a desktop entry id such
+   * as `org.kde.kate`, or a flatpak app id — spelled the way this backend's
+   * windows report `appName`. Present only when the backend can name it; its
+   * presence also says `pid` may belong to a launcher that handed off (flatpak,
+   * `gio launch`, a single-instance app), so window readiness accepts a window
+   * of this app when none carries the pid.
+   */
+  appId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
   window: Schema.NullOr(ComputerWindow),
 });
 export type ComputerLaunchAppResult = typeof ComputerLaunchAppResult.Type;
