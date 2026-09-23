@@ -23,6 +23,8 @@ SIGNATURES = {
     "int": "i",
     "double": "d",
     "QByteArray": "ay",
+    # keys(): SynaraKeyStroke streams as (keyCode, pressed).
+    "QList<SynaraKeyStroke>": "a(ub)",
 }
 
 

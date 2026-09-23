@@ -174,6 +174,16 @@ export class FakePlugin implements KWinComputerPluginApi {
   axis = async (horizontal: number, vertical: number) =>
     this.recordInput("axis", horizontal, vertical);
   key = async (code: number, pressed: boolean) => this.recordInput("key", code, pressed);
+  /** The stroke index `keys` stops at, mirroring a refusal mid-batch; undefined delivers all. */
+  keysStopAt: number | undefined;
+  keys = async (strokes: readonly (readonly [code: number, pressed: boolean])[]) => {
+    this.calls.push({ method: "keys", args: [strokes] });
+    if (this.inputFailure?.method === "keys" && (this.keysStopAt ?? 0) === 0) {
+      throw this.inputFailure.error;
+    }
+    if (!this.running) return 0;
+    return Math.min(strokes.length, this.keysStopAt ?? strokes.length);
+  };
   captureWindow = async (windowId: string, maxDimension: number) => {
     this.calls.push({ method: "captureWindow", args: [windowId, maxDimension] });
     if (this.captureFailure) throw this.captureFailure;

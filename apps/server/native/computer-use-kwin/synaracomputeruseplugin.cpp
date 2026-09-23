@@ -47,6 +47,7 @@
 #include <QDBusConnection>
 #include <QDBusError>
 #include <QDBusMessage>
+#include <QDBusMetaType>
 #include <QEasingCurve>
 #include <QFont>
 #include <QFontMetricsF>
@@ -92,6 +93,7 @@ static const QString s_agentCursorName = QStringLiteral("synara-agent");
 static constexpr int s_interfaceVersion = 2;
 static const QStringList s_interfaceFeatures = {
     QStringLiteral("captureEx"),
+    QStringLiteral("keys"),
     QStringLiteral("windowsStateJson"),
 };
 static const QString s_captureErrorName = QStringLiteral("org.synara.ComputerUse.Error.CaptureFailed");
@@ -121,6 +123,9 @@ static constexpr uint s_defaultHumanActiveGuardMs = 2000;
 static constexpr uint s_minHumanActiveGuardMs = 100;
 static constexpr uint s_maxHumanActiveGuardMs = 60 * 1000;
 static const QString s_releaseActionName = QStringLiteral("SynaraReleaseComputerControl");
+// keys() per call: a sentence of typing, and a bound on how long one call
+// can hold the compositor thread.
+static constexpr qsizetype s_maxKeyStrokes = 256;
 static constexpr int s_captureRenderDeadlineMilliseconds = 2000;
 static constexpr int s_captureEncodeDeadlineMilliseconds = 5000;
 static constexpr int s_captureMaxNativeSide = 16384;
@@ -1232,6 +1237,11 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
     // it - just before that destructor drops the name. The name going
     // unowned is therefore the moment to take both, and until then healthJson
     // (answered by whichever instance holds the path) says which is missing.
+    // Before the object is exported: QtDBus builds the introspection and the
+    // argument demarshalling for keys() from these registrations.
+    qDBusRegisterMetaType<SynaraKeyStroke>();
+    qDBusRegisterMetaType<QList<SynaraKeyStroke>>();
+
     m_serviceWatcher.setConnection(QDBusConnection::sessionBus());
     m_serviceWatcher.setWatchMode(QDBusServiceWatcher::WatchForUnregistration);
     m_serviceWatcher.addWatchedService(s_service);
@@ -2180,6 +2190,69 @@ bool SynaraComputerUsePlugin::key(uint keyCode, bool pressed)
         return false;
     }
     DirectInjectionScope scope(this);
+    return deliverKey(keyCode, pressed);
+}
+
+QDBusArgument &operator<<(QDBusArgument &argument, const SynaraKeyStroke &stroke)
+{
+    argument.beginStructure();
+    argument << stroke.keyCode << stroke.pressed;
+    argument.endStructure();
+    return argument;
+}
+
+const QDBusArgument &operator>>(const QDBusArgument &argument, SynaraKeyStroke &stroke)
+{
+    argument.beginStructure();
+    argument >> stroke.keyCode >> stroke.pressed;
+    argument.endStructure();
+    return argument;
+}
+
+/**
+ * A word of typing in one call instead of two per character.
+ *
+ * One synchronous call is one burst (DirectInjectionScope): the human's own
+ * events cannot land between two strokes, because the compositor thread is
+ * here until the batch is done, so a borrowed seat0 object is handed back once
+ * at the end rather than between every key. Everything that could change
+ * between strokes - the target, the path, whether the human is active - is
+ * still checked per stroke by the same code key() runs.
+ */
+uint SynaraComputerUsePlugin::keys(const QList<SynaraKeyStroke> &strokes)
+{
+    if (!m_auth.permits(*this)) return 0;
+    if (strokes.size() > s_maxKeyStrokes) {
+        if (calledFromDBus()) {
+            sendErrorReply(QDBusError::InvalidArgs,
+                           QStringLiteral("keys takes at most %1 strokes per call, not %2")
+                               .arg(s_maxKeyStrokes)
+                               .arg(strokes.size()));
+        }
+        return 0;
+    }
+    if (refuseIfSessionLocked()) {
+        return 0;
+    }
+    if (!requireRunning()) {
+        return 0;
+    }
+    DirectInjectionScope scope(this);
+    uint delivered = 0;
+    for (const SynaraKeyStroke &stroke : strokes) {
+        m_quietRefusals = delivered > 0;
+        const bool sent = deliverKey(stroke.keyCode, stroke.pressed);
+        m_quietRefusals = false;
+        if (!sent) {
+            break;
+        }
+        ++delivered;
+    }
+    return delivered;
+}
+
+bool SynaraComputerUsePlugin::deliverKey(uint keyCode, bool pressed)
+{
     if (!inputReady()) {
         return false;
     }
@@ -3910,7 +3983,7 @@ bool SynaraComputerUsePlugin::requireReachableClient(const Window *window, bool 
     if (name.isEmpty()) {
         name = QStringLiteral("This window");
     }
-    sendErrorReply(s_seatUnsupportedErrorName,
+    sendRefusal(s_seatUnsupportedErrorName,
                    QStringLiteral("%1 holds no pointer or keyboard on any seat, so input to it is dropped "
                                   "silently and the action would have no effect. Nothing aimed at this "
                                   "window will work until it asks its seat for input.")
@@ -3996,6 +4069,13 @@ SynaraComputerUsePlugin::HumanConflict SynaraComputerUsePlugin::humanConflict(co
     return HumanConflict::None;
 }
 
+void SynaraComputerUsePlugin::sendRefusal(const QString &name, const QString &message) const
+{
+    if (!m_quietRefusals) {
+        sendErrorReply(name, message);
+    }
+}
+
 bool SynaraComputerUsePlugin::refuseIfHumanActive(const Window *window, bool directInjection, InputKind kind)
 {
     const Window *human = nullptr;
@@ -4012,7 +4092,7 @@ bool SynaraComputerUsePlugin::refuseIfHumanActive(const Window *window, bool dir
         if (title.isEmpty()) {
             title = QStringLiteral("the focused window");
         }
-        sendErrorReply(s_humanActiveErrorName,
+        sendRefusal(s_humanActiveErrorName,
                        QStringLiteral("The human is using %1 right now - their keyboard focus is on it and "
                                       "their own devices were active %2 ms ago - so nothing was sent to it. "
                                       "Every other window is still available, and this action can be retried "
@@ -4030,7 +4110,7 @@ bool SynaraComputerUsePlugin::refuseIfHumanActive(const Window *window, bool dir
         name = QStringLiteral("this application");
     }
     const bool pointer = kind == InputKind::Pointer;
-    sendErrorReply(s_humanActiveErrorName,
+    sendRefusal(s_humanActiveErrorName,
                    QStringLiteral("The human is using %1 right now - their %2 is in another window of the "
                                   "same application, which shares one %3 connection with this one (every X11 "
                                   "window shares Xwayland's), and their %2 was active %4 ms ago - so nothing "

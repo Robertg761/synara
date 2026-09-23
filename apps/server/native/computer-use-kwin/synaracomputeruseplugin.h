@@ -10,6 +10,7 @@
 #include "computeruseauth.h"
 #include "scene/item.h"
 
+#include <QDBusArgument>
 #include <QDBusContext>
 #include <QDBusServiceWatcher>
 #include <QByteArray>
@@ -34,6 +35,15 @@ struct xkb_state;
 
 namespace KWin
 {
+
+/** One `(keyCode, pressed)` element of keys(), `(ub)` on the wire. */
+struct SynaraKeyStroke
+{
+    uint keyCode = 0;
+    bool pressed = false;
+};
+QDBusArgument &operator<<(QDBusArgument &argument, const SynaraKeyStroke &stroke);
+const QDBusArgument &operator>>(const QDBusArgument &argument, SynaraKeyStroke &stroke);
 
 class ImageItem;
 class LogicalOutput;
@@ -121,6 +131,13 @@ public:
     /** Deltas are desktop pixels, not wheel notches. Positive is right and down. */
     Q_INVOKABLE bool axis(double horizontal, double vertical);
     Q_INVOKABLE bool key(uint keyCode, bool pressed);
+    /**
+     * Sends the strokes in order, each checked exactly as key() checks one,
+     * and stops at the first that is not delivered. Returns how many were; a
+     * refusal of the first is an error, as it is from key(). At most
+     * s_maxKeyStrokes per call.
+     */
+    Q_INVOKABLE uint keys(const QList<SynaraKeyStroke> &strokes);
     Q_INVOKABLE QByteArray captureWindow(const QString &windowId, uint maxDimension);
     Q_INVOKABLE QByteArray captureRegion(int x, int y, uint width, uint height, uint maxDimension);
     /**
@@ -246,6 +263,11 @@ private:
     // Refuses a mutating action that collides with the human, sending the
     // D-Bus error the server turns into a retryable refusal.
     bool refuseIfHumanActive(const Window *window, bool directInjection, InputKind kind);
+    // The D-Bus error for a refusal, unless a batch is past its first element:
+    // keys() answers a later refusal with the count delivered, not an error.
+    void sendRefusal(const QString &name, const QString &message) const;
+    // key()'s per-stroke half: every check after admission, then the key.
+    bool deliverKey(uint keyCode, bool pressed);
     // Whether the client created a wl_pointer object on the agent seat (not just
     // bound the seat). This, not seat binding, decides whether the agent-seat
     // pointer path can reach the client; see usePointerDirectInjection.
@@ -371,6 +393,9 @@ private:
     // Open DirectInjectionScopes; the outermost closing restores the human's
     // delivery.
     int m_directInjectionDepth = 0;
+    // Set while keys() delivers anything after its first stroke; see
+    // sendRefusal.
+    bool m_quietRefusals = false;
     // seat0's PointerInterface this plugin is connected to, and its focus as of
     // the last change signal (the signal carries no payload).
     QPointer<PointerInterface> m_watchedHumanPointer;
@@ -397,3 +422,5 @@ private:
 };
 
 } // namespace KWin
+
+Q_DECLARE_METATYPE(KWin::SynaraKeyStroke)

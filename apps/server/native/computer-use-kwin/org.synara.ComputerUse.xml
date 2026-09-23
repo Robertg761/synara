@@ -25,6 +25,7 @@
   set that this build implements. A server calls one only when its feature is
   listed and falls back to the version 1 methods otherwise:
     captureEx          captureWindowEx, captureRegionEx
+    keys               keys
     windowsStateJson   windowsStateJson
 -->
 <node name="/org/synara/ComputerUse">
@@ -111,6 +112,16 @@
       <arg name="keyCode" type="u" direction="in"/>
       <arg name="pressed" type="b" direction="in"/>
       <arg name="delivered" type="b" direction="out"/>
+    </method>
+
+    <!-- Feature keys: (keyCode, pressed) strokes in order, each checked
+         exactly as key() checks one. Stops at the first stroke that is not
+         delivered and returns how many were; a refusal of the first stroke is
+         an error, as from key(). More than 256 strokes answer
+         org.freedesktop.DBus.Error.InvalidArgs. -->
+    <method name="keys">
+      <arg name="strokes" type="a(ub)" direction="in"/>
+      <arg name="delivered" type="u" direction="out"/>
     </method>
 
     <!-- Capture. PNG bytes; maxDimension 0 keeps native pixels. Failures are

@@ -89,6 +89,7 @@ export const COMPUTER_PLUGIN_METHOD_SIGNATURES: Readonly<
   button: { in: "ub", out: "b" },
   axis: { in: "dd", out: "b" },
   key: { in: "ub", out: "b" },
+  keys: { in: "a(ub)", out: "u" },
   captureWindow: { in: "su", out: "ay" },
   captureRegion: { in: "iiuuu", out: "ay" },
   captureWindowEx: { in: "suu", out: "ays" },
@@ -153,6 +154,13 @@ export interface KWinComputerPluginApi {
    */
   readonly axis: (horizontal: number, vertical: number) => Promise<unknown>;
   readonly key: (code: number, pressed: boolean) => Promise<unknown>;
+  /**
+   * Interface version 2, feature `keys`: up to 256 `[code, pressed]` strokes in
+   * one call, each checked as `key` checks one. Answers how many were
+   * delivered; it stops at the first that was not, and a refusal of the first
+   * is an error exactly as from `key`.
+   */
+  readonly keys?: (strokes: readonly (readonly [code: number, pressed: boolean])[]) => Promise<unknown>;
   /**
    * `pixels` is the source area the caller expects the capture to render, used
    * only to size the call's deadline; it is not sent to the plugin.
@@ -604,6 +612,7 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
     button: (code, pressed) => invoke(iface, "button", code, pressed),
     axis: (horizontal, vertical) => invoke(iface, "axis", horizontal, vertical),
     key: (code, pressed) => invoke(iface, "key", code, pressed),
+    keys: (strokes) => invoke(iface, "keys", strokes),
     captureWindow: (windowId, maxDimension, pixels) =>
       invokeWithTimeout(iface, "captureWindow", captureTimeoutMs(pixels), windowId, maxDimension),
     captureRegion: (x, y, width, height, maxDimension) =>

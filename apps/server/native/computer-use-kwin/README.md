@@ -149,6 +149,13 @@ plugin keeps working with a newer server. Every version 1 method is unchanged.
   neither has alpha. Unknown bits, or `2` with `4`, answer
   `org.freedesktop.DBus.Error.InvalidArgs`; every other refusal and error is
   exactly the version 1 methods'.
+- `keys(a(ub) strokes) -> u` (feature `keys`): up to 256 `(keyCode, pressed)`
+  strokes in order, each checked exactly as `key` checks one (target, path,
+  reachability, the human-active guard with its release exemption). It stops
+  at the first stroke that is not delivered and returns how many were; a
+  refusal of the first stroke is the same D-Bus error `key` sends. One call is
+  one burst: the human's own events cannot land between two strokes, so a
+  borrowed seat0 object is handed back once, at the end.
 
 `healthJson` also carries `xAuthority`: the cookie file of the Xwayland this
 compositor started, read from KWin's own environment the same way `xDisplay`
