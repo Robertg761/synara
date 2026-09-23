@@ -15,6 +15,7 @@
 #include <QDBusServiceWatcher>
 #include <QByteArray>
 #include <QElapsedTimer>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -29,6 +30,7 @@
 #include <QVariantAnimation>
 
 #include <memory>
+#include <vector>
 
 class QAction;
 struct xkb_state;
@@ -145,6 +147,14 @@ public:
      * luma; see CaptureFlag) and the MIME type of the bytes as a second reply
      * argument. Errors and refusals are the version 1 methods'.
      */
+    /**
+     * Replies once the window (any window, for an empty id) has committed new
+     * content after the agent's last input, or after this call when no input
+     * is pending, and then stayed quiet for `quietMs`; `settled` false at
+     * `timeoutMs`. A delayed reply driven by damage and timers: the
+     * compositor thread never waits.
+     */
+    Q_INVOKABLE bool waitForSettle(const QString &windowId, uint quietMs, uint timeoutMs, uint &elapsedMs);
     Q_INVOKABLE QByteArray captureWindowEx(const QString &windowId, uint maxDimension, uint flags, QString &mime);
     Q_INVOKABLE QByteArray captureRegionEx(int x, int y, uint width, uint height, uint maxDimension, uint flags, QString &mime);
 
@@ -158,6 +168,7 @@ Q_SIGNALS:
 
 private:
     struct CaptureRequest;
+    struct SettleRequest;
     class DirectInjectionScope;
     ComputerUseAuth m_auth;
 
@@ -328,6 +339,16 @@ private:
     void releasePressedState();
     void setTimestampNow();
     void syncModifiers();
+    // Every input that could make a window redraw marks the moment; the next
+    // waitForSettle waits for content committed after it.
+    void noteAgentInput();
+    void trackWindowDamage(Window *window);
+    void handleWindowDamaged(Window *window);
+    void handleWindowClosed(Window *window);
+    void evaluateSettle(SettleRequest *request);
+    void finishSettle(SettleRequest *request, bool settled);
+    void retireSettleTimer(SettleRequest *request);
+    void failSettleRequests(const QString &errorName, const QString &reason);
     bool admitCapture(uint flags);
     void startCapture(std::shared_ptr<CaptureRequest> request, uint maxDimension, uint flags, bool extended);
     void watchRenderLoop(LogicalOutput *output);
@@ -419,6 +440,13 @@ private:
     QTimer m_captureRenderWatchdog;
     QTimer m_captureEncodeWatchdog;
     std::shared_ptr<CaptureRequest> m_captureRequest;
+    // waitForSettle's clock (nanoseconds), each window's last damaged commit
+    // and any window's, and the agent input no wait has consumed yet (-1).
+    QElapsedTimer m_settleClock;
+    QHash<Window *, qint64> m_windowDamageNs;
+    qint64 m_anyDamageNs = -1;
+    qint64 m_pendingAgentInputNs = -1;
+    std::vector<std::unique_ptr<SettleRequest>> m_settleRequests;
 };
 
 } // namespace KWin

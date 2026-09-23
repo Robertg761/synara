@@ -156,6 +156,20 @@ plugin keeps working with a newer server. Every version 1 method is unchanged.
   refusal of the first stroke is the same D-Bus error `key` sends. One call is
   one burst: the human's own events cannot land between two strokes, so a
   borrowed seat0 object is handed back once, at the end.
+- `waitForSettle(s windowId, u quietMs, u timeoutMs) -> (b settled, u
+  elapsedMs)` (feature `waitForSettle`): replaces a fixed sleep between an
+  action and the observation of it. It replies once the window (any window,
+  for an empty id) has committed new content after the agent's last input and
+  then stayed quiet for `quietMs`, and with `settled` false at `timeoutMs`
+  (clamped to 30 seconds) or when the window closes. "New content" is
+  `Window::damaged`: a commit that changes pixels anywhere in the window's
+  surface tree, so a client that commits every frame only to request the next
+  frame callback still reads as quiet. Each wait consumes the input it answers
+  for: a second wait with no input in between, or one before any input, waits
+  for content committed after the call itself. The reply is delayed and driven
+  by the damage signal and one timer per wait; the compositor thread never
+  blocks. An unknown id answers `InvalidArgs`, more than 16 waits in flight
+  `LimitsExceeded`, a lock `SessionLocked`.
 
 `healthJson` also carries `xAuthority`: the cookie file of the Xwayland this
 compositor started, read from KWin's own environment the same way `xDisplay`

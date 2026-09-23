@@ -90,11 +90,15 @@ export const COMPUTER_PLUGIN_METHOD_SIGNATURES: Readonly<
   axis: { in: "dd", out: "b" },
   key: { in: "ub", out: "b" },
   keys: { in: "a(ub)", out: "u" },
+  waitForSettle: { in: "suu", out: "bu" },
   captureWindow: { in: "su", out: "ay" },
   captureRegion: { in: "iiuuu", out: "ay" },
   captureWindowEx: { in: "suu", out: "ays" },
   captureRegionEx: { in: "iiuuuu", out: "ays" },
 };
+
+/** The plugin clamps a `waitForSettle` timeout to this. */
+const SETTLE_MAX_TIMEOUT_MS = 30_000;
 
 /**
  * `flags` for `captureWindowEx`/`captureRegionEx` (feature `captureEx`). JPEG
@@ -161,6 +165,18 @@ export interface KWinComputerPluginApi {
    * is an error exactly as from `key`.
    */
   readonly keys?: (strokes: readonly (readonly [code: number, pressed: boolean])[]) => Promise<unknown>;
+  /**
+   * Interface version 2, feature `waitForSettle`: answers `[settled,
+   * elapsedMs]` once the window (any window for `""`) has committed new
+   * content after the agent's last input and then stayed quiet for
+   * `quietMs`, or `[false, elapsedMs]` at `timeoutMs` (the plugin clamps it to
+   * 30 s). The call's own deadline must outlast `timeoutMs`.
+   */
+  readonly waitForSettle?: (
+    windowId: string,
+    quietMs: number,
+    timeoutMs: number,
+  ) => Promise<unknown>;
   /**
    * `pixels` is the source area the caller expects the capture to render, used
    * only to size the call's deadline; it is not sent to the plugin.
@@ -613,6 +629,15 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
     axis: (horizontal, vertical) => invoke(iface, "axis", horizontal, vertical),
     key: (code, pressed) => invoke(iface, "key", code, pressed),
     keys: (strokes) => invoke(iface, "keys", strokes),
+    waitForSettle: (windowId, quietMs, timeoutMs) =>
+      invokeWithTimeout(
+        iface,
+        "waitForSettle",
+        Math.min(timeoutMs, SETTLE_MAX_TIMEOUT_MS) + KWIN_DBUS_DEFAULT_TIMEOUT_MS,
+        windowId,
+        quietMs,
+        timeoutMs,
+      ),
     captureWindow: (windowId, maxDimension, pixels) =>
       invokeWithTimeout(iface, "captureWindow", captureTimeoutMs(pixels), windowId, maxDimension),
     captureRegion: (x, y, width, height, maxDimension) =>

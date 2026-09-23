@@ -94,6 +94,7 @@ static constexpr int s_interfaceVersion = 2;
 static const QStringList s_interfaceFeatures = {
     QStringLiteral("captureEx"),
     QStringLiteral("keys"),
+    QStringLiteral("waitForSettle"),
     QStringLiteral("windowsStateJson"),
 };
 static const QString s_captureErrorName = QStringLiteral("org.synara.ComputerUse.Error.CaptureFailed");
@@ -126,6 +127,11 @@ static const QString s_releaseActionName = QStringLiteral("SynaraReleaseComputer
 // keys() per call: a sentence of typing, and a bound on how long one call
 // can hold the compositor thread.
 static constexpr qsizetype s_maxKeyStrokes = 256;
+// waitForSettle: concurrent waits, and the longest a single one may take. A
+// longer timeout is clamped rather than refused; the caller learns it from
+// `settled` being false.
+static constexpr size_t s_maxSettleWaits = 16;
+static constexpr uint s_maxSettleTimeoutMs = 30 * 1000;
 static constexpr int s_captureRenderDeadlineMilliseconds = 2000;
 static constexpr int s_captureEncodeDeadlineMilliseconds = 5000;
 static constexpr int s_captureMaxNativeSide = 16384;
@@ -741,6 +747,60 @@ private:
     }
 };
 
+/**
+ * One waitForSettle in flight: the reply it owes, what it watches, and the
+ * timer that wakes it when nothing else will. All times are the plugin's
+ * settle clock, in nanoseconds.
+ */
+struct SynaraComputerUsePlugin::SettleRequest
+{
+    SettleRequest(const QDBusConnection &connection, const QDBusMessage &message)
+        : connection(connection)
+        , message(message)
+    {
+    }
+
+    QDBusConnection connection;
+    QDBusMessage message;
+    // Null with anyWindow false means the window has gone.
+    QPointer<Window> window;
+    bool anyWindow = false;
+    qint64 baselineNs = 0;
+    qint64 startedNs = 0;
+    qint64 quietNs = 0;
+    qint64 deadlineNs = 0;
+    // Owned by the plugin and released with deleteLater: a wait usually ends
+    // inside this timer's own timeout.
+    QPointer<QTimer> timer;
+};
+
+struct SettleVerdict
+{
+    bool done = false;
+    bool settled = false;
+    // When to look again if nothing commits before then; meaningful while not done.
+    qint64 recheckNs = 0;
+};
+
+/**
+ * Whether a wait is over, from the last damaged commit of what it watches (-1
+ * for none yet). Settled needs a commit strictly after the baseline and then
+ * `quiet` without another; the deadline ends it unsettled. Until then the wait
+ * is looked at again when the quiet period would end, or at the deadline, or
+ * sooner if another commit arrives.
+ */
+static SettleVerdict settleVerdict(qint64 nowNs, qint64 lastCommitNs, qint64 baselineNs, qint64 quietNs, qint64 deadlineNs)
+{
+    const bool committed = lastCommitNs >= 0 && lastCommitNs > baselineNs;
+    if (committed && nowNs - lastCommitNs >= quietNs) {
+        return {true, true, 0};
+    }
+    if (nowNs >= deadlineNs) {
+        return {true, false, 0};
+    }
+    return {false, false, committed ? std::min(lastCommitNs + quietNs, deadlineNs) : deadlineNs};
+}
+
 struct SynaraComputerUsePlugin::CaptureRequest
 {
     CaptureRequest(const QDBusConnection &connection, const QDBusMessage &message)
@@ -1220,6 +1280,14 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
     setCursorVisible(false);
     watchSessionState();
 
+    m_settleClock.start();
+    if (Workspace *workspace = Workspace::self()) {
+        for (Window *window : workspace->windows()) {
+            trackWindowDamage(window);
+        }
+        connect(workspace, &Workspace::windowAdded, this, &SynaraComputerUsePlugin::trackWindowDamage);
+    }
+
     if (effects) {
         for (LogicalOutput *output : effects->screens()) {
             watchRenderLoop(output);
@@ -1264,6 +1332,7 @@ SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
     if (m_captureRequest) {
         failCapture(m_captureRequest, QStringLiteral("capture canceled: plugin destroyed"));
     }
+    failSettleRequests(QStringLiteral("org.freedesktop.DBus.Error.Failed"), QStringLiteral("wait canceled: plugin destroyed"));
     releasePressedState();
     detachInputDevice();
     // Both paths, because a session can end with either outstanding and a client
@@ -1826,6 +1895,7 @@ void SynaraComputerUsePlugin::handleSessionStateChanged()
     if (m_captureRequest) {
         failCapture(m_captureRequest, QStringLiteral("session locked"), s_sessionLockedErrorName);
     }
+    failSettleRequests(s_sessionLockedErrorName, QStringLiteral("session locked"));
     if (m_running) {
         stopSession(StopReason::SessionLocked);
     }
@@ -1952,6 +2022,7 @@ bool SynaraComputerUsePlugin::focusWindow(const QString &windowId)
     m_targetRequested = true;
     updatePointerFocus();
     updateKeyboardFocus();
+    noteAgentInput();
     return true;
 }
 
@@ -1972,6 +2043,7 @@ bool SynaraComputerUsePlugin::raiseWindow(const QString &windowId)
     // and the agent already has its own seat, so raising is the whole point:
     // it makes the window the agent is driving the one the user can see.
     Workspace::self()->raiseWindow(window);
+    noteAgentInput();
     return true;
 }
 
@@ -2013,6 +2085,8 @@ bool SynaraComputerUsePlugin::movePointer(double x, double y)
     }
 
     m_pos = confinedPoint(QPointF(x, y));
+    // Hover can redraw (a highlighted button, a tooltip), so a move counts.
+    noteAgentInput();
     if (m_ownsCompositor) {
         // KWin owns the cursor and the focus that follows it, so the move is the
         // whole action: the drawn cursor follows Cursor::posChanged once the
@@ -2154,6 +2228,7 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
         return false;
     }
 
+    noteAgentInput();
     if (m_ownsCompositor) {
         if (horizontal != 0) {
             m_inputDevice->sendAxis(PointerAxis::Horizontal, scrollAxisValue(horizontal), scrollValue120(horizontal));
@@ -2278,6 +2353,7 @@ void SynaraComputerUsePlugin::sendButton(quint32 code, bool pressed)
     if (!inputReady()) {
         return;
     }
+    noteAgentInput();
     if (pressed) {
         m_pressedButtons.insert(code);
     } else {
@@ -2308,6 +2384,7 @@ void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
     if (!inputReady()) {
         return;
     }
+    noteAgentInput();
     // The direct path owes the target an enter whenever the object was handed
     // back to the human since the last key (restoreHumanDelivery) or KWin moved
     // seat0 through this client (handleHumanKeyboardFocusAboutToChange). It has
@@ -2348,6 +2425,164 @@ void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
         xkb_state_update_key(m_xkbState, keyCode + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
         syncModifiers();
         directKeyboardModifiers();
+    }
+}
+
+bool SynaraComputerUsePlugin::waitForSettle(const QString &windowId, uint quietMs, uint timeoutMs, uint &elapsedMs)
+{
+    elapsedMs = 0;
+    if (!m_auth.permits(*this)) return false;
+    if (!calledFromDBus()) {
+        return false;
+    }
+    if (refuseIfSessionLocked()) {
+        return false;
+    }
+    Window *window = nullptr;
+    if (!windowId.isEmpty()) {
+        window = findWindowById(windowId);
+        if (!window || window->isDeleted()) {
+            sendErrorReply(QDBusError::InvalidArgs, QStringLiteral("unknown window %1").arg(windowId));
+            return false;
+        }
+    }
+    if (m_settleRequests.size() >= s_maxSettleWaits) {
+        sendErrorReply(QDBusError::LimitsExceeded,
+                       QStringLiteral("%1 waits are already in flight").arg(s_maxSettleWaits));
+        return false;
+    }
+    setDelayedReply(true);
+
+    const qint64 now = m_settleClock.nsecsElapsed();
+    auto request = std::make_unique<SettleRequest>(connection(), message());
+    request->window = window;
+    request->anyWindow = window == nullptr;
+    // The input this wait answers for is consumed by it: a second wait with no
+    // input in between asks for content committed after itself.
+    request->baselineNs = m_pendingAgentInputNs >= 0 ? m_pendingAgentInputNs : now;
+    m_pendingAgentInputNs = -1;
+    request->startedNs = now;
+    request->quietNs = qint64(quietMs) * 1000000;
+    request->deadlineNs = now + qint64(std::min(timeoutMs, s_maxSettleTimeoutMs)) * 1000000;
+    request->timer = new QTimer(this);
+    request->timer->setSingleShot(true);
+    request->timer->setTimerType(Qt::PreciseTimer);
+    SettleRequest *raw = request.get();
+    connect(request->timer, &QTimer::timeout, this, [this, raw]() {
+        evaluateSettle(raw);
+    });
+    m_settleRequests.push_back(std::move(request));
+    evaluateSettle(raw);
+    return false;
+}
+
+void SynaraComputerUsePlugin::noteAgentInput()
+{
+    m_pendingAgentInputNs = m_settleClock.nsecsElapsed();
+}
+
+/**
+ * Damage, not every commit: Window::damaged fires for commits that change
+ * pixels in the window's surface tree (subsurfaces and the decoration
+ * included), so a client that commits every frame only to ask for the next
+ * frame callback still reads as quiet.
+ */
+void SynaraComputerUsePlugin::trackWindowDamage(Window *window)
+{
+    if (!window) {
+        return;
+    }
+    connect(window, &Window::damaged, this, &SynaraComputerUsePlugin::handleWindowDamaged, Qt::UniqueConnection);
+    connect(window, &Window::closed, this, [this, window]() {
+        handleWindowClosed(window);
+    });
+}
+
+void SynaraComputerUsePlugin::handleWindowDamaged(Window *window)
+{
+    const qint64 now = m_settleClock.nsecsElapsed();
+    m_windowDamageNs.insert(window, now);
+    m_anyDamageNs = now;
+    if (m_settleRequests.empty()) {
+        return;
+    }
+    // Collected first: evaluating may finish a request and erase it.
+    QList<SettleRequest *> affected;
+    for (const auto &request : m_settleRequests) {
+        if (request->anyWindow || request->window == window) {
+            affected.append(request.get());
+        }
+    }
+    for (SettleRequest *request : std::as_const(affected)) {
+        evaluateSettle(request);
+    }
+}
+
+void SynaraComputerUsePlugin::handleWindowClosed(Window *window)
+{
+    m_windowDamageNs.remove(window);
+    QList<SettleRequest *> affected;
+    for (const auto &request : m_settleRequests) {
+        if (!request->anyWindow && request->window == window) {
+            affected.append(request.get());
+        }
+    }
+    // A window that closed will not settle; the caller learns it from the
+    // next observation rather than from an error.
+    for (SettleRequest *request : std::as_const(affected)) {
+        finishSettle(request, false);
+    }
+}
+
+void SynaraComputerUsePlugin::evaluateSettle(SettleRequest *request)
+{
+    if (!request->anyWindow && (!request->window || request->window->isDeleted())) {
+        finishSettle(request, false);
+        return;
+    }
+    const qint64 now = m_settleClock.nsecsElapsed();
+    const qint64 lastCommit = request->anyWindow ? m_anyDamageNs : m_windowDamageNs.value(request->window.data(), -1);
+    const SettleVerdict verdict = settleVerdict(now, lastCommit, request->baselineNs, request->quietNs, request->deadlineNs);
+    if (verdict.done) {
+        finishSettle(request, verdict.settled);
+        return;
+    }
+    // Rounded up, so the timer never fires a hair early and re-arms for 0 ms.
+    const qint64 waitMs = (verdict.recheckNs - now + 999999) / 1000000;
+    request->timer->start(int(std::clamp<qint64>(waitMs, 1, s_maxSettleTimeoutMs)));
+}
+
+void SynaraComputerUsePlugin::finishSettle(SettleRequest *request, bool settled)
+{
+    const auto it = std::find_if(m_settleRequests.begin(), m_settleRequests.end(), [request](const auto &candidate) {
+        return candidate.get() == request;
+    });
+    if (it == m_settleRequests.end()) {
+        return;
+    }
+    std::unique_ptr<SettleRequest> owned = std::move(*it);
+    m_settleRequests.erase(it);
+    retireSettleTimer(owned.get());
+    const qint64 elapsedMs = (m_settleClock.nsecsElapsed() - owned->startedNs) / 1000000;
+    owned->connection.send(owned->message.createReply(QVariantList{settled, uint(std::clamp<qint64>(elapsedMs, 0, std::numeric_limits<uint>::max()))}));
+}
+
+void SynaraComputerUsePlugin::retireSettleTimer(SettleRequest *request)
+{
+    if (QTimer *timer = request->timer) {
+        timer->stop();
+        timer->disconnect(this);
+        timer->deleteLater();
+    }
+}
+
+void SynaraComputerUsePlugin::failSettleRequests(const QString &errorName, const QString &reason)
+{
+    std::vector<std::unique_ptr<SettleRequest>> requests = std::move(m_settleRequests);
+    m_settleRequests.clear();
+    for (const auto &request : requests) {
+        retireSettleTimer(request.get());
+        request->connection.send(request->message.createErrorReply(errorName, reason));
     }
 }
 

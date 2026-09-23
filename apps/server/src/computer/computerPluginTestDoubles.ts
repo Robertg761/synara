@@ -201,6 +201,12 @@ export class FakePlugin implements KWinComputerPluginApi {
     return this.capture ? this.captureBytes : Uint8Array.of();
   };
 
+  /** What `waitForSettle` answers: `[settled, elapsedMs]`. */
+  settleAnswer: readonly [settled: boolean, elapsedMs: number] = [true, 0];
+  waitForSettle = async (windowId: string, quietMs: number, timeoutMs: number) => {
+    this.calls.push({ method: "waitForSettle", args: [windowId, quietMs, timeoutMs] });
+    return this.settleAnswer;
+  };
   /** The MIME type `captureWindowEx`/`captureRegionEx` pair with `captureBytes`. */
   captureMime = "image/png";
   captureWindowEx = async (windowId: string, maxDimension: number, flags: number) => {

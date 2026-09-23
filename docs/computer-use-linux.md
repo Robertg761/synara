@@ -151,8 +151,10 @@ drops the caller when the server name changes owner.
   cursor is painted in, the human's never is.
 - `healthJson` reports `interfaceVersion` 2 and `features`, the optional
   methods on top of the version 1 set (`captureEx`, `keys`,
-  `windowsStateJson`). `keys` sends a word of strokes per call with `key`'s
-  per-stroke checks.
+  `waitForSettle`, `windowsStateJson`). `keys` sends a word of strokes per
+  call with `key`'s per-stroke checks; `waitForSettle` replies once a window
+  has committed new content after the agent's input and gone quiet, driven by
+  damage signals and timers rather than a fixed sleep.
   `captureWindowEx`/`captureRegionEx` take flags for a passive frame (not
   agent activity: the preview no longer keeps an idle session alive), JPEG,
   or raw luma, and reply with the bytes' MIME type. The server uses a

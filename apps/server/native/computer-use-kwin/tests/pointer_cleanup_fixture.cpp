@@ -48,6 +48,7 @@ struct SynaraComputerUsePlugin {
     InputDevice* m_inputDevice;
 
     bool inputReady() const { return true; }
+    void noteAgentInput() {}
     void setTimestampNow() {}
     void directPointerButton(quint32 button, bool pressed) {
         events.push_back({"direct-button", m_directPointerSurface.window, button, pressed});

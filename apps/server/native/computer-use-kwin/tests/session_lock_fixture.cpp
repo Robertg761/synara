@@ -51,6 +51,8 @@ struct SynaraComputerUsePlugin {
 
     bool calledFromDBus() const { return fromDBus; }
     void sendErrorReply(const QString& name, const QString& message) const { errors.push_back({name, message}); }
+    std::vector<ErrorReply> settleFailures;
+    void failSettleRequests(const QString& errorName, const QString& reason) { settleFailures.push_back({errorName, reason}); }
     void failCapture(std::shared_ptr<CaptureRequest> request, const QString& reason, const QString& errorName = QString()) {
         if (request == m_captureRequest) m_captureRequest.reset();
         captureFailures.push_back({errorName, reason});
@@ -91,6 +93,8 @@ int main() {
     check(plugin.captureFailures.size() == 1 && plugin.captureFailures[0].name == SYNARA_SESSION_LOCKED_ERROR,
           "an in-flight capture must fail with the SessionLocked error, not CaptureFailed");
     check(!plugin.m_releasedByUser, "locking must not touch the user-release latch");
+    check(plugin.settleFailures.size() == 1 && plugin.settleFailures[0].name == SYNARA_SESSION_LOCKED_ERROR,
+          "waits for a settle must end with the SessionLocked error too");
 
     check(plugin.refuseIfSessionLocked(), "every entry point must refuse while locked");
     check(plugin.errors.size() == 1 && plugin.errors[0].name == SYNARA_SESSION_LOCKED_ERROR, "the refusal must carry the SessionLocked error name");

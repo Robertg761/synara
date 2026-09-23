@@ -315,6 +315,7 @@ struct SynaraComputerUsePlugin {
     Window* hitWindow = nullptr;
 
     bool inputReady() const { return true; }
+    void noteAgentInput() {}
     void setTimestampNow() {}
     void syncModifiers() {}
     void clearWindowActivation() {}

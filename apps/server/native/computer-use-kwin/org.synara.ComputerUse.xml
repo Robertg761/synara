@@ -26,6 +26,7 @@
   listed and falls back to the version 1 methods otherwise:
     captureEx          captureWindowEx, captureRegionEx
     keys               keys
+    waitForSettle      waitForSettle
     windowsStateJson   windowsStateJson
 -->
 <node name="/org/synara/ComputerUse">
@@ -122,6 +123,22 @@
     <method name="keys">
       <arg name="strokes" type="a(ub)" direction="in"/>
       <arg name="delivered" type="u" direction="out"/>
+    </method>
+
+    <!-- Feature waitForSettle: replies once the window (any window, for an
+         empty id) has committed new content after the agent's last input -
+         or after this call, when no input is waiting for a settle - and then
+         stayed quiet for quietMs; settled is false at timeoutMs (clamped to
+         30 s) or when the window closes. A delayed reply: the compositor
+         never waits on it. An unknown id answers
+         org.freedesktop.DBus.Error.InvalidArgs; more than 16 waits in flight
+         org.freedesktop.DBus.Error.LimitsExceeded. -->
+    <method name="waitForSettle">
+      <arg name="windowId" type="s" direction="in"/>
+      <arg name="quietMs" type="u" direction="in"/>
+      <arg name="timeoutMs" type="u" direction="in"/>
+      <arg name="settled" type="b" direction="out"/>
+      <arg name="elapsedMs" type="u" direction="out"/>
     </method>
 
     <!-- Capture. PNG bytes; maxDimension 0 keeps native pixels. Failures are
