@@ -4138,6 +4138,52 @@ describe("KWinComputerBackend plugin unloaded by someone (R12)", () => {
   });
 });
 
+describe("KWinComputerBackend compositor gone", () => {
+  it("keeps retrying through a restart and reports the desktop gone once it stays away", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      let kwin: string | undefined = ":1.7";
+      dbus.compositorInstance = async () => kwin;
+      let factoryCalls = 0;
+      const backend = makeBackend(dbus, {
+        random: () => 1,
+        dbusFactory: async () => {
+          factoryCalls += 1;
+          return dbus;
+        },
+      });
+      const gone: string[] = [];
+      backend.onEvent((event) => {
+        if (event.type === "desktop-gone") gone.push(event.message);
+      });
+      await backend.listWindows();
+
+      kwin = undefined;
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(gone).toEqual([]);
+      expect(backend.health().status).toBe("reconnecting");
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(gone).toHaveLength(1);
+      expect(gone[0]).toContain("No KWin compositor");
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+      const callsWhenGone = factoryCalls;
+      await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS * 4);
+      expect(factoryCalls).toBe(callsWhenGone);
+
+      // A real use still asks, and a compositor that came back is used.
+      kwin = ":1.8";
+      await expect(backend.listWindows()).resolves.toMatchObject([{ id: "window-1" }]);
+      expect(gone).toHaveLength(1);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("KWinComputerBackend perception", () => {
   it("walks the accessibility tree when the caller asks for it, scoped to a window", async () => {
     const dbus = new FakeDbus();

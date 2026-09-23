@@ -153,6 +153,12 @@ export const KWIN_RECONNECT_MAX_DELAY_MS = 30_000;
  */
 export const KWIN_RECONNECT_HEALTHY_MS = 30_000;
 /**
+ * How long the compositor itself may be missing before the reconnect loop
+ * calls the desktop gone rather than restarting: a crashed KWin is back
+ * within seconds under its wrapper, and a Hyprland restart takes about one.
+ */
+export const COMPOSITOR_GONE_AFTER_MS = 60_000;
+/**
  * How many consecutive still captures may fail before the stream stops
  * claiming capture works. One failure is a frame the compositor was busy for;
  * a run of them is a capture path that is gone, and a pane showing the last
@@ -521,6 +527,9 @@ export class KWinComputerBackend implements ComputerBackend {
    * instance was unloaded by someone, and the reconnect loop leaves it so.
    */
   private connectedCompositor: string | undefined;
+  /** Since when the compositor has been missing, while it is; see `compositorMissing`. */
+  private compositorMissingSince: number | undefined;
+  private desktopGoneReported = false;
   /** A retry is pending or running, which is what `reconnecting` reports. */
   private reconnecting = false;
   /**
@@ -1883,12 +1892,16 @@ export class KWinComputerBackend implements ComputerBackend {
         );
       });
     }
-    const compositor = dbus.compositorInstance
+    // `null` is "cannot tell", which is not the same answer as "none running".
+    const runningCompositor = dbus.compositorInstance
       ? await dbus.compositorInstance().catch((error: unknown) => {
           if (isConnectionLevelFailure(error)) throw error;
-          return undefined;
+          return null;
         })
-      : undefined;
+      : null;
+    if (runningCompositor === undefined) throw this.compositorMissing(automatic);
+    this.compositorMissingSince = undefined;
+    const compositor = runningCompositor ?? undefined;
     // Who owns the well-known service name *before* anything is loaded. The
     // plugin is addressed by that name, so without pinning the owner, a stale
     // duplicate Synara instance — or any same-session squatter — would receive
@@ -2021,6 +2034,32 @@ export class KWinComputerBackend implements ComputerBackend {
     // waiting for the next login is not superseded, it is pending.
     if (plan.kind === "replace") await this.pruneOlderBuilds(plan.pluginId);
     return connected;
+  }
+
+  /** What a use is told when no compositor instance is running at all. */
+  protected get compositorMissingMessage(): string {
+    return NO_KWIN_MESSAGE;
+  }
+
+  /**
+   * No compositor is running. A restart is the usual reason and the loop
+   * keeps trying through it; once the compositor has stayed away for
+   * `COMPOSITOR_GONE_AFTER_MS` the desktop this backend was bound to is
+   * reported gone — once, so the service can select another backend — and
+   * the loop stands down. A real use still asks again every time.
+   */
+  private compositorMissing(automatic: boolean): ComputerBackendError {
+    const now = this.now();
+    const since = (this.compositorMissingSince ??= now);
+    const message = this.compositorMissingMessage;
+    if (automatic && this.hasEverConnected && now - since >= COMPOSITOR_GONE_AFTER_MS) {
+      if (!this.desktopGoneReported) {
+        this.desktopGoneReported = true;
+        this.emit({ type: "desktop-gone", message });
+      }
+      return new ComputerBackendError(message, { dormant: true, retryable: true });
+    }
+    return new ComputerBackendError(message, { retryable: true });
   }
 
   private async pruneOlderBuilds(loadedId: string): Promise<void> {
@@ -2229,6 +2268,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.pluginId = pluginId;
     this.pluginHealth = health;
     this.connectedCompositor = compositor;
+    this.desktopGoneReported = false;
     // The backoff is not reset here: a connection that is lost again at once
     // proved nothing. See `scheduleReconnect`.
     this.connectedAt = this.now();
