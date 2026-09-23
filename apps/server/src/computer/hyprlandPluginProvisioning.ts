@@ -38,6 +38,11 @@ import { dirname, join, resolve } from "node:path";
 import { withProvisioningFileLock } from "./provisioning/fileLock.ts";
 import { buildPluginFromSource } from "./provisioning/sourceBuild.ts";
 import {
+  commandOnPath,
+  pkgConfigModulePresent,
+  type PathExists,
+} from "./provisioning/buildToolingProbe.ts";
+import {
   allocatePluginId,
   installPluginBytes,
   installStampPath,
@@ -50,17 +55,22 @@ export const HYPRLAND_INSTALL_SCRIPT_PATH =
   "apps/server/native/computer-use-hyprland/scripts/install-and-load.sh";
 
 /**
- * Where the marker for Hyprland's development headers lives. The pkg-config
- * file is what the plugin Makefile resolves everything through, so its
- * presence is the honest "could a source build proceed" signal. Arch installs
- * it under /usr/share/pkgconfig; the lib spellings cover other packagings.
+ * The pkg-config modules the plugin Makefile compiles and links through (its
+ * `PKGS`; keep the two lists in sync). `pkg-config --cflags` fails outright
+ * when any one of them is missing, so each one's `.pc` file is part of the
+ * "could a source build proceed" signal, not just Hyprland's own.
  */
-const HYPRLAND_PKGCONFIG_PATHS = [
-  "/usr/share/pkgconfig/hyprland.pc",
-  "/usr/lib/pkgconfig/hyprland.pc",
-  "/usr/lib64/pkgconfig/hyprland.pc",
-  "/usr/local/share/pkgconfig/hyprland.pc",
+const HYPRLAND_BUILD_PKGCONFIG_MODULES = [
+  "hyprland",
+  "pixman-1",
+  "libdrm",
+  "sdbus-c++",
+  "cairo",
+  "xkbcommon",
+  "libturbojpeg",
+  "libpng",
 ] as const;
+const HYPRLAND_BUILD_COMMANDS = ["g++", "make", "pkg-config"] as const;
 
 /** The sources the built `.so` is a function of; see `hyprlandPluginSourceHash`. */
 const HYPRLAND_PLUGIN_SOURCE_FILES = [
@@ -111,21 +121,22 @@ export function hyprlandInstallStampPath(
 }
 
 /**
- * Whether this machine could compile the plugin: Hyprland's headers (via their
- * pkg-config marker), and the compiler driver the Makefile invokes. The same
- * deliberate non-exhaustiveness as the KWin probe — sdbus-c++, cairo and
- * pixman headers are needed too, and the install script reports each missing
+ * Whether this machine could compile the plugin: every pkg-config module the
+ * Makefile resolves, and the commands it runs. Only existence checks, like the
+ * KWin probe. Modules hyprland.pc itself `Requires:` (aquamarine, hyprutils,
+ * libinput, ...) are not followed, since that would mean reading it; they ship
+ * with Hyprland's own packages, and the install script reports each missing
  * package by name when it actually runs.
  */
 export function hyprlandBuildToolingPresent(
-  exists: (path: string) => boolean = existsSync,
+  exists: PathExists = existsSync,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  if (!HYPRLAND_PKGCONFIG_PATHS.some((path) => exists(path))) return false;
-  const pathDirectories = (env.PATH ?? "").split(":").filter(Boolean);
-  const onPath = (command: string) =>
-    pathDirectories.some((directory) => exists(join(directory, command)));
-  return onPath("g++") && onPath("make") && onPath("pkg-config");
+  return (
+    HYPRLAND_BUILD_PKGCONFIG_MODULES.every((module) =>
+      pkgConfigModulePresent(module, exists, env),
+    ) && HYPRLAND_BUILD_COMMANDS.every((command) => commandOnPath(command, exists, env))
+  );
 }
 
 /** The plugin sources on disk, bundled beside this module or up in native/. */

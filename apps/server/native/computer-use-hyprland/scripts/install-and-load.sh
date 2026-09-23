@@ -153,11 +153,22 @@ take_lock 8 "$BUILD_LOCK_FILE" "build"
 
 need_command g++
 need_command pkg-config
-pkg-config --exists hyprland \
-    || die "Hyprland development headers are not installed (pkg-config cannot find hyprland). On Arch they ship with the hyprland package itself; check that /usr/share/pkgconfig/hyprland.pc exists."
-for pkg in pixman-1 libdrm sdbus-c++ cairo xkbcommon libturbojpeg libpng; do
-    pkg-config --exists "$pkg" || die "Missing development package: $pkg (pkg-config cannot find it)."
+# Keep this list in sync with PKGS in the Makefile and with
+# HYPRLAND_BUILD_PKGCONFIG_MODULES in hyprlandPluginProvisioning.ts, whose
+# build tooling probe checks the same .pc files. pkg-config's own error is
+# kept because it names the actual gap: hyprland.pc Requires: a dozen other
+# modules, and a missing one of those fails `--exists hyprland` too.
+missing_pkgs=()
+hyprland_hint=""
+for pkg in hyprland pixman-1 libdrm sdbus-c++ cairo xkbcommon libturbojpeg libpng; do
+    if ! pkg_error="$(pkg-config --print-errors --exists "$pkg" 2>&1)"; then
+        missing_pkgs+=("$pkg${pkg_error:+ ($(printf '%s' "$pkg_error" | tr '\n' ' ' | sed 's/ *$//'))}")
+        [[ "$pkg" != hyprland ]] ||
+            hyprland_hint=" Hyprland's own headers ship with the hyprland package on Arch; check that /usr/share/pkgconfig/hyprland.pc exists."
+    fi
 done
+(( ${#missing_pkgs[@]} == 0 )) ||
+    die "Missing development package(s), pkg-config cannot resolve: $(printf '%s; ' "${missing_pkgs[@]}" | sed 's/; $//').$hyprland_hint"
 
 HYPR_VERSION="$(pkg-config --modversion hyprland)"
 

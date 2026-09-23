@@ -64,30 +64,59 @@ describe("build tooling probe", () => {
   const env = { PATH: "/usr/bin" };
 
   const TOOLS = ["/usr/bin/g++", "/usr/bin/make", "/usr/bin/pkg-config"];
+  /** The Makefile's PKGS, where Arch installs them. */
+  const MODULES = [
+    "/usr/share/pkgconfig/hyprland.pc",
+    "/usr/lib/pkgconfig/pixman-1.pc",
+    "/usr/lib/pkgconfig/libdrm.pc",
+    "/usr/lib/pkgconfig/sdbus-c++.pc",
+    "/usr/lib/pkgconfig/cairo.pc",
+    "/usr/lib/pkgconfig/xkbcommon.pc",
+    "/usr/lib/pkgconfig/libturbojpeg.pc",
+    "/usr/lib/pkgconfig/libpng.pc",
+  ];
 
-  it("needs the Hyprland pkg-config marker and the whole toolchain together", () => {
-    expect(
-      hyprlandBuildToolingPresent(disk("/usr/share/pkgconfig/hyprland.pc", ...TOOLS), env),
-    ).toBe(true);
+  it("needs every pkg-config module the Makefile uses and the whole toolchain together", () => {
+    expect(hyprlandBuildToolingPresent(disk(...MODULES, ...TOOLS), env)).toBe(true);
     // Headers without a compiler, or a compiler without headers, both refuse.
-    expect(hyprlandBuildToolingPresent(disk("/usr/share/pkgconfig/hyprland.pc"), env)).toBe(false);
+    expect(hyprlandBuildToolingPresent(disk(...MODULES), env)).toBe(false);
     expect(hyprlandBuildToolingPresent(disk(...TOOLS), env)).toBe(false);
     expect(
-      hyprlandBuildToolingPresent(
-        disk("/usr/share/pkgconfig/hyprland.pc", "/usr/bin/g++", "/usr/bin/make"),
-        env,
-      ),
+      hyprlandBuildToolingPresent(disk(...MODULES, "/usr/bin/g++", "/usr/bin/make"), env),
     ).toBe(false);
   });
 
-  it("accepts the pkg-config file from any of its packaging locations", () => {
+  it("says no when hyprland.pc is present but another module the Makefile needs is not", () => {
+    // The old probe checked hyprland.pc alone, so a host without, say,
+    // libturbojpeg's development files was reported buildable and then failed
+    // in pkg-config --cflags.
+    for (const missing of MODULES) {
+      expect(
+        hyprlandBuildToolingPresent(
+          disk(...MODULES.filter((path) => path !== missing), ...TOOLS),
+          env,
+        ),
+        missing,
+      ).toBe(false);
+    }
+  });
+
+  it("accepts the pkg-config files from any of their packaging locations", () => {
+    const others = MODULES.filter((path) => !path.endsWith("/hyprland.pc"));
     for (const pc of [
       "/usr/lib/pkgconfig/hyprland.pc",
       "/usr/lib64/pkgconfig/hyprland.pc",
+      "/usr/lib/x86_64-linux-gnu/pkgconfig/hyprland.pc",
       "/usr/local/share/pkgconfig/hyprland.pc",
     ]) {
-      expect(hyprlandBuildToolingPresent(disk(pc, ...TOOLS), env)).toBe(true);
+      expect(hyprlandBuildToolingPresent(disk(pc, ...others, ...TOOLS), env)).toBe(true);
     }
+    expect(
+      hyprlandBuildToolingPresent(disk("/opt/hypr/pkgconfig/hyprland.pc", ...others, ...TOOLS), {
+        ...env,
+        PKG_CONFIG_PATH: "/opt/hypr/pkgconfig",
+      }),
+    ).toBe(true);
   });
 });
 
