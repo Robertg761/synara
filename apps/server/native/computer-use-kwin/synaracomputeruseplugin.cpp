@@ -3432,9 +3432,9 @@ quint32 SynaraComputerUsePlugin::keyboardLayoutIndex() const
 /**
  * The xkb (RMLVO) name of that layout, "us" or "de", which is what the
  * server's typing gate compares. A keymap loaded without a layout list has no
- * short names; the descriptive name ("English (US)") stands in so the refusal
- * can still say which layout it saw, and the server treats it as not
- * US-compatible.
+ * short names; the descriptive name ("English (US)") stands in, which the
+ * server's gate reads as it reads the short one: plain US passes, anything
+ * else is refused and named in the refusal.
  */
 QString SynaraComputerUsePlugin::keyboardLayout() const
 {

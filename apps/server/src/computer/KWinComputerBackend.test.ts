@@ -3886,6 +3886,48 @@ describe("KWinComputerBackend supervision", () => {
     await backend.dispose();
   });
 
+  it("types on plain US however the plugin spells it, and only there", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+    await backend.availability();
+    // The real pairs the plugins report: KWin with a layout list ("us" beside
+    // its descriptive name), KWin with no kxkbrc and the nested session (no
+    // short name, so the descriptive one in its place), and Hyprland on a
+    // virtual keyboard's own keymap (the same).
+    for (const [layout, name] of [
+      ["us", "English (US)"],
+      ["English (US)", "English (US)"],
+      ["English (US)", undefined],
+      ["us", undefined],
+      ["us(altgr-intl)", "English (intl., with AltGr dead keys)"],
+      ["English (intl., with AltGr dead keys)", "English (intl., with AltGr dead keys)"],
+      ["", ""],
+    ] as const) {
+      dbus.plugin.keyboardLayout = layout;
+      dbus.plugin.keyboardLayoutName = name;
+      await expect(backend.typeText("ok"), `${layout} / ${name}`).resolves.toEqual({
+        value: "ok",
+      });
+    }
+    for (const [layout, name] of [
+      ["English (Dvorak)", "English (Dvorak)"],
+      ["English (Colemak)", "English (Colemak)"],
+      ["English (US, intl., with dead keys)", "English (US, intl., with dead keys)"],
+      ["English (US, alt. intl.)", undefined],
+      ["us", "English (US, alt. intl.)"],
+      ["us(alt-intl)", "English (US)"],
+      ["German", "German"],
+      ["de", "German"],
+    ] as const) {
+      dbus.plugin.keyboardLayout = layout;
+      dbus.plugin.keyboardLayoutName = name;
+      await expect(backend.typeText("ok"), `${layout} / ${name}`).rejects.toMatchObject({
+        retryable: false,
+      });
+    }
+    await backend.dispose();
+  });
+
   it("reports text that stopped mid-string as a partial delivery, not a retryable miss", async () => {
     const dbus = new FakeDbus();
     const backend = makeBackend(dbus);

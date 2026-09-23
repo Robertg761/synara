@@ -247,14 +247,18 @@ const LAUNCH_SPAWN_DEADLINE_MS = 5_000;
  * move), not `intl`/`alt-intl` (quotes, backtick, tilde and caret are dead
  * keys). The plugins report the layout's short name without its variant
  * ("us" for all of them), so the variant is read off the descriptive name
- * xkeyboard-config gives each one, which they report beside it.
+ * xkeyboard-config gives each one, which they report beside it. A keymap
+ * built without a layout list (KWin with no kxkbrc, the nested session, a
+ * virtual keyboard's own map) has no short name at all, and the plugins then
+ * report the descriptive name in its place; see `usCompatibleLayout`.
  */
 const US_LAYOUT = /^us(?:\(([^)]*)\))?$/;
 const ASCII_SAFE_US_VARIANTS: ReadonlySet<string> = new Set(["altgr-intl", "euro"]);
+/** Descriptive names, compared case-insensitively. */
 const ASCII_SAFE_US_LAYOUT_NAMES: ReadonlySet<string> = new Set([
-  "English (US)",
-  "English (intl., with AltGr dead keys)",
-  "English (US, euro on 5)",
+  "english (us)",
+  "english (intl., with altgr dead keys)",
+  "english (us, euro on 5)",
 ]);
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
 const MIN_IDLE_TIMEOUT_MS = 1_000;
@@ -1895,17 +1899,9 @@ export class KWinComputerBackend implements ComputerBackend {
    * are not gated. A plugin that does not report the layout is trusted.
    */
   private assertUsCompatibleLayout(state: KWinPluginState, action: string): void {
-    const layout = state.keyboardLayout;
-    if (layout === undefined) return;
-    const variant = US_LAYOUT.exec(layout);
-    const name = state.keyboardLayoutName;
-    if (
-      variant &&
-      (variant[1] === undefined || ASCII_SAFE_US_VARIANTS.has(variant[1])) &&
-      (name === undefined || ASCII_SAFE_US_LAYOUT_NAMES.has(name))
-    ) {
-      return;
-    }
+    const layout = state.keyboardLayout?.trim() || undefined;
+    const name = state.keyboardLayoutName?.trim() || undefined;
+    if (usCompatibleLayout(layout, name)) return;
     const described = name && name !== layout ? `${layout}, ${name}` : layout;
     throw new ComputerBackendError(
       `The active keyboard layout is ${JSON.stringify(described)}, and Synara can only synthesise ` +
@@ -4409,6 +4405,25 @@ const JPEG_SIGNATURE = [0xff, 0xd8, 0xff] as const;
  * the server, not in a decoder in the browser where a blank pane is the only
  * symptom.
  */
+/**
+ * Whether the US-QWERTY table types correctly on this layout. `layout` is the
+ * xkb short name ("us", "us(altgr-intl)") or, for a keymap built without a
+ * layout list, the descriptive name standing in for it ("English (US)");
+ * `name` is the descriptive name. Nothing reported (an older plugin, or one
+ * that could not tell) is trusted, as before the plugins reported layouts.
+ */
+function usCompatibleLayout(layout: string | undefined, name: string | undefined): boolean {
+  if (layout === undefined) return true;
+  const safeName = (value: string) => ASCII_SAFE_US_LAYOUT_NAMES.has(value.toLowerCase());
+  const short = US_LAYOUT.exec(layout);
+  if (short) {
+    if (short[1] !== undefined && !ASCII_SAFE_US_VARIANTS.has(short[1])) return false;
+  } else if (!safeName(layout)) {
+    return false;
+  }
+  return name === undefined || safeName(name);
+}
+
 function previewStill(captured: CaptureEx, source: string): StillFrameCapture {
   if (captured.mime === "image/jpeg") {
     if (!JPEG_SIGNATURE.every((byte, index) => captured.bytes[index] === byte)) {
