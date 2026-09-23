@@ -79,7 +79,10 @@ struct {
     bool agentModifiersInEffect = false;
     SModifierState agentModifiers;
     std::set<uint32_t> humanHeldKeys;
+    int64_t lastAgentInputMs = -1;
 } g;
+int64_t clockMs = 1;
+int64_t nowMs() { return clockMs; }
 SP<CWLSurfaceResource> hitSurface;
 PHLWINDOW hitWindow = std::make_shared<Window>();
 CWLSurfaceResource* pointerEntered = nullptr;
@@ -456,6 +459,7 @@ int main() {
     onSeatKeyboardFocusChange();
     onSeatPointerFocusChange();
     const int wireBefore = pointerEnters + pointerLeaves + keyboardEnters + keyboardLeaves + motions;
+    g.lastAgentInputMs = -1;
     refuse = true;
     expectHumanActive([] { injectButton(272, true); }, "refused click");
     expectHumanActive([] { injectAxis(0, 80); }, "refused scroll");
@@ -463,6 +467,12 @@ int main() {
     refuse = false;
     check(pointerEnters + pointerLeaves + keyboardEnters + keyboardLeaves + motions == wireBefore, "a refused action sent enter, leave or motion events first");
     check(pointerEntered == human.get() && keyboardEntered == human.get(), "a refused action moved the human's focus");
+    // Only delivered input is what waitForSettle waits out.
+    check(g.lastAgentInputMs == -1, "a refused action counted as agent input");
+    clockMs = 42;
+    check(injectKey(30, true) && injectKey(30, false) && g.lastAgentInputMs == 42, "a delivered key did not count as agent input");
+    clockMs = 43;
+    check(injectAxis(0, 80) && g.lastAgentInputMs == 43, "a delivered scroll did not count as agent input");
 
     // Same surface (N3): the human's pointer sits on the very surface the
     // agent aims at. The enter is shared and stays, but every agent burst ends

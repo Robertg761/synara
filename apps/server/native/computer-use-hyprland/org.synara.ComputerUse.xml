@@ -123,6 +123,19 @@
       <arg name="strokes" type="a(ub)" direction="in"/>
       <arg name="delivered" type="u" direction="out"/>
     </method>
+    <!-- Version 2: returns once the window (any window when windowId is
+         empty) has committed at least once after the last agent input (or
+         after this call, when no input is pending) and then stayed quiet for
+         quietMs, with settled=true; or at timeoutMs with settled=false.
+         settled=false at once when no session is running or windowId names
+         no usable window. elapsedMs is the time the call waited. -->
+    <method name="waitForSettle">
+      <arg name="windowId" type="s" direction="in"/>
+      <arg name="quietMs" type="u" direction="in"/>
+      <arg name="timeoutMs" type="u" direction="in"/>
+      <arg name="settled" type="b" direction="out"/>
+      <arg name="elapsedMs" type="u" direction="out"/>
+    </method>
 
     <!-- Capture. PNG bytes; maxDimension 0 keeps native pixels. Failures are
          errors, never an empty array. -->

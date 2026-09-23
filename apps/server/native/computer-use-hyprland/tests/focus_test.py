@@ -201,6 +201,15 @@ class FocusRegressionTest(unittest.TestCase):
         ])
         compile_and_run("stitch_fixture.cpp", production, "synara-stitch-test-", packages=("cairo",))
 
+    def test_wait_for_settle(self):
+        production = definitions(self.source, [
+            ("SSettleWait", "struct"), ("SCommitRecord", "struct"), ("SCommitTracking", "struct"),
+            ("commitTracking", "variable"), ("MAX_SETTLE_TIMEOUT_MS", "variable"), ("MAX_SETTLE_WAITS", "variable"),
+            "replySettleWait", "evaluateSettleWait", "evaluateSettleWaits", "onSettleTimer", "onSurfaceCommit",
+            "stopCommitTracking", "waitForSettle",
+        ])
+        compile_and_run("settle_fixture.cpp", production, "synara-settle-test-")
+
     def test_window_identity(self):
         production = definitions(self.source, [
             ("SWindowIdentity", "struct"), ("windowIdentities", "variable"), ("nextWindowGeneration", "variable"),

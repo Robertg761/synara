@@ -55,6 +55,9 @@
 #include <hyprland/src/devices/Tablet.hpp>
 #include <hyprland/src/protocols/core/Seat.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
+#include <hyprland/src/protocols/core/Subcompositor.hpp>
+#include <hyprland/src/desktop/view/WLSurface.hpp>
+#include <hyprland/src/desktop/view/Popup.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
 #include <hyprland/src/managers/KeybindManager.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
@@ -113,6 +116,10 @@ void driveDbus();
 // Frees the capture stream's idle pixel-pack buffers; defined with the
 // capture jobs, needed when a session stops.
 void releaseIdlePixelPackBuffers();
+// waitForSettle's commit observation, which lives as long as a session;
+// defined with waitForSettle.
+void startCommitTracking();
+void stopCommitTracking();
 
 // ---------------------------------------------------------------------------
 // Constants shared with the KWin plugin. Names and values must stay in lock
@@ -374,6 +381,8 @@ struct SState {
     // Wall-clock bookkeeping, all in steady-clock milliseconds.
     int64_t lastActivityMs   = 0;
     int64_t lastHumanInputMs = -1;
+    // The last input the agent delivered, which waitForSettle waits out.
+    int64_t lastAgentInputMs = -1;
 
     // Bumped on every lock/unlock/VT change. Work started under one epoch
     // (a capture being encoded) answers SessionLocked instead of completing
@@ -1985,6 +1994,7 @@ void stopSession(StopReason reason) {
         g.captureFbs.clear();
     }
     releaseIdlePixelPackBuffers();
+    stopCommitTracking();
 
     if (changed)
         emitSessionStopped(g.stopReason);
@@ -2147,7 +2157,7 @@ std::string modulePath() {
 // is listed here, and falls back to the version-1 methods otherwise, so an
 // installed older plugin keeps working with a newer server.
 constexpr int         INTERFACE_VERSION    = 2;
-constexpr const char* INTERFACE_FEATURES[] = {"captureEx", "keys", "windowsStateJson"};
+constexpr const char* INTERFACE_FEATURES[] = {"captureEx", "keys", "waitForSettle", "windowsStateJson"};
 
 std::string healthJson() {
     ensureReleaseShortcut();
@@ -2365,6 +2375,7 @@ bool startSession() {
     }
     setCursorVisible(true);
     g.pointerWindow = windowAtPoint(g.pos);
+    startCommitTracking();
     noteActivity();
     damageCursorArea();
     return true;
@@ -2485,6 +2496,7 @@ bool movePointer(double x, double y) {
     // The move is the whole action even over empty desktop; focus maintenance
     // rides along so the surface under the ghost tracks it live.
     updatePointerFocus();
+    g.lastAgentInputMs = nowMs();
     return true;
 }
 
@@ -2502,6 +2514,7 @@ bool injectButton(uint32_t button, bool pressed) {
         if (!releasingHeld)
             refuseIfHumanHoldsButton();
         releasePressedButtons(button);
+        g.lastAgentInputMs = nowMs();
         return true;
     }
     settleDeferredReleases();
@@ -2530,6 +2543,7 @@ bool injectButton(uint32_t button, bool pressed) {
         else
             g.pressedButtons.erase(button);
         directPointerButtonEvent(surface, button, pressed);
+        g.lastAgentInputMs = nowMs();
     }
     return true;
 }
@@ -2635,6 +2649,7 @@ bool injectAxis(double horizontal, double vertical) {
         if (version >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(resource);
     }
+    g.lastAgentInputMs = nowMs();
     return true;
 }
 
@@ -2674,6 +2689,7 @@ bool injectKey(uint32_t keyCode, bool pressed) {
         std::erase(g.pressedKeys, keyCode);
     }
     directKeyboardKeyEvent(surface, keyCode, pressed);
+    g.lastAgentInputMs = nowMs();
     ensureXkbState();
     if (g.xkbState) {
         // evdev keycode -> xkb keycode offset is 8.
@@ -3728,6 +3744,234 @@ UP<SCaptureJob> captureRegion(int32_t x, int32_t y, uint32_t width, uint32_t hei
 }
 
 // ---------------------------------------------------------------------------
+// waitForSettle. "Did the application react, and has it finished?" answered
+// from the compositor's own evidence - surface commits - instead of a fixed
+// sleep on the server: the target's first commit after the agent's input,
+// then a quiet period with none. While a session runs, every surface's commit
+// is observed and stamped on the window it belongs to (its popups and
+// subsurfaces included), so a commit that lands between the agent's input and
+// the server's call still counts. A wait is a delayed D-Bus reply and a timer
+// on the Wayland loop; nothing ever blocks the compositor thread.
+// ---------------------------------------------------------------------------
+
+struct SSettleWait {
+    sdbus::Result<bool, uint32_t> reply;
+    // Empty for "any window".
+    PHLWINDOWREF     window;
+    bool             anyWindow   = false;
+    int64_t          startMs     = 0;
+    int64_t          referenceMs = 0; // a commit must come after this
+    int64_t          deadlineMs  = 0;
+    int64_t          quietMs     = 0;
+    int64_t          lastCommitMs = -1; // the latest qualifying commit
+    wl_event_source* timer       = nullptr;
+};
+
+struct SCommitRecord {
+    PHLWINDOWREF window;
+    int64_t      lastMs = -1;
+};
+
+struct SCommitTracking {
+    bool                                                          active = false;
+    CHyprSignalListener                                           newSurface;
+    std::vector<std::pair<WP<CWLSurfaceResource>, CHyprSignalListener>> surfaces;
+    // Keyed by window object; the ref tells a reused address apart.
+    std::unordered_map<const void*, SCommitRecord>                windows;
+    int64_t                                                       anyLastMs = -1;
+    std::vector<UP<SSettleWait>>                                  waits;
+    // The agent input the last settled wait covered: a later input is
+    // "pending" and becomes the next wait's reference.
+    int64_t                                                       settledInputMs = -1;
+};
+SCommitTracking commitTracking;
+
+constexpr uint32_t MAX_SETTLE_TIMEOUT_MS = 30 * 1000;
+constexpr size_t   MAX_SETTLE_WAITS      = 8;
+
+// The window a surface belongs to: its own toplevel surface, a subsurface of
+// it at any depth, or a popup it opened (through the popup's first-tier
+// owner). Null for anything that is not a window's: cursors, layer shells,
+// drag icons, the lock screen.
+PHLWINDOW windowOfSurface(SP<CWLSurfaceResource> surface) {
+    for (int depth = 0; surface && depth < 16; ++depth) {
+        if (surface->m_role && surface->m_role->role() == SURFACE_ROLE_SUBSURFACE) {
+            const auto sub = static_cast<CSubsurfaceRole*>(surface->m_role.get())->m_subsurface.lock();
+            surface        = sub ? sub->t1Parent() : nullptr;
+            continue;
+        }
+        const auto hlSurface = Desktop::View::CWLSurface::fromResource(surface);
+        const auto view      = hlSurface ? hlSurface->view() : nullptr;
+        if (!view)
+            return nullptr;
+        if (view->type() == Desktop::View::VIEW_TYPE_WINDOW)
+            return Desktop::View::CWindow::fromView(view);
+        if (view->type() == Desktop::View::VIEW_TYPE_POPUP) {
+            const auto popup = Desktop::View::CPopup::fromView(view);
+            const auto owner = popup ? popup->getT1Owner() : nullptr;
+            const auto ownerView = owner ? owner->view() : nullptr;
+            if (ownerView && ownerView->type() == Desktop::View::VIEW_TYPE_WINDOW)
+                return Desktop::View::CWindow::fromView(ownerView);
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+void replySettleWait(SSettleWait& wait, bool settled) {
+    if (wait.timer) {
+        wl_event_source_remove(wait.timer);
+        wait.timer = nullptr;
+    }
+    try {
+        wait.reply.returnResults(settled, static_cast<uint32_t>(std::clamp<int64_t>(nowMs() - wait.startMs, 0, std::numeric_limits<uint32_t>::max())));
+    } catch (const sdbus::Error& e) {
+        Log::logger->log(Log::ERR, "[synara] waitForSettle reply failed: {}", e.what());
+    }
+}
+
+// Settled, timed out, still waiting (re-armed), or gone: decides and, unless
+// still waiting, replies. True when the wait is finished.
+bool evaluateSettleWait(SSettleWait& wait) {
+    const int64_t now = nowMs();
+    if (!wait.anyWindow && wait.window.expired()) {
+        replySettleWait(wait, false);
+        return true;
+    }
+    if (wait.lastCommitMs >= 0 && now - wait.lastCommitMs >= wait.quietMs) {
+        if (wait.referenceMs == g.lastAgentInputMs)
+            commitTracking.settledInputMs = std::max(commitTracking.settledInputMs, wait.referenceMs);
+        replySettleWait(wait, true);
+        return true;
+    }
+    if (now >= wait.deadlineMs) {
+        replySettleWait(wait, false);
+        return true;
+    }
+    const int64_t next = wait.lastCommitMs >= 0 ? std::min(wait.lastCommitMs + wait.quietMs, wait.deadlineMs) : wait.deadlineMs;
+    if (wait.timer)
+        wl_event_source_timer_update(wait.timer, static_cast<int>(std::max<int64_t>(1, next - now)));
+    return false;
+}
+
+void evaluateSettleWaits() {
+    const size_t before = commitTracking.waits.size();
+    std::erase_if(commitTracking.waits, [](const UP<SSettleWait>& wait) { return evaluateSettleWait(*wait); });
+    if (commitTracking.waits.size() != before)
+        driveDbus();
+}
+
+int onSettleTimer(void* /*data*/) {
+    evaluateSettleWaits();
+    return 0;
+}
+
+void onSurfaceCommit(const SP<CWLSurfaceResource>& surface) {
+    const auto window = windowOfSurface(surface);
+    if (!window)
+        return;
+    const int64_t now    = nowMs();
+    auto&         record = commitTracking.windows[window.get()];
+    if (record.window.lock() != window)
+        record.window = window;
+    record.lastMs            = now;
+    commitTracking.anyLastMs = now;
+    for (const auto& wait : commitTracking.waits) {
+        if (!wait->anyWindow && wait->window.lock() != window)
+            continue;
+        if (now <= wait->referenceMs)
+            continue;
+        wait->lastCommitMs = now;
+        // Quiet from here on: the settle point moves out.
+        if (wait->timer)
+            wl_event_source_timer_update(wait->timer, static_cast<int>(std::max<int64_t>(1, std::min(now + wait->quietMs, wait->deadlineMs) - now)));
+    }
+}
+
+void trackSurfaceCommits(const SP<CWLSurfaceResource>& surface) {
+    if (!surface)
+        return;
+    const WP<CWLSurfaceResource> weak = surface;
+    commitTracking.surfaces.emplace_back(weak, surface->m_events.commit.listen([weak] {
+        if (const auto alive = weak.lock())
+            onSurfaceCommit(alive);
+    }));
+}
+
+// Commits are observed only while a session runs: an idle desktop pays
+// nothing per frame for a feature nobody is using.
+void startCommitTracking() {
+    if (commitTracking.active || !PROTO::compositor)
+        return;
+    commitTracking.active     = true;
+    commitTracking.newSurface = PROTO::compositor->m_events.newSurface.listen([](SP<CWLSurfaceResource> surface) {
+        // Listeners of destroyed surfaces are dropped as new ones arrive, so
+        // the list stays the size of the live surface set.
+        std::erase_if(commitTracking.surfaces, [](const auto& entry) { return entry.first.expired(); });
+        trackSurfaceCommits(surface);
+    });
+    PROTO::compositor->forEachSurface([](SP<CWLSurfaceResource> surface) { trackSurfaceCommits(surface); });
+}
+
+// Answers every wait (not settled) and stops observing; on session stop and
+// at unload, before the bus goes.
+void stopCommitTracking() {
+    std::vector<UP<SSettleWait>> waits;
+    waits.swap(commitTracking.waits);
+    for (const auto& wait : waits)
+        replySettleWait(*wait, false);
+    commitTracking.newSurface.reset();
+    commitTracking.surfaces.clear();
+    commitTracking.windows.clear();
+    commitTracking.anyLastMs = -1;
+    commitTracking.active    = false;
+    if (!waits.empty())
+        driveDbus();
+}
+
+void waitForSettle(sdbus::Result<bool, uint32_t>&& result, const std::string& windowId, uint32_t quietMs, uint32_t timeoutMs) {
+    requireUnlockedSession();
+    auto wait     = makeUnique<SSettleWait>();
+    wait->reply   = std::move(result);
+    wait->startMs = nowMs();
+    PHLWINDOW window;
+    if (!windowId.empty()) {
+        window = findWindowById(windowId);
+        if (!usableWindow(window))
+            window = nullptr;
+    }
+    // Nothing to observe: no session, or a window that is not there.
+    if (!g.running || !commitTracking.active || (!windowId.empty() && !window)) {
+        replySettleWait(*wait, false);
+        return;
+    }
+    if (commitTracking.waits.size() >= MAX_SETTLE_WAITS)
+        throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.LimitsExceeded"},
+                           std::format("at most {} waitForSettle calls may be pending at once", MAX_SETTLE_WAITS));
+    wait->anyWindow  = windowId.empty();
+    wait->window     = window;
+    wait->quietMs    = quietMs;
+    wait->deadlineMs = wait->startMs + std::min(timeoutMs, MAX_SETTLE_TIMEOUT_MS);
+    // An agent input the last settled wait has not covered is what this one
+    // waits out; with none pending, whatever happens after the call.
+    const bool inputPending = g.lastAgentInputMs >= 0 && g.lastAgentInputMs > commitTracking.settledInputMs;
+    wait->referenceMs       = inputPending ? g.lastAgentInputMs : wait->startMs;
+    int64_t lastCommit      = commitTracking.anyLastMs;
+    if (!wait->anyWindow) {
+        const auto record = commitTracking.windows.find(window.get());
+        lastCommit        = record != commitTracking.windows.end() && record->second.window.lock() == window ? record->second.lastMs : -1;
+    }
+    if (lastCommit > wait->referenceMs)
+        wait->lastCommitMs = lastCommit;
+    wait->timer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, onSettleTimer, nullptr);
+    if (!wait->timer)
+        throw sdbus::Error(sdbus::Error::Name{ERR_CAPTURE}, "waitForSettle could not be scheduled");
+    if (evaluateSettleWait(*wait))
+        return;
+    commitTracking.waits.push_back(std::move(wait));
+}
+
+// ---------------------------------------------------------------------------
 // D-Bus plumbing: the connection's fds run on Hyprland's Wayland event loop,
 // so handlers execute on the compositor thread with no locking.
 //
@@ -3871,6 +4115,13 @@ void setupDbus() {
                     sdbus::registerMethod("key").implementedAs([](uint32_t keyCode, bool pressed) { g.authentication->require(); return injectKey(keyCode, pressed); }),
                     sdbus::registerMethod("keys").implementedAs([](const std::vector<sdbus::Struct<uint32_t, bool>>& strokes) { g.authentication->require(); return injectKeys(strokes); }),
                     sdbus::registerMethod("windowsStateJson").implementedAs([]() { g.authentication->require(); return windowsStateJson(); }),
+                    // Asynchronous: the reply follows from a timer or a
+                    // surface commit, never from a wait on this thread.
+                    sdbus::registerMethod("waitForSettle")
+                        .implementedAs([](sdbus::Result<bool, uint32_t> result, const std::string& id, uint32_t quietMs, uint32_t timeoutMs) {
+                            g.authentication->require();
+                            waitForSettle(std::move(result), id, quietMs, timeoutMs);
+                        }),
                     // Asynchronous on the bus: the handler returns once the
                     // GPU work is done and the reply follows from
                     // onCaptureDone. An exception thrown here still becomes
