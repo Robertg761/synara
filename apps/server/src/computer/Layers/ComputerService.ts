@@ -293,8 +293,10 @@ class LinuxBackendStartup {
     void this.plan
       .select()
       .then(async (next) => {
-        // The same tier again is the occupant's own reconnect to handle; a
-        // newer occupant already replaced the one that reported.
+        // The same tier again is the occupant's own reconnect to handle (a
+        // backend that reports desktop-gone keeps looking for its desktop;
+        // see the event's contract); a newer occupant already replaced the
+        // one that reported.
         if (this.stopped || this.slot.current !== gone || next.choice === this.current.choice) {
           await next.backend.dispose();
           return;
