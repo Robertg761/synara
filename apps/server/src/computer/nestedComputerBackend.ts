@@ -648,6 +648,25 @@ export class NestedComputerBackend extends KWinComputerBackend {
     await this.parking;
   }
 
+  /**
+   * The desktop in use ended by itself — a crash, or a window the human
+   * closed. It is dormant from here, exactly as the reconnect loop would
+   * conclude after a failed attempt, so the loop is not started at all: the
+   * next real use boots a fresh session. A session this backend retired
+   * itself (idle shutdown, a replacement, dispose) is no longer `ref.session`
+   * and is ignored.
+   */
+  private sessionExited(session: NestedKWinSession, reason: string): void {
+    if (this.disposing || this.ref.session !== session) return;
+    this.releaseConnection(
+      new ComputerBackendError(desktopDormantMessage(this.mode), {
+        dormant: true,
+        retryable: true,
+        cause: new Error(reason),
+      }),
+    );
+  }
+
   /** What the base class's lazy `dbusFactory` resolves to: session, then bus. */
   private async connectToNestedSession(context: KWinDbusConnectContext): Promise<KWinComputerDbus> {
     const session = await this.ensureSession(context.automatic);
@@ -769,6 +788,9 @@ export class NestedComputerBackend extends KWinComputerBackend {
       throw shutDownWhileStarting();
     }
     this.ref.session = session;
+    // The session ending takes its bus with it; drop the connection now rather
+    // than let the next call find the bus dead.
+    session.onExit?.((reason) => this.sessionExited(session, reason));
     this.sessionStarted = true;
     this.parked = false;
     this.lastSize = session.size;

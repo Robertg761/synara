@@ -79,8 +79,15 @@ function fakeDbus(loaded: readonly string[] = [PLUGIN_ID]): KWinComputerDbus {
 interface Harness {
   readonly backend: NestedComputerBackend;
   readonly sessionStarts: NestedKWinSessionOptions[];
-  /** One entry per default-fixture session, with a way to end its processes. */
-  readonly startedSessions: Array<{ readonly busAddress: string; kill: (reason?: string) => void }>;
+  /**
+   * One entry per default-fixture session, with a way to end its processes.
+   * `busSurvives` holds back the bus disconnect, leaving the session's own
+   * exit notice as the only signal.
+   */
+  readonly startedSessions: Array<{
+    readonly busAddress: string;
+    kill: (reason?: string, options?: { readonly busSurvives?: boolean }) => void;
+  }>;
   readonly disposedSessions: string[];
   /** One entry per connectDbus call, with a way to drop that connection. */
   readonly dbusHandles: Array<ReturnType<typeof fakeDbusHandle>>;
@@ -137,15 +144,17 @@ function makeHarness(
       sessionStarts.push(sessionOptions);
       const busAddress = `unix:abstract=fake-${sessionStarts.length}`;
       let exitReason: string | undefined;
+      const exitListeners = new Set<(reason: string) => void>();
       startedSessions.push({
         busAddress,
-        // A real session takes its private bus down with the compositor, which
-        // is what makes the disconnect reach every client. Nothing here fires
-        // that by hand: a test that has to nudge the connection is a test that
-        // would pass with the self-heal removed.
-        kill: (reason = "exit code 0, signal null") => {
+        // A real session announces its exit, then takes its private bus down
+        // with the compositor, which is what makes the disconnect reach every
+        // client. Nothing here fires that by hand: a test that has to nudge
+        // the connection is a test that would pass with the self-heal removed.
+        kill: (reason = "exit code 0, signal null", killOptions = {}) => {
           exitReason = reason;
-          busHandles.get(busAddress)?.fireDisconnect();
+          for (const listener of exitListeners) listener(reason);
+          if (killOptions.busSurvives !== true) busHandles.get(busAddress)?.fireDisconnect();
         },
       });
       return {
@@ -155,6 +164,10 @@ function makeHarness(
         pluginId: PLUGIN_ID,
         xDisplay: ":7",
         exited: () => exitReason,
+        onExit: (listener) => {
+          exitListeners.add(listener);
+          return () => exitListeners.delete(listener);
+        },
         liveApplicationCount: () => options.liveApplications?.() ?? 0,
         spawnApp: () => {
           throw new Error("no application is launched in this suite");
@@ -830,6 +843,38 @@ describe("provision", () => {
     expect(harness.sessionStarts).toHaveLength(2);
     expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
     await harness.backend.dispose();
+  });
+
+  it("drops the connection the moment its session exits, without waiting on the bus", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeHarness();
+      await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+      expect(harness.backend.health().status).toBe("connected");
+
+      // The compositor is gone and the bus has not noticed yet: the session's
+      // own exit notice is enough to stop calling the desktop connected.
+      harness.startedSessions[0]?.kill("exit code 1, signal null", { busSurvives: true });
+      expect(harness.backend.health()).toMatchObject({
+        status: "unavailable",
+        lastFailure: { message: expect.stringContaining("not running") },
+      });
+
+      // Dormant straight away, so no reconnect loop spins up to find that out.
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(harness.dbusHandles).toHaveLength(1);
+      expect(harness.sessionStarts).toHaveLength(1);
+
+      // The next real use boots a fresh desktop.
+      await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+      expect(harness.sessionStarts).toHaveLength(2);
+      // An exit of the session it already replaced changes nothing.
+      harness.startedSessions[0]?.kill("exit code 1, signal null", { busSurvives: true });
+      expect(harness.backend.health().status).toBe("connected");
+      await harness.backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("recreates the AT-SPI client for the replacement session after the desktop dies", async () => {

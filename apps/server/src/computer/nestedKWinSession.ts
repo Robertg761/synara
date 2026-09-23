@@ -191,6 +191,13 @@ export interface NestedKWinSession {
    */
   readonly exited: () => string | undefined;
   /**
+   * Calls `listener` with that same reason the moment the session ends —
+   * once, whichever process went first — so a holder of its bus connection can
+   * drop it then rather than learn it from the next call. Returns the
+   * unsubscribe. Optional only so test doubles can leave it out.
+   */
+  readonly onExit?: (listener: (reason: string) => void) => () => void;
+  /**
    * How many applications the agent launched here are still running. A
    * session with any is never shut down for being idle: the app is the
    * agent's work in progress. Optional only so test doubles can leave it out.
@@ -241,6 +248,7 @@ export async function startNestedKWinSession(
   let runtimeDirectory: string | undefined;
   let marker: SessionMarkerWriter | undefined;
   let firstExit: string | undefined;
+  const exitListeners = new Set<(reason: string) => void>();
   let disposal: Promise<void> | undefined;
   const disposeHandle = Symbol(waylandDisplay);
   const dispose = () => (disposal ??= disposeSession());
@@ -381,6 +389,10 @@ export async function startNestedKWinSession(
       // the *first* ending is the reason worth reporting: the second is this
       // module's own teardown signal.
       exited: () => firstExit ?? kwin.exitDiagnostic() ?? bus.exitDiagnostic(),
+      onExit: (listener) => {
+        exitListeners.add(listener);
+        return () => exitListeners.delete(listener);
+      },
       liveApplicationCount: () => launchedApps.size,
       spawnApp: (app, args, spawnOptions) =>
         spawnIntoSession(
@@ -412,7 +424,17 @@ export async function startNestedKWinSession(
       ...[...launchedApps].map((child) => child.pid),
     ]);
     const endSession = (reason: string) => {
-      firstExit ??= reason;
+      if (firstExit === undefined) {
+        firstExit = reason;
+        for (const listener of exitListeners) {
+          try {
+            listener(reason);
+          } catch {
+            // One holder's failure must not keep the session from ending.
+          }
+        }
+        exitListeners.clear();
+      }
       void dispose().catch(() => undefined);
     };
     kwin.onExit(endSession);
@@ -464,8 +486,8 @@ class SessionMarkerWriter {
     if (pid === undefined || this.removed) return;
     const entry = describeNestedSessionProcess(pid, role, this.registry);
     if (entry && entry.command !== this.ownCommand) {
-    this.processes.set(entry.pid, entry);
-    this.flush();
+      this.processes.set(entry.pid, entry);
+      this.flush();
       return;
     }
     if (attempt >= MARKER_RECORD_ATTEMPTS) return;

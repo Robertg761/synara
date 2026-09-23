@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { resolveSynaraPluginLoad } from "./KWinComputerBackend.ts";
@@ -494,6 +494,28 @@ describe("a session that loses one of its own processes", () => {
     // Not "signal SIGTERM": that is this module's own teardown answering.
     expect(session.exited()).toBe("exit code 7, signal null");
     expect(harness.tornDown).toContain(kwin?.child.pid);
+  });
+
+  it("tells exit listeners once, with the first reason, before its bus goes down", async () => {
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(harness.options());
+    const [bus, kwin] = harness.spawns;
+    const reasons: string[] = [];
+    const busAliveAtNotice: boolean[] = [];
+    session.onExit?.((reason) => {
+      reasons.push(reason);
+      busAliveAtNotice.push(!harness.tornDown.includes(bus!.child.pid));
+    });
+    const unsubscribed = vi.fn();
+    session.onExit?.(unsubscribed)();
+
+    kwin?.child.end("SIGSEGV");
+    await settle();
+
+    expect(reasons).toEqual(["exit code null, signal SIGSEGV"]);
+    expect(busAliveAtNotice).toEqual([true]);
+    expect(unsubscribed).not.toHaveBeenCalled();
+    expect(harness.tornDown).toContain(bus?.child.pid);
   });
 
   it("removes its marker, so the next server does not try to reap a dead session", async () => {
