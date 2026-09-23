@@ -36,6 +36,7 @@ export class FakePlugin implements KWinComputerPluginApi {
   /** `null` mirrors a plugin whose shortcut registration failed. */
   releaseShortcut: string | null | undefined;
   keyboardLayout: string | undefined;
+  keyboardLayoutName: string | undefined;
   readonly calls: Array<{ readonly method: string; readonly args: readonly unknown[] }> = [];
   capture = true;
   captureBytes: Uint8Array = PNG_1X1;
@@ -95,6 +96,9 @@ export class FakePlugin implements KWinComputerPluginApi {
       position: this.position,
       targetWindowId: this.targetWindowId,
       ...(this.keyboardLayout === undefined ? {} : { keyboardLayout: this.keyboardLayout }),
+      ...(this.keyboardLayoutName === undefined
+        ? {}
+        : { keyboardLayoutName: this.keyboardLayoutName }),
       ...this.humanState,
     });
   windowsJson = async () => JSON.stringify(this.windows);

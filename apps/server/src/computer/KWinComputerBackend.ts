@@ -193,11 +193,21 @@ const LAUNCH_EXIT_GRACE_MS = 300;
 /** A spawn that emits neither `spawn` nor `error` must still fail the call. */
 const LAUNCH_SPAWN_DEADLINE_MS = 5_000;
 /**
- * The xkb layouts the US-QWERTY evdev table is correct for: the base US
- * layout and its variants (`us(intl)`, `us(altgr-intl)`, ...), which keep the
- * unshifted and shifted ASCII positions this table encodes.
+ * The xkb layouts the US-QWERTY evdev table is correct for: the base US layout
+ * and the variants that keep every unshifted and shifted ASCII character on
+ * its US key with no dead keys in the way. Not Dvorak or Colemak (the letters
+ * move), not `intl`/`alt-intl` (quotes, backtick, tilde and caret are dead
+ * keys). The plugins report the layout's short name without its variant
+ * ("us" for all of them), so the variant is read off the descriptive name
+ * xkeyboard-config gives each one, which they report beside it.
  */
-const US_COMPATIBLE_LAYOUT = /^us(?:\(|$)/;
+const US_LAYOUT = /^us(?:\(([^)]*)\))?$/;
+const ASCII_SAFE_US_VARIANTS: ReadonlySet<string> = new Set(["altgr-intl", "euro"]);
+const ASCII_SAFE_US_LAYOUT_NAMES: ReadonlySet<string> = new Set([
+  "English (US)",
+  "English (intl., with AltGr dead keys)",
+  "English (US, euro on 5)",
+]);
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
 const MIN_IDLE_TIMEOUT_MS = 1_000;
 const MAX_IDLE_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -318,6 +328,8 @@ interface KWinPluginState {
   readonly capsLockOn: boolean | undefined;
   /** The xkb layout name of the seat keymap in use; `undefined` on an older build. */
   readonly keyboardLayout: string | undefined;
+  /** Its descriptive xkeyboard-config name ("English (Dvorak)"), which names the variant. */
+  readonly keyboardLayoutName: string | undefined;
 }
 
 /** What a desktop application is spawned with, beyond its command line. */
@@ -1423,10 +1435,21 @@ export class KWinComputerBackend implements ComputerBackend {
    */
   private assertUsCompatibleLayout(state: KWinPluginState, action: string): void {
     const layout = state.keyboardLayout;
-    if (layout === undefined || US_COMPATIBLE_LAYOUT.test(layout)) return;
+    if (layout === undefined) return;
+    const variant = US_LAYOUT.exec(layout);
+    const name = state.keyboardLayoutName;
+    if (
+      variant &&
+      (variant[1] === undefined || ASCII_SAFE_US_VARIANTS.has(variant[1])) &&
+      (name === undefined || ASCII_SAFE_US_LAYOUT_NAMES.has(name))
+    ) {
+      return;
+    }
+    const described = name && name !== layout ? `${layout}, ${name}` : layout;
     throw new ComputerBackendError(
-      `The active keyboard layout is ${JSON.stringify(layout)}, and Synara can only synthesise ` +
-        `characters on the US layout ("us" and its variants), so ${action} was refused before any ` +
+      `The active keyboard layout is ${JSON.stringify(described)}, and Synara can only synthesise ` +
+        "characters on the plain US layout (or US with AltGr dead keys), so " +
+        `${action} was refused before any ` +
         "key was sent. Named keys — Enter, Escape, Tab, arrows, function keys, modifiers — still " +
         "work; for text, use computer_set_value on the control or switch the layout to US.",
     );
@@ -2552,6 +2575,7 @@ export class KWinComputerBackend implements ComputerBackend {
       capsLockOn:
         parsed.capsLockOn === true ? true : parsed.capsLockOn === false ? false : undefined,
       keyboardLayout: asString(parsed.keyboardLayout),
+      keyboardLayoutName: asString(parsed.keyboardLayoutName),
     };
   }
 

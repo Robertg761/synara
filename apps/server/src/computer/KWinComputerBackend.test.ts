@@ -3770,10 +3770,40 @@ describe("KWinComputerBackend supervision", () => {
     await backend.hotkey(["ctrl", "F5"]);
     expect(dbus.plugin.calls.filter((call) => call.method === "key").length).toBeGreaterThan(0);
 
-    dbus.plugin.keyboardLayout = "us(intl)";
+    dbus.plugin.keyboardLayout = "us(altgr-intl)";
     dbus.plugin.calls.length = 0;
     await backend.typeText("ok");
     expect(dbus.plugin.calls.filter((call) => call.method === "key")).toHaveLength(4);
+    await backend.dispose();
+  });
+
+  it("refuses US variants that move letters or add dead keys, however the plugin names them", async () => {
+    const dbus = new FakeDbus();
+    const backend = makeBackend(dbus);
+    await backend.availability();
+    // What both plugins actually report: the short name without the variant,
+    // and xkeyboard-config's descriptive name beside it.
+    dbus.plugin.keyboardLayout = "us";
+    for (const name of ["English (Dvorak)", "English (Colemak)", "English (US, intl., with dead keys)"]) {
+      dbus.plugin.keyboardLayoutName = name;
+      await expect(backend.typeText("ok")).rejects.toMatchObject({
+        retryable: false,
+        message: expect.stringContaining(name),
+      });
+    }
+    for (const layout of ["us(dvorak)", "us(colemak)", "us(intl)"]) {
+      dbus.plugin.keyboardLayout = layout;
+      dbus.plugin.keyboardLayoutName = undefined;
+      await expect(backend.typeText("ok")).rejects.toMatchObject({ retryable: false });
+    }
+    // Named keys never depend on the layout.
+    await backend.pressKey("Enter");
+
+    dbus.plugin.keyboardLayout = "us";
+    for (const name of ["English (US)", "English (intl., with AltGr dead keys)"]) {
+      dbus.plugin.keyboardLayoutName = name;
+      await expect(backend.typeText("ok")).resolves.toEqual({ value: "ok" });
+    }
     await backend.dispose();
   });
 
