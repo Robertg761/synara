@@ -14,6 +14,7 @@
 #include "core/renderloop.h"
 #include "core/rendertarget.h"
 #include "core/session.h"
+#include "compositor.h"
 #include "cursor.h"
 #include "effect/effecthandler.h"
 #include "input.h"
@@ -1509,6 +1510,16 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
     m_captureTargetIdle.setSingleShot(true);
     m_captureTargetIdle.setInterval(s_captureTargetIdleMs);
     connect(&m_captureTargetIdle, &QTimer::timeout, this, &SynaraComputerUsePlugin::releaseCaptureTargets);
+    // The targets are objects of the compositor's GL context, and a
+    // compositing restart (a GPU reset, a driver change) replaces that
+    // context. Both signals come while the old one is still alive - before
+    // the effects handler and the renderer go - so the targets are deleted in
+    // it rather than abandoned; the pool's own context check stays as the
+    // backstop for a replacement nothing announced.
+    if (Compositor *compositor = Compositor::self()) {
+        connect(compositor, &Compositor::aboutToToggleCompositing, this, &SynaraComputerUsePlugin::releaseCaptureTargets);
+        connect(compositor, &Compositor::aboutToDestroy, this, &SynaraComputerUsePlugin::releaseCaptureTargets);
+    }
     m_captureEncodeWatchdog.setSingleShot(true);
     connect(&m_captureEncodeWatchdog, &QTimer::timeout, this, [this]() {
         if (m_captureRequest) {
