@@ -520,3 +520,65 @@ describe("batched typing through keys", () => {
     expect(callsOf(plugin, "key")).toBe(6);
   });
 });
+
+describe("luma capture", () => {
+  it("captures a window as raw luma through captureWindowEx, with the screenshot's geometry", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["captureEx"];
+    plugin.workspace = { x: 0, y: 0, width: 5_120, height: 2_520 };
+    // The fake window is 648x518 at (956, 1519); rendered at half size.
+    plugin.captureMime = "image/x-luma8; width=324; height=259";
+    plugin.captureBytes = new Uint8Array(324 * 259).fill(7);
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const luma = await backend.captureLuma({ kind: "window", windowId: "window-1" });
+    expect(luma).toMatchObject({ width: 324, height: 259, scale: 0.5 });
+    expect(luma.data.byteLength).toBe(324 * 259);
+    expect(plugin.calls).toContainEqual({
+      method: "captureWindowEx",
+      args: ["window-1", 1_536, 4],
+    });
+  });
+
+  it("captures a region as luma in the plugin's global space", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["captureEx"];
+    plugin.workspace = { x: -100, y: 0, width: 1_000, height: 800 };
+    plugin.captureMime = "image/x-luma8; width=200; height=100";
+    plugin.captureBytes = new Uint8Array(200 * 100);
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const luma = await backend.captureLuma({
+      kind: "region",
+      region: { x: 0, y: 0, width: 200, height: 100 },
+      maxDimension: 800,
+    });
+    expect(luma.scale).toBe(1);
+    expect(plugin.calls).toContainEqual({
+      method: "captureRegionEx",
+      args: [-100, 0, 200, 100, 800, 4],
+    });
+  });
+
+  it("refuses luma whose bytes do not fill the size it names", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["captureEx"];
+    plugin.captureMime = "image/x-luma8; width=10; height=10";
+    plugin.captureBytes = new Uint8Array(99);
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    await expect(backend.captureLuma({ kind: "window", windowId: "window-1" })).rejects.toThrow(
+      "usable luma image",
+    );
+  });
+
+  it("refuses on a plugin without captureEx, so the manager takes a screenshot", async () => {
+    const plugin = new FakePlugin();
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    await expect(backend.captureLuma({ kind: "window", windowId: "window-1" })).rejects.toThrow(
+      "cannot capture raw luma",
+    );
+    expect(callsOf(plugin, "captureWindowEx")).toBe(0);
+  });
+});

@@ -42,6 +42,7 @@ import {
   type ComputerBackendEventListener,
   type ComputerCaptureRequest,
   type ComputerFrameListener,
+  type ComputerLumaCapture,
   type ComputerResolvedTarget,
   type ComputerTextRange,
 } from "./ComputerBackend.ts";
@@ -2058,17 +2059,85 @@ export class KWinComputerBackend implements ComputerBackend {
    * Zoomed perception for the agent. The workspace shot in `getState` is one
    * downscaled image of every monitor, so small text is unreadable; this
    * captures a single window or region, which spends the same pixel budget on a
-   * fraction of the desktop.
-   *
-   * The returned `region` is always what KWin actually captured: the plugin
-   * clips both forms to the workspace geometry, and a window capture uses the
-   * window's `frameGeometry`, which is the same rect `windowsJson` reports. The
-   * scale is derived from the encoded PNG rather than assumed, because the
-   * plugin renders at the output's device pixel ratio and only then downscales
-   * to `maxDimension`.
+   * fraction of the desktop. See `resolveCaptureTarget` for the region.
    */
   async captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot> {
     const maxDimension = request.maxDimension ?? this.captureMaxDimension;
+    const target = await this.resolveCaptureTarget(request);
+    const bytes =
+      target.kind === "window"
+        ? await this.captureWindow(target.windowId, maxDimension, target.pixels)
+        : await this.captureRegion(
+            target.global.x,
+            target.global.y,
+            target.global.width,
+            target.global.height,
+            maxDimension,
+          );
+    return this.screenshot(bytes, target.region);
+  }
+
+  /**
+   * The same capture as `captureScreenshot`, as raw luma, for a picture that
+   * is only ever measured (the scroll baseline). The plugin renders it through
+   * the same plan as the PNG — same size, same scale — and derives each byte
+   * from the RGB the PNG would carry, `floor((299 R + 587 G + 114 B) / 1000)`,
+   * so the two correlate exactly. A plugin without `captureEx` refuses, and
+   * the manager takes a screenshot instead.
+   */
+  async captureLuma(request: ComputerCaptureRequest): Promise<ComputerLumaCapture> {
+    const plugin = await this.ensurePlugin({ start: false });
+    this.assertCaptureSupported();
+    const ex = this.pluginFeature("captureEx") ? plugin : undefined;
+    const captureWindowEx = ex?.captureWindowEx;
+    const captureRegionEx = ex?.captureRegionEx;
+    if (!captureWindowEx || !captureRegionEx) {
+      throw new ComputerBackendError(
+        `The loaded Synara ${this.integrationName} plugin cannot capture raw luma.`,
+      );
+    }
+    const maxDimension = normalizeDimension(request.maxDimension ?? this.captureMaxDimension);
+    const target = await this.resolveCaptureTarget(request);
+    const flags = COMPUTER_CAPTURE_FLAGS.luma;
+    const reply = await this.enqueueCapture(() =>
+      this.pluginValue(() =>
+        target.kind === "window"
+          ? captureWindowEx(target.windowId, maxDimension, flags, target.pixels)
+          : captureRegionEx(
+              target.global.x,
+              target.global.y,
+              target.global.width,
+              target.global.height,
+              maxDimension,
+              flags,
+            ),
+      ),
+    );
+    const luma = readLumaCapture(readCaptureEx(reply), this.captureSource);
+    return { ...luma, scale: luma.width / target.region.width };
+  }
+
+  /**
+   * What a capture request photographs: the window (clipped to the workspace
+   * the way the plugin clips it) or the region, as the agent-space rect the
+   * pixels will be mapped against and the global rect the plugin is asked for.
+   *
+   * The returned `region` is always what KWin actually captures: the plugin
+   * clips both forms to the workspace geometry, and a window capture uses the
+   * window's `frameGeometry`, which is the same rect `windowsJson` reports.
+   * The scale is derived from the delivered image rather than assumed, because
+   * the plugin renders at the output's device pixel ratio and only then
+   * downscales to `maxDimension`.
+   */
+  private async resolveCaptureTarget(request: ComputerCaptureRequest): Promise<
+    | {
+        readonly kind: "window";
+        readonly windowId: string;
+        readonly region: ComputerRect;
+        readonly pixels: number;
+      }
+    | { readonly kind: "region"; readonly global: ComputerRect; readonly region: ComputerRect }
+  > {
     if (request.kind === "window") {
       const [windows, origin] = await this.readWindows();
       const window = windows.find((candidate) => candidate.id === request.windowId);
@@ -2095,10 +2164,12 @@ export class KWinComputerBackend implements ComputerBackend {
           `Window ${JSON.stringify(request.windowId)} sits outside the desktop workspace and has nothing to capture.`,
         );
       }
-      return this.screenshot(
-        await this.captureWindow(request.windowId, maxDimension, region.width * region.height),
+      return {
+        kind: "window",
+        windowId: request.windowId,
         region,
-      );
+        pixels: region.width * region.height,
+      };
     }
 
     const requested = request.region;
@@ -2128,10 +2199,7 @@ export class KWinComputerBackend implements ComputerBackend {
           "Regions use desktop logical pixels, the same space as window bounds.",
       );
     }
-    return this.screenshot(
-      await this.captureRegion(global.x, global.y, global.width, global.height, maxDimension),
-      shiftRect(global, -origin.x, -origin.y),
-    );
+    return { kind: "region", global, region: shiftRect(global, -origin.x, -origin.y) };
   }
 
   async dispose(): Promise<void> {
@@ -4124,6 +4192,22 @@ function readSettleReply(value: unknown): readonly [settled: boolean, elapsedMs:
 /** A wait length the plugin's `u` argument can carry. */
 function clampMilliseconds(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.min(0xffff_ffff, Math.floor(value))) : 0;
+}
+
+const LUMA_MIME = /^image\/x-luma8;\s*width=(\d+);\s*height=(\d+)$/;
+
+/** A luma capture's size comes in its MIME type, and the bytes must fill it exactly. */
+function readLumaCapture(
+  captured: CaptureEx,
+  source: string,
+): { readonly width: number; readonly height: number; readonly data: Uint8Array } {
+  const match = LUMA_MIME.exec(captured.mime);
+  const width = Number(match?.[1]);
+  const height = Number(match?.[2]);
+  if (!match || width <= 0 || height <= 0 || captured.bytes.byteLength !== width * height) {
+    throw new ComputerBackendError(`${source} did not return a usable luma image.`);
+  }
+  return { width, height, data: captured.bytes };
 }
 
 /** A `captureWindowEx`/`captureRegionEx` reply: the bytes and their MIME type. */

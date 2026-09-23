@@ -724,16 +724,27 @@ static EncodedCapture encodeImage(QImage image, CaptureFormat format, bool opaqu
         return {jpeg, QStringLiteral("image/jpeg")};
     }
     case CaptureFormat::Luma: {
-        image = image.convertToFormat(QImage::Format_Grayscale8);
+        // The server correlates this against the PNG of the same capture
+        // (scroll measurement), decoding that PNG's RGB as
+        // floor((299 R + 587 G + 114 B) / 1000). So the bytes come from the
+        // very pixels the PNG path would write — the same conversion, alpha
+        // unpremultiplied the same way — through that same integer formula.
+        // Qt's Grayscale8 conversion is colour-managed and differs by a few
+        // levels on most pixels.
+        image = image.convertToFormat(opaque ? QImage::Format_RGBX8888 : QImage::Format_RGBA8888);
         if (image.isNull()) {
             *error = QStringLiteral("luma conversion failed");
             return {};
         }
-        // QImage pads every scanline to four bytes; the wire format has none.
-        const qsizetype width = image.width();
-        QByteArray luma(width * image.height(), Qt::Uninitialized);
+        const int width = image.width();
+        QByteArray luma(qsizetype(width) * image.height(), Qt::Uninitialized);
         for (int y = 0; y < image.height(); ++y) {
-            std::memcpy(luma.data() + y * width, image.constScanLine(y), size_t(width));
+            const uchar *row = image.constScanLine(y);
+            uchar *out = reinterpret_cast<uchar *>(luma.data()) + qsizetype(y) * width;
+            for (int x = 0; x < width; ++x) {
+                const uchar *pixel = row + 4 * x;
+                out[x] = uchar((299u * pixel[0] + 587u * pixel[1] + 114u * pixel[2]) / 1000u);
+            }
         }
         return {luma, QStringLiteral("image/x-luma8; width=%1; height=%2").arg(image.width()).arg(image.height())};
     }
@@ -777,9 +788,10 @@ static EncodedCapture encodeCapture(const QList<CapturePart> &parts, const Captu
     // empty nested desktop, entirely) transparent PNG that viewers and models
     // flatten to white — nothing like the black the visible output shows. Only
     // a single-window PNG keeps alpha: there the surround genuinely is "not
-    // this window" rather than screen the compositor painted black. JPEG and
-    // luma have no alpha to keep it in.
-    const bool opaqueBackground = !windowCapture || format != CaptureFormat::Png;
+    // this window" rather than screen the compositor painted black. JPEG has
+    // no alpha to keep it in. Luma is composed exactly as the PNG is, because
+    // it is measured against one.
+    const bool opaqueBackground = !windowCapture || format == CaptureFormat::Jpeg;
     image.fill(opaqueBackground ? QColor(Qt::black) : QColor(Qt::transparent));
 
     QPainter painter(&image);
