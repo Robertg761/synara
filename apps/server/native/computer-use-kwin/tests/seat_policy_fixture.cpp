@@ -203,6 +203,7 @@ struct SeatInterface {
     // The agent seat's side, never reached: every scenario drives the direct path.
     void notifyPointerEnter(SurfaceInterface*, const QPointF&, const QMatrix4x4&) { throw std::runtime_error("agent seat used"); }
     void notifyPointerMotion(const QPointF&) { throw std::runtime_error("agent seat used"); }
+    quint32 pointerButtonSerial(quint32) const { return 0; }
     void notifyPointerButton(quint32, PointerButtonState) { throw std::runtime_error("agent seat used"); }
     void notifyPointerFrame() {}
     void notifyPointerLeave() {}
@@ -316,6 +317,9 @@ struct SynaraComputerUsePlugin {
 
     bool inputReady() const { return true; }
     void noteAgentInput() {}
+    // The popup rule's bookkeeping; attribution has its own fixture.
+    template <class W> void noteAgentPress(const W&) {}
+    void noteAgentSerial(quint32) {}
     void setTimestampNow() {}
     void syncModifiers() {}
     void clearWindowActivation() {}

@@ -119,6 +119,11 @@ unclaimed rather than given a backend that refuses forever.
 - `Meta+Shift+Esc` stops the session and latches until pressed again; a plugin
   that could not register the shortcut is reported as a setup blocker rather
   than advertising a hotkey that does not exist.
+- A popup the agent opens never grabs. KWin ignores the seat in
+  `xdg_popup.grab` and would move seat0's keyboard onto any grabbing popup,
+  swallowing the human's keys and next click, so the plugin attributes each
+  popup at creation, withholds an agent popup's grab, and closes it itself on
+  a human press outside it (the press still goes through).
 - Anything that would break the policy is refused rather than approximated:
   protocol drag-and-drop, client-side titlebar moves, modifier-held clicks.
 

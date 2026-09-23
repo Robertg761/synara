@@ -1,0 +1,157 @@
+// The popup rule (audit N2), driven through the production attribution, grab
+// check and dismissal against modelled windows: an agent-opened popup never
+// grabs, a human press outside it closes it and still goes through, and a
+// wrong creation-time guess is closed rather than left grabbing seat0.
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <functional>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using quint32 = uint32_t;
+using quint64 = uint64_t;
+using qint64 = int64_t;
+
+struct QPointF {
+    double xv = 0, yv = 0;
+    double x() const { return xv; }
+    double y() const { return yv; }
+};
+template <class T> struct QPointer {
+    T* p = nullptr;
+    QPointer() = default;
+    QPointer(T* v) : p(v) {}
+    operator T*() const { return p; }
+    T* operator->() const { return p; }
+};
+template <class T> struct QList : std::vector<T> {
+    using std::vector<T>::vector;
+    bool isEmpty() const { return this->empty(); }
+    void append(const T& v) { this->push_back(v); }
+};
+struct QElapsedTimer {
+    bool valid = false;
+    void restart() { valid = true; }
+    bool isValid() const { return valid; }
+};
+struct ClientConnection {};
+struct SurfaceInterface {
+    ClientConnection* owner = nullptr;
+    ClientConnection* client() const { return owner; }
+};
+struct PointerInterface {
+    SurfaceInterface* focus = nullptr;
+    SurfaceInterface* focusedSurface() const { return focus; }
+};
+struct SeatInterface {
+    PointerInterface pointerObject;
+    PointerInterface* pointer() { return &pointerObject; }
+};
+struct WaylandServer {
+    SeatInterface seat0;
+    SeatInterface* seat() { return &seat0; }
+};
+WaylandServer server;
+WaylandServer* waylandServer() { return &server; }
+SurfaceInterface* humanKeyboardSurface() { return nullptr; }
+
+std::vector<std::string> dismissed;
+struct Window {
+    std::string name;
+    double x = 0, y = 0, w = 0, h = 0;
+    bool deleted = false;
+    bool isDeleted() const { return deleted; }
+    bool hitTest(const QPointF& p) const { return p.x() >= x && p.x() < x + w && p.y() >= y && p.y() < y + h; }
+    void popupDone() { dismissed.push_back(name); deleted = true; }
+};
+
+// PRODUCTION_FREE
+
+struct SynaraComputerUsePlugin {
+    SeatInterface agentSeat;
+    SeatInterface* m_seat = &agentSeat;
+    QList<QPointer<Window>> m_agentPopups;
+    quint64 m_popupsDismissed = 0;
+    const ClientConnection* m_lastHumanPressClient = nullptr;
+    QElapsedTimer m_lastHumanPress;
+    std::array<quint32, 64> m_agentSerials = {};
+    size_t m_agentSerialNext = 0;
+
+    void handlePopupGrab(Window* window, SeatInterface* seat, quint32 serial);
+    bool isAgentPopup(const Window* window) const;
+    void dismissAgentPopups(const std::function<bool(const Window*)>& shouldDismiss);
+    void noteAgentSerial(quint32 serial);
+    void handleHumanPointerPress(const QPointF& position);
+};
+
+// PRODUCTION_DEFINITIONS
+
+void check(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+int main() {
+    try {
+        // Attribution at creation.
+        check(popupOpenedByAgent(PopupOwner::Unknown, 30, -1), "the agent pressed into this client and the human never did");
+        check(popupOpenedByAgent(PopupOwner::Unknown, 30, 900), "the agent pressed more recently than the human");
+        check(!popupOpenedByAgent(PopupOwner::Unknown, 900, 30), "the human pressed more recently");
+        check(!popupOpenedByAgent(PopupOwner::Unknown, -1, -1), "nobody pressed: KWin's own rules");
+        check(!popupOpenedByAgent(PopupOwner::Unknown, s_popupAttributionMs + 1, -1), "an old agent press does not claim a popup");
+        check(popupOpenedByAgent(PopupOwner::Agent, -1, 5), "a submenu of the agent's menu is the agent's");
+        check(!popupOpenedByAgent(PopupOwner::Human, 5, -1), "a submenu of the human's menu is the human's");
+
+        ClientConnection chromium;
+        SurfaceInterface page{&chromium};
+        {
+            // The grab check against the exact answer.
+            SynaraComputerUsePlugin plugin;
+            SeatInterface& seat0 = server.seat0;
+            Window agentMenu{"agent-menu", 100, 100, 50, 80};
+            Window humanMenu{"human-menu", 400, 100, 50, 80};
+            plugin.m_agentPopups.append(&agentMenu);
+            plugin.noteAgentSerial(4242);
+            dismissed.clear();
+            plugin.handlePopupGrab(&agentMenu, &plugin.agentSeat, 1);
+            plugin.handlePopupGrab(&agentMenu, &seat0, 4242);
+            check(dismissed.empty(), "an agent popup grabbing with the agent seat or an agent serial is left open");
+            plugin.handlePopupGrab(&humanMenu, &seat0, 17);
+            check(dismissed.empty(), "a human popup grabbing with a human serial is left alone");
+            plugin.handlePopupGrab(&humanMenu, &seat0, 4242);
+            check(dismissed.size() == 1 && dismissed[0] == "human-menu", "a grab quoting an agent serial on a popup that kept its grab is closed");
+            Window lateAgent{"late-agent", 0, 0, 1, 1};
+            plugin.handlePopupGrab(&lateAgent, &plugin.agentSeat, 9);
+            check(dismissed.size() == 2 && dismissed[1] == "late-agent", "an agent-seat grab that got through is closed before it maps");
+            Window misread{"misread", 0, 0, 1, 1};
+            plugin.m_agentPopups.append(&misread);
+            plugin.handlePopupGrab(&misread, &seat0, 17);
+            check(dismissed.size() == 3 && dismissed[2] == "misread", "a human grab on a popup taken for the agent's is closed, not left without its grab");
+            plugin.handlePopupGrab(&humanMenu, &seat0, 0);
+            check(dismissed.size() == 3, "serial 0 never matches the empty slots of the ring");
+            check(plugin.m_popupsDismissed == 3, "every dismissal is counted");
+        }
+        {
+            // A human press: recorded, and it closes the agent's popups unless
+            // it lands on one of them.
+            SynaraComputerUsePlugin plugin;
+            Window menu{"menu", 100, 100, 50, 80};
+            Window submenu{"submenu", 150, 120, 50, 80};
+            plugin.m_agentPopups.append(&menu);
+            plugin.m_agentPopups.append(&submenu);
+            server.seat0.pointerObject.focus = &page;
+            dismissed.clear();
+            plugin.handleHumanPointerPress({160, 130});
+            check(dismissed.empty(), "a human press on the agent's menu is theirs to make");
+            check(plugin.m_lastHumanPressClient == &chromium && plugin.m_lastHumanPress.isValid(), "the press is recorded against seat0's pointer focus");
+            plugin.handleHumanPointerPress({900, 900});
+            check(dismissed.size() == 2 && dismissed[0] == "submenu" && dismissed[1] == "menu", "a press elsewhere closes the agent's popups, submenu first");
+        }
+    } catch (const std::exception& failure) {
+        std::cout << "FAILED: " << failure.what() << "\n";
+        return 1;
+    }
+    std::cout << "popup rule: attribution, the exact grab check, and dismissal on a human press outside.\n";
+}

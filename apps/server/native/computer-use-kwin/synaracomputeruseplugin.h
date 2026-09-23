@@ -29,6 +29,8 @@
 #include <QTimer>
 #include <QVariantAnimation>
 
+#include <array>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -47,6 +49,7 @@ struct SynaraKeyStroke
 QDBusArgument &operator<<(QDBusArgument &argument, const SynaraKeyStroke &stroke);
 const QDBusArgument &operator>>(const QDBusArgument &argument, SynaraKeyStroke &stroke);
 
+class ClientConnection;
 class ImageItem;
 class LogicalOutput;
 class PointerInterface;
@@ -56,6 +59,7 @@ class RenderLoop;
 class SeatInterface;
 class SurfaceInterface;
 class Window;
+class XdgPopupInterface;
 
 /**
  * The ghost cursor: the agent's drawn pointer, identical on every backend.
@@ -313,6 +317,18 @@ private:
     // it back.
     void handleHumanPointerInput();
     void handleHumanKeyboardInput();
+    // The popup rule: an agent-opened popup never grabs; see watchPopups in
+    // the .cpp.
+    void watchPopups();
+    void handlePopupCreated(XdgPopupInterface *popup);
+    void handlePopupGrab(Window *window, SeatInterface *seat, quint32 serial);
+    bool isAgentPopup(const Window *window) const;
+    void dismissAgentPopups(const std::function<bool(const Window *)> &shouldDismiss);
+    // Who pressed into which client last, for attributing the next popup.
+    void noteAgentPress(const Window *window);
+    void noteAgentSerial(quint32 serial);
+    void handleHumanPointerPress(const QPointF &position);
+    void handleHumanKeyPress();
     void watchHumanSeat();
     void watchHumanPointer();
     void handleHumanPointerFocusChanged();
@@ -440,6 +456,19 @@ private:
     QTimer m_captureRenderWatchdog;
     QTimer m_captureEncodeWatchdog;
     std::shared_ptr<CaptureRequest> m_captureRequest;
+    // Popups the agent opened, held without a grab, oldest first.
+    QList<QPointer<Window>> m_agentPopups;
+    quint64 m_popupsDismissed = 0;
+    // The last press into a client by each party: which client and when.
+    // Compared, never dereferenced.
+    const ClientConnection *m_lastAgentPressClient = nullptr;
+    QElapsedTimer m_lastAgentPress;
+    const ClientConnection *m_lastHumanPressClient = nullptr;
+    QElapsedTimer m_lastHumanPress;
+    // Serials of the agent's recent presses, on either path: a popup grab
+    // quoting one of them was opened by the agent.
+    std::array<quint32, 64> m_agentSerials = {};
+    size_t m_agentSerialNext = 0;
     // waitForSettle's clock (nanoseconds), each window's last damaged commit
     // and any window's, and the agent input no wait has consumed yet (-1).
     QElapsedTimer m_settleClock;

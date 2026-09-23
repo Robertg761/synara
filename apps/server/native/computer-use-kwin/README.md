@@ -225,8 +225,9 @@ for the menu that opened it and drawn above it). Popups are pointer targets
 generally, not only under an explicit target: KWin's `XdgPopupWindow` answers
 `wantsInput()` false by construction, so the plugin gates the pointer on
 "focusable **or** popup" and the keyboard on `wantsInput()` alone. Nothing ever
-focuses or activates a popup; menu key navigation works through KWin's own popup
-filter, which holds seat0's keyboard for the duration of the grab.
+focuses or activates a popup; the agent's keys stay on the window that opened
+the menu, and the toolkit routes them to its open menu from there. KWin's popup
+filter is not involved, and must not be: see "Popups the agent opens" below.
 
 Each `windowsJson` entry also carries `active`: whether the compositor reports
 the window as activated to its client. This matters because toolkits gate
@@ -499,6 +500,44 @@ server's own guard uses, so a caller never has to know which side refused.
 - `stateJson` reports `humanFocusWindowId` (empty when nothing has focus),
   `msSinceHumanInput` (`-1` when no real device event has been observed at all,
   which is not the same as a long quiet period) and `humanActiveGuardMs`.
+
+## Popups the agent opens
+
+KWin ignores the seat in `xdg_popup.grab`, and its `PopupInputFilter` treats
+every grabbing popup as seat0's (KWin 6.7.4 `popup_input_filter.cpp`,
+`xdgshellwindow.cpp`): when the popup maps it moves seat0's keyboard focus onto
+it, every key the human presses goes to it, and their next press outside the
+popup's application is swallowed to dismiss it. Left alone, a context menu the
+agent opened in Chromium took the keys of a human typing in Kate (Enter
+activated a menu item) and ate their next click. That happens on both of the
+agent's paths: an agent-seat client grabs with the agent seat, which KWin
+ignores, and a directly driven client grabs with seat0.
+
+So an agent-opened popup never grabs:
+
+- Each new `xdg_popup` is attributed when it is created, before its client can
+  ask for a grab: a submenu follows its parent menu, and otherwise the popup
+  belongs to whoever pressed into its client last, the agent (within 5 seconds)
+  or the human. An agent popup has the connection that would record its grab
+  cut, so KWin's filter never takes it: seat0's focus stays where the human put
+  it, their keys go where they were going, and every click reaches what it
+  lands on.
+- The grab request is then checked against the exact answer: the agent seat,
+  or a serial the agent's own press issued. When the creation-time guess was
+  wrong either way, the popup is closed before it maps and whoever opened it
+  opens it again. An agent grab never reaches the filter, and a human popup is
+  never left without its grab.
+- What the grab did for the popup is done by the plugin instead. A human
+  press anywhere outside the agent's popups closes them, and the press is
+  delivered, not eaten. An agent press on another application closes them too,
+  as the grab would have. Stopping the session or `resetInputDelivery` closes
+  them. Toolkits route key navigation to an open menu themselves, so the
+  agent's keys still reach it through the window that opened it.
+- `stateJson` reports `agentPopupCount` (open agent popups) and
+  `agentPopupsDismissed` (how many the plugin has closed).
+
+A compositor the agent owns (`SYNARA_COMPUTER_USE_OWNS_COMPOSITOR=1`) has no
+human seat to protect, so there popups grab as usual.
 
 ## Lock screen and session activity
 
