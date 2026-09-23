@@ -34,6 +34,33 @@ const WINDOW: ComputerWindow = {
 };
 
 describe("AtspiHelperClient", () => {
+  it("stops an idle helper on release and starts a fresh one on the next request", async () => {
+    const children: FakeHelperProcess[] = [];
+    const spawnProcess = vi.fn(() => {
+      const child = new FakeHelperProcess();
+      child.stdin.on("data", (chunk) => {
+        const { id } = JSON.parse(chunk.toString()) as { id: number };
+        child.stdout.write(`${JSON.stringify({ id, result: EMPTY_TREES })}\n`);
+      });
+      children.push(child);
+      return child as unknown as ChildProcessWithoutNullStreams;
+    });
+    const client = new AtspiHelperClient({ requestTimeoutMs: 1_000, spawnProcess });
+    try {
+      await expect(client.readTrees([WINDOW])).resolves.toEqual([]);
+      await client.release();
+      expect(children[0]!.stdin.writableEnded).toBe(true);
+      // The released helper's exit is ours, not a crash: nothing latches.
+      children[0]!.emit("exit", null, "SIGTERM");
+      expect(client.unavailableReason()).toBeUndefined();
+
+      await expect(client.readTrees([WINDOW])).resolves.toEqual([]);
+      expect(spawnProcess).toHaveBeenCalledTimes(2);
+    } finally {
+      await client.dispose();
+    }
+  });
+
   it("ignores replies and errors from a helper replaced after a timeout", async () => {
     vi.useFakeTimers();
     const oldChild = new FakeHelperProcess();

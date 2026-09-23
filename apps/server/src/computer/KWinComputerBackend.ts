@@ -181,6 +181,10 @@ const STILL_FAILURE_LIMIT = 5;
  * pane is watching.
  */
 const CAPTURE_RECOVERY_BASE_MS = 1_000;
+/** S9: how long a host desktop may sit unused before its connection is let go. */
+const DEFAULT_IDLE_RELEASE_MINUTES = 10;
+const MAX_IDLE_CHECK_INTERVAL_MS = 60_000;
+const MIN_IDLE_CHECK_INTERVAL_MS = 250;
 const CAPTURE_RECOVERY_MAX_MS = 30_000;
 /** How long a passive availability answer stays good. */
 const PROBE_MEMO_MS = 3_000;
@@ -421,6 +425,15 @@ export interface KWinComputerBackendOptions {
    */
   readonly idleTimeoutMs?: number;
   /**
+   * S9: how long the connection may sit unused — no lease, no pane watching,
+   * no plugin call — before it is released: the session bus connection, the
+   * server's bus name and the AT-SPI helper all go, and the next use connects
+   * again. `0` disables it. Falls back to `SYNARA_COMPUTER_IDLE_RELEASE_MINUTES`,
+   * then to ten minutes on a visible desktop; a nested desktop has its own
+   * idle shutdown and releases nothing here.
+   */
+  readonly idleReleaseMs?: number;
+  /**
    * How recently the human's own seat must have been active for a mutating
    * action aimed at their focused window to be refused. `0` disables the guard.
    * Falls back to `SYNARA_COMPUTER_HUMAN_ACTIVE_MS`, then to
@@ -515,6 +528,14 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly stillIntervalMs: number;
   private readonly captureMaxDimension: number;
   private readonly idleTimeoutMs: number;
+  private readonly idleReleaseMs: number;
+  /** The last plugin call, lease change or pane detach; see `releaseIfIdle`. */
+  private lastUseAt: number;
+  private pluginCallsInFlight = 0;
+  private idleReleaseTimer: ReturnType<typeof setInterval> | undefined;
+  /** Released for being idle: passive answers until the next real use. */
+  private idleReleased = false;
+  private idleReleasing: Promise<void> | undefined;
   private readonly humanActiveGuardMs: number;
   private readonly atspi: AtspiTreeReader;
   private readonly perception: AtspiPerception;
@@ -681,6 +702,17 @@ export class KWinComputerBackend implements ComputerBackend {
     this.idleTimeoutMs = normalizeIdleTimeout(
       options.idleTimeoutMs ?? parseIdleTimeoutEnv(process.env.SYNARA_COMPUTER_IDLE_TIMEOUT_MS),
     );
+    this.idleReleaseMs = Math.max(
+      0,
+      options.idleReleaseMs ??
+        (this.visibleDesktop
+          ? parseIdleMinutesEnv(
+              process.env.SYNARA_COMPUTER_IDLE_RELEASE_MINUTES,
+              DEFAULT_IDLE_RELEASE_MINUTES,
+            )
+          : 0),
+    );
+    this.lastUseAt = this.now();
     this.humanActiveGuardMs = normalizeHumanActiveGuard(
       options.humanActiveGuardMs ??
         parseHumanActiveGuardEnv(process.env.SYNARA_COMPUTER_HUMAN_ACTIVE_MS),
@@ -913,6 +945,11 @@ export class KWinComputerBackend implements ComputerBackend {
     if (this.sessionType.toLowerCase() !== "wayland") {
       return { kind: "backend-unavailable", message: WAYLAND_REQUIRED_MESSAGE };
     }
+    // Released for being idle: every state publish and settings poll reads
+    // this, and reconnecting for them would take the desktop back from a
+    // second server the release made room for. The passive probe answers
+    // what a connect would find; the next real use connects.
+    if (this.idleReleased) return await this.probeAvailability();
     try {
       const plugin = await this.ensurePlugin({ start: false });
       const health = await this.readPluginHealth(plugin);
@@ -1169,6 +1206,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async setDrivingAgent(name: string | null): Promise<void> {
     this.drivingAgent = name?.trim() ? name.trim() : null;
+    this.lastUseAt = this.now();
     // Only pushed to a session that is already up. A start pushes the cached
     // name itself, so naming a thread must not be what starts the session -
     // the human would get an agent cursor before any agent asked for one.
@@ -1667,6 +1705,7 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async detachStream(): Promise<void> {
+    this.lastUseAt = this.now();
     this.streamGeneration += 1;
     this.cancelCaptureRecovery();
     this.stillDedupe.reset();
@@ -1807,6 +1846,8 @@ export class KWinComputerBackend implements ComputerBackend {
     if (this.disposed) return;
     this.disposed = true;
     this.provisionAbort.abort();
+    this.stopIdleReleaseTimer();
+    await this.idleReleasing;
     await this.connectPromise?.catch(() => undefined);
     await this.startPromise?.catch(() => undefined);
     await this.detachStream();
@@ -2435,6 +2476,9 @@ export class KWinComputerBackend implements ComputerBackend {
     this.pluginHealth = health;
     this.connectedCompositor = compositor;
     this.desktopGoneReported = false;
+    this.idleReleased = false;
+    this.lastUseAt = this.now();
+    this.startIdleReleaseTimer();
     // The backoff is not reset here: a connection that is lost again at once
     // proved nothing. See `scheduleReconnect`.
     this.connectedAt = this.now();
@@ -2942,11 +2986,71 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   private async pluginValue<T>(invoke: () => Promise<T>): Promise<T> {
+    // Every input and capture passes through here, which makes it the one
+    // place that knows the desktop is in use; see `releaseIfIdle`.
+    this.pluginCallsInFlight += 1;
+    this.lastUseAt = this.now();
     try {
       return await invoke();
     } catch (error) {
       throw this.reportPluginFailure(error);
+    } finally {
+      this.pluginCallsInFlight -= 1;
+      this.lastUseAt = this.now();
     }
+  }
+
+  private startIdleReleaseTimer(): void {
+    this.stopIdleReleaseTimer();
+    if (this.idleReleaseMs <= 0 || this.disposed) return;
+    const interval = Math.min(
+      MAX_IDLE_CHECK_INTERVAL_MS,
+      Math.max(MIN_IDLE_CHECK_INTERVAL_MS, Math.floor(this.idleReleaseMs / 4)),
+    );
+    this.idleReleaseTimer = setInterval(() => {
+      void this.releaseIfIdle();
+    }, interval);
+    this.idleReleaseTimer.unref?.();
+  }
+
+  private stopIdleReleaseTimer(): void {
+    if (this.idleReleaseTimer !== undefined) clearInterval(this.idleReleaseTimer);
+    this.idleReleaseTimer = undefined;
+  }
+
+  /** Connected and untouched for the whole idle period, with nobody holding or watching it. */
+  private idlePlugin(): KWinComputerPluginApi | undefined {
+    const plugin = this.connectedPlugin();
+    if (!plugin || this.disposed || this.connectPromise || this.startPromise) return undefined;
+    if (this.drivingAgent !== null || this.streamListener !== undefined) return undefined;
+    if (this.pluginCallsInFlight > 0 || this.capturePending > 0) return undefined;
+    if (this.now() - this.lastUseAt < this.idleReleaseMs) return undefined;
+    return plugin;
+  }
+
+  /**
+   * S9: a desktop nobody is using gives back what it holds on the session:
+   * the bus connection, `org.synara.ComputerUse.Server` (so a second Synara
+   * server — a dev server beside the desktop app — can drive this desktop
+   * without "Another Synara server owns this desktop"), and the AT-SPI
+   * helper. An agent session still running is stopped first, which hands the
+   * seat back as its own idle timeout would. The next use connects again.
+   */
+  private async releaseIfIdle(): Promise<void> {
+    const plugin = this.idlePlugin();
+    if (!plugin || this.idleReleasing) return;
+    this.idleReleasing = (async () => {
+      if (this.pluginHealth?.running === true) await plugin.stop().catch(() => undefined);
+      // Anything that started meanwhile wins.
+      if (this.idlePlugin() !== plugin) return;
+      this.stopIdleReleaseTimer();
+      this.idleReleased = true;
+      this.releaseConnection();
+      await this.atspi.release?.().catch(() => undefined);
+    })().finally(() => {
+      this.idleReleasing = undefined;
+    });
+    await this.idleReleasing;
   }
 
   private enqueueCapture<T>(invoke: () => Promise<T>): Promise<T> {
@@ -3671,6 +3775,20 @@ function normalizeHumanActiveGuard(value: number | undefined): number {
  * anything that is not `0` or a millisecond count up to an hour is dropped and
  * the default applies. Accepted values still pass through normalizeIdleTimeout.
  */
+/**
+ * An idle period configured in minutes (`SYNARA_COMPUTER_IDLE_RELEASE_MINUTES`,
+ * `SYNARA_COMPUTER_NESTED_IDLE_MINUTES`), as milliseconds: `0` disables it, a
+ * positive number of minutes (fractions allowed) sets it, and anything else —
+ * a typo included — keeps the default rather than either extreme.
+ */
+export function parseIdleMinutesEnv(value: string | undefined, defaultMinutes: number): number {
+  const fallback = defaultMinutes * 60_000;
+  if (value === undefined || value.trim() === "") return fallback;
+  const minutes = Number(value.trim());
+  if (!Number.isFinite(minutes) || minutes < 0) return fallback;
+  return Math.round(minutes * 60_000);
+}
+
 function parseIdleTimeoutEnv(value: string | undefined): number | undefined {
   if (value === undefined || value.trim() === "") return undefined;
   const milliseconds = Number(value);

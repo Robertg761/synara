@@ -78,6 +78,8 @@ function makeBackend(
       options.installedPluginIds ??
       (async () => ["SynaraComputerUsePluginV2", "SynaraComputerUsePluginV10"]),
     sleep: options.sleep ?? (async () => undefined),
+    // Off unless a test is about it: fake clocks in other suites run far past it.
+    idleReleaseMs: options.idleReleaseMs ?? 0,
     // Tests must never resolve names against the host's PATH or flatpak dirs.
     resolveApp:
       options.resolveApp ?? ((app, args) => ({ command: app, args: [...args], via: "path" })),
@@ -4867,5 +4869,88 @@ describe("KWinComputerBackend perception", () => {
       expect(lastMove()?.args).toEqual([1_080, 1_605]);
       await backend.dispose();
     });
+  });
+});
+
+describe("KWinComputerBackend idle release (S9)", () => {
+  const IDLE_MS = 60_000;
+
+  function releasingBackend(dbus: FakeDbus, released: { count: number }) {
+    let dials = 0;
+    const backend = makeBackend(dbus, {
+      idleReleaseMs: IDLE_MS,
+      // KWin and the plugin answer on the bus, as the passive probe will ask.
+      busNamesHaveOwners: async (names) => names.map(() => true),
+      dbusFactory: async () => {
+        dials += 1;
+        return dbus;
+      },
+      atspi: {
+        ...atspi,
+        release: async () => {
+          released.count += 1;
+        },
+      },
+    });
+    return { backend, dials: () => dials };
+  }
+
+  it("lets an unused desktop go and connects again on the next real use", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      const released = { count: 0 };
+      const { backend, dials } = releasingBackend(dbus, released);
+      await backend.moveCursor({ x: 5, y: 5 });
+      expect(dbus.plugin.running).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(IDLE_MS / 2);
+      expect(dbus.calls.map((call) => call.method)).not.toContain("close");
+      await vi.advanceTimersByTimeAsync(IDLE_MS);
+      // The agent session handed back, the bus (and the server's name on it)
+      // closed, the helper stopped — and health says idle, not lost.
+      expect(dbus.plugin.running).toBe(false);
+      expect(dbus.calls.map((call) => call.method)).toContain("close");
+      expect(released.count).toBe(1);
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+
+      // Publishes and settings polls answer passively.
+      const before = dials();
+      await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+      expect(dials()).toBe(before);
+
+      await backend.moveCursor({ x: 6, y: 6 });
+      expect(dials()).toBe(before + 1);
+      expect(backend.health().status).toBe("connected");
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the connection while a lease is held or the pane watches", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      const released = { count: 0 };
+      const { backend } = releasingBackend(dbus, released);
+      await backend.listWindows();
+
+      await backend.setDrivingAgent("Thread A");
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
+      expect(released.count).toBe(0);
+      await backend.setDrivingAgent(null);
+
+      await backend.attachStream(() => undefined);
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
+      expect(released.count).toBe(0);
+      await backend.detachStream();
+
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 2);
+      expect(released.count).toBe(1);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

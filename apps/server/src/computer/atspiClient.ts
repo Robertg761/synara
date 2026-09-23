@@ -157,6 +157,11 @@ export interface AtspiTreeReader {
    * unprobed, or due for another look.
    */
   readonly unavailableReason?: () => string | undefined;
+  /**
+   * Stops the helper process without disposing the reader: the next request
+   * starts a fresh one. For a backend letting an idle desktop go.
+   */
+  readonly release?: () => Promise<void>;
   readonly dispose: () => Promise<void>;
 }
 
@@ -379,6 +384,14 @@ export class AtspiHelperClient implements AtspiTreeReader {
     if (result.protocol === ATSPI_HELPER_PROTOCOL) return;
     this.latchUnavailable(protocolMismatch(result.protocol));
     throw new AtspiHelperUnavailableError(this.unavailableText());
+  }
+
+  async release(): Promise<void> {
+    if (this.disposed || this.process === null) return;
+    // Detached first, like every kill of ours, so its exit is not read as a
+    // crash; and it is not a failure, so the next start carries no backoff.
+    this.resetProcess(new Error("AT-SPI helper released while the desktop is idle."));
+    this.reconnectFailures = 0;
   }
 
   async dispose(): Promise<void> {

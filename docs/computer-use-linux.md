@@ -231,7 +231,11 @@ loads `dbus-next` the way the backend does.
 Environment: `SYNARA_KWIN_PLUGIN_DIR`, `SYNARA_KWIN_PREBUILT_DIR`,
 `SYNARA_KWIN_SOURCE_DIR`, `SYNARA_KWIN_STATE_ROOT` override paths;
 `SYNARA_COMPUTER_IDLE_TIMEOUT_MS` and `SYNARA_COMPUTER_HUMAN_ACTIVE_MS` tune the
-session; `SYNARA_ATSPI_PYTHON` and `SYNARA_ATSPI_HELPER` point at the helper.
+session; `SYNARA_COMPUTER_IDLE_RELEASE_MINUTES` (default 10, `0` off) is how long
+an unused desktop keeps its bus connection, the server's bus name and the AT-SPI
+helper before letting them go, so a second Synara server can drive it (the next
+use connects again); `SYNARA_ATSPI_PYTHON` and `SYNARA_ATSPI_HELPER` point at
+the helper, and `SYNARA_ATSPI_EVENTS=0` turns off its event-fed cache.
 Every variable the server reads for computer use is listed in `turbo.json`'s
 `globalPassThroughEnv`, which turbo strips otherwise in strict mode; a backend
 that reads a new one adds it there.
