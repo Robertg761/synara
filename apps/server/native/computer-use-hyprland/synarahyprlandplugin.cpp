@@ -459,8 +459,16 @@ struct SState {
     double axisRemainderV = 0;
     // The agent's own xkb modifier state, built from the seat keyboard's keymap
     // and fed only the agent's keys, so its Ctrl is never the human's Ctrl.
+    // Its locks and latches are the seat's, re-seeded whenever the agent holds
+    // nothing (N4): CapsLock and NumLock are the state of the human's keyboard,
+    // which the agent's typing lands under too, not something it may reset.
     xkb_state*  xkbState       = nullptr;
     xkb_keymap* xkbStateKeymap = nullptr;
+    // Whether the modifiers the agent's keyboard client last heard are the
+    // agent's (directKeyboardModifiers) rather than the seat's. A key is only
+    // ever sent under the agent's own modifiers, and a hand-back on a surface
+    // the human's keyboard focus shares puts the seat's back.
+    bool agentModifiersInEffect = false;
 
     // Physical keycodes currently held on the human's keyboard: what the
     // seat's enter re-sent by restoreSeatKeyboardEnter reports as held. The
@@ -1477,10 +1485,22 @@ void ensureXkbState() {
         g.xkbState = xkb_state_new(keymap);
 }
 
+// The seat's locks, latches and layout, under whatever the agent itself holds
+// (nothing, when this runs): the agent's typing is interpreted with the
+// human's CapsLock, NumLock and layout group, as the human's own would be.
+void seedAgentXkbState() {
+    const auto keyboard = seatKeyboard();
+    if (!g.xkbState || !keyboard)
+        return;
+    const auto& mods = keyboard->m_modifiersState;
+    xkb_state_update_mask(g.xkbState, 0, mods.latched, mods.locked, 0, 0, mods.group);
+}
+
 void directKeyboardModifiers() {
     const auto surface = g.directKeyboardSurface.lock();
     if (!surface || !g.xkbState)
         return;
+    g.agentModifiersInEffect = true;
     const uint32_t serial    = directSerial(surface);
     const uint32_t depressed = xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_DEPRESSED);
     const uint32_t latched   = xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_LATCHED);
@@ -1544,6 +1564,29 @@ void directKeyboardKeyEvent(const SP<CWLSurfaceResource>& surface, uint32_t keyC
         wl_keyboard_send_key(resource, serial, time, keyCode, pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
 }
 
+// The seat keyboard's modifier state, as the seat itself sends it, to every
+// wl_keyboard of `client`: what the human's own keys are interpreted under.
+void sendSeatKeyboardModifiers(wl_client* client, uint32_t serial) {
+    const auto keyboard = seatKeyboard();
+    if (!keyboard)
+        return;
+    const auto& mods = keyboard->m_modifiersState;
+    for (wl_resource* resource : clientInputResources(client, "wl_keyboard"))
+        wl_keyboard_send_modifiers(resource, serial, mods.depressed, mods.latched, mods.locked, mods.group);
+    g.agentModifiersInEffect = false;
+}
+
+// The same-surface hand-back (N4): the human's keyboard focus is on the very
+// surface the agent typed into, so the enter is shared and stays, but the
+// modifiers that client last heard are the agent's - its Ctrl, and before the
+// seeding, a CapsLock and NumLock forced off. The seat's are put back so the
+// human's next key means what they typed.
+void restoreSeatKeyboardModifiers(const SP<CWLSurfaceResource>& surface) {
+    if (!g.agentModifiersInEffect)
+        return;
+    sendSeatKeyboardModifiers(surface->client(), directSerial(surface));
+}
+
 // The keyboard twin of restoreSeatPointerEnter: the seat's own enter for the
 // surface the human's keyboard focus is on, if it belongs to `client`, carrying
 // the keys the human is physically holding and the seat keyboard's modifier
@@ -1560,16 +1603,11 @@ void restoreSeatKeyboardEnter(wl_client* client) {
         if (auto* slot = static_cast<uint32_t*>(wl_array_add(&keys, sizeof(uint32_t))))
             *slot = key;
     }
-    const uint32_t serial   = directSerial(seatSurface, true);
-    const auto     keyboard = g_pSeatManager->m_keyboard.lock();
-    for (wl_resource* resource : clientInputResources(client, "wl_keyboard")) {
+    const uint32_t serial = directSerial(seatSurface, true);
+    for (wl_resource* resource : clientInputResources(client, "wl_keyboard"))
         wl_keyboard_send_enter(resource, serial, seatSurface->getResource()->resource(), &keys);
-        if (keyboard) {
-            const auto& mods = keyboard->m_modifiersState;
-            wl_keyboard_send_modifiers(resource, serial, mods.depressed, mods.latched, mods.locked, mods.group);
-        }
-    }
     wl_array_release(&keys);
+    sendSeatKeyboardModifiers(client, serial);
 }
 
 void directKeyboardLeave() {
@@ -1609,7 +1647,15 @@ void releasePressedKeys() {
             xkb_state_update_key(g.xkbState, key + 8, XKB_KEY_UP);
     }
     g.pressedKeys.clear();
-    directKeyboardModifiers();
+    // The modifiers that go with the releases, only where they can land on
+    // the pressed surface: the seat's own on a surface the human's focus
+    // shares, the agent's where its enter stands, and none at all while the
+    // client's keyboard is the seat's on a sibling window - a modifiers event
+    // names no surface, and the agent's would clear the human's Shift there.
+    if (surface && seatHere)
+        restoreSeatKeyboardModifiers(surface);
+    else if (!g.directKeyboardNeedsEnter)
+        directKeyboardModifiers();
     if (restamp)
         directKeyboardLeave();
 }
@@ -1620,11 +1666,17 @@ void releasePressedKeys() {
 // window. After each agent key the seat's enter is put back, unless the agent
 // is mid-chord: a Ctrl it still holds must stay where it was pressed.
 void returnKeyboardToSeat() {
-    if (!g_pSeatManager || !g.pressedKeys.empty() || g.directKeyboardNeedsEnter)
+    if (!g_pSeatManager || !g.pressedKeys.empty())
         return;
     const auto agentSurface = g.directKeyboardSurface.lock();
     const auto seatSurface  = g_pSeatManager->m_state.keyboardFocus.lock();
-    if (!agentSurface || !seatSurface || seatSurface == agentSurface || seatSurface->client() != agentSurface->client())
+    if (!agentSurface || !seatSurface || seatSurface->client() != agentSurface->client())
+        return;
+    if (seatSurface == agentSurface) {
+        restoreSeatKeyboardModifiers(agentSurface);
+        return;
+    }
+    if (g.directKeyboardNeedsEnter)
         return;
     g.directKeyboardNeedsEnter = true;
     sendKeyboardLeave(agentSurface);
@@ -1643,8 +1695,14 @@ void handBackKeyboardBeforeHumanKey() {
         return;
     const auto agentSurface = g.directKeyboardSurface.lock();
     const auto seatSurface  = g_pSeatManager->m_state.keyboardFocus.lock();
-    if (!agentSurface || !seatSurface || seatSurface == agentSurface || seatSurface->client() != agentSurface->client())
+    if (!agentSurface || !seatSurface || seatSurface->client() != agentSurface->client())
         return;
+    if (seatSurface == agentSurface) {
+        // Mid-chord on the human's own surface: their key is theirs, under
+        // their modifiers, not the agent's held Ctrl.
+        restoreSeatKeyboardModifiers(agentSurface);
+        return;
+    }
     g.directKeyboardNeedsEnter = true;
     sendKeyboardLeave(agentSurface);
     restoreSeatKeyboardEnter(agentSurface->client());
@@ -1667,6 +1725,9 @@ void onSeatKeyboardFocusChange() {
     wl_client* const agentClient = agentSurface->client();
     if ((previous && previous->client() == agentClient) || (current && current->client() == agentClient))
         g.directKeyboardNeedsEnter = true;
+    // The seat's enter carried the seat's modifiers to that client.
+    if (current && current->client() == agentClient)
+        g.agentModifiersInEffect = false;
 }
 
 void clearKeyboardDelivery() {
@@ -2518,8 +2579,15 @@ bool injectKey(uint32_t keyCode, bool pressed) {
     const auto surface = g.directKeyboardSurface.lock();
     if (!surface)
         return false;
-    // The re-stamp, with the held-key state as it is before this event.
+    ensureXkbState();
+    // Holding nothing, the agent starts from the human's locks and layout.
+    if (g.pressedKeys.empty())
+        seedAgentXkbState();
+    // The re-stamp, with the held-key state as it is before this event, and
+    // the agent's modifiers wherever the seat's were put back since.
     sendKeyboardEnterEvent(surface);
+    if (!g.agentModifiersInEffect)
+        directKeyboardModifiers();
     if (pressed) {
         if (std::ranges::find(g.pressedKeys, keyCode) == g.pressedKeys.end())
             g.pressedKeys.push_back(keyCode);
@@ -2527,7 +2595,6 @@ bool injectKey(uint32_t keyCode, bool pressed) {
         std::erase(g.pressedKeys, keyCode);
     }
     directKeyboardKeyEvent(surface, keyCode, pressed);
-    ensureXkbState();
     if (g.xkbState) {
         // evdev keycode -> xkb keycode offset is 8.
         xkb_state_update_key(g.xkbState, keyCode + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);

@@ -70,7 +70,9 @@ struct {
     bool targetRequested = false;
     double axisRemainderH = 0, axisRemainderV = 0;
     Vector2D pos;
-    void* xkbState = nullptr;
+    struct xkb_state* xkbState = nullptr;
+    bool agentModifiersInEffect = false;
+    std::set<uint32_t> humanHeldKeys;
 } g;
 SP<CWLSurfaceResource> hitSurface;
 PHLWINDOW hitWindow = std::make_shared<Window>();
@@ -152,6 +154,36 @@ void restoreSeatPointerEnter(wl_client* client) {
     }
 }
 Vector2D seatPointerLocal(SP<CWLSurfaceResource>) { return SEAT_LOCAL; }
+void check(bool condition, const char* message);
+// The client's keyboard modifiers: whatever wl_keyboard.modifiers it heard
+// last, from the seat or from the agent. Keys are interpreted under them.
+struct Mods {
+    uint32_t depressed = 0, latched = 0, locked = 0, group = 0;
+    bool operator==(const Mods&) const = default;
+};
+constexpr uint32_t SHIFT = 1, CAPS = 2, CTRL = 4, NUMLOCK = 16;
+Mods clientMods, keyMods;
+struct Keyboard { Mods m_modifiersState; } seatKb;
+SP<Keyboard> seatKeyboard() { return SP<Keyboard>(&seatKb, [](Keyboard*) {}); }
+// The agent's xkb state: Ctrl (evdev 29) is the one modifier key modelled.
+struct xkb_state { Mods mods; } agentXkb;
+enum { XKB_STATE_MODS_DEPRESSED, XKB_STATE_MODS_LATCHED, XKB_STATE_MODS_LOCKED, XKB_STATE_LAYOUT_EFFECTIVE };
+uint32_t xkb_state_serialize_mods(xkb_state* s, int component) {
+    return component == XKB_STATE_MODS_DEPRESSED ? s->mods.depressed : component == XKB_STATE_MODS_LATCHED ? s->mods.latched : s->mods.locked;
+}
+uint32_t xkb_state_serialize_layout(xkb_state* s, int) { return s->mods.group; }
+void xkb_state_update_mask(xkb_state* s, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t, uint32_t, uint32_t group) {
+    s->mods = {depressed, latched, locked, group};
+}
+// A modifiers event lands on whatever the client's keyboard is entered on,
+// so one carrying the agent's state must only ever reach the agent's target;
+// the human's windows only ever hear the seat's own.
+void wl_keyboard_send_modifiers(wl_resource*, uint32_t, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+    const Mods mods{depressed, latched, locked, group};
+    check(keyboardEntered != nullptr, "modifiers sent with nothing entered");
+    check(keyboardEntered == hitSurface.get() || mods == seatKb.m_modifiersState, "agent modifiers sent into the human's window");
+    clientMods = mods;
+}
 struct wl_array { std::vector<uint32_t> keys; };
 void wl_array_init(wl_array*) {}
 void* wl_array_add(wl_array* array, size_t) { array->keys.push_back(0); return &array->keys.back(); }
@@ -159,9 +191,6 @@ void wl_array_release(wl_array*) {}
 void wl_keyboard_send_enter(wl_resource*, uint32_t, wl_resource* surface, wl_array*) { enterKeyboard(surface->surface); }
 void wl_keyboard_send_leave(wl_resource*, uint32_t, wl_resource* surface) {
     if (keyboardEntered == surface->surface) keyboardEntered = nullptr;
-}
-void restoreSeatKeyboardEnter(wl_client* client) {
-    if (auto surface = seat.m_state.keyboardFocus.lock(); surface && surface->client() == client) enterKeyboard(surface.get());
 }
 bool requireRunning() { return true; }
 struct InputManagerFixture { bool held = false; bool hasHeldButtons() { return held; } } inputManager;
@@ -179,11 +208,13 @@ void directPointerButtonEvent(SP<CWLSurfaceResource> surface, uint32_t, bool) {
 }
 void directKeyboardKeyEvent(SP<CWLSurfaceResource> surface, uint32_t, bool) {
     check(keyboardEntered == surface.get(), "key misdirected"); ++keyEvents;
+    keyMods = clientMods;
 }
-void ensureXkbState() {}
+void ensureXkbState() { g.xkbState = &agentXkb; }
 constexpr int XKB_KEY_DOWN = 1, XKB_KEY_UP = 0;
-void xkb_state_update_key(void*, uint32_t, int) {}
-void directKeyboardModifiers() {}
+void xkb_state_update_key(xkb_state* s, uint32_t key, int direction) {
+    if (key == 29 + 8) s->mods.depressed = direction == XKB_KEY_DOWN ? (s->mods.depressed | CTRL) : (s->mods.depressed & ~CTRL);
+}
 CBox workspaceGeometry() { return {}; }
 void damageCursorArea() {}
 
@@ -415,6 +446,66 @@ int main() {
     seat.m_state.pointerFocus = human;
     pointerEntered = human.get();
     onSeatPointerFocusChange();
+
+    // Same surface, keyboard (N4): the human's keyboard focus is on the very
+    // surface the agent types into, with NumLock on. The agent's keys go out
+    // under the human's locks, and the seat's own modifiers are back after
+    // every burst.
+    clearKeyboardDelivery();
+    hitSurface = agent;
+    seat.m_state.keyboardFocus = agent;
+    keyboardEntered = agent.get();
+    onSeatKeyboardFocusChange();
+    seatKb.m_modifiersState = {0, 0, NUMLOCK, 0};
+    clientMods = seatKb.m_modifiersState;
+    check(injectKey(30, true) && injectKey(30, false), "same-surface key refused");
+    check(keyMods.locked == NUMLOCK, "agent key sent with the human's NumLock forced off");
+    check(clientMods == seatKb.m_modifiersState, "seat modifiers not restored after a same-surface burst");
+    check(injectKey(29, true) && injectKey(30, true), "same-surface chord refused");
+    check(keyMods == Mods{CTRL, 0, NUMLOCK, 0}, "chord key not sent under the agent's Ctrl and the human's NumLock");
+    // The human types mid-chord: their key is under their own modifiers, and
+    // the agent's next key under the agent's again.
+    handBackKeyboardBeforeHumanKey();
+    check(clientMods == seatKb.m_modifiersState && keyboardEntered == agent.get(), "human key mid-chord ran under the agent's Ctrl");
+    check(injectKey(30, false) && keyMods.depressed == CTRL, "agent key after the human's not under the agent's Ctrl");
+    check(injectKey(29, false) && clientMods == seatKb.m_modifiersState, "chord end did not restore the seat's modifiers");
+    // The human toggles CapsLock between bursts; the agent follows it.
+    seatKb.m_modifiersState = {0, 0, NUMLOCK | CAPS, 0};
+    clientMods = seatKb.m_modifiersState;
+    check(injectKey(30, true) && keyMods.locked == (NUMLOCK | CAPS), "agent did not pick up the human's CapsLock");
+    check(injectKey(30, false), "release refused");
+    // The human holds Shift on that surface: the agent's key is not shifted
+    // by it, and their Shift is theirs again after the burst.
+    seatKb.m_modifiersState = {SHIFT, 0, NUMLOCK, 0};
+    clientMods = seatKb.m_modifiersState;
+    check(injectKey(30, true) && keyMods == Mods{0, 0, NUMLOCK, 0}, "agent key shifted by the human's Shift");
+    check(injectKey(30, false) && clientMods == seatKb.m_modifiersState, "the human's Shift was not restored after the burst");
+    // A stop with a key held releases it and leaves the seat's modifiers.
+    check(injectKey(29, true), "held key refused");
+    clearKeyboardDelivery();
+    check(g.pressedKeys.empty() && clientMods == seatKb.m_modifiersState, "same-surface release left the agent's modifiers");
+
+    // No stray modifiers into the human's sibling (P2): with the agent's
+    // enter gone stale and nothing held, clearing delivery sends nothing to
+    // the window the client's keyboard now belongs to - the human holds Shift
+    // there, which an agent modifiers(0) would have cleared.
+    seat.m_state.keyboardFocus = human;
+    keyboardEntered = human.get();
+    onSeatKeyboardFocusChange();
+    seatKb.m_modifiersState = {SHIFT, 0, 0, 0};
+    clientMods = seatKb.m_modifiersState;
+    check(injectKey(29, true) && keyboardEntered == agent.get(), "sibling chord refused");
+    keyboardEntered = human.get(); // the human clicks their window mid-chord
+    onSeatKeyboardFocusChange();
+    clearKeyboardDelivery();
+    check(g.pressedKeys.empty() && keyboardEntered == human.get() && clientMods == seatKb.m_modifiersState, "release did not leave the human's modifiers");
+    check(injectKey(30, true) && injectKey(30, false) && keyboardEntered == human.get(), "key refused");
+    keyboardEntered = human.get();
+    onSeatKeyboardFocusChange();
+    clearKeyboardDelivery();
+    check(clientMods == seatKb.m_modifiersState, "stray agent modifiers reached the human's sibling");
+    seatKb.m_modifiersState = {};
+    clientMods = {};
 
     // keys: a batch is one agent burst. Every stroke is delivered in order to
     // the target, and the keyboard is handed back once, after the batch,

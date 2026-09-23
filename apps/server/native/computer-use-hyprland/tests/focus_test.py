@@ -173,6 +173,8 @@ class FocusRegressionTest(unittest.TestCase):
             "releasePressedButtons", "directPointerLeave", "returnPointerToSeat",
             "handBackPointerBeforeHumanEvent", "directPointerMotion", "clearPointerDelivery",
             "refuseIfHumanHoldsButton", "updatePointerFocus", "onSeatPointerFocusChange",
+            "seedAgentXkbState", "directKeyboardModifiers", "sendSeatKeyboardModifiers", "restoreSeatKeyboardModifiers",
+            "restoreSeatKeyboardEnter",
             "sendKeyboardLeave", "leaveSeatSiblingBeforeKeyboardEnter", "sendKeyboardEnterEvent",
             "directKeyboardLeave", "releasePressedKeys", "returnKeyboardToSeat",
             "handBackKeyboardBeforeHumanKey", "onSeatKeyboardFocusChange",
