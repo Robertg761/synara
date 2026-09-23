@@ -101,6 +101,16 @@ export type ComputerCaptureRequest =
   | { readonly kind: "window"; readonly windowId: string; readonly maxDimension?: number }
   | { readonly kind: "region"; readonly region: ComputerRect; readonly maxDimension?: number };
 
+/** A single-channel capture; see `ComputerBackend.captureLuma`. */
+export interface ComputerLumaCapture {
+  readonly width: number;
+  readonly height: number;
+  /** Row-major, one byte per pixel, no row padding: `width * height` bytes. */
+  readonly data: Uint8Array;
+  /** Capture pixels per desktop pixel, as on `ComputerScreenshot.scale`. */
+  readonly scale: number;
+}
+
 export interface ComputerStreamFrame {
   readonly sequence: number;
   readonly timestampMs: number;
@@ -572,6 +582,22 @@ export interface ComputerBackend {
    * `region` + `scale` mapping so pixels still convert to desktop coordinates.
    */
   captureScreenshot(request: ComputerCaptureRequest): Promise<ComputerScreenshot>;
+  /**
+   * The same capture as `captureScreenshot(request)`, as raw 8-bit luma instead
+   * of an encoded image, for a picture that is only ever measured.
+   *
+   * Scroll calibration photographs the window before every measured scroll and
+   * never shows that frame to anyone; encoding it to PNG, base64-encoding it
+   * and decoding it back costs more than the correlation it feeds. A backend
+   * that can hand back pixels implements this and the manager uses it for that
+   * baseline. The next capture is still an ordinary screenshot (it becomes the
+   * action's observation) and is correlated against this one, so the two must
+   * agree: the same `width`, `height` and `scale` a `captureScreenshot` of this
+   * request would report, and luma computed exactly as `decodePngLuma` derives
+   * it — `floor((299 R + 587 G + 114 B) / 1000)` per pixel. A failure falls
+   * back to the PNG baseline. Absent means every baseline is a screenshot.
+   */
+  captureLuma?(request: ComputerCaptureRequest): Promise<ComputerLumaCapture>;
   /** Pin or release the plugin's per-seat target window when supported. */
   focusWindow?(windowId: string): Promise<void>;
   /**

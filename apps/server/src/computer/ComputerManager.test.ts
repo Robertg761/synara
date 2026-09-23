@@ -26,6 +26,7 @@ import {
   withComputerCallContext,
 } from "./computerCallContext.ts";
 import { withComputerTask } from "./computerTaskContext.ts";
+import type { ComputerCaptureRequest } from "./ComputerBackend.ts";
 import { FakeComputerBackend } from "./FakeComputerBackend.ts";
 import type { FrameSink } from "@synara/shared/frameTransport";
 
@@ -3139,6 +3140,71 @@ describe("ComputerManager and FakeComputerBackend", () => {
     backend.queueScreenshots(Array.from({ length: 12 }, (_unused, index) => `capture-${index}`));
     return { backend, manager, measurements: measured };
   }
+
+  /** A backend that can hand back raw luma for a capture nobody looks at. */
+  class LumaCaptureBackend extends FakeComputerBackend {
+    lumaCaptures = 0;
+    malformed = false;
+    async captureLuma(request: ComputerCaptureRequest) {
+      this.lumaCaptures += 1;
+      // Same geometry an ordinary capture of this request reports.
+      const shot = await super.captureScreenshot(request);
+      const pixels = shot.width * shot.height;
+      return {
+        width: shot.width,
+        height: shot.height,
+        data: new Uint8Array(this.malformed ? pixels - 1 : pixels),
+        scale: shot.scale!,
+      };
+    }
+  }
+
+  function scrollMeasurementKinds(backend: FakeComputerBackend) {
+    const kinds: string[] = [];
+    const manager = new ComputerManager({
+      backend,
+      actionSettleMs: 0,
+      measureScrollTravel: (before, after) => {
+        kinds.push(`${before.kind}->${after.kind}`);
+        return 40;
+      },
+    });
+    backend.queueScreenshots(Array.from({ length: 12 }, (_unused, index) => `capture-${index}`));
+    return { manager, kinds };
+  }
+
+  it("measures a scroll from a luma baseline when the backend can capture one", async () => {
+    const backend = new LumaCaptureBackend();
+    const { manager, kinds } = scrollMeasurementKinds(backend);
+    try {
+      const scrolled = await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 40, {
+        observe: true,
+      });
+      expect(backend.lumaCaptures).toBe(1);
+      // The baseline is luma; the capture after the scroll is still a PNG,
+      // because it is the observation the caller is handed.
+      expect(kinds).toEqual(["luma->png"]);
+      expect(scrolled.result.scroll?.traveledY).toBe(40);
+      expect(scrolled.observation !== undefined && "screenshot" in scrolled.observation).toBe(true);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("keeps the PNG baseline on a backend without luma capture, or a malformed one", async () => {
+    for (const backend of [
+      new FakeComputerBackend(),
+      Object.assign(new LumaCaptureBackend(), { malformed: true }),
+    ]) {
+      const { manager, kinds } = scrollMeasurementKinds(backend);
+      try {
+        await manager.scrollCalibrated("thread-1", { x: 1_100, y: 200 }, 0, 40, { observe: true });
+        expect(kinds).toEqual(["png->png"]);
+      } finally {
+        await manager.dispose();
+      }
+    }
+  });
 
   it("probes an unmeasured window, then delivers the remainder pre-corrected", async () => {
     // A GTK-hosted browser gears a pixel delta up by ~7x, and nothing in the

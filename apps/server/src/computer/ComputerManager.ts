@@ -67,6 +67,7 @@ import {
   type ComputerGuidanceProfile,
   type ComputerBackendActionResult,
   type ComputerClipboardPasteOffer,
+  type ComputerLumaCapture,
   type ComputerBrowserCallResult,
   type ComputerCaptureRequest,
   type ComputerStreamFrame,
@@ -88,7 +89,12 @@ import {
   topmostWindowAtPoint,
   windowsCoveringPoint,
 } from "./computerGeometry.ts";
-import { decodePngLuma, estimateVerticalTravel, ScrollGearingStore } from "./scrollCalibration.ts";
+import {
+  estimateVerticalTravel,
+  measurementFrameLuma,
+  ScrollGearingStore,
+  type ScrollMeasurementFrame,
+} from "./scrollCalibration.ts";
 import { ScrollGearingFile } from "./scrollGearingFile.ts";
 import {
   ComputerTargetError,
@@ -309,12 +315,20 @@ export interface ComputerManagerOptions {
   readonly actionSettleMs?: number;
   /** Injected for tests, so window-churn tests do not wait out the real window. */
   readonly windowsPublishDebounceMs?: number;
-  /** Injected for tests; decodes and correlates two PNG captures. */
+  /** Injected for tests; decodes and correlates two captures. */
   readonly measureScrollTravel?: (
-    before: Uint8Array,
-    after: Uint8Array,
+    before: ScrollMeasurementFrame,
+    after: ScrollMeasurementFrame,
   ) => number | undefined | Promise<number | undefined>;
 }
+
+/**
+ * What a scroll leg is measured from: a capture that may also become the
+ * action's observation, or a luma-only baseline nobody will ever see.
+ */
+type ScrollBaseline =
+  | { readonly kind: "capture"; readonly capture: ComputerCapturedWindow }
+  | { readonly kind: "luma"; readonly luma: ComputerLumaCapture };
 
 /**
  * A resolved pointer target, plus what the window read taken while resolving it
@@ -428,8 +442,8 @@ export class ComputerManager {
   private readonly actionSettleMs: number;
   private readonly windowsPublishDebounceMs: number;
   private readonly measureScrollTravel: (
-    before: Uint8Array,
-    after: Uint8Array,
+    before: ScrollMeasurementFrame,
+    after: ScrollMeasurementFrame,
   ) => number | undefined | Promise<number | undefined>;
   /** Learned per window and kept for the manager's life; see ScrollGearingStore. */
   private readonly scrollGearing = new ScrollGearingStore();
@@ -1131,7 +1145,7 @@ export class ComputerManager {
       options.actionSettleMs ?? cuaActionSettleMsOverride() ?? COMPUTER_ACTION_SETTLE_MS;
     this.windowsPublishDebounceMs =
       options.windowsPublishDebounceMs ?? COMPUTER_WINDOWS_PUBLISH_DEBOUNCE_MS;
-    this.measureScrollTravel = options.measureScrollTravel ?? measureScrollTravelFromPng;
+    this.measureScrollTravel = options.measureScrollTravel ?? measureScrollTravelFromFrames;
     this.backendHealth = options.backend.health();
     this.transport =
       options.transport ??
@@ -2895,7 +2909,7 @@ export class ComputerManager {
         (await this.agentFocusWindowId());
       const before = !options.observe
         ? undefined
-        : await this.captureForMeasurement(observedWindowId);
+        : await this.captureScrollBaseline(observedWindowId);
 
       // Gearing keys are route-scoped: an AX scroll-bar press and a wheel
       // gesture move the same window different distances for one request, so
@@ -2991,7 +3005,7 @@ export class ComputerManager {
           if (after) {
             const remainderLeg = await this.settleAndMeasure(
               observedWindowId,
-              after,
+              { kind: "capture", capture: after },
               remainderResult?.scrollDelta?.deltaY ?? legY,
               windowKey(remainderRoute),
               durableKey(remainderRoute),
@@ -3156,7 +3170,7 @@ export class ComputerManager {
    */
   private async settleAndMeasure(
     windowId: string | undefined,
-    from: ComputerCapturedWindow,
+    from: ScrollBaseline,
     injectedY: number,
     windowKey?: string,
     appKey?: string,
@@ -3172,11 +3186,7 @@ export class ComputerManager {
         const expectedY = injectedY * predictedGearing;
         const early = await this.captureForMeasurement(windowId);
         if (early) {
-          const traveled = await this.measureLegTravel(
-            from.screenshot,
-            early.screenshot,
-            injectedY,
-          );
+          const traveled = await this.measureLegTravel(from, early.screenshot, injectedY);
           if (
             traveled !== undefined &&
             Math.abs(traveled - expectedY) <=
@@ -3197,7 +3207,7 @@ export class ComputerManager {
     }
     const capture = await this.captureForMeasurement(windowId);
     if (!capture) return {};
-    const traveled = await this.measureLegTravel(from.screenshot, capture.screenshot, injectedY);
+    const traveled = await this.measureLegTravel(from, capture.screenshot, injectedY);
     this.learnLegTravel(windowKey ?? windowId, appKey, injectedY, traveled);
     return { capture, ...(traveled === undefined ? {} : { traveled }) };
   }
@@ -3211,7 +3221,7 @@ export class ComputerManager {
    * direction nothing moved in.
    */
   private async measureLegTravel(
-    from: ComputerScreenshot,
+    from: ScrollBaseline,
     to: ComputerScreenshot,
     injectedY: number,
   ): Promise<number | undefined> {
@@ -3247,6 +3257,43 @@ export class ComputerManager {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * The picture a scroll is measured from. It is never shown to anyone, so a
+   * backend that can hand back raw luma (`captureLuma`) skips the PNG encode,
+   * the base64 round trip and the decode; any other backend, a scroll with no
+   * window to name, and a luma capture that fails or comes back malformed all
+   * take the ordinary measurement capture instead.
+   */
+  private async captureScrollBaseline(
+    windowId: string | undefined,
+  ): Promise<ScrollBaseline | undefined> {
+    const captureLuma = this.backend.captureLuma?.bind(this.backend);
+    if (windowId !== undefined && captureLuma && this.backendCapabilities.capture) {
+      this.engageBackend();
+      try {
+        const luma = await timedComputerLeg("observe", () =>
+          captureLuma({
+            kind: "window",
+            windowId,
+            maxDimension: COMPUTER_ACTION_OBSERVATION_MAX_DIMENSION,
+          }),
+        );
+        if (
+          luma.width > 0 &&
+          luma.height > 0 &&
+          luma.data.byteLength === luma.width * luma.height &&
+          luma.scale > 0
+        ) {
+          return { kind: "luma", luma };
+        }
+      } catch {
+        // Fall through to the screenshot baseline.
+      }
+    }
+    const capture = await this.captureForMeasurement(windowId);
+    return capture ? { kind: "capture", capture } : undefined;
   }
 
   /**
@@ -3301,18 +3348,25 @@ export class ComputerManager {
   }
 
   private async measureTravel(
-    before: ComputerScreenshot,
+    before: ScrollBaseline,
     after: ComputerScreenshot,
   ): Promise<number | undefined> {
-    if (before.bytesBase64 === after.bytesBase64) return 0;
+    if (before.kind === "capture" && before.capture.screenshot.bytesBase64 === after.bytesBase64) {
+      return 0;
+    }
     // Without a scale on both captures there is no conversion from capture
     // pixels to the logical pixels the request was made in, and two different
     // scales are two different pictures of the window.
-    const scale = before.scale;
+    const scale = before.kind === "capture" ? before.capture.screenshot.scale : before.luma.scale;
     if (scale === undefined || scale !== after.scale || scale <= 0) return undefined;
     const traveled = await this.measureScrollTravel(
-      this.measurementBytes(before),
-      this.measurementBytes(after),
+      before.kind === "capture"
+        ? { kind: "png", bytes: this.measurementBytes(before.capture.screenshot) }
+        : {
+            kind: "luma",
+            image: { width: before.luma.width, height: before.luma.height, luma: before.luma.data },
+          },
+      { kind: "png", bytes: this.measurementBytes(after) },
     );
     return traveled === undefined ? undefined : traveled / scale;
   }
@@ -5383,13 +5437,13 @@ export class ComputerManager {
  * capture in a format this does not decode costs the measurement, not the
  * scroll.
  */
-async function measureScrollTravelFromPng(
-  before: Uint8Array,
-  after: Uint8Array,
+async function measureScrollTravelFromFrames(
+  before: ScrollMeasurementFrame,
+  after: ScrollMeasurementFrame,
 ): Promise<number | undefined> {
   const [decodedBefore, decodedAfter] = await Promise.all([
-    decodePngLuma(before),
-    decodePngLuma(after),
+    measurementFrameLuma(before),
+    measurementFrameLuma(after),
   ]);
   if (!decodedBefore || !decodedAfter) return undefined;
   return estimateVerticalTravel(decodedBefore, decodedAfter);
