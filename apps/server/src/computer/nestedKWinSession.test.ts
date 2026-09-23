@@ -163,6 +163,13 @@ describe("nested session environment", () => {
     expect(nestedKWinBackendOptions(() => undefined).visibleDesktop).toBe(false);
   });
 
+  it("moves the headless pointer without a glide nobody can watch", () => {
+    expect(nestedKWinBackendOptions(() => undefined).glideDurationMs).toBe(0);
+    expect(nestedKWinBackendOptions(() => undefined, { mode: "window" }).glideDurationMs).toBe(
+      undefined,
+    );
+  });
+
   it("resolves the session on every use, so a replacement is never driven through a dead bus", async () => {
     // The backend that owns these options is built before any session exists
     // and outlives each one it boots.

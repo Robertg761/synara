@@ -618,6 +618,9 @@ export function nestedKWinBackendOptions(
     // so its desktop genuinely is on screen; the headless one has no output at
     // all and the Computer pane is the only view onto it.
     visibleDesktop: mode === "window",
+    // Nobody watches a headless pointer move: the pane shows stills a couple
+    // of times a second, so a glide there is only latency on every action.
+    ...(mode === "window" ? {} : { glideDurationMs: 0 }),
     // The nested compositor is a Wayland session even when the server was
     // started from a tty or a CI runner with no session at all, so the platform
     // gate must not read the ambient session type.
