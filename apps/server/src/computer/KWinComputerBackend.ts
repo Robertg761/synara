@@ -3178,6 +3178,10 @@ export class KWinComputerBackend implements ComputerBackend {
   protected releaseConnection(reason?: unknown): void {
     this.standDownReconnect();
     this.invalidateConnection();
+    // The helper reads the desktop this connection drove: it goes with it
+    // (an idle release, a nested desktop shut down or ended), and the next
+    // request starts a fresh one.
+    void this.atspi.release?.().catch(() => undefined);
     if (reason !== undefined) {
       this.recordHealthFailure(reason);
       // The desktop ended, and its windows with it.
@@ -3821,7 +3825,6 @@ export class KWinComputerBackend implements ComputerBackend {
       this.stopIdleReleaseTimer();
       this.idleReleased = true;
       this.releaseConnection();
-      await this.atspi.release?.().catch(() => undefined);
     })().finally(() => {
       this.idleReleasing = undefined;
     });

@@ -10,6 +10,7 @@ import {
   ATSPI_HELPER_PROTOCOL,
   AtspiHelperClient,
   AtspiHelperUnavailableError,
+  atspiHelperEnvironment,
 } from "./atspiClient.ts";
 import { DesktopOperationQueue } from "./DesktopOperationQueue.ts";
 
@@ -820,3 +821,29 @@ function scriptedHelper(
   });
   return child;
 }
+
+describe("atspiHelperEnvironment", () => {
+  const server = {
+    PATH: "/usr/bin",
+    AT_SPI_BUS_ADDRESS: "unix:path=/run/user/1000/at-spi/bus_1",
+    SYNARA_AUTH_TOKEN: "secret",
+  };
+
+  it("layers the overrides on the server's environment by default", () => {
+    expect(
+      atspiHelperEnvironment({ env: { DBUS_SESSION_BUS_ADDRESS: "unix:abstract=x" } }, server),
+    ).toEqual({ ...server, DBUS_SESSION_BUS_ADDRESS: "unix:abstract=x", PYTHONUNBUFFERED: "1" });
+  });
+
+  it("gives exactly the overrides when told not to inherit, host accessibility bus included", () => {
+    const env = atspiHelperEnvironment(
+      { env: { PATH: "/usr/bin", DBUS_SESSION_BUS_ADDRESS: "unix:abstract=x" }, inheritEnv: false },
+      server,
+    );
+    expect(env).toEqual({
+      PATH: "/usr/bin",
+      DBUS_SESSION_BUS_ADDRESS: "unix:abstract=x",
+      PYTHONUNBUFFERED: "1",
+    });
+  });
+});

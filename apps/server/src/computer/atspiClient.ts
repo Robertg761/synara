@@ -175,12 +175,31 @@ export interface AtspiHelperClientOptions {
    * `DBUS_SESSION_BUS_ADDRESS` here to keep perception inside that session.
    */
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * `false`: the helper gets exactly `env`, none of this server's own
+   * environment underneath it. A nested session needs that: merged over the
+   * server's environment, a host `AT_SPI_BUS_ADDRESS` would point the helper
+   * at the human's accessibility bus, whatever session bus `env` names.
+   */
+  readonly inheritEnv?: boolean;
   readonly spawnProcess?: (
     command: string,
     args: readonly string[],
   ) => ChildProcessWithoutNullStreams;
   /** Wall clock for the unavailable latch's retry window; tests move it by hand. */
   readonly now?: () => number;
+}
+
+/** The helper process's environment; see `AtspiHelperClientOptions.inheritEnv`. */
+export function atspiHelperEnvironment(
+  options: Pick<AtspiHelperClientOptions, "env" | "inheritEnv">,
+  serverEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...(options.inheritEnv === false ? {} : serverEnv),
+    ...options.env,
+    PYTHONUNBUFFERED: "1",
+  };
 }
 
 type RequestPriority = "high" | "normal";
@@ -560,7 +579,7 @@ export class AtspiHelperClient implements AtspiTreeReader {
       ((spawnCommand, args) =>
         spawn(spawnCommand, args, {
           stdio: ["pipe", "pipe", "pipe"],
-          env: { ...process.env, ...this.options.env, PYTHONUNBUFFERED: "1" },
+          env: atspiHelperEnvironment(this.options),
         }));
     const child = spawnProcess(command, ["-u", scriptPath]);
     this.process = child;
