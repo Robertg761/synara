@@ -120,3 +120,115 @@ describe("pointer glides", () => {
     }
   });
 });
+
+/** Counts the plugin's window reads, which the double does not record itself. */
+function countWindowReads(plugin: FakePlugin): { stateJson: number; windowsJson: number } {
+  const counts = { stateJson: 0, windowsJson: 0 };
+  const stateJson = plugin.stateJson;
+  const windowsJson = plugin.windowsJson;
+  plugin.stateJson = async () => {
+    counts.stateJson += 1;
+    return stateJson();
+  };
+  plugin.windowsJson = async () => {
+    counts.windowsJson += 1;
+    return windowsJson();
+  };
+  return counts;
+}
+
+describe("one window snapshot per desktop operation", () => {
+  it("serves a click's repeated window reads from one enumeration", async () => {
+    const plugin = new FakePlugin();
+    const backend = makeBackend(plugin, { glideDurationMs: 0 });
+    const manager = new (await import("./ComputerManager.ts")).ComputerManager({
+      backend,
+      actionSettleMs: 0,
+    });
+    try {
+      await backend.availability();
+      const counts = countWindowReads(plugin);
+      await manager.withAgentActivity("thread-a", () =>
+        manager.click("thread-a", { x: 1_000, y: 1_600, windowId: "window-1" }),
+      );
+      // Before the snapshot every read paid a stateJson + windowsJson pair.
+      expect(counts.windowsJson).toBeLessThanOrEqual(2);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("reads afresh after input, and after the snapshot ages out", async () => {
+    const plugin = new FakePlugin();
+    let now = 1_000;
+    const backend = makeBackend(plugin, { glideDurationMs: 0, now: () => now });
+    const { DesktopOperationQueue } = await import("./DesktopOperationQueue.ts");
+    const queue = new DesktopOperationQueue();
+    await backend.availability();
+    const counts = countWindowReads(plugin);
+    await queue.run(async () => {
+      await backend.listWindows();
+      await backend.listWindows();
+      expect(counts.windowsJson).toBe(1);
+      await backend.click({ x: 10, y: 10 });
+      await backend.listWindows();
+      expect(counts.windowsJson).toBe(2);
+      now += 100;
+      await backend.listWindows();
+      expect(counts.windowsJson).toBe(3);
+    });
+    // Outside any operation nothing is cached at all.
+    await backend.listWindows();
+    await backend.listWindows();
+    expect(counts.windowsJson).toBe(5);
+  });
+
+  it("uses windowsStateJson in place of the stateJson + windowsJson pair when advertised", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["windowsStateJson"];
+    plugin.workspace = { x: -1_920, y: 0, width: 3_840, height: 1_080 };
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const counts = countWindowReads(plugin);
+    const windows = await backend.listWindows();
+    expect(counts).toEqual({ stateJson: 0, windowsJson: 0 });
+    expect(callsOf(plugin, "windowsStateJson")).toBe(1);
+    expect(windows.map((window) => window.id)).toEqual(["window-1"]);
+    expect(windows[0]?.focused).toBe(true);
+    // Agent space is anchored at the reported workspace origin.
+    expect(windows[0]?.bounds).toEqual({ x: 956 + 1_920, y: 1_519, width: 648, height: 518 });
+
+    // A monitor added to the left moves the origin at the next read.
+    plugin.workspace = { x: -3_840, y: 0, width: 5_760, height: 1_080 };
+    const moved = await backend.listWindows();
+    expect(moved[0]?.bounds?.x).toBe(956 + 3_840);
+  });
+
+  it("treats the combined document's lock flag as the answer, windows or not", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["windowsStateJson"];
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    // Hyprland keeps listing windows while locked; KWin sends none.
+    plugin.windowsStateJson = async () =>
+      JSON.stringify({ windows: plugin.windows, targetWindowId: null, locked: true });
+    const events: string[] = [];
+    backend.onEvent((event) => {
+      if (event.type === "desktop-interrupted") events.push(event.pauses.join(","));
+    });
+    const error = await backend.listWindows().catch((caught: unknown) => caught);
+    expect(String(error)).toContain("computer_session_locked");
+    expect((error as { inputPause?: unknown }).inputPause).toBeDefined();
+    expect(events).toEqual(["screen-lock"]);
+  });
+
+  it("keeps the version-1 reads on a plugin that does not advertise the combined document", async () => {
+    const plugin = new FakePlugin();
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const counts = countWindowReads(plugin);
+    await backend.listWindows();
+    expect(counts).toEqual({ stateJson: 1, windowsJson: 1 });
+    expect(callsOf(plugin, "windowsStateJson")).toBe(0);
+  });
+});

@@ -6,7 +6,11 @@ import { join, resolve } from "node:path";
 
 import { StillFrameDedupe } from "./stillFrameDedupe.ts";
 import { COMPUTER_MODIFIER_KEY_NAMES } from "@synara/shared/computerKeyNames";
-import { assertDesktopOperationActive, desktopOperationSignal } from "./DesktopOperationQueue.ts";
+import {
+  assertDesktopOperationActive,
+  desktopOperationContext,
+  desktopOperationSignal,
+} from "./DesktopOperationQueue.ts";
 import {
   COMPUTER_KWIN_BACKEND,
   COMPUTER_RELEASE_CONTROL_HOTKEY,
@@ -302,6 +306,20 @@ const KWIN_SOURCE_BUILD_HEADERS = [
 ] as const;
 const ENABLE_REBUILD_SCRIPT_PATH = "apps/server/native/computer-use-kwin/systemd/enable.sh";
 const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
+/**
+ * How long one window snapshot answers every window read of the desktop
+ * operation that took it. Short enough that a readiness poll inside one
+ * operation (150 ms apart) always reads afresh; long enough to cover the
+ * bursts a single action makes — resolving, guarding, targeting and fusing a
+ * tree each asked for the whole list, seven reads per click.
+ */
+const WINDOW_SNAPSHOT_TTL_MS = 75;
+/**
+ * Interface-version-2 capabilities a plugin advertises in `healthJson`. A
+ * method is used only when its feature is listed: an installed plugin that
+ * predates it keeps the version-1 path.
+ */
+type PluginFeature = "captureEx" | "keys" | "waitForSettle" | "windowsStateJson";
 const MAX_PLUGIN_ID = /^SynaraComputerUsePlugin(?:V(\d+))?$/;
 const INSTALLED_PLUGIN_FILE = /^(SynaraComputerUsePluginV(\d+))\.so$/;
 interface KWinHealth {
@@ -319,7 +337,12 @@ interface KWinHealth {
   /** The KWin the loaded plugin was compiled against. */
   readonly kwinVersion: string | undefined;
   readonly workspace: ComputerRect | null;
+  /** The interface-version-2 features the loaded plugin implements. */
+  readonly features: ReadonlySet<string>;
 }
+
+/** One window enumeration in both spaces; see `readWindows`. */
+type WindowSnapshot = readonly [windows: ComputerWindow[], origin: ComputerPoint];
 
 interface KWinPluginState {
   readonly position: ComputerPoint | null;
@@ -641,6 +664,18 @@ export class KWinComputerBackend implements ComputerBackend {
   private captureRecoveryDelayMs = CAPTURE_RECOVERY_BASE_MS;
   /** The last window explicitly aimed or raised by a caller. */
   private lastAimedWindowId: string | undefined;
+  /**
+   * The window list the current desktop operation already read, reused by
+   * that operation's later reads until any input, focus or raise changes the
+   * desktop; see `readWindows`.
+   */
+  private windowSnapshot:
+    | {
+        readonly operation: object;
+        readonly at: number;
+        readonly read: Promise<WindowSnapshot>;
+      }
+    | undefined;
   /** The last lock state the plugin reported; see `noteSessionLock`. */
   private sessionLocked = false;
   /** The write scope sampled by the last tree read; see `assertWriteScope`. */
@@ -1059,14 +1094,52 @@ export class KWinComputerBackend implements ComputerBackend {
    * one choke point rather than teaching every tool, the manager, and the pane
    * that the origin might not be (0, 0).
    */
-  private async readWindows(): Promise<
-    readonly [windows: ComputerWindow[], origin: ComputerPoint]
-  > {
+  private async readWindows(): Promise<WindowSnapshot> {
+    // One snapshot per desktop operation: an action resolves, guards, targets
+    // and observes against the same list, and every read after the first was
+    // a compositor-thread JSON build that could only return the same answer.
+    // Anything that changes the desktop drops it (`noteDesktopChange`).
+    const operation = desktopOperationContext();
+    const memo = this.windowSnapshot;
+    if (
+      operation?.active === true &&
+      memo?.operation === operation &&
+      this.now() - memo.at < WINDOW_SNAPSHOT_TTL_MS
+    ) {
+      return await memo.read;
+    }
+    const read = this.readWindowsFresh();
+    if (operation?.active === true) {
+      const snapshot = { operation, at: this.now(), read };
+      this.windowSnapshot = snapshot;
+      read.catch(() => {
+        if (this.windowSnapshot === snapshot) this.windowSnapshot = undefined;
+      });
+    } else {
+      this.windowSnapshot = undefined;
+    }
+    return await read;
+  }
+
+  /** Drops the operation's window snapshot: the desktop may have just changed. */
+  private noteDesktopChange(): void {
+    this.windowSnapshot = undefined;
+  }
+
+  /**
+   * Input is about to reach the desktop: a cached tree or window list read
+   * before it may no longer describe what is there.
+   */
+  private noteInput(): void {
+    this.noteDesktopChange();
+    this.perception.noteInput();
+  }
+
+  private async readWindowsFresh(): Promise<WindowSnapshot> {
     const plugin = await this.ensurePlugin({ start: false });
     try {
-      const state = await this.readPluginState(plugin);
-      const payload = await plugin.windowsJson();
-      const raw = parseWindows(payload, state.targetWindowId);
+      const { payload, targetWindowId } = await this.readWindowPayload(plugin);
+      const raw = parseWindows(payload, targetWindowId);
       const rect = workspaceRectFromWindows(raw, this.pluginHealth?.workspace);
       const origin = { x: rect.x, y: rect.y };
       // The cached origin input actions translate with until the next read:
@@ -1079,11 +1152,51 @@ export class KWinComputerBackend implements ComputerBackend {
       // re-serializing the parsed list — on a call that runs several times per
       // action and per publish — buys nothing. The focus target rides along
       // because it decides `focused` without appearing in that document.
-      this.windowChanges.observe(windowsPayloadFingerprint(payload, state.targetWindowId), windows);
+      this.windowChanges.observe(windowsPayloadFingerprint(payload, targetWindowId), windows);
       return [windows, origin];
     } catch (error) {
       throw this.reportPluginFailure(error);
     }
+  }
+
+  /**
+   * The raw window document and the seat's target window: one
+   * `windowsStateJson` call on a plugin that has it, `stateJson` then
+   * `windowsJson` on one that does not.
+   *
+   * The combined document says `locked` rather than refusing, and that flag is
+   * the whole answer while it is set — KWin sends no windows then and Hyprland
+   * still does, so the list is never read past it. Its workspace rect replaces
+   * the one health last reported, so a monitor plugged in since moves the
+   * agent-space origin at this read rather than at the next reconnect.
+   */
+  private async readWindowPayload(
+    plugin: KWinComputerPluginApi,
+  ): Promise<{ readonly payload: unknown; readonly targetWindowId: string | null }> {
+    const windowsState = this.pluginFeature("windowsStateJson")
+      ? plugin.windowsStateJson
+      : undefined;
+    if (!windowsState) {
+      const state = await this.readPluginState(plugin);
+      return { payload: await plugin.windowsJson(), targetWindowId: state.targetWindowId };
+    }
+    const document = asRecord(parseJsonPayload(await windowsState()));
+    const locked = document.locked === true;
+    this.noteSessionLock(locked);
+    if (locked) throw this.sessionLockedError(SESSION_LOCKED_MESSAGE);
+    const workspace = parseComputerRect(document.workspace);
+    if (workspace && workspace.width > 0 && workspace.height > 0 && this.pluginHealth) {
+      this.pluginHealth = { ...this.pluginHealth, workspace };
+    }
+    return {
+      payload: Array.isArray(document.windows) ? document.windows : [],
+      targetWindowId: asString(document.targetWindowId) ?? null,
+    };
+  }
+
+  /** Whether the loaded plugin advertised `feature`; see `PluginFeature`. */
+  private pluginFeature(feature: PluginFeature): boolean {
+    return this.pluginHealth?.features.has(feature) === true;
   }
 
   /**
@@ -1172,6 +1285,7 @@ export class KWinComputerBackend implements ComputerBackend {
   async focusWindow(windowId: string): Promise<void> {
     const plugin = await this.ensurePlugin();
     assertDesktopOperationActive();
+    this.noteDesktopChange();
     await this.pluginSuccess("focusWindow", () => plugin.focusWindow(windowId));
     this.lastAimedWindowId = windowId;
   }
@@ -1179,6 +1293,7 @@ export class KWinComputerBackend implements ComputerBackend {
   async raiseWindow(windowId: string): Promise<void> {
     const plugin = await this.ensurePlugin();
     assertDesktopOperationActive();
+    this.noteDesktopChange();
     try {
       await this.pluginSuccess("raiseWindow", () => plugin.raiseWindow(windowId));
       this.lastAimedWindowId = windowId;
@@ -1198,6 +1313,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async clearFocusWindow(): Promise<void> {
     const plugin = await this.ensurePlugin();
+    this.noteDesktopChange();
     await this.pluginSuccess("clearFocusWindow", () => plugin.clearFocusWindow());
     this.lastAimedWindowId = undefined;
   }
@@ -1210,6 +1326,7 @@ export class KWinComputerBackend implements ComputerBackend {
    */
   async resetInputDelivery(): Promise<void> {
     this.lastAimedWindowId = undefined;
+    this.noteDesktopChange();
     // Only a session that is up holds anything: the manager calls this on
     // every lease transition, and a reset must never restart a session that
     // idled out or boot a dormant desktop to hand back a seat nobody holds.
@@ -1239,6 +1356,7 @@ export class KWinComputerBackend implements ComputerBackend {
     // The last moment to refuse: after this the process exists whatever the
     // caller does with the cancellation.
     assertDesktopOperationActive();
+    this.noteDesktopChange();
     // An app the agent launches is one it will read: accessibility on from
     // the start (the environment below, and Chromium's switch when known).
     const launch = withAgentAccessibilityArguments(this.resolveApp(app, args));
@@ -1400,7 +1518,7 @@ export class KWinComputerBackend implements ComputerBackend {
     const plugin = await this.ensurePlugin();
     assertDesktopOperationActive();
     const moved = point ? await this.moveCursor(point) : {};
-    this.perception.noteInput();
+    this.noteInput();
     await this.pluginSuccess("axis", () => {
       assertDesktopOperationActive();
       return plugin.axis(deltaX, deltaY);
@@ -1577,7 +1695,7 @@ export class KWinComputerBackend implements ComputerBackend {
         (candidate) => candidate.id === address.windowId,
       );
       if (!window) return false;
-      this.perception.noteInput();
+      this.noteInput();
       return await this.atspi.setText({
         window,
         path: address.path,
@@ -2747,25 +2865,28 @@ export class KWinComputerBackend implements ComputerBackend {
    * and leave translated into the global space the plugin drives.
    */
   private inputSink(plugin: KWinComputerPluginApi): ComputerInputSink {
-    // Every pointer and key stroke goes through a sink: a tree read before
-    // it may no longer describe the desktop.
-    this.perception.noteInput();
+    // Every pointer and key stroke goes through a sink: a tree read or window
+    // list taken before it may no longer describe the desktop.
+    this.noteInput();
     return {
       movePointer: (x, y, operation) => {
         const origin = this.currentOrigin();
         return this.pluginSuccess(operation, () => {
           assertDesktopOperationActive();
+          this.noteDesktopChange();
           return plugin.movePointer(x + origin.x, y + origin.y);
         });
       },
       button: (code, pressed, operation) =>
         this.pluginSuccess(operation, () => {
           if (pressed) assertDesktopOperationActive();
+          this.noteDesktopChange();
           return plugin.button(code, pressed);
         }),
       key: (code, pressed, operation) =>
         this.pluginSuccess(operation, () => {
           if (pressed) assertDesktopOperationActive();
+          this.noteDesktopChange();
           return plugin.key(code, pressed);
         }),
     };
@@ -3731,6 +3852,11 @@ function parseHealth(value: unknown): KWinHealth {
     releaseShortcut: record.releaseShortcut === null ? null : asString(record.releaseShortcut),
     kwinVersion: asString(record.kwinVersion),
     workspace: parseWorkspaceGeometry(record),
+    features: new Set(
+      Array.isArray(record.features)
+        ? record.features.filter((feature): feature is string => typeof feature === "string")
+        : [],
+    ),
   };
 }
 
