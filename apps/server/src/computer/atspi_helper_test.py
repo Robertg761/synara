@@ -742,6 +742,10 @@ class TreeCacheTest(unittest.TestCase):
     def test_serves_a_tree_the_application_has_not_changed_since(self):
         self.warm()
         self.assertEqual(self.desktop.registered, list(HELPER.CACHE_EVENTS))
+        # Per-frame classes are never asked for: every application on the bus
+        # would emit them on each scroll and animation frame.
+        self.assertNotIn("object:bounds-changed", self.desktop.registered)
+        self.assertNotIn("object:visible-data-changed", self.desktop.registered)
         walked = self.desktop.calls["GetChildren"]
         confirmed = self.desktop.calls[(self.dest, "GetState")]
 

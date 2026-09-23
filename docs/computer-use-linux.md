@@ -274,7 +274,10 @@ session; `SYNARA_COMPUTER_IDLE_RELEASE_MINUTES` (default 10, `0` off) is how lon
 an unused desktop keeps its bus connection, the server's bus name and the AT-SPI
 helper before letting them go, so a second Synara server can drive it (the next
 use connects again); `SYNARA_ATSPI_PYTHON` and `SYNARA_ATSPI_HELPER` point at
-the helper, and `SYNARA_ATSPI_EVENTS=0` turns off its event-fed cache.
+the helper, and `SYNARA_ATSPI_EVENTS` switches its event-fed tree cache (off by
+default on the real desktop, where registering for events makes every
+application emit them, GTK 3 all of them; on in the nested desktop; `1` or `0`
+overrides either).
 Every variable the server reads for computer use is listed in `turbo.json`'s
 `globalPassThroughEnv`, which turbo strips otherwise in strict mode; a backend
 that reads a new one adds it there.

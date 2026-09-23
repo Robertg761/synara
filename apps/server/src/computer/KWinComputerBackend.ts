@@ -875,7 +875,16 @@ export class KWinComputerBackend implements ComputerBackend {
       options.humanActiveGuardMs ??
         parseHumanActiveGuardEnv(process.env.SYNARA_COMPUTER_HUMAN_ACTIVE_MS),
     );
-    this.atspi = options.atspi ?? new AtspiHelperClient();
+    // The helper's event-fed tree cache is off on the human's own desktop
+    // unless asked for: registering for AT-SPI events makes every application
+    // there emit them, and GTK 3 then emits all of them (a scrolling list
+    // sends ~250 messages a second from its main thread) for as long as the
+    // helper runs. A nested desktop's reader, passed in, has its own bus.
+    this.atspi =
+      options.atspi ??
+      new AtspiHelperClient({
+        env: { SYNARA_ATSPI_EVENTS: process.env.SYNARA_ATSPI_EVENTS ?? "0" },
+      });
     this.perception = new AtspiPerception({
       reader: this.atspi,
       now: () => this.now(),

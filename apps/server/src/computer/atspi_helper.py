@@ -148,14 +148,21 @@ CONTENT_HIDDEN_REASON = (
 )
 
 # The event classes whose arrival invalidates an application's cached trees.
-# Registering is what makes toolkits emit them at all.
+# Registering is what makes toolkits emit them at all, and every application
+# on the bus pays for what is registered, so only the classes that change
+# what a tree says are asked for. bounds-changed and visible-data-changed fire
+# on every scroll and animation frame; a node that moved is caught when it is
+# used (validateNode re-reads its extents before any action), not by a
+# generation bump. Toolkits that filter per class (Qt, Chromium) then emit
+# nothing for scrolling; GTK 3's bridge emits everything once anything is
+# registered (measured 2026-09-23: one scrolling GTK 3 list, ~180
+# BoundsChanged/s whichever single class was registered), which is why the
+# real-desktop backends leave these events off by default (SYNARA_ATSPI_EVENTS).
 CACHE_EVENTS = (
     "object:children-changed",
     "object:state-changed",
     "object:property-change",
-    "object:bounds-changed",
     "object:text-changed",
-    "object:visible-data-changed",
     "window:",
     "document:",
 )
