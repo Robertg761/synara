@@ -18,7 +18,7 @@ class PopupTest(unittest.TestCase):
         free = "\n".join([owner.group(0), window.group(0), definition(source, "popupOpenedByAgent", member=False),
                           definition(source, "serialInBurst", member=False)])
         definitions = [definition(source, name) for name in
-                       ["handlePopupGrab", "isAgentPopup", "dismissAgentPopups", "noteAgentBurst", "agentMintedSerial", "handleHumanPointerPress"]]
+                       ["handlePopupCreated", "handlePopupGrab", "isAgentPopup", "dismissAgentPopups", "noteAgentBurst", "agentMintedSerial", "handleHumanPointerPress"]]
         run_fixture(FIXTURE, definitions, prefix="synara-kwin-popup-test-", replacements={"// PRODUCTION_FREE": free})
 
 

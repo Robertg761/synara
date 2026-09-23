@@ -31,11 +31,14 @@ template <class T> struct QList : std::vector<T> {
     using std::vector<T>::vector;
     bool isEmpty() const { return this->empty(); }
     void append(const T& v) { this->push_back(v); }
+    template <class U> void removeAll(const U& v) { this->erase(std::remove(this->begin(), this->end(), T(v)), this->end()); }
 };
 struct QElapsedTimer {
     bool valid = false;
-    void restart() { valid = true; }
+    qint64 ms = 0;
+    void restart() { valid = true; ms = 0; }
     bool isValid() const { return valid; }
+    qint64 elapsed() const { return ms; }
 };
 struct SynaraSerialBurst {
     quint32 after = 0;
@@ -54,22 +57,53 @@ struct SeatInterface {
     PointerInterface pointerObject;
     PointerInterface* pointer() { return &pointerObject; }
 };
-struct WaylandServer {
-    SeatInterface seat0;
-    SeatInterface* seat() { return &seat0; }
-};
-WaylandServer server;
-WaylandServer* waylandServer() { return &server; }
-SurfaceInterface* humanKeyboardSurface() { return nullptr; }
-
 std::vector<std::string> dismissed;
 struct Window {
     std::string name;
     double x = 0, y = 0, w = 0, h = 0;
     bool deleted = false;
+    SurfaceInterface* surf = nullptr;
+    bool popupWindow = true;
+    std::vector<std::function<void()>> closedHandlers;
     bool isDeleted() const { return deleted; }
     bool hitTest(const QPointF& p) const { return p.x() >= x && p.x() < x + w && p.y() >= y && p.y() < y + h; }
     void popupDone() { dismissed.push_back(name); deleted = true; }
+    SurfaceInterface* surface() const { return surf; }
+    bool isPopupWindow() const { return popupWindow; }
+    void closed() {}
+};
+struct WaylandServer {
+    SeatInterface seat0;
+    std::vector<Window*> windows;
+    SeatInterface* seat() { return &seat0; }
+    Window* findWindow(const SurfaceInterface* s) const {
+        for (Window* w : windows) if (s && w->surf == s) return w;
+        return nullptr;
+    }
+};
+WaylandServer server;
+WaylandServer* waylandServer() { return &server; }
+SurfaceInterface* humanKeyboardSurface() { return nullptr; }
+// xdg_popup as KWin exposes it: the popup's and its parent's surfaces, and the
+// grab request, which KWin's XdgPopupWindow is connected to (kwinGrab) before
+// the plugin sees the popup.
+struct XdgPopupInterface {
+    SurfaceInterface* s = nullptr;
+    SurfaceInterface* parent = nullptr;
+    bool kwinGrab = true;
+    std::vector<std::function<void(SeatInterface*, quint32)>> grabHandlers;
+    SurfaceInterface* surface() const { return s; }
+    SurfaceInterface* parentSurface() const { return parent; }
+    void grabRequested(SeatInterface*, quint32) {}
+    // The client asks for its grab: KWin records it, then the plugin hears it.
+    bool requestGrab(SeatInterface* seat, quint32 serial) {
+        const bool kwinRecorded = kwinGrab;
+        for (auto& handler : grabHandlers) handler(seat, serial);
+        return kwinRecorded;
+    }
+};
+struct QObject {
+    static void disconnect(XdgPopupInterface* popup, void (XdgPopupInterface::*)(SeatInterface*, quint32), Window*, std::nullptr_t) { popup->kwinGrab = false; }
 };
 
 // PRODUCTION_FREE
@@ -85,6 +119,13 @@ struct SynaraComputerUsePlugin {
     size_t m_agentBurstNext = 0;
     size_t m_agentBurstCount = 0;
 
+    void connect(Window* window, void (Window::*)(), SynaraComputerUsePlugin*, std::function<void()> f) { window->closedHandlers.push_back(std::move(f)); }
+    void connect(XdgPopupInterface* popup, void (XdgPopupInterface::*)(SeatInterface*, quint32), SynaraComputerUsePlugin*, std::function<void(SeatInterface*, quint32)> f) {
+        popup->grabHandlers.push_back(std::move(f));
+    }
+    const ClientConnection* m_lastAgentPressClient = nullptr;
+    QElapsedTimer m_lastAgentPress;
+    void handlePopupCreated(XdgPopupInterface* popup);
     void handlePopupGrab(Window* window, SeatInterface* seat, quint32 serial);
     bool isAgentPopup(const Window* window) const;
     void dismissAgentPopups(const std::function<bool(const Window*)>& shouldDismiss);
@@ -158,6 +199,26 @@ int main() {
             check(plugin.m_lastHumanPressClient == &chromium && plugin.m_lastHumanPress.isValid(), "the press is recorded against seat0's pointer focus");
             plugin.handleHumanPointerPress({900, 900});
             check(dismissed.size() == 2 && dismissed[0] == "submenu" && dismissed[1] == "menu", "a press elsewhere closes the agent's popups, submenu first");
+        }
+        {
+            // A popup whose window is gone before its grab request arrives:
+            // the request is dropped, never handed a dead window.
+            SynaraComputerUsePlugin plugin;
+            ClientConnection app;
+            SurfaceInterface parentSurface{&app}, popupSurface{&app};
+            Window parentWindow{"parent"};
+            parentWindow.surf = &parentSurface;
+            parentWindow.popupWindow = false;
+            Window gone{"gone"};
+            gone.surf = &popupSurface;
+            server.windows = {&parentWindow, &gone};
+            XdgPopupInterface popup{&popupSurface, &parentSurface};
+            plugin.handlePopupCreated(&popup);
+            gone.deleted = true;
+            dismissed.clear();
+            plugin.noteAgentBurst(10, 20);
+            popup.requestGrab(&server.seat0, 15);
+            check(dismissed.empty() && plugin.m_popupsDismissed == 0, "a grab request for a destroyed popup window was acted on");
         }
     } catch (const std::exception& failure) {
         std::cout << "FAILED: " << failure.what() << "\n";

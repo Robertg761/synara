@@ -4719,8 +4719,12 @@ void SynaraComputerUsePlugin::handlePopupCreated(XdgPopupInterface *popup)
             m_agentPopups.removeAll(window);
         });
     }
-    connect(popup, &XdgPopupInterface::grabRequested, this, [this, window](SeatInterface *seat, quint32 serial) {
-        handlePopupGrab(window, seat, serial);
+    // The window can be gone before the client asks for its grab (a popup
+    // destroyed before its first commit), so it is held weakly.
+    connect(popup, &XdgPopupInterface::grabRequested, this, [this, window = QPointer<Window>(window)](SeatInterface *seat, quint32 serial) {
+        if (window && !window->isDeleted()) {
+            handlePopupGrab(window, seat, serial);
+        }
     });
 }
 
