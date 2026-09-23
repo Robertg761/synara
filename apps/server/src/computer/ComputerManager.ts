@@ -3642,19 +3642,36 @@ export class ComputerManager {
       );
       let restored = false;
       let result: ComputerBackendActionResult | void;
+      // Whether the offer was read before the shortcut was even dispatched:
+      // that reader was not the target but a clipboard watcher (Klipper, a
+      // `wl-paste --watch` history daemon), so it says nothing about the paste.
+      let consumedBeforeShortcut = false;
+      let shortcutDispatched = false;
+      if (offer) {
+        offer.consumed.then(
+          () => {
+            if (!shortcutDispatched) consumedBeforeShortcut = true;
+          },
+          () => undefined,
+        );
+      }
       try {
-        result = await this.runKeyboardDispatch(threadId, windowId, () =>
-          this.backend.hotkey(
+        result = await this.runKeyboardDispatch(threadId, windowId, () => {
+          shortcutDispatched = true;
+          return this.backend.hotkey(
             this.agentDialect === "macos" ? ["meta", "v"] : ["ctrl", "v"],
             windowId,
-          ),
-        );
+          );
+        });
       } finally {
+        shortcutDispatched = true;
         // The restore runs whether or not the shortcut dispatched: the payload
         // is already on the clipboard either way, and leaving it there leaks
         // the agent's text into the next paste the human makes.
         if (previous !== undefined) {
-          await timedComputerLeg("settle", () => pasteConsumed(offer));
+          await timedComputerLeg("settle", () =>
+            pasteConsumed(consumedBeforeShortcut ? { consumed: new Promise(() => undefined) } : offer),
+          );
           restored = await write(previous).then(
             () => true,
             () => false,
@@ -5534,22 +5551,27 @@ async function measureScrollTravelFromFrames(
 
 /**
  * The wait between a paste shortcut and putting the human's clipboard back.
- * A backend that can observe the paste (`writeClipboardForPaste`) ends it the
- * moment the target has read the payload, bounded for a paste that never
- * reads; every other backend keeps the fixed settle.
+ * A backend that can observe the paste (`writeClipboardForPaste`) ends it once
+ * the target has read the payload, bounded for a paste that never reads;
+ * every other backend keeps the fixed settle. Never shorter than that settle
+ * either way: a read reported the instant the keys went out can still be a
+ * watcher's, and the target reads off the keystroke asynchronously. An offer
+ * read before the shortcut was sent is passed in as never read.
  */
 async function pasteConsumed(offer: ComputerClipboardPasteOffer | void): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const bound = new Promise<void>((resolve) => {
-    timer = setTimeout(
-      resolve,
-      offer ? COMPUTER_PASTE_CONSUME_TIMEOUT_MS : COMPUTER_PASTE_RESTORE_MS,
-    );
-  });
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number) =>
+    new Promise<void>((resolve) => {
+      timers.push(setTimeout(resolve, ms));
+    });
+  const floor = after(COMPUTER_PASTE_RESTORE_MS);
   try {
-    await (offer ? Promise.race([offer.consumed.catch(() => bound), bound]) : bound);
+    if (!offer) return await floor;
+    const bound = after(COMPUTER_PASTE_CONSUME_TIMEOUT_MS);
+    await Promise.race([offer.consumed.catch(() => bound), bound]);
+    await floor;
   } finally {
-    clearTimeout(timer);
+    for (const timer of timers) clearTimeout(timer);
   }
 }
 

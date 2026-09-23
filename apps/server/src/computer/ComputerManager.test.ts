@@ -5110,6 +5110,35 @@ describe("paste clipboard restore", () => {
     expect(restoredAfter).toBeLessThan(COMPUTER_PASTE_CONSUME_TIMEOUT_MS - 500);
   });
 
+  it("never restores sooner than the fixed settle after the shortcut", async () => {
+    const backend = new PasteOnceBackend();
+    const hotkey = backend.hotkey.bind(backend);
+    backend.hotkey = async (...args) => {
+      const result = await hotkey(...args);
+      // Read quickly, well inside the settle.
+      setTimeout(() => backend.consume?.(), 50);
+      return result;
+    };
+    const restoredAfter = await pasteRestoredAfterMs(backend);
+    expect(restoredAfter).toBeGreaterThanOrEqual(COMPUTER_PASTE_RESTORE_MS - 5);
+    expect(restoredAfter).toBeLessThan(COMPUTER_PASTE_CONSUME_TIMEOUT_MS - 500);
+  });
+
+  it("takes an offer read before the shortcut for a clipboard watcher's, not the paste", async () => {
+    // Klipper or a `wl-paste --watch` history daemon reads every new
+    // selection at once; restoring on that read would put the human's text
+    // back before the target ever saw the paste.
+    const backend = new PasteOnceBackend();
+    const writeForPaste = backend.writeClipboardForPaste.bind(backend);
+    backend.writeClipboardForPaste = async (text: string) => {
+      const offer = await writeForPaste(text);
+      backend.consume?.();
+      return offer;
+    };
+    const restoredAfter = await pasteRestoredAfterMs(backend);
+    expect(restoredAfter).toBeGreaterThanOrEqual(COMPUTER_PASTE_CONSUME_TIMEOUT_MS - 5);
+  });
+
   it("restores at the bound when a paste-once offer is never read", async () => {
     const backend = new PasteOnceBackend();
     const restoredAfter = await pasteRestoredAfterMs(backend);
