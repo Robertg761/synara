@@ -211,9 +211,11 @@ The same engine drives all three Linux backends.
   use the core's 1536 px budget. `launchApp` reports the pid, the app id a
   launcher hands off to, and whether one of its windows took activation.
 - Settle: with `waitForSettle`, an action waits until the target window has
-  repainted and stayed quiet for 100 ms, capped at 1.5 s. A window that has
-  not repainted at all 300 ms after the input is taken as unchanged. After
-  three such actions in a row the manager's fixed wait comes back.
+  repainted and stayed quiet for 100 ms, for at most the 300 ms the fixed
+  wait used to take. At 300 ms, a window that has not repainted at all is
+  taken as unchanged and one still repainting as an animation; both are
+  photographed then. After three actions in a row that saw no repaint the
+  manager's fixed wait comes back.
 - Preview: stills are passive JPEGs (`captureRegionEx`) at a 1280 px budget
   through `StillFramePublisher`. They slow from 500 ms to 2 s after four
   identical frames, wake on actions and window changes, and wait while a

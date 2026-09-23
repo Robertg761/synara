@@ -552,6 +552,24 @@ describe("compositor-observed settle", () => {
       expect(backend.waitForSettle).toBeDefined();
     });
 
+    it("photographs a window still animating at the bound as it is (the backend's policy)", async () => {
+      const plugin = new FakePlugin();
+      plugin.features = ["waitForSettle"];
+      answeringSettle(plugin, { first: [false, 300], changed: true });
+      const backend = makeBackend(plugin);
+      await backend.availability();
+      expect(backend.actionSettle).toMatchObject({ quietWithinMs: 300, changeWithinMs: 300 });
+      await expect(
+        backend.waitForSettle!({ ...options, ...backend.actionSettle }),
+      ).resolves.toEqual({ settled: false, waitedMs: 300 });
+      // Nothing is left waiting in the plugin: the quiet bound is spent.
+      expect(plugin.calls.filter((call) => call.method === "waitForSettle")).toEqual([
+        { method: "waitForSettle", args: ["window-1", 100, 300] },
+        { method: "waitForSettle", args: ["window-1", 0, 0] },
+      ]);
+      expect(backend.waitForSettle).toBeDefined();
+    });
+
     it("gives the fixed wait back after three settles in a row saw no repaint", async () => {
       const plugin = new FakePlugin();
       plugin.features = ["waitForSettle"];

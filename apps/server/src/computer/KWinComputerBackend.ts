@@ -357,15 +357,18 @@ const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
 const WINDOW_SNAPSHOT_TTL_MS = 75;
 /**
  * The post-action settle on a plugin that answers `waitForSettle` from surface
- * commits: the target has repainted since the input and then stayed quiet
- * this long, measured on the target window alone. A window that has not
- * repainted at all within the fixed 300 ms guess this replaces is taken as
- * unchanged — most clicks that change nothing visible (a label, empty space)
- * would otherwise hold the observation for the whole cap — and one that has
- * repainted is waited on for its quiet up to the cap.
+ * commits: the target window has repainted since the input and then stayed
+ * quiet this long. Both are looked for only as long as the fixed 300 ms guess
+ * this replaces used to wait. A window that has not repainted at all by then
+ * is taken as unchanged — a click that changes nothing visible (a label,
+ * empty space) used to hold the observation for the whole cap. One still
+ * repainting is an animation and is photographed then, as before: GTK
+ * animates under any pointer motion (the overlay scrollbar fades for about a
+ * second), and waiting for its quiet up to the cap measured 1.1 s per click
+ * on a GTK text view against 0.35 s.
  */
 const PLUGIN_SETTLE_QUIET_MS = 100;
-const PLUGIN_SETTLE_CHANGE_WITHIN_MS = 300;
+const PLUGIN_SETTLE_WITHIN_MS = 300;
 const PLUGIN_SETTLE_TIMEOUT_MS = 1_500;
 /**
  * Consecutive settles of visible windows that saw no repaint at all before the
@@ -601,7 +604,8 @@ export class KWinComputerBackend implements ComputerBackend {
   readonly actionSettle = {
     quietMs: PLUGIN_SETTLE_QUIET_MS,
     timeoutMs: PLUGIN_SETTLE_TIMEOUT_MS,
-    changeWithinMs: PLUGIN_SETTLE_CHANGE_WITHIN_MS,
+    quietWithinMs: PLUGIN_SETTLE_WITHIN_MS,
+    changeWithinMs: PLUGIN_SETTLE_WITHIN_MS,
   } as const;
 
   protected readonly integrationName: string;
