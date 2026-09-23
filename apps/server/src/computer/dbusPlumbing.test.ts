@@ -147,6 +147,40 @@ describe("watching a D-Bus connection", () => {
     await expect(waiting).rejects.toMatchObject({ cause: reset, connectionLevel: true });
   });
 
+  it("keeps the connection through errors about one message", async () => {
+    const bus = withFakeDbusTransport(new EventEmitter());
+    const watch = watchDbusConnection(bus);
+    const closed = vi.fn();
+    watch.onClosed(closed);
+    let answer!: (value: string) => void;
+    const waiting = watch.guard(
+      () =>
+        new Promise<string>((resolve) => {
+          answer = resolve;
+        }),
+    );
+
+    // An undecodable message: dbus-next adds a description and reads on.
+    bus.emit("error", new TypeError("bad variant"), "There was an error receiving a message");
+    // A failed AddMatch/RemoveMatch reply: a DBusError, named by `type`.
+    const refused = Object.assign(new Error("match rule refused"), {
+      name: "DBusError",
+      type: "org.freedesktop.DBus.Error.MatchRuleInvalid",
+      reply: null,
+    });
+    bus.emit("error", refused);
+
+    expect(watch.isClosed()).toBe(false);
+    expect(closed).not.toHaveBeenCalled();
+    answer("still here");
+    await expect(waiting).resolves.toBe("still here");
+
+    // A socket error still ends it.
+    bus.emit("error", Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }));
+    expect(watch.isClosed()).toBe(true);
+    expect(closed).toHaveBeenCalledTimes(1);
+  });
+
   it("settles a released connection's calls with the releaser's reason and tells no one", async () => {
     const bus = withFakeDbusTransport(new EventEmitter());
     const watch = watchDbusConnection(bus);

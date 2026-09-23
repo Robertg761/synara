@@ -167,7 +167,9 @@ export function watchDbusConnection(bus: object): DbusConnectionWatch {
     target.on(event, handler);
     attached.push([target, event, handler]);
   };
-  const onError = (error: unknown) => drop(error);
+  const onError = (error: unknown, detail?: unknown) => {
+    if (!isMessageLevelBusError(error, detail)) drop(error);
+  };
   const onEnd = () => drop();
   listen(bus, "error", onError);
   listen(bus, "disconnect", onEnd);
@@ -212,6 +214,28 @@ export function watchDbusConnection(bus: object): DbusConnectionWatch {
       for (const [target, event, handler] of attached.splice(0)) target.off(event, handler);
     },
   };
+}
+
+/**
+ * An `error` the bus emits about one message rather than the connection.
+ *
+ * dbus-next funnels everything through the bus's `error` event, and two kinds
+ * leave the connection working: a message it failed to decode (emitted with a
+ * description as a second argument, and the stream reads on) and a D-Bus error
+ * reply to its own AddMatch/RemoveMatch bookkeeping (a `DBusError`, which
+ * carries the error name as `type`). Taking either for a drop would tear down
+ * a healthy connection and every call on it. Anything else — a socket error,
+ * a failed handshake, a write to a closed stream — ends the connection, and
+ * the transport's own `end`/`close` may never follow a handshake failure, so
+ * those still drop here.
+ */
+function isMessageLevelBusError(error: unknown, detail: unknown): boolean {
+  if (detail !== undefined) return true;
+  return (
+    error instanceof Error &&
+    error.name === "DBusError" &&
+    typeof (error as { readonly type?: unknown }).type === "string"
+  );
 }
 
 interface Emitter {
