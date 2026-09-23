@@ -231,8 +231,11 @@ export type ComputerBackendEvent =
    * Hyprland session ends while the server keeps running. Distinct from a
    * reconnect, which the backend handles itself. The service may re-run
    * backend selection and swap in whatever it picks, except for a backend an
-   * explicit override named, which stays and reports. `message` says what
-   * was lost.
+   * explicit override named, which stays and reports. When selection picks
+   * the same tier again, nothing is swapped and the event is spent: a backend
+   * that emits it therefore owns the retry, and keeps looking for its desktop
+   * (at a slow cadence) so one that comes back later is picked up without an
+   * agent action. `message` says what was lost.
    */
   | { readonly type: "desktop-gone"; readonly message: string }
   | { readonly type: "frame"; readonly frame: ComputerStreamFrame };
