@@ -396,6 +396,7 @@ private:
     void evaluateSettle(SettleRequest *request);
     void finishSettle(SettleRequest *request, bool settled);
     void retireSettleTimer(SettleRequest *request);
+    void finishAllSettleRequests();
     void failSettleRequests(const QString &errorName, const QString &reason);
     bool admitCapture();
     void startCapture(std::shared_ptr<CaptureRequest> request, uint maxDimension, uint flags, bool extended);

@@ -170,8 +170,10 @@ plugin keeps working with a newer server. Every version 1 method is unchanged.
   input until one settles on it; after that, or before any input, a wait asks
   for content committed after the call itself. The reply is delayed and driven
   by the damage signal and one timer per wait; the compositor thread never
-  blocks. More than 16 waits in flight answer `LimitsExceeded`, a lock
-  `SessionLocked`.
+  blocks. `focusWindow` and `raiseWindow` count as input. A session stop (or
+  the plugin unloading) answers every pending wait unsettled, and a lock
+  answers them `SessionLocked`; more than 16 waits in flight answer
+  `LimitsExceeded`. The Hyprland plugin answers identically.
 
 `healthJson` also carries `xAuthority`: the cookie file of the Xwayland this
 compositor started, read from KWin's own environment the same way `xDisplay`

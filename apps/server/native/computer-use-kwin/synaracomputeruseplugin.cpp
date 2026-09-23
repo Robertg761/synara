@@ -1615,7 +1615,7 @@ SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
     if (m_captureRequest) {
         failCapture(m_captureRequest, QStringLiteral("capture canceled: plugin destroyed"));
     }
-    failSettleRequests(QStringLiteral("org.freedesktop.DBus.Error.Failed"), QStringLiteral("wait canceled: plugin destroyed"));
+    finishAllSettleRequests();
     releaseCaptureTargets();
     releasePressedState();
     detachInputDevice();
@@ -2056,6 +2056,10 @@ void SynaraComputerUsePlugin::stopSession(StopReason reason)
 {
     DirectInjectionScope scope(this);
     m_idleTimer.stop();
+    // Nothing is left to settle: every wait is answered, unsettled, as the
+    // Hyprland plugin answers them. A lock has answered its own already, with
+    // SessionLocked (handleSessionStateChanged).
+    finishAllSettleRequests();
     if (m_captureRequest) {
         if (reason == StopReason::SessionLocked) {
             failCapture(m_captureRequest, QStringLiteral("session locked"), s_sessionLockedErrorName);
@@ -2921,6 +2925,17 @@ void SynaraComputerUsePlugin::retireSettleTimer(SettleRequest *request)
         timer->stop();
         timer->disconnect(this);
         timer->deleteLater();
+    }
+}
+
+void SynaraComputerUsePlugin::finishAllSettleRequests()
+{
+    std::vector<SettleRequest *> pending;
+    for (const auto &request : m_settleRequests) {
+        pending.push_back(request.get());
+    }
+    for (SettleRequest *request : pending) {
+        finishSettle(request, false);
     }
 }
 
