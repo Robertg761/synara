@@ -88,6 +88,9 @@ const ATSPI_BUS_LAUNCHER_PATHS = [
 ];
 const ATSPI_BUS_NAME = "org.a11y.Bus";
 const ATSPI_READY_TIMEOUT_MS = 5_000;
+/** How long a just-spawned process may take to become itself before the marker gives up. */
+const MARKER_RECORD_RETRY_MS = 10;
+const MARKER_RECORD_ATTEMPTS = 200;
 const KWIN_COMMAND = "kwin_wayland";
 const XWAYLAND_COMMAND = "Xwayland";
 const DEFAULT_NESTED_WIDTH = 1_920;
@@ -434,6 +437,8 @@ export async function startNestedKWinSession(
  */
 class SessionMarkerWriter {
   private readonly processes = new Map<number, NestedSessionProcess>();
+  private readonly retries = new Map<number, ReturnType<typeof setTimeout>>();
+  private readonly ownCommand: string | undefined;
   private chain: Promise<void> = Promise.resolve();
   private path: string | undefined;
   private removed = false;
@@ -442,22 +447,48 @@ class SessionMarkerWriter {
     private readonly base: Omit<NestedSessionMarker, "processes">,
     private readonly registry: NestedSessionRegistryDependencies,
   ) {
+    this.ownCommand = (registry.processCommand ?? readProcessCommand)(
+      registry.serverPid ?? process.pid,
+    );
     this.flush();
   }
 
-  record(pid: number | undefined, role: NestedSessionProcessRole): void {
+  /**
+   * Records a process as soon as it is the program it was spawned as. A
+   * runtime that spawns through vfork (Bun does) can return before the exec,
+   * when the child's cmdline is still this server's own or momentarily empty;
+   * such a child is retried briefly rather than recorded under the wrong name
+   * or not at all.
+   */
+  record(pid: number | undefined, role: NestedSessionProcessRole, attempt = 0): void {
+    if (pid === undefined || this.removed) return;
     const entry = describeNestedSessionProcess(pid, role, this.registry);
-    if (!entry) return;
+    if (entry && entry.command !== this.ownCommand) {
     this.processes.set(entry.pid, entry);
     this.flush();
+      return;
+    }
+    if (attempt >= MARKER_RECORD_ATTEMPTS) return;
+    const retry = setTimeout(() => {
+      this.retries.delete(pid);
+      this.record(pid, role, attempt + 1);
+    }, MARKER_RECORD_RETRY_MS);
+    retry.unref?.();
+    this.retries.set(pid, retry);
   }
 
   forget(pid: number | undefined): void {
-    if (pid !== undefined && this.processes.delete(pid)) this.flush();
+    if (pid === undefined) return;
+    const retry = this.retries.get(pid);
+    if (retry !== undefined) clearTimeout(retry);
+    this.retries.delete(pid);
+    if (this.processes.delete(pid)) this.flush();
   }
 
   async remove(): Promise<void> {
     this.removed = true;
+    for (const retry of this.retries.values()) clearTimeout(retry);
+    this.retries.clear();
     await this.chain;
     if (this.path) await removeNestedSessionMarker(this.path);
   }

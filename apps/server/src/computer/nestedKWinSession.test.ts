@@ -701,6 +701,31 @@ describe("the session marker", () => {
     expect(await harness.markers()).toEqual([]);
   });
 
+  it("waits for a child spawned through vfork to become itself before recording it", async () => {
+    // Under Bun, spawn can return while the child is still this server's image.
+    const harness = new NestedHarness();
+    let preExec = true;
+    const session = await startNestedKWinSession(
+      harness.options({
+        registry: {
+          ...harness.options().registry,
+          processCommand: (pid) =>
+            pid === 424_242 || preExec ? "bun src/index.ts" : harness.commandForTest(pid),
+        },
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect((await harness.marker())?.processes).toEqual([]);
+
+    preExec = false;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect((await harness.marker())?.processes.map((entry) => entry.role)).toEqual([
+      "bus",
+      "compositor",
+    ]);
+    await session.dispose();
+  });
+
   it("records apps the agent launches and forgets the ones that exit", async () => {
     const harness = new NestedHarness();
     const session = await startNestedKWinSession(harness.options());
@@ -914,6 +939,10 @@ class NestedHarness {
     return JSON.parse(
       await readFile(join(this.stateDirectoryPath, name), "utf8"),
     ) as NestedSessionMarker;
+  }
+
+  commandForTest(pid: number): string | undefined {
+    return this.commandFor(pid);
   }
 
   /** Every process the harness started, by pid, as the marker reads it back. */
