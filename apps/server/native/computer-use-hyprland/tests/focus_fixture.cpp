@@ -52,6 +52,11 @@ struct CBox { double x = 0, y = 0, w = 1920, h = 1080; };
 struct Window {};
 using PHLWINDOW = SP<Window>;
 struct Seat { struct { std::weak_ptr<CWLSurfaceResource> pointerFocus, keyboardFocus; } m_state; } seat;
+// One wl_keyboard.modifiers worth of state, as the plugin declares it.
+struct SModifierState {
+    uint32_t depressed = 0, latched = 0, locked = 0, group = 0;
+    bool operator==(const SModifierState&) const = default;
+};
 Seat* g_pSeatManager = &seat;
 struct SDeferredRelease {
     WP<CWLSurfaceResource> surface;
@@ -72,6 +77,7 @@ struct {
     Vector2D pos;
     struct xkb_state* xkbState = nullptr;
     bool agentModifiersInEffect = false;
+    SModifierState agentModifiers;
     std::set<uint32_t> humanHeldKeys;
 } g;
 SP<CWLSurfaceResource> hitSurface;
@@ -81,11 +87,13 @@ CWLSurfaceResource* pointerEntered = nullptr;
 // coordinates of the last enter or motion it heard. The agent aims at local
 // (7, 9) of the hit surface; the human's pointer is at (50, 60) of the seat's.
 Vector2D pointerAt, buttonAt, axisAt;
-constexpr Vector2D AGENT_LOCAL{7, 9}, SEAT_LOCAL{50, 60};
+constexpr Vector2D AGENT_LOCAL{7, 9}, SEAT_LOCAL{50, 60}, GRAB_LOCAL{11, 13};
+// The surface an agent drag holds, while one is being checked.
+CWLSurfaceResource* grabbedSurface = nullptr;
 bool samePoint(Vector2D a, Vector2D b) { return a.x == b.x && a.y == b.y; }
 int motions = 0;
 CWLSurfaceResource* keyboardEntered = nullptr;
-int buttonEvents = 0, axisEvents = 0, discreteSteps = 0, keyEvents = 0, pointerEnters = 0, keyboardEnters = 0;
+int buttonEvents = 0, axisEvents = 0, discreteSteps = 0, keyEvents = 0, pointerEnters = 0, keyboardEnters = 0, pointerLeaves = 0, keyboardLeaves = 0;
 int pointerVersion = 9;
 bool refuse = false, reachable = true;
 // Strokes refuseIfHumanActive lets through before it starts refusing; -1 for
@@ -123,6 +131,7 @@ void enterKeyboard(CWLSurfaceResource* surface) {
 }
 void wl_pointer_send_leave(wl_resource*, uint32_t, wl_resource* surface) {
     if (pointerEntered == surface->surface) pointerEntered = nullptr;
+    ++pointerLeaves;
 }
 void wl_pointer_send_enter(wl_resource*, uint32_t, wl_resource* surface, int x, int y) {
     enterPointer(surface->surface);
@@ -134,6 +143,8 @@ void wl_pointer_send_motion(wl_resource*, uint32_t, int x, int y) {
     const Vector2D at{double(x), double(y)};
     if (samePoint(at, SEAT_LOCAL))
         check(pointerEntered == seat.m_state.pointerFocus.lock().get(), "seat position sent to another surface");
+    else if (samePoint(at, GRAB_LOCAL))
+        check(grabbedSurface && pointerEntered == grabbedSurface, "grabbed motion misdirected");
     else
         check(pointerEntered == hitSurface.get(), "motion misdirected");
     pointerAt = at;
@@ -154,13 +165,11 @@ void restoreSeatPointerEnter(wl_client* client) {
     }
 }
 Vector2D seatPointerLocal(SP<CWLSurfaceResource>) { return SEAT_LOCAL; }
+Vector2D surfaceLocalPosition(SP<CWLSurfaceResource>, Vector2D) { return GRAB_LOCAL; }
 void check(bool condition, const char* message);
 // The client's keyboard modifiers: whatever wl_keyboard.modifiers it heard
 // last, from the seat or from the agent. Keys are interpreted under them.
-struct Mods {
-    uint32_t depressed = 0, latched = 0, locked = 0, group = 0;
-    bool operator==(const Mods&) const = default;
-};
+using Mods = SModifierState;
 constexpr uint32_t SHIFT = 1, CAPS = 2, CTRL = 4, NUMLOCK = 16;
 Mods clientMods, keyMods;
 struct Keyboard { Mods m_modifiersState; } seatKb;
@@ -191,6 +200,7 @@ void wl_array_release(wl_array*) {}
 void wl_keyboard_send_enter(wl_resource*, uint32_t, wl_resource* surface, wl_array*) { enterKeyboard(surface->surface); }
 void wl_keyboard_send_leave(wl_resource*, uint32_t, wl_resource* surface) {
     if (keyboardEntered == surface->surface) keyboardEntered = nullptr;
+    ++keyboardLeaves;
 }
 bool requireRunning() { return true; }
 struct InputManagerFixture { bool held = false; bool hasHeldButtons() { return held; } } inputManager;
@@ -232,6 +242,7 @@ int main() {
     auto human = std::make_shared<CWLSurfaceResource>(); human->c = &browser;
     auto outsider = std::make_shared<CWLSurfaceResource>(); outsider->c = &other;
     hitSurface = agent;
+    grabbedSurface = agent.get(); // every drag below presses on the agent's surface
     seat.m_state.pointerFocus = human;
     seat.m_state.keyboardFocus = human;
     pointerEntered = keyboardEntered = human.get();
@@ -410,6 +421,49 @@ int main() {
     check(keyEvents == before + 2 && g.pressedKeys.empty(), "held keys were not released");
     check(keyboardEntered == human.get(), "key release did not hand the keyboard back");
 
+    // Implicit grab (P2): a button the agent holds keeps its pointer on the
+    // pressed surface wherever the ghost goes - over another client's window
+    // here - so the drag is neither released nor retargeted, and the motion
+    // arrives in the pressed surface's own coordinates.
+    clearPointerDelivery();
+    hitSurface = agent;
+    seat.m_state.pointerFocus = human;
+    pointerEntered = human.get();
+    onSeatPointerFocusChange();
+    check(injectButton(272, true) && pointerEntered == agent.get(), "grab press refused");
+    hitSurface = outsider;
+    before = buttonEvents;
+    check(movePointer(900, 900), "grabbed motion refused");
+    check(buttonEvents == before && g.pressedButtons.contains(272), "drag released when another surface came under the ghost");
+    check(pointerEntered == agent.get() && samePoint(pointerAt, GRAB_LOCAL), "grabbed motion not delivered to the pressed surface");
+    // A stale enter mid-grab is re-stamped on the pressed surface.
+    handBackPointerBeforeHumanEvent();
+    check(pointerEntered == human.get(), "grab hand-back failed");
+    check(movePointer(910, 910) && pointerEntered == agent.get() && samePoint(pointerAt, GRAB_LOCAL), "grab did not re-enter the pressed surface");
+    check(injectButton(272, false) && buttonEvents == before + 1 && samePoint(buttonAt, GRAB_LOCAL), "grab release not delivered to the pressed surface");
+    check(g.pressedButtons.empty() && pointerEntered == human.get(), "grab release did not hand back");
+    hitSurface = agent;
+    // Without a button held the hit test decides again.
+    check(movePointer(100, 100) && g.directPointerSurface.lock() == agent, "hit test not restored after the grab");
+
+    // Refusals come before any wire event (P2): a refused click, scroll or
+    // key leaves no enter, leave or motion behind in the human's window.
+    clearPointerDelivery();
+    clearKeyboardDelivery();
+    seat.m_state.keyboardFocus = human;
+    keyboardEntered = human.get();
+    pointerEntered = human.get();
+    onSeatKeyboardFocusChange();
+    onSeatPointerFocusChange();
+    const int wireBefore = pointerEnters + pointerLeaves + keyboardEnters + keyboardLeaves + motions;
+    refuse = true;
+    expectHumanActive([] { injectButton(272, true); }, "refused click");
+    expectHumanActive([] { injectAxis(0, 80); }, "refused scroll");
+    expectHumanActive([] { injectKey(30, true); }, "refused key");
+    refuse = false;
+    check(pointerEnters + pointerLeaves + keyboardEnters + keyboardLeaves + motions == wireBefore, "a refused action sent enter, leave or motion events first");
+    check(pointerEntered == human.get() && keyboardEntered == human.get(), "a refused action moved the human's focus");
+
     // Same surface (N3): the human's pointer sits on the very surface the
     // agent aims at. The enter is shared and stays, but every agent burst ends
     // with the seat's position re-sent, so the human's bare scroll or click
@@ -435,7 +489,7 @@ int main() {
     before = motions;
     handBackPointerBeforeHumanEvent();
     check(motions == before, "same-surface hand-back repeated for every human event");
-    check(injectButton(272, false) && samePoint(buttonAt, AGENT_LOCAL), "same-surface release not at the agent's position");
+    check(injectButton(272, false) && samePoint(buttonAt, GRAB_LOCAL), "same-surface release not at the agent's grab position");
     check(g.pressedButtons.empty() && samePoint(pointerAt, SEAT_LOCAL), "same-surface release did not hand the position back");
     // Leaving the shared surface revokes nothing, but the position goes back.
     check(movePointer(310, 310) && samePoint(pointerAt, SEAT_LOCAL), "move refused");

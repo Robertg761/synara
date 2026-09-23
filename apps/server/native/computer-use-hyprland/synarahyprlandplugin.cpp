@@ -350,6 +350,12 @@ enum class StopReason : uint8_t {
     SessionLocked,
 };
 
+// One wl_keyboard.modifiers worth of state.
+struct SModifierState {
+    uint32_t depressed = 0, latched = 0, locked = 0, group = 0;
+    bool     operator==(const SModifierState&) const = default;
+};
+
 struct SState {
     bool     running        = false;
     bool     releasedByUser = false;
@@ -469,6 +475,8 @@ struct SState {
     // ever sent under the agent's own modifiers, and a hand-back on a surface
     // the human's keyboard focus shares puts the seat's back.
     bool agentModifiersInEffect = false;
+    // What the agent last sent there, so an unchanged state is not re-sent.
+    SModifierState agentModifiers;
 
     // Physical keycodes currently held on the human's keyboard: what the
     // seat's enter re-sent by restoreSeatKeyboardEnter reports as held. The
@@ -1327,6 +1335,35 @@ void directPointerMotion(const PHLWINDOW& window) {
     }
 }
 
+// The implicit grab. A pointer that presses a button belongs to the surface
+// that saw the press until the last button is up, wherever it moves: a
+// scrollbar dragged past the window's edge, a selection dragged out of a
+// text field, a drag between windows. So while the agent holds a button its
+// motion keeps going to the pressed surface in that surface's own
+// coordinates, whatever the hit test at the ghost's position says, instead
+// of releasing the button the moment another surface is under it.
+bool pointerGrabbed() {
+    return !g.pressedButtons.empty() && !g.directPointerSurface.expired() && usableWindow(g.pointerWindow.lock());
+}
+
+void directPointerGrabbedMotion() {
+    const auto surface = g.directPointerSurface.lock();
+    if (!surface)
+        return;
+    const Vector2D local   = surfaceLocalPosition(surface, g.pos);
+    const bool     reenter = g.directPointerNeedsEnter;
+    g.directPointerNeedsEnter = false;
+    g.directPointerLocal      = local;
+    g.directPointerHandedBack = false;
+    if (reenter) {
+        // The enter went stale mid-drag (P2); the buttons are still held
+        // there, and wl_pointer.enter carries no button state to undo that.
+        leaveSeatSiblingBeforePointerEnter(surface);
+        sendPointerEnter(surface, local);
+    }
+    sendPointerMotion(surface, local);
+}
+
 void clearPointerDelivery() {
     releasePressedButtons();
     directPointerLeave();
@@ -1349,30 +1386,44 @@ void refuseIfHumanHoldsButton() {
                        "performed. It can be retried once they release it.");
 }
 
-// Maintains the pointer's enter/leave state to match the ghost cursor, and
-// says whether there is a surface to deliver to. An explicit target owns the
-// pointer: a point it does not claim is refused rather than delivered to
-// whatever covers it, because the caller can recover from a refusal and cannot
-// recover from a click it never made.
-bool updatePointerFocus() {
-    PHLWINDOW window;
+// The window the agent's pointer is aimed at, decided without a single wire
+// event, so that every refusal can be made before any client hears anything:
+// the explicit target when one was asked for, the window holding the agent's
+// grab while it holds a button, else whatever is under the ghost. Null when
+// that is nothing usable. An explicit target owns the pointer: a point it
+// does not claim is refused rather than delivered to whatever covers it,
+// because the caller can recover from a refusal and cannot recover from a
+// click it never made.
+PHLWINDOW resolvePointerWindow() {
     if (g.targetRequested) {
         const auto target = g.targetWindow.lock();
-        if (!usableWindow(target)) {
-            clearPointerDelivery();
-            return false;
-        }
-        window = target;
-    } else {
-        window = windowAtPoint(g.pos);
+        return usableWindow(target) ? target : nullptr;
     }
-    if (!usableWindow(window)) {
+    if (pointerGrabbed())
+        return g.pointerWindow.lock();
+    const auto window = windowAtPoint(g.pos);
+    return usableWindow(window) ? window : nullptr;
+}
+
+// Maintains the pointer's enter/leave state to match the ghost cursor over
+// `window` (from resolvePointerWindow), and says whether there is a surface
+// to deliver to.
+bool deliverPointerFocus(const PHLWINDOW& window) {
+    if (!window) {
         clearPointerDelivery();
         return false;
     }
-    g.pointerWindow = window;
-    directPointerMotion(window);
+    const bool grabbed = pointerGrabbed() && g.pointerWindow.lock() == window;
+    g.pointerWindow    = window;
+    if (grabbed)
+        directPointerGrabbedMotion();
+    else
+        directPointerMotion(window);
     return !g.directPointerSurface.expired();
+}
+
+bool updatePointerFocus() {
+    return deliverPointerFocus(resolvePointerWindow());
 }
 
 // The shared-object focus invalidation, the pointer twin of the keyboard's
@@ -1496,18 +1547,33 @@ void seedAgentXkbState() {
     xkb_state_update_mask(g.xkbState, 0, mods.latched, mods.locked, 0, 0, mods.group);
 }
 
-void directKeyboardModifiers() {
+// Sends the agent's modifier state to its keyboard client: brought up to date
+// first (the seat's keymap, and while the agent holds nothing, the seat's
+// locks), and skipped when that client already has exactly this state from
+// the agent, so it can run before every key at no cost. `force` is for an
+// enter, which a modifiers event must always follow.
+void directKeyboardModifiers(bool force = false) {
     const auto surface = g.directKeyboardSurface.lock();
-    if (!surface || !g.xkbState)
+    if (!surface)
+        return;
+    ensureXkbState();
+    if (!g.xkbState)
+        return;
+    if (g.pressedKeys.empty())
+        seedAgentXkbState();
+    const SModifierState mods{
+        xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_DEPRESSED),
+        xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_LATCHED),
+        xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_LOCKED),
+        xkb_state_serialize_layout(g.xkbState, XKB_STATE_LAYOUT_EFFECTIVE),
+    };
+    if (!force && g.agentModifiersInEffect && g.agentModifiers == mods)
         return;
     g.agentModifiersInEffect = true;
+    g.agentModifiers         = mods;
     const uint32_t serial    = directSerial(surface);
-    const uint32_t depressed = xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_DEPRESSED);
-    const uint32_t latched   = xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_LATCHED);
-    const uint32_t locked    = xkb_state_serialize_mods(g.xkbState, XKB_STATE_MODS_LOCKED);
-    const uint32_t group     = xkb_state_serialize_layout(g.xkbState, XKB_STATE_LAYOUT_EFFECTIVE);
     for (wl_resource* resource : clientInputResources(surface->client(), "wl_keyboard"))
-        wl_keyboard_send_modifiers(resource, serial, depressed, latched, locked, group);
+        wl_keyboard_send_modifiers(resource, serial, mods.depressed, mods.latched, mods.locked, mods.group);
 }
 
 void sendKeyboardLeave(const SP<CWLSurfaceResource>& surface) {
@@ -1554,7 +1620,7 @@ void sendKeyboardEnterEvent(const SP<CWLSurfaceResource>& surface) {
     wl_array_release(&keys);
     g.directKeyboardSurface    = surface;
     g.directKeyboardNeedsEnter = false;
-    directKeyboardModifiers();
+    directKeyboardModifiers(true);
 }
 
 void directKeyboardKeyEvent(const SP<CWLSurfaceResource>& surface, uint32_t keyCode, bool pressed) {
@@ -1738,22 +1804,22 @@ void clearKeyboardDelivery() {
 
 // Target if one was asked for — a target that has gone away fails loudly,
 // because a Ctrl+Q aimed at a closing window must not quit whatever sits under
-// the ghost cursor instead — else the window the pointer is in.
-bool updateKeyboardFocus() {
-    PHLWINDOW window;
+// the ghost cursor instead — else the window the pointer is in. Decided
+// without a wire event, like resolvePointerWindow.
+PHLWINDOW resolveKeyboardWindow() {
     if (g.targetRequested) {
         const auto target = g.targetWindow.lock();
-        if (!usableWindow(target)) {
-            clearKeyboardDelivery();
-            return false;
-        }
-        window = target;
-    } else if (const auto pointerWindow = g.pointerWindow.lock(); usableWindow(pointerWindow)) {
-        window = pointerWindow;
-    } else {
-        window = windowAtPoint(g.pos);
+        return usableWindow(target) ? target : nullptr;
     }
-    if (!usableWindow(window)) {
+    if (const auto pointerWindow = g.pointerWindow.lock(); usableWindow(pointerWindow))
+        return pointerWindow;
+    const auto window = windowAtPoint(g.pos);
+    return usableWindow(window) ? window : nullptr;
+}
+
+// The keyboard's enter bookkeeping for `window` (from resolveKeyboardWindow).
+bool deliverKeyboardFocus(const PHLWINDOW& window) {
+    if (!window) {
         clearKeyboardDelivery();
         return false;
     }
@@ -1771,6 +1837,10 @@ bool updateKeyboardFocus() {
         g.keyboardWindow = window;
     }
     return true;
+}
+
+bool updateKeyboardFocus() {
+    return deliverKeyboardFocus(resolveKeyboardWindow());
 }
 
 // Refuse, out loud, rather than inject into a client that cannot hear us:
@@ -2430,21 +2500,22 @@ bool injectButton(uint32_t button, bool pressed) {
         return true;
     }
     settleDeferredReleases();
-    // The reachability refusal outranks the plain focus failure: a pointer-less
-    // client leaves updatePointerFocus without a surface too, and the caller
-    // deserves the loud error, not a silent false.
-    const bool focused = updatePointerFocus();
-    const auto window  = g.pointerWindow.lock();
+    // Every refusal comes before any wire event: an enter, a leave or a motion
+    // sent into the human's window and then taken back is still a hover and
+    // focus flicker in it. The reachability refusal outranks the plain focus
+    // failure: a pointer-less client leaves deliverPointerFocus without a
+    // surface too, and the caller deserves the loud error, not a silent false.
+    const auto window = resolvePointerWindow();
     if (window)
         requireReachableClient(window, "wl_pointer");
-    if (!focused)
-        return false;
     // The release half of a press the agent already delivered is never
     // refused: the client is holding that button down because of us, and
     // leaving it held is worse than the press was.
     const bool completingPress = !pressed && g.pressedButtons.contains(button);
-    if (!completingPress)
+    if (window && !completingPress)
         refuseIfHumanActive(window);
+    if (!deliverPointerFocus(window))
+        return false;
     // A click aims the keyboard too, the way a human's click does.
     updateKeyboardFocus();
 
@@ -2510,13 +2581,14 @@ bool injectAxis(double horizontal, double vertical) {
     refuseIfHumanHoldsButton();
     settleDeferredReleases();
     const InputFocusHandback handback;
-    const bool focused = updatePointerFocus();
-    const auto window  = g.pointerWindow.lock();
-    if (window)
+    // Refusals first, wire events after (see injectButton).
+    const auto window = resolvePointerWindow();
+    if (window) {
         requireReachableClient(window, "wl_pointer");
-    if (!focused)
+        refuseIfHumanActive(window);
+    }
+    if (!deliverPointerFocus(window))
         return false;
-    refuseIfHumanActive(window);
 
     const auto surface = g.directPointerSurface.lock();
     if (!surface)
@@ -2566,28 +2638,30 @@ bool injectKey(uint32_t keyCode, bool pressed) {
     if (!requireRunning())
         return false;
     const InputFocusHandback handback;
-    if (!updateKeyboardFocus())
+    // Refusals first, wire events after (see injectButton).
+    const auto window = resolveKeyboardWindow();
+    if (!window) {
+        clearKeyboardDelivery();
         return false;
-    const auto window = g.keyboardWindow.lock();
+    }
     requireReachableClient(window, "wl_keyboard");
     // Same exemption the pointer makes, and it matters more here: refusing the
     // release of a held Ctrl leaves the client believing a modifier is down.
     const bool completingPress = !pressed && std::ranges::find(g.pressedKeys, keyCode) != g.pressedKeys.end();
     if (!completingPress)
         refuseIfHumanActive(window);
+    if (!deliverKeyboardFocus(window))
+        return false;
 
     const auto surface = g.directKeyboardSurface.lock();
     if (!surface)
         return false;
-    ensureXkbState();
-    // Holding nothing, the agent starts from the human's locks and layout.
-    if (g.pressedKeys.empty())
-        seedAgentXkbState();
     // The re-stamp, with the held-key state as it is before this event, and
-    // the agent's modifiers wherever the seat's were put back since.
+    // the agent's own modifiers under the key: re-sent when the seat's were
+    // put back since, or when the human's locks moved while the agent held
+    // nothing.
     sendKeyboardEnterEvent(surface);
-    if (!g.agentModifiersInEffect)
-        directKeyboardModifiers();
+    directKeyboardModifiers();
     if (pressed) {
         if (std::ranges::find(g.pressedKeys, keyCode) == g.pressedKeys.end())
             g.pressedKeys.push_back(keyCode);
@@ -2595,6 +2669,7 @@ bool injectKey(uint32_t keyCode, bool pressed) {
         std::erase(g.pressedKeys, keyCode);
     }
     directKeyboardKeyEvent(surface, keyCode, pressed);
+    ensureXkbState();
     if (g.xkbState) {
         // evdev keycode -> xkb keycode offset is 8.
         xkb_state_update_key(g.xkbState, keyCode + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
