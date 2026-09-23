@@ -161,6 +161,22 @@ done
 
 HYPR_VERSION="$(pkg-config --modversion hyprland)"
 
+# The version the stamp records is the running compositor's, the same one the
+# server compares the stamp against (`hyprctl version`), so the two can never
+# disagree about whether an install is current. The headers' version only
+# stands in when there is no compositor to ask (--build-only). A compositor
+# that has been upgraded on disk but not restarted refuses anything built
+# against the new headers, so that is reported before a pointless build.
+RUNNING_VERSION=""
+if (( BUILD_ONLY == 0 )); then
+    RUNNING_VERSION="$(hypr -j version 2>/dev/null |
+        sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+    if [[ -n "$RUNNING_VERSION" && "$RUNNING_VERSION" != "$HYPR_VERSION" ]]; then
+        die "Hyprland instance $INSTANCE runs $RUNNING_VERSION, but the installed headers are $HYPR_VERSION: the compositor was upgraded without a restart, and it refuses a plugin built for another version. Restart Hyprland, then run this again."
+    fi
+fi
+STAMP_VERSION="${RUNNING_VERSION:-$HYPR_VERSION}"
+
 source_hash() {
     local file
     {
@@ -267,7 +283,7 @@ stamp_tmp="$(mktemp "$STATE_ROOT/install.stamp.XXXXXX")"
     printf 'plugin_id=%s\n' "$PLUGIN_ID"
     printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'plugin_path=%s\n' "$PLUGIN_PATH"
-    printf 'hyprland_version=%s\n' "$HYPR_VERSION"
+    printf 'hyprland_version=%s\n' "$STAMP_VERSION"
     # Read back by the server to decide whether a rebuild is needed at all.
     printf 'source_hash=%s\n' "$(source_hash)"
 } >"$stamp_tmp"
