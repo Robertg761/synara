@@ -75,7 +75,33 @@ int main() {
         const SEncodedImage image = encodeCaptureImage(surface, CaptureFormat::Luma, true);
         check(image.mime == "image/x-luma8; width=5; height=3", "luma MIME type wrong");
         check(image.bytes.size() == 15, "luma image padded");
-        check(image.bytes[0] == 77 && image.bytes[1] == 0 && image.bytes[5 + 4] == 255, "luma values wrong");
+        // floor((299 R + 587 G + 114 B) / 1000): the server's PNG luma.
+        check(image.bytes[0] == 76 && image.bytes[1] == 0 && image.bytes[5 + 4] == 255, "luma values wrong");
+        cairo_surface_destroy(surface);
+    }
+
+    // Luma is what the server derives from the PNG of the same capture, pixel
+    // for pixel, translucent pixels included: it measures one against the
+    // other.
+    for (const bool opaque : {true, false}) {
+        cairo_surface_t* surface = filled(64, 16, 0xff'00'00'00);
+        auto*            data    = cairo_image_surface_get_data(surface);
+        const int        stride  = cairo_image_surface_get_stride(surface);
+        uint32_t         seed    = 12345;
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 64; ++x) {
+                seed              = seed * 1664525u + 1013904223u;
+                const uint32_t a  = opaque ? 255 : (seed >> 24);
+                const auto     ch = [&](int shift) { return a == 0 ? 0u : ((seed >> shift) & 0xff) * a / 255; };
+                reinterpret_cast<uint32_t*>(data + y * stride)[x] = (a << 24) | (ch(0) << 16) | (ch(8) << 8) | ch(16);
+            }
+        cairo_surface_mark_dirty(surface);
+        const auto luma = encodeCaptureImage(surface, CaptureFormat::Luma, opaque).bytes;
+        const auto rgba = decodePng(encodeCaptureImage(surface, CaptureFormat::Png, opaque).bytes, 64, 16, !opaque);
+        for (size_t i = 0; i < luma.size(); ++i) {
+            const int expected = (299 * rgba[i * 4] + 587 * rgba[i * 4 + 1] + 114 * rgba[i * 4 + 2]) / 1000;
+            check(luma[i] == expected, "luma differs from the PNG's luma");
+        }
         cairo_surface_destroy(surface);
     }
 

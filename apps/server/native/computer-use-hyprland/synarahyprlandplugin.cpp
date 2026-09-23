@@ -3025,8 +3025,12 @@ std::vector<uint8_t> encodeJpeg(cairo_surface_t* surface) {
 
 // One byte of BT.601 luma per pixel, rows top to bottom with no padding: the
 // cheapest answer to "did anything on screen change", for a caller that
-// compares frames rather than looks at them.
-std::vector<uint8_t> encodeLuma(cairo_surface_t* surface) {
+// compares frames rather than looks at them. The server correlates it against
+// the PNG of the same capture (scroll measurement), decoding that PNG's RGB as
+// floor((299 R + 587 G + 114 B) / 1000), so each byte comes from exactly the
+// RGB writePngRows would write — unpremultiplied the same way when the
+// capture keeps alpha — through that same integer formula.
+std::vector<uint8_t> encodeLuma(cairo_surface_t* surface, bool opaque) {
     const int            w      = cairo_image_surface_get_width(surface);
     const int            h      = cairo_image_surface_get_height(surface);
     const int            stride = cairo_image_surface_get_stride(surface);
@@ -3037,7 +3041,14 @@ std::vector<uint8_t> encodeLuma(cairo_surface_t* surface) {
         uint8_t*    dst = out.data() + size_t(y) * w;
         for (int x = 0; x < w; ++x) {
             const uint32_t p = row[x];
-            dst[x]           = static_cast<uint8_t>((77 * ((p >> 16) & 0xff) + 150 * ((p >> 8) & 0xff) + 29 * (p & 0xff) + 128) >> 8);
+            const uint32_t a = p >> 24;
+            uint32_t       r = (p >> 16) & 0xff, g = (p >> 8) & 0xff, b = p & 0xff;
+            if (!opaque && a != 0 && a != 255) {
+                r = (r * 255 + a / 2) / a;
+                g = (g * 255 + a / 2) / a;
+                b = (b * 255 + a / 2) / a;
+            }
+            dst[x] = static_cast<uint8_t>((299 * r + 587 * g + 114 * b) / 1000);
         }
     }
     return out;
@@ -3054,7 +3065,7 @@ SEncodedImage encodeCaptureImage(cairo_surface_t* surface, CaptureFormat format,
     switch (format) {
         case CaptureFormat::Jpeg: return {encodeJpeg(surface), "image/jpeg"};
         case CaptureFormat::Luma:
-            return {encodeLuma(surface),
+            return {encodeLuma(surface, opaque),
                     std::format("image/x-luma8; width={}; height={}", cairo_image_surface_get_width(surface), cairo_image_surface_get_height(surface))};
         case CaptureFormat::Png: break;
     }
