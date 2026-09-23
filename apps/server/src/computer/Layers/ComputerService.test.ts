@@ -1,3 +1,5 @@
+import { types } from "node:util";
+
 import { Effect } from "effect";
 import { describe, expect, it, vi } from "vitest";
 
@@ -352,5 +354,138 @@ describe("ComputerServiceLive", () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+describe("ComputerServiceLive startup selection", () => {
+  /** Runs `body` against a Linux service whose tiers are fakes. */
+  async function withLinuxService(
+    options: {
+      readonly env?: NodeJS.ProcessEnv;
+      readonly busNameHasOwner: (name: string) => Promise<boolean>;
+      readonly hyprlandSessionPresent: () => boolean;
+      readonly backends: Partial<Record<"kwin" | "hyprland" | "nested", () => FakeComputerBackend>>;
+    },
+    body: (service: ComputerServiceShape) => Promise<void>,
+  ): Promise<void> {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const service = yield* ComputerService;
+          yield* Effect.promise(() => body(service));
+        }).pipe(
+          Effect.provide(
+            makeComputerServiceLayer({
+              platform: "linux",
+              selectionBudgetMs: 30,
+              selection: {
+                env: options.env ?? {},
+                busNameHasOwner: options.busNameHasOwner,
+                hyprlandSessionPresent: options.hyprlandSessionPresent,
+              },
+              linuxBackends: options.backends,
+            }),
+          ),
+        ),
+      ),
+    );
+  }
+
+  it("does not wait on a wedged session bus, and adopts the tier once selection answers", async () => {
+    const bus = Promise.withResolvers<boolean>();
+    const nested = new FakeComputerBackend();
+    const started = performance.now();
+    await withLinuxService(
+      {
+        busNameHasOwner: () => bus.promise,
+        hyprlandSessionPresent: () => false,
+        backends: { nested: () => nested },
+      },
+      async (service) => {
+        expect(performance.now() - started).toBeLessThan(1_000);
+        expect(service.supported).toBe(true);
+        expect(service.availability).toMatchObject({ kind: "checking" });
+        expect((await service.manager.getStatus()).availability).toMatchObject({
+          kind: "checking",
+        });
+        await expect(service.manager.listWindows()).rejects.toMatchObject({ retryable: true });
+        // Every Linux tier's profile, before the tier is known.
+        expect(service.manager.guidanceProfile).toEqual({ dialect: "linux", dedicatedSeat: true });
+        expect(nested.calls).toEqual([]);
+
+        bus.resolve(false);
+        await vi.waitFor(() =>
+          expect(service.availability).toEqual({ kind: "available", backend: "fake" }),
+        );
+        expect((await service.manager.getStatus()).availability).toEqual({
+          kind: "available",
+          backend: "fake",
+        });
+        await service.manager.listWindows();
+        expect(nested.callsFor("listWindows")).toHaveLength(1);
+      },
+    );
+  });
+
+  it("re-selects when the selected tier's desktop is gone for good", async () => {
+    let hyprlandLive = true;
+    const hyprland = new FakeComputerBackend();
+    const nested = new FakeComputerBackend();
+    await withLinuxService(
+      {
+        busNameHasOwner: async () => false,
+        hyprlandSessionPresent: () => hyprlandLive,
+        backends: { hyprland: () => hyprland, nested: () => nested },
+      },
+      async (service) => {
+        await service.manager.listWindows();
+        const hyprlandReads = hyprland.callsFor("listWindows").length;
+        expect(hyprlandReads).toBeGreaterThan(0);
+
+        hyprlandLive = false;
+        hyprland.emitDesktopGone("The Hyprland instance exited.");
+        await vi.waitFor(() => expect(hyprland.callsFor("dispose")).toHaveLength(1));
+        await service.manager.listWindows();
+        expect(nested.callsFor("listWindows").length).toBeGreaterThan(0);
+        expect(hyprland.callsFor("listWindows")).toHaveLength(hyprlandReads);
+      },
+    );
+  });
+
+  it("never re-selects a tier an explicit override named", async () => {
+    const hyprland = new FakeComputerBackend();
+    const nested = new FakeComputerBackend();
+    await withLinuxService(
+      {
+        env: { SYNARA_COMPUTER_BACKEND: "hyprland" },
+        busNameHasOwner: async () => false,
+        hyprlandSessionPresent: () => false,
+        backends: { hyprland: () => hyprland, nested: () => nested },
+      },
+      async (service) => {
+        hyprland.emitDesktopGone();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        await service.manager.listWindows().catch(() => undefined);
+        expect(hyprland.callsFor("listWindows").length).toBeGreaterThan(0);
+        expect(hyprland.callsFor("dispose")).toHaveLength(0);
+        expect(nested.calls).toEqual([]);
+      },
+    );
+  });
+
+  it("hands the macOS host its Cua backend directly, probed before startup continues", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const service = yield* ComputerService;
+          const backend = backendOf(service);
+          expect(types.isProxy(backend)).toBe(false);
+          expect(backend).toBeInstanceOf(CuaComputerBackend);
+          expect(service.availability.kind).not.toBe("checking");
+        }).pipe(
+          Effect.provide(makeComputerServiceLayer({ platform: "darwin", selection: { env: {} } })),
+        ),
+      ),
+    );
   });
 });
