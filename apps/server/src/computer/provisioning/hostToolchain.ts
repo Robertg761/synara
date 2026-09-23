@@ -55,6 +55,11 @@ const KF: ToolchainComponent = {
   libraryPattern: /^libKF6WindowSystem\.so\.([0-9]+\.[0-9]+\.[0-9]+)$/,
 };
 
+const KWIN: ToolchainComponent = {
+  cmakePackage: "KWin",
+  libraryPattern: /^libkwin\.so\.([0-9]+\.[0-9]+\.[0-9]+)$/,
+};
+
 export const defaultHostToolchainReaders: HostToolchainReaders = {
   readFile: (path) => {
     try {
@@ -100,4 +105,18 @@ export function readHostToolchainVersions(
     qtVersion: componentVersion(QT, readers),
     kfVersion: componentVersion(KF, readers),
   };
+}
+
+/**
+ * The KWin installed on disk — what a build compiles against, and not
+ * necessarily the one running: after a package upgrade the two differ until
+ * the next login. Read like the Qt and KF versions, never off
+ * `kwin_wayland --version`: that binary aborts outside a real compositor boot
+ * on some setups (a core dump and a crash notification on the human's desktop
+ * per probe), and spawning it handed the server's environment to it.
+ */
+export function readHostKwinVersion(
+  readers: HostToolchainReaders = defaultHostToolchainReaders,
+): string | undefined {
+  return componentVersion(KWIN, readers);
 }

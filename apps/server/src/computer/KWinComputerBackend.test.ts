@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import type { ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,7 +10,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ComputerHealth, ComputerWindow } from "@synara/contracts";
 
 import {
-  detectInstalledKwinVersion,
   installStampIsCurrent,
   isConnectionLevelFailure,
   KWIN_RECONNECT_MAX_DELAY_MS,
@@ -4707,36 +4706,5 @@ describe("KWinComputerBackend perception", () => {
       expect(lastMove()?.args).toEqual([1_080, 1_605]);
       await backend.dispose();
     });
-  });
-});
-
-describe("installed KWin version", () => {
-  it("reads the version off the library and CMake files without spawning kwin_wayland", async () => {
-    const root = await mkdtemp(join(tmpdir(), "synara-kwin-version-"));
-    try {
-      const lib64 = join(root, "lib64");
-      const lib = join(root, "lib");
-      const cmake = join(root, "cmake", "KWin");
-      await Promise.all([mkdir(lib64), mkdir(lib), mkdir(cmake, { recursive: true })]);
-      const config = join(cmake, "KWinConfig.cmake");
-      await writeFile(join(cmake, "KWinConfigVersion.cmake"), 'set(PACKAGE_VERSION "6.6.1")\n');
-
-      // Nothing but the development files: the CMake package version.
-      await expect(detectInstalledKwinVersion([lib64, lib], [config])).resolves.toBe("6.6.1");
-
-      // A library, but not under the soname link: the newest versioned file.
-      await writeFile(join(lib, "libkwin.so.6.7.3"), "");
-      await writeFile(join(lib, "libkwin.so.6.10.0"), "");
-      await expect(detectInstalledKwinVersion([lib64, lib], [config])).resolves.toBe("6.10.0");
-
-      // The soname link names the library the package actually installed.
-      await writeFile(join(lib64, "libkwin.so.6.7.4"), "");
-      await symlink("libkwin.so.6.7.4", join(lib64, "libkwin.so.6"));
-      await expect(detectInstalledKwinVersion([lib64, lib], [config])).resolves.toBe("6.7.4");
-
-      await expect(detectInstalledKwinVersion([join(root, "absent")], [])).resolves.toBeUndefined();
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
   });
 });

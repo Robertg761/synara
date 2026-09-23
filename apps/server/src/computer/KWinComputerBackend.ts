@@ -1,8 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readdir, readFile, readlink } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { StillFrameDedupe } from "./stillFrameDedupe.ts";
 import { COMPUTER_MODIFIER_KEY_NAMES } from "@synara/shared/computerKeyNames";
@@ -127,6 +127,7 @@ import {
   type LinuxDistribution,
 } from "./provisioning/linuxDistribution.ts";
 import { buildPluginFromSource } from "./provisioning/sourceBuild.ts";
+import { readHostKwinVersion } from "./provisioning/hostToolchain.ts";
 import {
   commandOnPath,
   libraryRootFilePresent,
@@ -433,7 +434,7 @@ export interface KWinComputerBackendOptions {
    */
   readonly runningKwinVersion?: () => Promise<string | undefined>;
   /**
-   * The KWin version installed on disk (see `detectInstalledKwinVersion`), which is
+   * The KWin version installed on disk (see `readHostKwinVersion`), which is
    * what a build compiles against. Equal to the running one except in the
    * window between a package upgrade and the next login.
    */
@@ -705,7 +706,8 @@ export class KWinComputerBackend implements ComputerBackend {
       options.readInstallStamp ??
       (() => readInstallStamp(options.installStampPath ?? installStampPath(stateRoot)));
     this.runningKwinVersion = options.runningKwinVersion;
-    this.installedKwinVersion = options.installedKwinVersion ?? detectInstalledKwinVersion;
+    this.installedKwinVersion =
+      options.installedKwinVersion ?? (async () => readHostKwinVersion());
     this.linuxDistribution = options.linuxDistribution ?? detectLinuxDistribution;
     this.provisionPlugin =
       options.provisionPlugin ??
@@ -3335,64 +3337,6 @@ export function installStampIsCurrent(
   const builtFor = stampKwinVersion(stamp);
   if (builtFor && runningKwinVersion && builtFor !== runningKwinVersion) return false;
   return true;
-}
-
-/** Where a distribution puts `libkwin.so.<major>`, probed in this order. */
-const KWIN_LIBRARY_DIRECTORIES = [
-  "/usr/lib64",
-  "/usr/lib",
-  "/usr/lib/x86_64-linux-gnu",
-  "/usr/lib/aarch64-linux-gnu",
-] as const;
-const KWIN_LIBRARY_VERSION = /^libkwin\.so\.(\d+(?:\.\d+)+)$/;
-const KWIN_CMAKE_PACKAGE_VERSION = /^\s*set\(PACKAGE_VERSION "(\d+(?:\.\d+)+)"\)/m;
-
-/**
- * The KWin installed on disk — what a build compiles against — and not
- * necessarily the one running: after a package upgrade the two differ until
- * the next login, which is exactly the case the running-version probe exists
- * for.
- *
- * Read off files, never off `kwin_wayland --version`: that binary aborts
- * outside a real compositor boot on some setups (a core dump and a crash
- * notification on the human's desktop per probe), and spawning it handed the
- * server's whole environment to a compositor binary. The shared library's
- * versioned name is what every KWin package installs; the CMake package
- * version is the fallback where only the development files say it. Unknown is
- * an answer: it costs the caller the version detail, nothing more.
- */
-export async function detectInstalledKwinVersion(
-  libraryDirectories: readonly string[] = KWIN_LIBRARY_DIRECTORIES,
-  cmakeConfigPaths: readonly string[] = KWIN_CMAKE_CONFIG_PATHS,
-): Promise<string | undefined> {
-  for (const directory of libraryDirectories) {
-    const target = await readlink(join(directory, "libkwin.so.6")).catch(() => undefined);
-    const fromLink = target ? KWIN_LIBRARY_VERSION.exec(basename(target))?.[1] : undefined;
-    if (fromLink) return fromLink;
-    const entries = await readdir(directory).catch(() => [] as string[]);
-    const versions = entries.flatMap((name) => KWIN_LIBRARY_VERSION.exec(name)?.[1] ?? []);
-    const newest = versions.toSorted(compareDottedVersions).at(-1);
-    if (newest) return newest;
-  }
-  for (const config of cmakeConfigPaths) {
-    const text = await readFile(
-      join(dirname(config), "KWinConfigVersion.cmake"),
-      "utf8",
-    ).catch(() => undefined);
-    const version = text ? KWIN_CMAKE_PACKAGE_VERSION.exec(text)?.[1] : undefined;
-    if (version) return version;
-  }
-  return undefined;
-}
-
-function compareDottedVersions(left: string, right: string): number {
-  const a = left.split(".").map(Number);
-  const b = right.split(".").map(Number);
-  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
-    const difference = (a[index] ?? 0) - (b[index] ?? 0);
-    if (difference !== 0) return difference;
-  }
-  return 0;
 }
 
 function pluginVersion(id: string): number {
