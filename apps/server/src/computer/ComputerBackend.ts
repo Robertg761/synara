@@ -698,6 +698,15 @@ export interface ComputerBackend {
         readonly windowId: string;
         readonly timeoutMs: number;
         readonly quietMs: number;
+        /**
+         * How long `quietMs` of quiet is looked for. Past it, a surface that
+         * has changed since the action counts as settled even though it keeps
+         * repainting — an animation (a fading scrollbar, a button transition)
+         * never goes quiet — and one that has not changed yet is waited for
+         * until `timeoutMs`, for a slow application's first repaint. Absent:
+         * quiet is waited for until `timeoutMs`.
+         */
+        readonly quietWithinMs?: number;
       }) => Promise<{
         readonly settled: boolean;
         readonly waitedMs: number;
@@ -711,10 +720,15 @@ export interface ComputerBackend {
    * the first commit is enough, and a window that keeps repainting (a video,
    * a spinner) should not hold the observation for the observer's full bound.
    * The manager waits `min(quietMs, its configured settle)` of quiet, capped
-   * at `timeoutMs`, after an action; an explicit `computer_wait` keeps its
-   * own timeout. Absent means the manager's defaults.
+   * at `timeoutMs` and passing `quietWithinMs` through, after an action; an
+   * explicit `computer_wait` keeps its own timeout and waits for real quiet.
+   * Absent means the manager's defaults.
    */
-  readonly actionSettle?: { readonly quietMs: number; readonly timeoutMs: number };
+  readonly actionSettle?: {
+    readonly quietMs: number;
+    readonly timeoutMs: number;
+    readonly quietWithinMs?: number;
+  };
   /**
    * The process-level app list — name, pid, bundle id, active state — for
    * backends that can enumerate it. Optional because a compositor plugin may
