@@ -120,6 +120,24 @@ describe("spawnClipboardCommand", () => {
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
   });
 
+  it("ends a watched forked child on request, whose pid nothing reports", async () => {
+    const startedAt = Date.now();
+    const result = await node(
+      [
+        "require('node:child_process').spawn(process.execPath,",
+        "  ['-e', 'setTimeout(() => {}, 20000)'], { stdio: ['ignore', 'ignore', 2] }).unref();",
+        "process.exit(0);",
+      ].join(" "),
+      { forks: true, observeFork: true },
+    );
+    expect(result.endFork).toBeTypeOf("function");
+    result.endFork?.();
+    await result.forkExited;
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    // Ending again, once it is gone, signals nothing.
+    result.endFork?.();
+  });
+
   it("watches nothing unless asked", async () => {
     const result = await node("process.exit(0)", { forks: true });
     expect(result.forkExited).toBeUndefined();
@@ -172,6 +190,25 @@ describe("writeWlClipboardForPaste", () => {
     expect(consumed).toBe(false);
     ended.resolve();
     await offer.consumed;
+  });
+
+  it("can withdraw the offer, ending wl-copy's background child", async () => {
+    let ended = 0;
+    const offer = await writeWlClipboardForPaste(
+      async (): Promise<ClipboardCommandResult> => ({
+        outcome: "exited",
+        code: 0,
+        stdout: "",
+        stderr: "",
+        forkExited: new Promise(() => undefined),
+        endFork: () => {
+          ended += 1;
+        },
+      }),
+      "agent text",
+    );
+    offer.withdraw();
+    expect(ended).toBe(1);
   });
 
   it("fails like an ordinary write when wl-copy fails", async () => {

@@ -786,6 +786,8 @@ export class KWinComputerBackend implements ComputerBackend {
   ) => ChildProcess;
   private readonly resolveApp: AppLaunchResolver;
   private readonly runClipboardCommand: ClipboardCommandRunner;
+  /** Paste-once offers still on the clipboard; see `writeClipboardForPaste`. */
+  private readonly pasteOffers = new Set<() => void>();
   private currentPoint: ComputerPoint | null = null;
   /**
    * Where the workspace's top-left sat in global coordinates at the last
@@ -1992,7 +1994,14 @@ export class KWinComputerBackend implements ComputerBackend {
    * application could miss. The restore itself replaces an unread offer.
    */
   async writeClipboardForPaste(text: string): Promise<ComputerClipboardPasteOffer> {
-    return await writeWlClipboardForPaste(this.runClipboardCommand, text);
+    const offer = await writeWlClipboardForPaste(this.runClipboardCommand, text);
+    // The offer must not outlive the backend: one nobody pasted by dispose is
+    // withdrawn, not left for the human's next paste.
+    this.pasteOffers.add(offer.withdraw);
+    const settled = () => this.pasteOffers.delete(offer.withdraw);
+    offer.consumed.then(settled, settled);
+    if (this.disposed) offer.withdraw();
+    return { consumed: offer.consumed };
   }
 
   /** Replace the complete value through EditableText; insertion is a separate operation. */
@@ -2397,6 +2406,8 @@ export class KWinComputerBackend implements ComputerBackend {
     this.plugin = undefined;
     this.pluginHealth = undefined;
     await this.atspi.dispose().catch(() => undefined);
+    for (const withdraw of this.pasteOffers) withdraw();
+    this.pasteOffers.clear();
     this.eventListeners.clear();
   }
 

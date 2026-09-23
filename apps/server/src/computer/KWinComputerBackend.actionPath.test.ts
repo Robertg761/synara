@@ -1021,6 +1021,40 @@ describe("paste-once clipboard", () => {
       await manager.dispose();
     }
   });
+
+  it("withdraws an offer nobody pasted when the backend goes away", async () => {
+    const plugin = new FakePlugin();
+    const ended: string[] = [];
+    const offers = new Map<string, PromiseWithResolvers<void>>();
+    const backend = makeBackend(plugin, {
+      runClipboardCommand: async (spec) => {
+        const text = spec.input ?? "";
+        const pending = Promise.withResolvers<void>();
+        offers.set(text, pending);
+        return {
+          outcome: "exited",
+          code: 0,
+          stdout: "",
+          stderr: "",
+          forkExited: pending.promise,
+          endFork: () => {
+            ended.push(text);
+            pending.resolve();
+          },
+        };
+      },
+    });
+    await backend.availability();
+    const unpasted = await backend.writeClipboardForPaste("agent text");
+    const pasted = await backend.writeClipboardForPaste("pasted text");
+    offers.get("pasted text")!.resolve();
+    await pasted.consumed;
+    expect(ended).toEqual([]);
+    await backend.dispose();
+    // Only the offer still on the clipboard; a consumed one is forgotten.
+    expect(ended).toEqual(["agent text"]);
+    await unpasted.consumed;
+  });
 });
 
 /** Two 1920x1080 monitors side by side, the left one at a negative x. */
