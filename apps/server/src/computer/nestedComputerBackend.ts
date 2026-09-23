@@ -127,6 +127,7 @@ const NESTED_DESKTOP_USES = [
   "setValue",
   "typeText",
   "writeClipboard",
+  "writeClipboardForPaste",
 ] as const satisfies readonly (keyof KWinComputerBackend)[];
 /**
  * Only the windowed mode blames a closed window: the headless desktop has no
