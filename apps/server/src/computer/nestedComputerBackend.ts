@@ -49,6 +49,7 @@ import { NO_COMPUTER_CAPABILITIES, ComputerBackendError } from "./ComputerBacken
 import { type AtspiTreeReader } from "./atspiClient.ts";
 import {
   KWinComputerBackend,
+  PluginProvisioningError,
   defaultPluginDirectories,
   localBuildToolingPresent,
   prebuiltPluginRoot,
@@ -200,14 +201,8 @@ export class NestedComputerBackend extends KWinComputerBackend {
       ...(options.provisionPlugin ? { provisionPlugin: options.provisionPlugin } : {}),
       installedPluginIds,
       clipboardToolsPresent: () => wlClipboardToolsPresent(hasCommand),
-      // The private bus is born owned by a compositor this process started;
-      // the ambient session bus knows nothing about it.
-      busNamesHaveOwners: async (names) => names.map(() => true),
-      // The compositor here is spawned with the plugin root already on its
-      // QT_PLUGIN_PATH, so a fresh install loads without anyone logging out;
-      // the default check reads the server's session environment and would
-      // tell the user to relogin a session this plugin never loads into.
-      compositorSeesPluginRoot: () => true,
+      // Boots the session on demand before dialling its bus, where the shared
+      // options only dial a session that already exists.
       dbusFactory: (context) => requireBackend(ref).connectToNestedSession(context),
     });
     ref.backend = this;
@@ -277,8 +272,9 @@ export class NestedComputerBackend extends KWinComputerBackend {
    *
    * A boot in flight is not a desktop that is not running: reporting dormancy
    * while the compositor is still coming up makes the card flip to "not
-   * running, click Set up" for the thirty seconds a cold start takes, and the
-   * Set up it invites does nothing but join the boot already running. Health
+   * running, click Set up" for the second or so a cold start takes (minutes
+   * when it has to compile the plugin first), and the Set up it invites does
+   * nothing but join the boot already running. Health
    * is where a start in progress shows (`connecting`), so this answers with the
    * passive probe until there is a real verdict.
    */
@@ -440,6 +436,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
       await current.dispose().catch(() => undefined);
     }
     if (this.sessionStart) return await this.sessionStart;
+    if (this.disposing) throw shutDownWhileStarting();
     if (automatic && this.sessionStarted) {
       // The reconnect loop is asking, with no user or agent behind it, about a
       // desktop that *did* run. Booting here would respawn a window the human
@@ -458,9 +455,13 @@ export class NestedComputerBackend extends KWinComputerBackend {
         retryable: true,
       });
     }
-    this.sessionStart = this.bootSession().finally(() => {
-      this.sessionStart = undefined;
-    });
+    this.sessionStart = this.bootSession()
+      .catch((error: unknown) => {
+        throw new NestedSessionStartError(error);
+      })
+      .finally(() => {
+        this.sessionStart = undefined;
+      });
     return await this.sessionStart;
   }
 
@@ -500,6 +501,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
     await this.assertSetupSupported();
     // Never two sweeps racing over the same stale pids.
     await this.staleSweep;
+    if (this.disposing) throw shutDownWhileStarting();
     // The session loads the plugin as part of coming up, so a machine that has
     // never had one gets the silent user-space install first: a shipped binary
     // when one matches, a source build otherwise. The system packages that
@@ -514,6 +516,8 @@ export class NestedComputerBackend extends KWinComputerBackend {
           { cause: error },
         );
       });
+      // A build that finished after shutdown began is not a reason to boot.
+      if (this.disposing) throw shutDownWhileStarting();
     }
     const session = await this.startWithPluginRetry({
       mode: this.mode,
@@ -530,7 +534,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
       // rather than published: dispose() has already passed the point where it
       // would have found it.
       await session.dispose().catch(() => undefined);
-      throw new ComputerBackendError("The agent's isolated desktop was shut down while starting.");
+      throw shutDownWhileStarting();
     }
     this.ref.session = session;
     this.sessionStarted = true;
@@ -540,6 +544,30 @@ export class NestedComputerBackend extends KWinComputerBackend {
     this.emit({ type: "capabilities-changed", capabilities: this.capabilities() });
     return session;
   }
+}
+
+/**
+ * A boot that failed, as the connect ladder sees it.
+ *
+ * Every step of a boot is already its own retry policy — the plugin install
+ * is memoised, a refused plugin is rebuilt once, the compositor gets its full
+ * ready timeout — so the ladder repeating the whole boot three times inside
+ * one call only multiplied a ~30 s failure into a ~90 s `availability()`, and
+ * could spawn and kill two more compositors on the way. A provisioning-class
+ * failure ends the ladder at once and does not arm the reconnect timer; the
+ * next real use boots again.
+ */
+export class NestedSessionStartError extends PluginProvisioningError {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "NestedSessionStartError";
+  }
+}
+
+function shutDownWhileStarting(): NestedSessionStartError {
+  return new NestedSessionStartError(
+    new ComputerBackendError("The agent's isolated desktop was shut down while starting."),
+  );
 }
 
 function requireBackend(ref: NestedSessionRef): NestedComputerBackend {

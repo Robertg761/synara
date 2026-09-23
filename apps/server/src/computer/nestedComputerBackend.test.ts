@@ -102,6 +102,7 @@ function makeHarness(
     ) => Promise<NestedKWinSession>;
     readonly installPackages?: (plan: SystemPackagePlan) => Promise<string>;
     readonly onPluginProvision?: () => void;
+    readonly provisionPlugin?: NestedComputerBackendOptions["provisionPlugin"];
     readonly atspiMode?: NestedAtspiMode;
     readonly createAtspiClient?: (env: NodeJS.ProcessEnv) => AtspiTreeReader;
     readonly sweepStaleSessions?: () => Promise<unknown>;
@@ -194,7 +195,7 @@ function makeHarness(
         state.clipboardInstalled = true;
         return `Installed ${plan.packages.join(", ")} with ${plan.manager}.`;
       }),
-    provisionPlugin: async () => {
+    provisionPlugin: options.provisionPlugin ?? (async () => {
       options.onPluginProvision?.();
       pluginProvisions.push(1);
       state.installedPlugins = [PLUGIN_ID];
@@ -205,7 +206,7 @@ function makeHarness(
         requiresRelogin: false,
         summary: "Compiled and installed the Synara KWin plugin.",
       };
-    },
+    }),
   };
   const backend = new NestedComputerBackend(backendOptions);
   backend.onEvent?.((event) => events.push(event));
@@ -797,30 +798,23 @@ describe("a desktop that has never booted", () => {
         throw new Error("spawn kwin_wayland ENOENT");
       },
     });
-    vi.useFakeTimers();
-    try {
-      const established = harness.backend.availability();
-      // The connect path sleeps between its own attempts, so the clock has to
-      // be driven for the first establishing read to finish at all.
-      await vi.advanceTimersByTimeAsync(2_000);
-      await expect(established).resolves.toMatchObject({
-        kind: "backend-unavailable",
-        message: expect.stringContaining("ENOENT"),
-      });
-
-      // The boot was really attempted, and its own reason survived.
-      expect(attempts).toBeGreaterThan(0);
-      const failure = harness.backend.health().lastFailure?.message ?? "";
-      expect(failure).toContain("ENOENT");
-      expect(failure).not.toContain("Set up to start it now");
-    } finally {
-      // Disposal joins the connect attempt in flight, which is sleeping on a
-      // timer of this fake clock: the clock has to be driven, not discarded.
-      const disposal = harness.backend.dispose();
-      await vi.advanceTimersByTimeAsync(2_000);
-      await disposal;
-      vi.useRealTimers();
-    }
+    // No clock to drive: a failed boot ends the connect ladder at once rather
+    // than booting twice more inside the same call.
+    await expect(harness.backend.availability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+      message: expect.stringContaining("ENOENT"),
+    });
+    expect(attempts).toBe(1);
+    const failure = harness.backend.health().lastFailure?.message ?? "";
+    expect(failure).toContain("ENOENT");
+    expect(failure).not.toContain("Set up to start it now");
+    // Nor is a reconnect timer armed for it: the next real use boots again.
+    expect(harness.backend.health().status).toBe("unavailable");
+    await expect(harness.backend.availability()).resolves.toMatchObject({
+      kind: "backend-unavailable",
+    });
+    expect(attempts).toBe(2);
+    await harness.backend.dispose();
   });
 
   it("still refuses an automatic call once a desktop has run and stopped", async () => {
@@ -844,7 +838,7 @@ describe("a desktop that has never booted", () => {
 describe("statusAvailability", () => {
   it("does not call a desktop that is still starting one that is not running", async () => {
     // The settings screen polls this every ten seconds. Reporting "not running,
-    // click Set up" for the thirty seconds a cold start takes invites a
+    // click Set up" for as long as a cold start takes invites a
     // Set up that can only join the boot already under way.
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
@@ -898,6 +892,32 @@ describe("disposal during a boot", () => {
     // Whatever the retry loop managed to boot, none of it is left running.
     expect(starts).toBeGreaterThan(0);
     expect(disposed).toHaveLength(starts);
+  });
+});
+
+describe("disposal during a plugin build", () => {
+  it("aborts the build instead of waiting minutes for a compiler", async () => {
+    let provisionSignal: AbortSignal | undefined;
+    const harness = makeHarness({
+      pluginInstalled: false,
+      provisionPlugin: async ({ signal }) => {
+        provisionSignal = signal;
+        // A source build that only ends when it is cancelled.
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        throw new Error("unreachable");
+      },
+    });
+    const availability = harness.backend.availability();
+    for (let turn = 0; turn < 20 && !provisionSignal; turn += 1) await Promise.resolve();
+    expect(provisionSignal?.aborted).toBe(false);
+
+    await harness.backend.dispose();
+    expect(provisionSignal?.aborted).toBe(true);
+    await expect(availability).resolves.toMatchObject({ kind: "backend-unavailable" });
+    // Nothing was booted after the shutdown began.
+    expect(harness.sessionStarts).toHaveLength(0);
   });
 });
 

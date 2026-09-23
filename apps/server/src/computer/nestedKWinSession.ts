@@ -509,6 +509,8 @@ export type NestedAtspiMode = "off" | "session";
 export interface NestedBackendOptions {
   readonly mode?: NestedSessionMode;
   readonly atspiMode?: NestedAtspiMode;
+  /** Dials a session's private bus; a test seam. */
+  readonly connectDbus?: (busAddress: string) => Promise<KWinComputerDbus>;
   /**
    * Builds the AT-SPI client for one nested session's environment. A test
    * seam: the default spawns the Python helper against that session's bus.
@@ -532,10 +534,21 @@ export function nestedKWinBackendOptions(
   resolveSession: () => NestedKWinSession | undefined,
   options: NestedBackendOptions = {},
 ): KWinComputerBackendOptions {
-  const session = resolveSession();
   const mode = options.mode ?? "virtual";
+  const connectDbus =
+    options.connectDbus ?? ((busAddress: string) => createSessionKWinComputerDbus({ busAddress }));
   return {
-    ...(session ? { busAddress: session.busAddress } : {}),
+    // Dialled per connect, never captured: a fixed address would keep pointing
+    // a reconnect at the bus of a session that has since been replaced.
+    dbusFactory: async () => await connectDbus(requireSession(resolveSession).busAddress),
+    // The private bus is born owned by a compositor this process started; the
+    // ambient session bus the default check would ask knows nothing about it.
+    busNamesHaveOwners: async (names) => names.map(() => true),
+    // The compositor here is spawned with the plugin root already on its
+    // QT_PLUGIN_PATH, so a fresh install loads without anyone logging out; the
+    // default check reads the server's session environment and would tell the
+    // user to relogin a session this plugin never loads into.
+    compositorSeesPluginRoot: () => true,
     // A windowed nested compositor is an ordinary window of the host session,
     // so its desktop genuinely is on screen; the headless one has no output at
     // all and the Computer pane is the only view onto it.

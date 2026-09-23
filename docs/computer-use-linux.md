@@ -266,16 +266,26 @@ Launched applications get the session's runtime directory, the nested
 `WAYLAND_DISPLAY`, the private bus, and the nested Xwayland's `DISPLAY` and
 `XAUTHORITY` (the cookie KWin generated, as the plugin reports it in
 `healthJson.xAuthority`) on top of the scrubbed application environment.
-The compositor, the bus, Xwayland and every launched application form one
-process group tied to the server's lifetime (`supervisedProcess.ts`); teardown
-runs from `dispose()` and the server's signal handlers, and a startup sweep
-(`nestedSessionRegistry.ts`) reaps sessions a crashed server left behind.
+The compositor, the bus, Xwayland and every launched application are children
+of the server (`supervisedProcess.ts`). `dispose()` ends them as process trees,
+and a synchronous `exit` hook SIGKILLs them when the server dies by an uncaught
+exception or `process.exit`. A server that is SIGKILLed runs neither, so each
+session keeps a marker (`nestedSessionRegistry.ts`) naming its processes from
+the first spawn on, with the server's pid and start time; the next server
+sweeps markers whose owner is gone when its nested backend is constructed and
+again before each boot. The sweep only reads a 0700 directory the user owns,
+only signals `kwin_wayland`, `dbus-daemon`, Xwayland, `at-spi-bus-launcher` or
+recorded apps whose argv and start time still match, and only deletes the
+session directory the marker is named after.
 
 ### Lifecycle
 
-Construction and `probeAvailability()` touch nothing. First real use boots the
-session, installing the plugin into the home directory first when it is
-missing. `provision()` is the only step that installs system packages
+Construction and `probeAvailability()` boot nothing (construction only starts
+the stale-session sweep). First real use boots the session in about a second,
+installing the plugin into the home directory first when it is missing. A
+failed boot is reported once per call: it ends the connect ladder instead of
+being retried inside it, and arms no reconnect timer. `dispose()` aborts a
+plugin build or boot in progress. `provision()` is the only step that installs system packages
 (`kwin`, `wl-clipboard` and the build toolchain in one `pkexec`
 authorization); it then provisions the plugin and boots the session.
 

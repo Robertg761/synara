@@ -129,8 +129,19 @@ describe("nested session environment", () => {
       },
       dispose: async () => undefined,
     };
-    const options = nestedKWinBackendOptions(() => session);
-    expect(options.busAddress).toBe(BUS_ADDRESS);
+    const dialled: string[] = [];
+    const options = nestedKWinBackendOptions(() => session, {
+      connectDbus: async (address) => {
+        dialled.push(address);
+        return {} as KWinComputerDbus;
+      },
+    });
+    // No fixed address: the backend dials whichever session is current.
+    expect(options.busAddress).toBeUndefined();
+    await options.dbusFactory?.({ automatic: false });
+    expect(dialled).toEqual([BUS_ADDRESS]);
+    await expect(options.busNamesHaveOwners?.(["org.kde.KWin"])).resolves.toEqual([true]);
+    expect(options.compositorSeesPluginRoot?.()).toBe(true);
     expect(options.sessionType).toBe("wayland");
     expect(options.visibleDesktop).toBe(false);
     await expect(options.atspi?.readTrees([])).resolves.toEqual([]);
@@ -152,9 +163,17 @@ describe("nested session environment", () => {
     // The backend that owns these options is built before any session exists
     // and outlives each one it boots.
     let session: NestedKWinSession | undefined;
-    const options = nestedKWinBackendOptions(() => session);
-    expect(options.busAddress).toBeUndefined();
+    const dialled: string[] = [];
+    const options = nestedKWinBackendOptions(() => session, {
+      connectDbus: async (address) => {
+        dialled.push(address);
+        return {} as KWinComputerDbus;
+      },
+    });
     expect(() => options.spawnProcess?.("kcalc", [], SPAWN_OPTIONS)).toThrow(
+      /isolated desktop is not running/,
+    );
+    await expect(options.dbusFactory?.({ automatic: true })).rejects.toThrow(
       /isolated desktop is not running/,
     );
 
@@ -174,6 +193,11 @@ describe("nested session environment", () => {
     };
     options.spawnProcess?.("kcalc", [], SPAWN_OPTIONS);
     expect(launches).toEqual(["kcalc"]);
+    await options.dbusFactory?.({ automatic: false });
+    // A replacement session is dialled at its own address, not the first one's.
+    session = { ...session, busAddress: "unix:path=/replacement" };
+    await options.dbusFactory?.({ automatic: false });
+    expect(dialled).toEqual([BUS_ADDRESS, "unix:path=/replacement"]);
   });
 });
 
