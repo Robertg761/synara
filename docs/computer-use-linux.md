@@ -550,6 +550,11 @@ for a Hyprland upgraded on disk but not restarted.
 - X11 sessions are unsupported; Xwayland clients inside a Wayland session are
   in scope, except that their override-redirect menus are not pointer targets
   on KWin.
+- In the owned-compositor mode and on the agent seat a scroll goes through
+  KWin's own `wl_pointer`, which tells a client bound to `wl_seat` older than
+  version 8 (GTK 3) nothing about a scroll under half a notch and keeps the
+  remainder for one second, so small scrolls a few seconds apart are lost in
+  such a client. Direct injection carries the remainder.
 - The plugin is built per compositor version, so every KWin release needs a
   new build; a KWin upgrade leaves no plugin loaded until the next login
   provisions one.
