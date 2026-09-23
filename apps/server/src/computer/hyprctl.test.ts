@@ -139,6 +139,15 @@ describe("hyprlandSessionPresent", () => {
   });
 });
 
+/** Reads the named files, and fails like a missing file for any other path. */
+function locks(files: Record<string, string>) {
+  return async (path: string) => {
+    const content = files[path];
+    if (content === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return content;
+  };
+}
+
 describe("hyprlandInstanceEnvironment", () => {
   const env = {
     XDG_RUNTIME_DIR: "/run/user/1000",
@@ -146,12 +155,6 @@ describe("hyprlandInstanceEnvironment", () => {
     WAYLAND_DISPLAY: "wayland-1",
     DISPLAY: ":0",
   };
-  const locks = (files: Record<string, string>) => async (path: string) => {
-    const content = files[path];
-    if (content === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-    return content;
-  };
-
   it("keeps the inherited display for the instance this process was started in", async () => {
     const read = locks({ "/run/user/1000/hypr/old/hyprland.lock": "1789\nwayland-1\n" });
     await expect(hyprlandInstanceEnvironment("old", env, read)).resolves.toEqual({
