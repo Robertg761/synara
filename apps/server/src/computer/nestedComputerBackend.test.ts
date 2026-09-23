@@ -108,7 +108,7 @@ function makeHarness(
     readonly startSession?: (
       sessionOptions: NestedKWinSessionOptions,
     ) => Promise<NestedKWinSession>;
-    readonly installPackages?: (plan: SystemPackagePlan) => Promise<string>;
+    readonly installPackages?: (plan: SystemPackagePlan, signal: AbortSignal) => Promise<string>;
     readonly onPluginProvision?: () => void;
     readonly provisionPlugin?: NestedComputerBackendOptions["provisionPlugin"];
     readonly atspiMode?: NestedAtspiMode;
@@ -1039,6 +1039,28 @@ describe("disposal during a boot", () => {
     // Whatever the retry loop managed to boot, none of it is left running.
     expect(starts).toBeGreaterThan(0);
     expect(disposed).toHaveLength(starts);
+  });
+});
+
+describe("disposal during a package install", () => {
+  it("cancels an authorization dialog nobody answered", async () => {
+    let installSignal: AbortSignal | undefined;
+    const harness = makeHarness({
+      kwinInstalled: false,
+      installPackages: (_plan, signal) => {
+        installSignal = signal;
+        return new Promise<string>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+        });
+      },
+    });
+    const provision = harness.backend.provision().catch((error: unknown) => error);
+    for (let turn = 0; turn < 20 && !installSignal; turn += 1) await Promise.resolve();
+    expect(installSignal?.aborted).toBe(false);
+
+    await harness.backend.dispose();
+    expect(installSignal?.aborted).toBe(true);
+    await expect(provision).resolves.toBeInstanceOf(Error);
   });
 });
 

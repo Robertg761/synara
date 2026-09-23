@@ -285,9 +285,13 @@ the stale-session sweep). First real use boots the session in about a second,
 installing the plugin into the home directory first when it is missing. A
 failed boot is reported once per call: it ends the connect ladder instead of
 being retried inside it, and arms no reconnect timer. `dispose()` aborts a
-plugin build or boot in progress. `provision()` is the only step that installs system packages
-(`kwin`, `wl-clipboard` and the build toolchain in one `pkexec`
-authorization); it then provisions the plugin and boots the session.
+plugin build or boot in progress. `provision()` is the only step that installs
+system packages (`kwin`, `wl-clipboard` and the build toolchain in one `pkexec`
+authorization); it then provisions the plugin and boots the session. An
+authorization dialog nobody answers is cancelled after five minutes, and
+`dispose()` cancels one still waiting; both end only `pkexec` while it still
+runs with the user's real uid. A package manager that is already running as
+root is never interrupted.
 
 A dead compositor is never restarted on a timer: the backend reaps the
 session, reports `dormant`, and the reconnect loop stands down. The next real

@@ -179,7 +179,11 @@ export interface NestedComputerBackendOptions {
   readonly prebuiltRoot?: () => string | undefined;
   readonly verifiedPrebuiltAvailable?: () => Promise<boolean>;
   readonly planPackages?: () => SystemPackagePlan | undefined;
-  readonly installPackages?: (plan: SystemPackagePlan) => Promise<string>;
+  /**
+   * The privileged install. `signal` fires on dispose and cancels an
+   * authorization dialog nobody has answered yet — never a running manager.
+   */
+  readonly installPackages?: (plan: SystemPackagePlan, signal: AbortSignal) => Promise<string>;
   /**
    * Ends what a crashed server's nested sessions left running. Replaced in
    * tests, which must never read or signal the host's process table.
@@ -228,7 +232,12 @@ export class NestedComputerBackend extends KWinComputerBackend {
   private readonly nestedPrebuiltRoot: () => string | undefined;
   private readonly verifiedPrebuiltAvailable: () => Promise<boolean>;
   private readonly planPackages: () => SystemPackagePlan | undefined;
-  private readonly installPackages: (plan: SystemPackagePlan) => Promise<string>;
+  private readonly installPackages: (
+    plan: SystemPackagePlan,
+    signal: AbortSignal,
+  ) => Promise<string>;
+  /** Aborted on dispose: an unanswered authorization dialog must not outlive the server. */
+  private readonly packageInstallAbort = new AbortController();
   private readonly listInstalledPluginIds: () => Promise<readonly string[]>;
   private sessionStart: Promise<NestedKWinSession> | undefined;
   private sessionStarted = false;
@@ -298,7 +307,9 @@ export class NestedComputerBackend extends KWinComputerBackend {
     this.verifiedPrebuiltAvailable =
       options.verifiedPrebuiltAvailable ?? (() => this.hasVerifiedPrebuilt());
     this.planPackages = options.planPackages ?? (() => planSystemPackageInstall(this.hasCommand));
-    this.installPackages = options.installPackages ?? installSystemPackages;
+    this.installPackages =
+      options.installPackages ??
+      ((plan, signal) => installSystemPackages(plan, undefined, { signal }));
     this.listInstalledPluginIds = installedPluginIds;
     // A server that was SIGKILLed left its desktop running — a compositor, its
     // Xwayland and a bus, ~260 MB — and waiting for this server's own first
@@ -456,6 +467,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
    */
   override async dispose(): Promise<void> {
     this.disposing = true;
+    this.packageInstallAbort.abort();
     this.stopIdleTimer();
     await this.parking;
     const pending = this.sessionStart;
@@ -478,7 +490,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
             "(cmake, extra-cmake-modules, a C++ compiler), then click Set up again.",
         );
       }
-      steps.push(await this.installPackages(plan));
+      steps.push(await this.installPackages(plan, this.packageInstallAbort.signal));
       this.resetKwinVersionProbe();
       await this.assertSetupSupported();
       if (!wlClipboardToolsPresent(this.hasCommand)) {
