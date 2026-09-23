@@ -2127,7 +2127,8 @@ export class KWinComputerBackend implements ComputerBackend {
     };
     offer.consumed.then(early, early);
     const consumed = offer.consumed.then(() => {
-      if (pending.takenEarly) throw new Error("A clipboard watcher read the offer before the paste.");
+      if (pending.takenEarly)
+        throw new Error("A clipboard watcher read the offer before the paste.");
     });
     consumed.catch(() => undefined);
     return { consumed };
@@ -4325,7 +4326,9 @@ async function readInstallStamp(path: string): Promise<string | undefined> {
  */
 function stampCompositorVersion(stamp: string | undefined, key: string): string | undefined {
   const line = stamp?.split("\n").find((entry) => entry.startsWith(`${key}=`));
-  return line ? (KWIN_VERSION_PATTERN.exec(line.slice(key.length + 1))?.[0] ?? undefined) : undefined;
+  return line
+    ? (KWIN_VERSION_PATTERN.exec(line.slice(key.length + 1))?.[0] ?? undefined)
+    : undefined;
 }
 
 /** A paste nothing can observe: the manager falls back to its bounded wait. */

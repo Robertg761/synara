@@ -232,6 +232,8 @@ interface Emitter {
 
 function isEmitter(value: unknown): value is Emitter {
   return (
-    typeof value === "object" && value !== null && typeof (value as { on?: unknown }).on === "function"
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { on?: unknown }).on === "function"
   );
 }
