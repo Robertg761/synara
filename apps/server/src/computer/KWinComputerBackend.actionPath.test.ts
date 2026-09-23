@@ -360,6 +360,24 @@ describe("preview stills", () => {
   });
 });
 
+/** A plugin answering the three settle waits by their bounds. */
+function answeringSettle(
+  plugin: FakePlugin,
+  answers: {
+    readonly first: readonly [boolean, number];
+    readonly quiet?: readonly [boolean, number];
+    readonly changed: boolean;
+  },
+): void {
+  plugin.waitForSettle = async (windowId, quietMs, timeoutMs) => {
+    plugin.calls.push({ method: "waitForSettle", args: [windowId, quietMs, timeoutMs] });
+    if (timeoutMs === 300) return answers.first;
+    if (timeoutMs === 0) return [answers.changed, 0] as const;
+    // The rest-of-the-bound quiet wait; never answered when nothing changed.
+    return answers.quiet ?? new Promise<never>(() => undefined);
+  };
+}
+
 describe("compositor-observed settle", () => {
   it("is offered only while the loaded plugin advertises waitForSettle", async () => {
     const old = makeBackend(new FakePlugin());
@@ -481,27 +499,10 @@ describe("compositor-observed settle", () => {
       changeWithinMs: 300,
     } as const;
 
-    function answering(
-      plugin: FakePlugin,
-      answers: {
-        readonly first: readonly [boolean, number];
-        readonly quiet?: readonly [boolean, number];
-        readonly changed: boolean;
-      },
-    ): void {
-      plugin.waitForSettle = async (windowId, quietMs, timeoutMs) => {
-        plugin.calls.push({ method: "waitForSettle", args: [windowId, quietMs, timeoutMs] });
-        if (timeoutMs === 300) return answers.first;
-        if (timeoutMs === 0) return [answers.changed, 0] as const;
-        // The rest-of-the-bound quiet wait; never answered when nothing changed.
-        return answers.quiet ?? new Promise<never>(() => undefined);
-      };
-    }
-
     it("settles a window that repainted and went quiet within the bound at once", async () => {
       const plugin = new FakePlugin();
       plugin.features = ["waitForSettle"];
-      answering(plugin, { first: [true, 130], changed: true });
+      answeringSettle(plugin, { first: [true, 130], changed: true });
       const backend = makeBackend(plugin);
       await backend.availability();
       await expect(backend.waitForSettle!(options)).resolves.toEqual({
@@ -515,7 +516,7 @@ describe("compositor-observed settle", () => {
       // Was: the rest of the 1.5 s cap for a first frame that never came.
       const plugin = new FakePlugin();
       plugin.features = ["waitForSettle"];
-      answering(plugin, { first: [false, 300], changed: false });
+      answeringSettle(plugin, { first: [false, 300], changed: false });
       const backend = makeBackend(plugin);
       await backend.availability();
       await expect(backend.waitForSettle!(options)).resolves.toEqual({
@@ -534,7 +535,7 @@ describe("compositor-observed settle", () => {
     it("waits out the quiet of a window that did repaint, up to the cap", async () => {
       const plugin = new FakePlugin();
       plugin.features = ["waitForSettle"];
-      answering(plugin, { first: [false, 300], quiet: [true, 140], changed: true });
+      answeringSettle(plugin, { first: [false, 300], quiet: [true, 140], changed: true });
       const backend = makeBackend(plugin);
       await backend.availability();
       await expect(backend.waitForSettle!(options)).resolves.toEqual({
@@ -542,7 +543,7 @@ describe("compositor-observed settle", () => {
         waitedMs: 440,
       });
 
-      answering(plugin, { first: [false, 300], quiet: [false, 1_200], changed: true });
+      answeringSettle(plugin, { first: [false, 300], quiet: [false, 1_200], changed: true });
       await expect(backend.waitForSettle!(options)).resolves.toEqual({
         settled: false,
         waitedMs: 1_500,
@@ -554,7 +555,7 @@ describe("compositor-observed settle", () => {
     it("gives the fixed wait back after three settles in a row saw no repaint", async () => {
       const plugin = new FakePlugin();
       plugin.features = ["waitForSettle"];
-      answering(plugin, { first: [false, 300], changed: false });
+      answeringSettle(plugin, { first: [false, 300], changed: false });
       const backend = makeBackend(plugin);
       await backend.availability();
       for (let miss = 0; miss < 3; miss += 1) await backend.waitForSettle!(options);
