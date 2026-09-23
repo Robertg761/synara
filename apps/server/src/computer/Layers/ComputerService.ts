@@ -175,11 +175,15 @@ export function makeComputerServiceLayer(options: ComputerServiceLiveOptions = {
         };
       }
       return {
-        // Supported backends remain routable even before setup grants access.
-        // Every Linux tier is one, including a slot still selecting its tier.
-        supported:
-          options.supported ??
-          (linux !== undefined || !(backend instanceof UnavailableComputerBackend)),
+        // Supported backends remain routable even before setup grants access,
+        // and so is a slot still selecting its tier. Read as the slot's
+        // occupant changes: selection may land on no backend at all.
+        get supported() {
+          return (
+            options.supported ??
+            !((linux?.slot.current ?? backend) instanceof UnavailableComputerBackend)
+          );
+        },
         // A Linux probe that outlived the budget lands here when it answers.
         get availability() {
           return options.supported === undefined && linux
@@ -360,7 +364,10 @@ function planBackend(
         ...(forcedChoice !== undefined ? { override: forcedChoice } : {}),
       });
       if (!linux) return { backend: fallbackBackend(platform, env) };
-      const make = linuxBackends?.[linux.choice] ?? LINUX_BACKENDS[linux.choice];
+      // Annotated: with no tier registered the choice is `never`, and so
+      // would the factory be.
+      const make: () => ComputerBackend =
+        linuxBackends?.[linux.choice] ?? LINUX_BACKENDS[linux.choice];
       return { backend: make(), choice: linux.choice };
     },
   };
