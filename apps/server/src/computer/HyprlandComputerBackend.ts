@@ -85,6 +85,8 @@ export interface HyprlandComputerBackendOptions {
   /** Whether a name is owned on the ambient session bus; the passive probe. */
   readonly busNameHasOwner?: (name: string) => Promise<boolean>;
   readonly provisionPlugin?: KWinComputerBackendOptions["provisionPlugin"];
+  /** See `KWinComputerBackendOptions.idleReleaseMs`. */
+  readonly idleReleaseMs?: number;
   /** The Hyprland the installed headers are for; replaced in tests. */
   readonly headersVersion?: () => Promise<string | undefined>;
   readonly dbusFactory?: KWinComputerBackendOptions["dbusFactory"];
@@ -168,6 +170,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
     super({
       ...(options.platform !== undefined ? { platform: options.platform } : {}),
       ...(options.atspi ? { atspi: options.atspi } : {}),
+      ...(options.idleReleaseMs !== undefined ? { idleReleaseMs: options.idleReleaseMs } : {}),
       integrationName: "Hyprland",
       installHint: HYPRLAND_INSTALL_SCRIPT_PATH,
       // A live Hyprland instance is a Wayland session by construction, even
