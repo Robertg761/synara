@@ -308,6 +308,13 @@ export const ComputerAvailability = Schema.Union([
    * wait on that question — a wedged session bus could stall it for tens of
    * seconds — so for that window the answer is "not yet", which is neither a
    * failure to report nor a setup to offer; it ends by itself.
+   *
+   * Decoding is strict, so a client built before this member cannot decode an
+   * availability carrying it. That was accepted rather than bumping the WS
+   * protocol revision: only a Linux server emits it, only while its first
+   * detection outlives the startup budget, and the web client ships with the
+   * server it talks to. A later member that a server sends in steady state
+   * needs the revision bump (see wsCompatibility.ts).
    */
   Schema.Struct({
     kind: Schema.Literal("checking"),
