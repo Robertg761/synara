@@ -21,6 +21,27 @@ function node(source: string, options: Partial<ClipboardCommandSpec> = {}) {
 }
 
 describe("spawnClipboardCommand", () => {
+  it("hands wl-clipboard the desktop's environment and none of the server's secrets", async () => {
+    const saved = process.env.SYNARA_AUTH_TOKEN;
+    process.env.SYNARA_AUTH_TOKEN = "server-secret";
+    try {
+      const result = await spawnClipboardCommand(
+        {
+          command: process.execPath,
+          args: [
+            "-e",
+            "process.stdout.write(JSON.stringify([process.env.SYNARA_AUTH_TOKEN ?? null, process.env.WAYLAND_DISPLAY ?? null]))",
+          ],
+        },
+        { WAYLAND_DISPLAY: "nested-0" },
+      );
+      expect(JSON.parse(result.stdout)).toEqual([null, "nested-0"]);
+    } finally {
+      if (saved === undefined) delete process.env.SYNARA_AUTH_TOKEN;
+      else process.env.SYNARA_AUTH_TOKEN = saved;
+    }
+  });
+
   it("settles with bounded diagnostics when stderr exceeds its limit", async () => {
     const result = await node("process.stderr.write('x'.repeat(20000)); process.exitCode=1");
     expect(result.code).toBe(1);

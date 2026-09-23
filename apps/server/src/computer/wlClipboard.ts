@@ -15,6 +15,7 @@
  */
 import { spawn } from "node:child_process";
 
+import { desktopApplicationEnvironment } from "./desktopAppEnvironment.ts";
 import { commandOnPath } from "./provisioning/systemPackages.ts";
 
 import {
@@ -171,6 +172,11 @@ function describeFailure(result: ClipboardCommandResult): string {
  * `env` overrides the inherited environment and is how a nested compositor's
  * clipboard is reached: wl-clipboard talks to whichever `WAYLAND_DISPLAY` it is
  * handed, so the same code addresses the ambient session and a Tier 3 one.
+ *
+ * The process gets the desktop session's variables and nothing of the
+ * server's (see `desktopApplicationEnvironment`): `wl-copy` forks and stays
+ * alive holding the selection, and it has no use for the server's auth token
+ * or provider keys.
  */
 export function spawnClipboardCommand(
   spec: ClipboardCommandSpec,
@@ -181,7 +187,7 @@ export function spawnClipboardCommand(
   return new Promise((resolve, reject) => {
     const child = spawn(spec.command, [...spec.args], {
       stdio: ["pipe", "pipe", "pipe"],
-      ...(env ? { env: { ...process.env, ...env } } : {}),
+      env: desktopApplicationEnvironment(process.env, env),
     });
     const stdout = new ChunkBuffer(maxOutputBytes);
     const stderr = new ChunkBuffer(MAX_CLIPBOARD_STDERR_BYTES);
