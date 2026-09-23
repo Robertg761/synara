@@ -44,11 +44,18 @@ def _balanced(source, start, opening):
     return source[start:end]
 
 
-def run_fixture(fixture, definitions, prefix="synara-kwin-fixture-"):
-    """Compile @p fixture with the placeholder replaced by @p definitions, then run it."""
+def run_fixture(fixture, definitions, prefix="synara-kwin-fixture-", replacements=None):
+    """Compile @p fixture with the placeholder replaced by @p definitions, then run it.
+
+    @p replacements maps further placeholders to production text, for
+    declarations a fixture needs ahead of its own model (enums, constants).
+    """
     with tempfile.TemporaryDirectory(prefix=prefix) as directory:
         cpp = Path(directory) / "fixture.cpp"
-        cpp.write_text(fixture.read_text().replace(PLACEHOLDER, "\n\n".join(definitions)))
+        text = fixture.read_text().replace(PLACEHOLDER, "\n\n".join(definitions))
+        for placeholder, replacement in (replacements or {}).items():
+            text = text.replace(placeholder, replacement)
+        cpp.write_text(text)
         binary = Path(directory) / "fixture"
         subprocess.run(["g++", "-std=c++20", "-Wall", "-Wextra", str(cpp), "-o", str(binary)], check=True)
         result = subprocess.run([str(binary)], capture_output=True, text=True)

@@ -40,12 +40,23 @@ def argument_signatures(parameters):
     return [signature(parameter.rsplit(" ", 1)[0]) for parameter in parameters.split(",")]
 
 
+def is_output(parameter):
+    """QtDBus reads a non-const reference parameter as a further reply argument."""
+    return "&" in parameter and not re.match(r"\s*const\b", parameter)
+
+
 def declared_methods(header):
     """{name: (in signatures, out signature)} from Q_INVOKABLE declarations."""
     methods = {}
     for match in re.finditer(r"Q_INVOKABLE\s+(\w+)\s+(\w+)\(([^)]*)\)(?:\s+const)?;", header):
         returned, name, parameters = match.groups()
-        methods[name] = (argument_signatures(parameters), signature(returned))
+        split = [parameter.strip() for parameter in parameters.split(",") if parameter.strip()]
+        inputs = [parameter for parameter in split if not is_output(parameter)]
+        outputs = [parameter for parameter in split if is_output(parameter)]
+        methods[name] = (
+            argument_signatures(",".join(inputs)),
+            signature(returned) + "".join(argument_signatures(",".join(outputs))),
+        )
     return methods
 
 

@@ -91,7 +91,22 @@ export const COMPUTER_PLUGIN_METHOD_SIGNATURES: Readonly<
   key: { in: "ub", out: "b" },
   captureWindow: { in: "su", out: "ay" },
   captureRegion: { in: "iiuuu", out: "ay" },
+  captureWindowEx: { in: "suu", out: "ays" },
+  captureRegionEx: { in: "iiuuuu", out: "ays" },
 };
+
+/**
+ * `flags` for `captureWindowEx`/`captureRegionEx` (feature `captureEx`). JPEG
+ * and luma exclude each other; without either the bytes are a PNG.
+ */
+export const COMPUTER_CAPTURE_FLAGS = {
+  /** An observer's frame: not agent activity, so the idle deadline and badge are untouched. */
+  passive: 1,
+  /** JPEG at quality 85, `image/jpeg`. */
+  jpeg: 2,
+  /** Raw 8-bit luma, row-major and unpadded: `image/x-luma8; width=<w>; height=<h>`. */
+  luma: 4,
+} as const;
 
 export interface KWinComputerPluginApi {
   readonly instanceId?: string;
@@ -153,6 +168,25 @@ export interface KWinComputerPluginApi {
     width: number,
     height: number,
     maxDimension: number,
+  ) => Promise<unknown>;
+  /**
+   * Interface version 2, feature `captureEx`: the captures above with
+   * `COMPUTER_CAPTURE_FLAGS`, answering `[bytes, mime]`. Call only when
+   * `healthJson().features` lists it.
+   */
+  readonly captureWindowEx?: (
+    windowId: string,
+    maxDimension: number,
+    flags: number,
+    pixels?: number,
+  ) => Promise<unknown>;
+  readonly captureRegionEx?: (
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    maxDimension: number,
+    flags: number,
   ) => Promise<unknown>;
 }
 
@@ -583,6 +617,27 @@ function makePluginApi(iface: unknown): KWinComputerPluginApi {
         height,
         maxDimension,
       ),
+    captureWindowEx: (windowId, maxDimension, flags, pixels) =>
+      invokeWithTimeout(
+        iface,
+        "captureWindowEx",
+        captureTimeoutMs(pixels),
+        windowId,
+        maxDimension,
+        flags,
+      ),
+    captureRegionEx: (x, y, width, height, maxDimension, flags) =>
+      invokeWithTimeout(
+        iface,
+        "captureRegionEx",
+        captureTimeoutMs(width * height),
+        x,
+        y,
+        width,
+        height,
+        maxDimension,
+        flags,
+      ),
   };
 }
 
@@ -619,7 +674,12 @@ async function invokeWithTimeout(
 const invoke = invokeKWinDbusMethod;
 
 export function isCaptureMethod(methodName: string): boolean {
-  return methodName === "captureWindow" || methodName === "captureRegion";
+  return (
+    methodName === "captureWindow" ||
+    methodName === "captureRegion" ||
+    methodName === "captureWindowEx" ||
+    methodName === "captureRegionEx"
+  );
 }
 
 /**

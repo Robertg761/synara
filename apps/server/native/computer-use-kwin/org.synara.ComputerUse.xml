@@ -24,6 +24,7 @@
   absent means 1) and "features", the optional methods below the version 1
   set that this build implements. A server calls one only when its feature is
   listed and falls back to the version 1 methods otherwise:
+    captureEx          captureWindowEx, captureRegionEx
     windowsStateJson   windowsStateJson
 -->
 <node name="/org/synara/ComputerUse">
@@ -126,6 +127,32 @@
       <arg name="height" type="u" direction="in"/>
       <arg name="maxDimension" type="u" direction="in"/>
       <arg name="png" type="ay" direction="out"/>
+    </method>
+
+    <!-- Feature captureEx: the captures above with flags, and the bytes'
+         MIME type as a second reply argument. Flags: 1 passive (an
+         observer's frame: not agent activity, so the idle deadline and the
+         badge are untouched), 2 JPEG quality 85 ("image/jpeg"), 4 raw 8-bit
+         luma ("image/x-luma8; width=<w>; height=<h>", row-major, unpadded).
+         Without 2 or 4 it is a PNG ("image/png"). Unknown bits, or 2 with 4,
+         answer org.freedesktop.DBus.Error.InvalidArgs; every other error is
+         the version 1 methods'. -->
+    <method name="captureWindowEx">
+      <arg name="windowId" type="s" direction="in"/>
+      <arg name="maxDimension" type="u" direction="in"/>
+      <arg name="flags" type="u" direction="in"/>
+      <arg name="image" type="ay" direction="out"/>
+      <arg name="mime" type="s" direction="out"/>
+    </method>
+    <method name="captureRegionEx">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+      <arg name="width" type="u" direction="in"/>
+      <arg name="height" type="u" direction="in"/>
+      <arg name="maxDimension" type="u" direction="in"/>
+      <arg name="flags" type="u" direction="in"/>
+      <arg name="image" type="ay" direction="out"/>
+      <arg name="mime" type="s" direction="out"/>
     </method>
 
     <!-- A running session ended: request, idle-timeout, user-release, or

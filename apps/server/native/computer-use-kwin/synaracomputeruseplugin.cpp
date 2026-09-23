@@ -45,6 +45,7 @@
 #include <QBuffer>
 #include <QCoreApplication>
 #include <QDBusConnection>
+#include <QDBusError>
 #include <QDBusMessage>
 #include <QEasingCurve>
 #include <QFont>
@@ -90,6 +91,7 @@ static const QString s_agentCursorName = QStringLiteral("synara-agent");
 // version 1 set; see the XML for what each feature names.
 static constexpr int s_interfaceVersion = 2;
 static const QStringList s_interfaceFeatures = {
+    QStringLiteral("captureEx"),
     QStringLiteral("windowsStateJson"),
 };
 static const QString s_captureErrorName = QStringLiteral("org.synara.ComputerUse.Error.CaptureFailed");
@@ -488,7 +490,93 @@ static bool isWindowVisibleForCapture(const Window *window)
         && !window->isHiddenByShowDesktop();
 }
 
-static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &nativeSize, qreal effectiveScale, uint maxDimension, bool opaqueBackground, QString *error)
+/**
+ * What captureWindowEx and captureRegionEx take in `flags`. Without JPEG or
+ * LUMA the bytes are a PNG, as from captureWindow and captureRegion.
+ */
+enum CaptureFlag : uint {
+    // An observer's frame (the preview): not agent activity, so it neither
+    // resets the idle deadline nor brings the badge back.
+    CapturePassive = 1,
+    CaptureJpeg = 2,
+    // Raw 8-bit luma, row-major and unpadded, for measuring rather than looking.
+    CaptureLuma = 4,
+};
+static constexpr uint s_captureKnownFlags = CapturePassive | CaptureJpeg | CaptureLuma;
+static constexpr int s_jpegQuality = 85;
+
+enum class CaptureFormat {
+    Png,
+    Jpeg,
+    Luma,
+};
+
+static CaptureFormat captureFormat(uint flags)
+{
+    if (flags & CaptureJpeg) {
+        return CaptureFormat::Jpeg;
+    }
+    return flags & CaptureLuma ? CaptureFormat::Luma : CaptureFormat::Png;
+}
+
+struct EncodedCapture
+{
+    QByteArray bytes;
+    QString mime;
+};
+
+static EncodedCapture encodeImage(QImage image, CaptureFormat format, bool opaque, qreal effectiveScale, QString *error)
+{
+    switch (format) {
+    case CaptureFormat::Jpeg: {
+        // Flattened onto the black the capture was composed over; JPEG has no
+        // alpha to keep a window's surround in.
+        image = image.convertToFormat(QImage::Format_RGB888);
+        QByteArray jpeg;
+        QBuffer buffer(&jpeg);
+        if (image.isNull() || !buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "JPG", s_jpegQuality)) {
+            *error = QStringLiteral("JPEG encoding failed");
+            return {};
+        }
+        return {jpeg, QStringLiteral("image/jpeg")};
+    }
+    case CaptureFormat::Luma: {
+        image = image.convertToFormat(QImage::Format_Grayscale8);
+        if (image.isNull()) {
+            *error = QStringLiteral("luma conversion failed");
+            return {};
+        }
+        // QImage pads every scanline to four bytes; the wire format has none.
+        const qsizetype width = image.width();
+        QByteArray luma(width * image.height(), Qt::Uninitialized);
+        for (int y = 0; y < image.height(); ++y) {
+            std::memcpy(luma.data() + y * width, image.constScanLine(y), size_t(width));
+        }
+        return {luma, QStringLiteral("image/x-luma8; width=%1; height=%2").arg(image.width()).arg(image.height())};
+    }
+    case CaptureFormat::Png:
+        break;
+    }
+
+    image.setText(QStringLiteral("SynaraCaptureScale"), QString::number(effectiveScale, 'f', 3));
+    // An opaque capture has nothing to say in its alpha channel, and RGBX is
+    // written as a three-channel PNG: a quarter less for zlib to chew through.
+    image = image.convertToFormat(opaque ? QImage::Format_RGBX8888 : QImage::Format_RGBA8888);
+    if (image.isNull()) {
+        *error = QStringLiteral("PNG image conversion failed");
+        return {};
+    }
+
+    QByteArray png;
+    QBuffer buffer(&png);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG", s_pngFastQuality)) {
+        *error = QStringLiteral("PNG encoding failed");
+        return {};
+    }
+    return {png, QStringLiteral("image/png")};
+}
+
+static EncodedCapture encodeCapture(const QList<CapturePart> &parts, const QSize &nativeSize, qreal effectiveScale, uint maxDimension, bool windowCapture, CaptureFormat format, QString *error)
 {
     if (parts.isEmpty() || !nativeSize.isValid()) {
         *error = QStringLiteral("capture produced no pixels");
@@ -505,8 +593,10 @@ static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &na
     // On a desktop with no maximized window that encodes as a mostly (or, on an
     // empty nested desktop, entirely) transparent PNG that viewers and models
     // flatten to white — nothing like the black the visible output shows. Only
-    // a single-window capture keeps alpha: there the surround genuinely is
-    // "not this window" rather than screen the compositor painted black.
+    // a single-window PNG keeps alpha: there the surround genuinely is "not
+    // this window" rather than screen the compositor painted black. JPEG and
+    // luma have no alpha to keep it in.
+    const bool opaqueBackground = !windowCapture || format != CaptureFormat::Png;
     image.fill(opaqueBackground ? QColor(Qt::black) : QColor(Qt::transparent));
 
     QPainter painter(&image);
@@ -542,22 +632,7 @@ static QByteArray encodeCapture(const QList<CapturePart> &parts, const QSize &na
         }
     }
 
-    image.setText(QStringLiteral("SynaraCaptureScale"), QString::number(effectiveScale, 'f', 3));
-    // An opaque capture has nothing to say in its alpha channel, and RGBX is
-    // written as a three-channel PNG: a quarter less for zlib to chew through.
-    image = image.convertToFormat(opaqueBackground ? QImage::Format_RGBX8888 : QImage::Format_RGBA8888);
-    if (image.isNull()) {
-        *error = QStringLiteral("PNG image conversion failed");
-        return {};
-    }
-
-    QByteArray png;
-    QBuffer buffer(&png);
-    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG", s_pngFastQuality)) {
-        *error = QStringLiteral("PNG encoding failed");
-        return {};
-    }
-    return png;
+    return encodeImage(std::move(image), format, opaqueBackground, effectiveScale, error);
 }
 
 /**
@@ -675,7 +750,10 @@ struct SynaraComputerUsePlugin::CaptureRequest
     QMetaObject::Connection windowDestroyedConnection;
     RectF region;
     uint maxDimension = 0;
+    uint flags = 0;
     bool windowCapture = false;
+    // captureWindowEx or captureRegionEx: the reply carries the MIME type.
+    bool extended = false;
     std::atomic_bool renderStarted = false;
     std::atomic_bool finished = false;
 };
@@ -2202,9 +2280,61 @@ void SynaraComputerUsePlugin::sendKey(quint32 keyCode, bool pressed)
 
 QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint maxDimension)
 {
-    if (!m_auth.permits(*this)) return {};
-    if (!calledFromDBus()) {
+    if (!admitCapture(0)) {
         return {};
+    }
+    auto request = std::make_shared<CaptureRequest>(connection(), message());
+    request->window = findWindowById(windowId);
+    request->windowCapture = true;
+    startCapture(std::move(request), maxDimension, 0, false);
+    return {};
+}
+
+QByteArray SynaraComputerUsePlugin::captureRegion(int x, int y, uint width, uint height, uint maxDimension)
+{
+    if (!admitCapture(0)) {
+        return {};
+    }
+    auto request = std::make_shared<CaptureRequest>(connection(), message());
+    request->region = RectF(qreal(x), qreal(y), qreal(width), qreal(height));
+    startCapture(std::move(request), maxDimension, 0, false);
+    return {};
+}
+
+QByteArray SynaraComputerUsePlugin::captureWindowEx(const QString &windowId, uint maxDimension, uint flags, QString &mime)
+{
+    Q_UNUSED(mime)
+    if (!admitCapture(flags)) {
+        return {};
+    }
+    auto request = std::make_shared<CaptureRequest>(connection(), message());
+    request->window = findWindowById(windowId);
+    request->windowCapture = true;
+    startCapture(std::move(request), maxDimension, flags, true);
+    return {};
+}
+
+QByteArray SynaraComputerUsePlugin::captureRegionEx(int x, int y, uint width, uint height, uint maxDimension, uint flags, QString &mime)
+{
+    Q_UNUSED(mime)
+    if (!admitCapture(flags)) {
+        return {};
+    }
+    auto request = std::make_shared<CaptureRequest>(connection(), message());
+    request->region = RectF(qreal(x), qreal(y), qreal(width), qreal(height));
+    startCapture(std::move(request), maxDimension, flags, true);
+    return {};
+}
+
+/**
+ * The refusals every capture method shares, in order, before anything is
+ * queued: the caller, the release latch, the lock, and the flags.
+ */
+bool SynaraComputerUsePlugin::admitCapture(uint flags)
+{
+    if (!m_auth.permits(*this)) return false;
+    if (!calledFromDBus()) {
+        return false;
     }
     // The release shortcut revokes the agent's view as well as its hands:
     // a latched release refuses capture until the user resumes, matching
@@ -2213,51 +2343,33 @@ QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint 
         sendErrorReply(s_releasedErrorName,
                        QStringLiteral("computer control was released with %1")
                            .arg(releaseShortcutText()));
-        return {};
+        return false;
     }
     if (refuseIfSessionLocked()) {
-        return {};
+        return false;
     }
-    setDelayedReply(true);
-    if (m_running) {
-        noteActivity();
+    if ((flags & ~s_captureKnownFlags) != 0 || ((flags & CaptureJpeg) && (flags & CaptureLuma))) {
+        sendErrorReply(QDBusError::InvalidArgs,
+                       QStringLiteral("capture flags %1 are not a valid combination: 1 passive, and at most one "
+                                      "of 2 JPEG and 4 luma")
+                           .arg(flags));
+        return false;
     }
-
-    auto request = std::make_shared<CaptureRequest>(connection(), message());
-    request->window = findWindowById(windowId);
-    request->maxDimension = maxDimension;
-    request->windowCapture = true;
-    queueCapture(request);
-    return {};
+    return true;
 }
 
-QByteArray SynaraComputerUsePlugin::captureRegion(int x, int y, uint width, uint height, uint maxDimension)
+void SynaraComputerUsePlugin::startCapture(std::shared_ptr<CaptureRequest> request, uint maxDimension, uint flags, bool extended)
 {
-    if (!m_auth.permits(*this)) return {};
-    if (!calledFromDBus()) {
-        return {};
-    }
-    // Same privacy rule as captureWindow: a latched user release blanks the
-    // agent's view of the desktop, not just its input.
-    if (m_releasedByUser) {
-        sendErrorReply(s_releasedErrorName,
-                       QStringLiteral("computer control was released with %1")
-                           .arg(releaseShortcutText()));
-        return {};
-    }
-    if (refuseIfSessionLocked()) {
-        return {};
-    }
     setDelayedReply(true);
-    if (m_running) {
+    // A passive frame is an observer's (the preview), not the agent acting: it
+    // must not keep an idle session alive or bring the badge back.
+    if (m_running && !(flags & CapturePassive)) {
         noteActivity();
     }
-
-    auto request = std::make_shared<CaptureRequest>(connection(), message());
-    request->region = RectF(qreal(x), qreal(y), qreal(width), qreal(height));
     request->maxDimension = maxDimension;
-    queueCapture(request);
-    return {};
+    request->flags = flags;
+    request->extended = extended;
+    queueCapture(std::move(request));
 }
 
 void SynaraComputerUsePlugin::watchRenderLoop(LogicalOutput *output)
@@ -2516,27 +2628,28 @@ void SynaraComputerUsePlugin::captureAtRenderOpportunity(std::shared_ptr<Capture
 
     QPointer<SynaraComputerUsePlugin> receiver(this);
     const uint maxDimension = request->maxDimension;
+    const CaptureFormat format = captureFormat(request->flags);
     m_captureRenderWatchdog.stop();
     m_captureEncodeWatchdog.start(s_captureEncodeDeadlineMilliseconds);
     encodePool()->start(new CaptureEncodeTask(
-        [receiver, request, parts = std::move(parts), nativeSize = *nativeSize, effectiveScale, maxDimension, opaqueBackground = !request->windowCapture]() mutable {
+        [receiver, request, parts = std::move(parts), nativeSize = *nativeSize, effectiveScale, maxDimension, windowCapture = request->windowCapture, format]() mutable {
             QString error;
-            const QByteArray png = encodeCapture(parts, nativeSize, effectiveScale, maxDimension, opaqueBackground, &error);
+            const EncodedCapture encoded = encodeCapture(parts, nativeSize, effectiveScale, maxDimension, windowCapture, format, &error);
             // Posted to the application, which outlives every plugin, rather
             // than to the plugin: an event posted to an object being destroyed
             // on another thread is a race, and the receiver is only looked at
             // on the main thread, where its destruction happens.
             QMetaObject::invokeMethod(QCoreApplication::instance(),
-                                      [receiver, request, png, error]() {
+                                      [receiver, request, encoded, error]() {
                                           if (receiver) {
-                                              receiver->finishCapture(request, png, error);
+                                              receiver->finishCapture(request, encoded.bytes, encoded.mime, error);
                                           }
                                       },
                                       Qt::QueuedConnection);
         }));
 }
 
-void SynaraComputerUsePlugin::finishCapture(std::shared_ptr<CaptureRequest> request, const QByteArray &png, const QString &error, const QString &errorName)
+void SynaraComputerUsePlugin::finishCapture(std::shared_ptr<CaptureRequest> request, const QByteArray &bytes, const QString &mime, const QString &error, const QString &errorName)
 {
     if (!request || m_captureRequest != request || request->finished.exchange(true)) {
         return;
@@ -2553,18 +2666,18 @@ void SynaraComputerUsePlugin::finishCapture(std::shared_ptr<CaptureRequest> requ
     m_captureRequest.reset();
 
     QString reason = error.simplified();
-    if (reason.isEmpty() && png.isEmpty()) {
+    if (reason.isEmpty() && bytes.isEmpty()) {
         reason = QStringLiteral("capture failed");
     }
     if (!reason.isEmpty()) {
         request->connection.send(request->message.createErrorReply(errorName.isEmpty() ? s_captureErrorName : errorName, reason));
         return;
     }
-    if (png.isEmpty()) {
-        request->connection.send(request->message.createErrorReply(s_captureErrorName, QStringLiteral("capture produced no PNG")));
+    if (request->extended) {
+        request->connection.send(request->message.createReply(QVariantList{QVariant::fromValue(bytes), mime}));
         return;
     }
-    request->connection.send(request->message.createReply(QVariant::fromValue(png)));
+    request->connection.send(request->message.createReply(QVariant::fromValue(bytes)));
 }
 
 void SynaraComputerUsePlugin::failCapture(std::shared_ptr<CaptureRequest> request, const QString &reason, const QString &errorName)
@@ -2573,7 +2686,7 @@ void SynaraComputerUsePlugin::failCapture(std::shared_ptr<CaptureRequest> reques
         return;
     }
     if (m_captureRequest == request) {
-        finishCapture(std::move(request), {}, reason, errorName);
+        finishCapture(std::move(request), {}, {}, reason, errorName);
         return;
     }
     if (!request->finished.exchange(true)) {

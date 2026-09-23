@@ -136,6 +136,19 @@ plugin keeps working with a newer server. Every version 1 method is unchanged.
   width, height}, "locked": <bool>}`, replacing a `stateJson` and `windowsJson`
   pair with one call. While the session is locked it answers with no windows
   and a null target instead of refusing.
+- `captureWindowEx(s windowId, u maxDimension, u flags) -> (ay image, s mime)`
+  and `captureRegionEx(i x, i y, u width, u height, u maxDimension, u flags)
+  -> (ay image, s mime)` (feature `captureEx`): the version 1 captures with
+  flags. `1` is passive, an observer's frame such as the preview: it is not
+  agent activity, so it neither resets the idle deadline nor brings the badge
+  back, and an open preview can no longer keep an abandoned session alive.
+  `2` encodes JPEG at quality 85 (`image/jpeg`), `4` raw 8-bit luma
+  (`image/x-luma8; width=<w>; height=<h>`, row-major, no padding) for
+  measuring rather than showing. Without either it is the same PNG as the
+  version 1 methods (`image/png`). JPEG and luma are flattened onto black, since
+  neither has alpha. Unknown bits, or `2` with `4`, answer
+  `org.freedesktop.DBus.Error.InvalidArgs`; every other refusal and error is
+  exactly the version 1 methods'.
 
 `healthJson` also carries `xAuthority`: the cookie file of the Xwayland this
 compositor started, read from KWin's own environment the same way `xDisplay`

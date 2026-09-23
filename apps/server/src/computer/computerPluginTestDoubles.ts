@@ -191,6 +191,29 @@ export class FakePlugin implements KWinComputerPluginApi {
     return this.capture ? this.captureBytes : Uint8Array.of();
   };
 
+  /** The MIME type `captureWindowEx`/`captureRegionEx` pair with `captureBytes`. */
+  captureMime = "image/png";
+  captureWindowEx = async (windowId: string, maxDimension: number, flags: number) => {
+    this.calls.push({ method: "captureWindowEx", args: [windowId, maxDimension, flags] });
+    if (this.captureFailure) throw this.captureFailure;
+    return [this.capture ? this.captureBytes : Uint8Array.of(), this.captureMime];
+  };
+  captureRegionEx = async (
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    maxDimension: number,
+    flags: number,
+  ) => {
+    this.calls.push({
+      method: "captureRegionEx",
+      args: [x, y, width, height, maxDimension, flags],
+    });
+    if (this.captureFailure) throw this.captureFailure;
+    return [this.capture ? this.captureBytes : Uint8Array.of(), this.captureMime];
+  };
+
   private recordResult(method: string, ...args: readonly unknown[]): true {
     this.calls.push({ method, args });
     return true;

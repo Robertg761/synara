@@ -123,6 +123,13 @@ public:
     Q_INVOKABLE bool key(uint keyCode, bool pressed);
     Q_INVOKABLE QByteArray captureWindow(const QString &windowId, uint maxDimension);
     Q_INVOKABLE QByteArray captureRegion(int x, int y, uint width, uint height, uint maxDimension);
+    /**
+     * captureWindow and captureRegion with `flags` (1 passive, 2 JPEG, 4 raw
+     * luma; see CaptureFlag) and the MIME type of the bytes as a second reply
+     * argument. Errors and refusals are the version 1 methods'.
+     */
+    Q_INVOKABLE QByteArray captureWindowEx(const QString &windowId, uint maxDimension, uint flags, QString &mime);
+    Q_INVOKABLE QByteArray captureRegionEx(int x, int y, uint width, uint height, uint maxDimension, uint flags, QString &mime);
 
 Q_SIGNALS:
     /**
@@ -299,6 +306,8 @@ private:
     void releasePressedState();
     void setTimestampNow();
     void syncModifiers();
+    bool admitCapture(uint flags);
+    void startCapture(std::shared_ptr<CaptureRequest> request, uint maxDimension, uint flags, bool extended);
     void watchRenderLoop(LogicalOutput *output);
     void queueCapture(std::shared_ptr<CaptureRequest> request);
     void scheduleCapture(std::shared_ptr<CaptureRequest> request);
@@ -306,7 +315,7 @@ private:
     void captureAtRenderOpportunity(std::shared_ptr<CaptureRequest> request);
     // An empty error name means the generic CaptureFailed; SessionLocked is the
     // one other name a capture can fail with.
-    void finishCapture(std::shared_ptr<CaptureRequest> request, const QByteArray &png, const QString &error, const QString &errorName = QString());
+    void finishCapture(std::shared_ptr<CaptureRequest> request, const QByteArray &bytes, const QString &mime, const QString &error, const QString &errorName = QString());
     void failCapture(std::shared_ptr<CaptureRequest> request, const QString &reason, const QString &errorName = QString());
 
     bool m_running = false;

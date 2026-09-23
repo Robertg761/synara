@@ -150,7 +150,10 @@ drops the caller when the server name changes owner.
 - Captures render offscreen at the next safe compositor point; the agent's
   cursor is painted in, the human's never is.
 - `healthJson` reports `interfaceVersion` 2 and `features`, the optional
-  methods on top of the version 1 set (`windowsStateJson`). The server uses a
+  methods on top of the version 1 set (`captureEx`, `windowsStateJson`).
+  `captureWindowEx`/`captureRegionEx` take flags for a passive frame (not
+  agent activity: the preview no longer keeps an idle session alive), JPEG,
+  or raw luma, and reply with the bytes' MIME type. The server uses a
   feature only when it is listed, so an installed older plugin keeps working.
   `healthJson.xAuthority` names the cookie file of the compositor's own
   Xwayland, which X11 apps launched into a nested session need.
