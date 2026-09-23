@@ -49,6 +49,7 @@ struct SynaraKeyStroke
 QDBusArgument &operator<<(QDBusArgument &argument, const SynaraKeyStroke &stroke);
 const QDBusArgument &operator>>(const QDBusArgument &argument, SynaraKeyStroke &stroke);
 
+class CaptureTargetPool;
 class ClientConnection;
 class ImageItem;
 class LogicalOutput;
@@ -367,6 +368,7 @@ private:
     void failSettleRequests(const QString &errorName, const QString &reason);
     bool admitCapture(uint flags);
     void startCapture(std::shared_ptr<CaptureRequest> request, uint maxDimension, uint flags, bool extended);
+    void releaseCaptureTargets();
     void watchRenderLoop(LogicalOutput *output);
     void queueCapture(std::shared_ptr<CaptureRequest> request);
     void scheduleCapture(std::shared_ptr<CaptureRequest> request);
@@ -455,6 +457,10 @@ private:
     QSet<RenderLoop *> m_captureFrameLoops;
     QTimer m_captureRenderWatchdog;
     QTimer m_captureEncodeWatchdog;
+    // Offscreen render targets reused between captures, and the timer that
+    // frees them once captures stop.
+    std::unique_ptr<CaptureTargetPool> m_captureTargets;
+    QTimer m_captureTargetIdle;
     std::shared_ptr<CaptureRequest> m_captureRequest;
     // Popups the agent opened, held without a grab, oldest first.
     QList<QPointer<Window>> m_agentPopups;

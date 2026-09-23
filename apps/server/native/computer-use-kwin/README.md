@@ -359,9 +359,19 @@ so a stop can never be followed by invisible input. Captures work in both
 states.
 
 Capture requests are rendered at the next safe compositor render opportunity.
-`maxDimension = 0` keeps native pixels; otherwise the PNG is downscaled so its
-largest dimension is at most `maxDimension`. The plugin reads back the native
-resolution first, then applies `maxDimension` during PNG encoding, which uses
+`maxDimension = 0` keeps native pixels (the largest scale among the outputs
+the capture touches); otherwise the image is downscaled so its largest
+dimension is at most `maxDimension`. A downscale of a quarter or more is done by
+the GPU: each output's part is rendered straight at the delivered scale, so the
+readback, the compose and the encode only see the pixels that are sent (a 4K
+output at scale 2 reads back 9 MB for a 2048 capture instead of 33). The GPU
+samples surfaces bilinearly, which filters cleanly between three quarters and
+half size, so a smaller target is rendered at half the native scale and the
+encoder takes the rest with an area-averaging downscale, and a milder one
+(1920 to 1536) is left to the encoder. Parts of a capture that spans outputs of
+different scales, rotations or a negative origin are each rendered to their
+exact rectangle of the canvas. Render targets are kept per size between
+captures and freed ten seconds after the last one. PNG encoding uses
 zlib level 1 (Qt quality 80): about half the encode time of the default level
 for files a few percent larger. An opaque capture (a region; a window capture
 keeps its alpha) is written as three-channel RGB. The agent's
@@ -379,8 +389,8 @@ drop its result, rather than stalling the compositor until the PNG is done.
 
 Captures work whether the input seat is running or stopped. `stop()` cancels an
 in-flight capture. A region request is first clamped to the workspace geometry.
-After applying the output scale, the native image must be no larger than 16,384
-pixels on either side and 64 megapixels total. Requests above either limit fail
+The rendered image (native, or smaller when downscaled as above) must be no
+larger than 16,384 pixels on either side and 64 megapixels total. Requests above either limit fail
 with `CaptureFailed` before the render target is allocated.
 
 Capture failures are returned as the D-Bus error

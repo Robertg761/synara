@@ -134,6 +134,7 @@ static constexpr qsizetype s_maxKeyStrokes = 256;
 static constexpr size_t s_maxSettleWaits = 16;
 static constexpr uint s_maxSettleTimeoutMs = 30 * 1000;
 static constexpr int s_captureRenderDeadlineMilliseconds = 2000;
+static constexpr int s_captureTargetIdleMs = 10 * 1000;
 static constexpr int s_captureEncodeDeadlineMilliseconds = 5000;
 static constexpr int s_captureMaxNativeSide = 16384;
 static constexpr qint64 s_captureMaxNativePixels = 64LL * 1024 * 1024;
@@ -510,6 +511,157 @@ static bool captureSizeWithinLimits(const QSize &size)
         && qint64(size.width()) * qint64(size.height()) <= s_captureMaxNativePixels;
 }
 
+/**
+ * The sizes a capture is rendered and delivered at.
+ *
+ * `nativeScale` is the largest scale of the outputs the region touches, the
+ * scale a maxDimension of 0 delivers. With a maxDimension at least a quarter
+ * smaller than that, the GPU renders at the delivered size directly, so the
+ * readback, the compose and the encode see only the pixels that are sent. A
+ * 4K output at scale 2 captured at 2048 or 1536 reads back 9 or 8 MB instead
+ * of 33; measured on a headless KWin 6.7.4, a 1536 PNG went from 53 to 43 ms
+ * and a JPEG from 33 to 17 ms. Surface textures are
+ * sampled bilinearly, which is a clean filter from about three quarters down
+ * to half size and aliases outside that band, so a smaller target is rendered
+ * at half the native scale and the encoder takes the rest of the way with an
+ * area-averaging downscale; a mild one (1920 to 1536 on a scale 1 desktop) is
+ * left to the encoder entirely, because the GPU's version of it came out 40%
+ * larger as a PNG and slower overall.
+ */
+struct CapturePlan
+{
+    qreal nativeScale = 1;
+    // What the parts are rendered at, and the canvas they are composed on.
+    qreal renderScale = 1;
+    QSize renderSize;
+    // What is delivered, and at what scale; equal to the render size and
+    // scale unless the CPU downscales.
+    QSize finalSize;
+    qreal finalScale = 1;
+};
+
+// The band of downscales the GPU takes on its own; see CapturePlan.
+static constexpr qreal s_captureMinRenderFactor = 0.5;
+static constexpr qreal s_captureMaxRenderFactor = 0.75;
+
+static std::optional<CapturePlan> planCapture(const RectF &region, qreal nativeScale, uint maxDimension)
+{
+    const std::optional<QSize> native = deviceSize(region, nativeScale);
+    if (!native) {
+        return std::nullopt;
+    }
+    const auto scaled = [&native](qreal factor) {
+        return QSize(qMax(1, qRound(native->width() * factor)), qMax(1, qRound(native->height() * factor)));
+    };
+    const qint64 largest = std::max(native->width(), native->height());
+    const qreal factor = maxDimension > 0 && largest > maxDimension ? qreal(maxDimension) / qreal(largest) : 1.0;
+    const qreal renderFactor = factor <= s_captureMaxRenderFactor ? std::max(factor, s_captureMinRenderFactor) : 1.0;
+    CapturePlan plan;
+    plan.nativeScale = nativeScale;
+    plan.finalSize = factor < 1 ? scaled(factor) : *native;
+    plan.renderSize = renderFactor == factor ? plan.finalSize : scaled(renderFactor);
+    plan.renderScale = nativeScale * renderFactor;
+    plan.finalScale = nativeScale * factor;
+    return plan;
+}
+
+/**
+ * Offscreen render targets kept between captures, keyed by size: a preview
+ * polling one region, or observations of one window, reuse the same texture
+ * and framebuffer instead of allocating a fresh pair per frame. Parts are read
+ * back as soon as each is rendered, so one target per size is enough even
+ * when a capture spans several outputs of the same size. Bounded, and emptied
+ * after a quiet spell (s_captureTargetIdleMs), so an idle desktop does not
+ * hold capture-sized textures on the GPU.
+ */
+class CaptureTargetPool
+{
+public:
+    GLFramebuffer *acquire(EglContext *context, const QSize &size, QString *error)
+    {
+        if (context != m_context) {
+            // The compositor's context was replaced, and these objects died
+            // with the old one: nothing may be deleted in the new context.
+            abandon();
+            m_context = context;
+        }
+        ++m_clock;
+        for (Target &target : m_targets) {
+            if (target.size == size) {
+                target.lastUse = m_clock;
+                return target.framebuffer.get();
+            }
+        }
+        if (m_targets.size() >= s_maxTargets) {
+            m_targets.erase(std::min_element(m_targets.begin(), m_targets.end(), [](const Target &a, const Target &b) {
+                return a.lastUse < b.lastUse;
+            }));
+        }
+        Target target;
+        target.size = size;
+        target.lastUse = m_clock;
+        target.texture = GLTexture::allocate(GL_RGBA8, size);
+        if (!target.texture || target.texture->isNull()) {
+            *error = QStringLiteral("offscreen texture allocation failed");
+            return nullptr;
+        }
+        target.framebuffer = std::make_unique<GLFramebuffer>(target.texture.get());
+        if (!target.framebuffer->valid()) {
+            *error = QStringLiteral("offscreen framebuffer allocation failed");
+            return nullptr;
+        }
+        m_targets.push_back(std::move(target));
+        return m_targets.back().framebuffer.get();
+    }
+
+    /** Frees every target; @p context must be current if it is still alive. */
+    void clear(EglContext *current)
+    {
+        if (current && current == m_context) {
+            m_targets.clear();
+        } else {
+            abandon();
+        }
+    }
+
+    bool isEmpty() const
+    {
+        return m_targets.empty();
+    }
+
+    EglContext *context() const
+    {
+        return m_context;
+    }
+
+private:
+    struct Target
+    {
+        QSize size;
+        quint64 lastUse = 0;
+        // The framebuffer is declared after the texture it wraps, so it is
+        // destroyed first.
+        std::unique_ptr<GLTexture> texture;
+        std::unique_ptr<GLFramebuffer> framebuffer;
+    };
+
+    void abandon()
+    {
+        for (Target &target : m_targets) {
+            // Their GL names belonged to a context that is gone; deleting them
+            // now would free whatever reuses those names in the current one.
+            Q_UNUSED(target.framebuffer.release())
+            Q_UNUSED(target.texture.release())
+        }
+        m_targets.clear();
+    }
+
+    static constexpr size_t s_maxTargets = 4;
+    std::vector<Target> m_targets;
+    EglContext *m_context = nullptr;
+    quint64 m_clock = 0;
+};
+
 static bool isWindowVisibleForCapture(const Window *window)
 {
     return window
@@ -607,14 +759,14 @@ static EncodedCapture encodeImage(QImage image, CaptureFormat format, bool opaqu
     return {png, QStringLiteral("image/png")};
 }
 
-static EncodedCapture encodeCapture(const QList<CapturePart> &parts, const QSize &nativeSize, qreal effectiveScale, uint maxDimension, bool windowCapture, CaptureFormat format, QString *error)
+static EncodedCapture encodeCapture(const QList<CapturePart> &parts, const CapturePlan &plan, bool windowCapture, CaptureFormat format, QString *error)
 {
-    if (parts.isEmpty() || !nativeSize.isValid()) {
+    if (parts.isEmpty() || !plan.renderSize.isValid()) {
         *error = QStringLiteral("capture produced no pixels");
         return {};
     }
 
-    QImage image(nativeSize, QImage::Format_RGBA8888_Premultiplied);
+    QImage image(plan.renderSize, QImage::Format_RGBA8888_Premultiplied);
     if (image.isNull()) {
         *error = QStringLiteral("capture image allocation failed");
         return {};
@@ -645,25 +797,18 @@ static EncodedCapture encodeCapture(const QList<CapturePart> &parts, const QSize
     }
     painter.end();
 
-    image.setDevicePixelRatio(effectiveScale);
-
-    if (maxDimension > 0) {
-        const qint64 largest = std::max(image.width(), image.height());
-        if (largest > maxDimension) {
-            const qreal factor = qreal(maxDimension) / qreal(largest);
-            const QSize scaledSize(
-                qMax(1, qRound(image.width() * factor)),
-                qMax(1, qRound(image.height() * factor)));
-            image = image.scaled(scaledSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-            if (image.isNull()) {
-                *error = QStringLiteral("capture downscale failed");
-                return {};
-            }
-            image.setDevicePixelRatio(effectiveScale * factor);
+    // Only outside the band the GPU renders at the delivered size in
+    // (planCapture).
+    if (plan.finalSize != plan.renderSize) {
+        image = image.scaled(plan.finalSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        if (image.isNull()) {
+            *error = QStringLiteral("capture downscale failed");
+            return {};
         }
     }
+    image.setDevicePixelRatio(plan.finalScale);
 
-    return encodeImage(std::move(image), format, opaqueBackground, effectiveScale, error);
+    return encodeImage(std::move(image), format, opaqueBackground, plan.nativeScale, error);
 }
 
 /**
@@ -872,10 +1017,21 @@ struct SynaraComputerUsePlugin::CaptureRequest
     std::atomic_bool finished = false;
 };
 
+/**
+ * Renders the part of one output a capture covers, at @p scale, into a target
+ * of exactly @p size - its rectangle in the capture's canvas - and reads it
+ * back. The scene maps the viewport onto the whole target, so an output at a
+ * lower scale than the capture's is magnified by the GPU and a downscaled
+ * capture is rendered small in the first place; a rotated output needs nothing,
+ * since the target is untransformed and the scene is laid out logically.
+ */
 static bool renderCapturePart(WorkspaceScene *scene,
                               EglContext *context,
+                              CaptureTargetPool &targets,
                               LogicalOutput *output,
                               const RectF &viewport,
+                              qreal scale,
+                              const QSize &size,
                               Window *selectedWindow,
                               bool windowCapture,
                               bool sceneCursorIsAgents,
@@ -887,25 +1043,17 @@ static bool renderCapturePart(WorkspaceScene *scene,
         *error = QStringLiteral("render unavailable");
         return false;
     }
-
-    const std::optional<QSize> nativeSize = deviceSize(viewport, output->scale());
-    if (!nativeSize) {
+    if (!size.isValid() || size.isEmpty()) {
         *error = QStringLiteral("capture dimensions are invalid");
         return false;
     }
 
-    std::unique_ptr<GLTexture> texture = GLTexture::allocate(GL_RGBA8, *nativeSize);
-    if (!texture || texture->isNull()) {
-        *error = QStringLiteral("offscreen texture allocation failed");
-        return false;
-    }
-    auto framebuffer = std::make_unique<GLFramebuffer>(texture.get());
-    if (!framebuffer->valid()) {
-        *error = QStringLiteral("offscreen framebuffer allocation failed");
+    GLFramebuffer *framebuffer = targets.acquire(context, size, error);
+    if (!framebuffer) {
         return false;
     }
 
-    CaptureLayer layer(backendOutput, framebuffer.get());
+    CaptureLayer layer(backendOutput, framebuffer);
     if (!layer.preparePresentationTest()) {
         *error = QStringLiteral("render unavailable");
         return false;
@@ -918,7 +1066,7 @@ static bool renderCapturePart(WorkspaceScene *scene,
 
     SceneView view(scene, output, backendOutput, &layer);
     view.setViewport(viewport);
-    view.setScale(output->scale());
+    view.setScale(scale);
     view.addWindowFilter([selectedWindow, windowCapture](Window *window) {
         if (!window || window->excludeFromCapture()) {
             return true;
@@ -948,23 +1096,23 @@ static bool renderCapturePart(WorkspaceScene *scene,
     }
 
     view.prePaint();
-    view.paint(frame->renderTarget, QPoint(), Region(0, 0, nativeSize->width(), nativeSize->height()));
+    view.paint(frame->renderTarget, QPoint(), Region(0, 0, size.width(), size.height()));
     view.postPaint();
     if (!layer.endFrame(Region(), Region(), nullptr)) {
         *error = QStringLiteral("offscreen frame submission failed");
         return false;
     }
 
-    QImage readback(*nativeSize, QImage::Format_RGBA8888_Premultiplied);
+    QImage readback(size, QImage::Format_RGBA8888_Premultiplied);
     if (readback.isNull()) {
         *error = QStringLiteral("capture readback allocation failed");
         return false;
     }
-    GLFramebuffer::pushFramebuffer(framebuffer.get());
+    GLFramebuffer::pushFramebuffer(framebuffer);
     context->glReadnPixels(0,
                            0,
-                           nativeSize->width(),
-                           nativeSize->height(),
+                           size.width(),
+                           size.height(),
                            GL_RGBA,
                            GL_UNSIGNED_BYTE,
                            static_cast<GLsizei>(readback.sizeInBytes()),
@@ -1280,6 +1428,7 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
     , m_humanActiveGuardMs(s_defaultHumanActiveGuardMs)
     , m_pos(Cursors::self()->mouse()->pos())
     , m_ownsCompositor(readOwnsCompositor())
+    , m_captureTargets(std::make_unique<CaptureTargetPool>())
 {
     m_auth.onRevoked = [this] {
         stopSession(StopReason::Request);
@@ -1299,6 +1448,11 @@ SynaraComputerUsePlugin::SynaraComputerUsePlugin()
             failCapture(m_captureRequest, QStringLiteral("capture render timeout"));
         }
     });
+    // Render targets are kept while captures keep coming (a preview polls
+    // every half second) and freed once they stop.
+    m_captureTargetIdle.setSingleShot(true);
+    m_captureTargetIdle.setInterval(s_captureTargetIdleMs);
+    connect(&m_captureTargetIdle, &QTimer::timeout, this, &SynaraComputerUsePlugin::releaseCaptureTargets);
     m_captureEncodeWatchdog.setSingleShot(true);
     connect(&m_captureEncodeWatchdog, &QTimer::timeout, this, [this]() {
         if (m_captureRequest) {
@@ -1389,6 +1543,7 @@ SynaraComputerUsePlugin::~SynaraComputerUsePlugin()
         failCapture(m_captureRequest, QStringLiteral("capture canceled: plugin destroyed"));
     }
     failSettleRequests(QStringLiteral("org.freedesktop.DBus.Error.Failed"), QStringLiteral("wait canceled: plugin destroyed"));
+    releaseCaptureTargets();
     releasePressedState();
     detachInputDevice();
     // Both paths, because a session can end with either outstanding and a client
@@ -2766,6 +2921,20 @@ void SynaraComputerUsePlugin::startCapture(std::shared_ptr<CaptureRequest> reque
     queueCapture(std::move(request));
 }
 
+void SynaraComputerUsePlugin::releaseCaptureTargets()
+{
+    m_captureTargetIdle.stop();
+    if (m_captureTargets->isEmpty()) {
+        return;
+    }
+    // Deleted in the context they were made in, when it still exists.
+    EglContext *current = nullptr;
+    if (effects && effects->openglContext() == m_captureTargets->context() && effects->makeOpenGLContextCurrent()) {
+        current = effects->openglContext();
+    }
+    m_captureTargets->clear(current);
+}
+
 void SynaraComputerUsePlugin::watchRenderLoop(LogicalOutput *output)
 {
     if (!output || !output->backendOutput()) {
@@ -2866,12 +3035,14 @@ void SynaraComputerUsePlugin::queueCapture(std::shared_ptr<CaptureRequest> reque
         return;
     }
 
-    const std::optional<QSize> nativeSize = deviceSize(request->region, effectiveScale);
-    if (!nativeSize) {
+    const std::optional<CapturePlan> plan = planCapture(request->region, effectiveScale, request->maxDimension);
+    if (!plan) {
         failCapture(request, QStringLiteral("capture dimensions are invalid"));
         return;
     }
-    if (!captureSizeWithinLimits(*nativeSize)) {
+    // On what is rendered, not the native size: a downscaled capture of a
+    // large mixed-scale desktop renders small and is well within limits.
+    if (!captureSizeWithinLimits(plan->renderSize)) {
         failCapture(request, s_captureSizeLimitReason);
         return;
     }
@@ -2991,24 +3162,34 @@ void SynaraComputerUsePlugin::captureAtRenderOpportunity(std::shared_ptr<Capture
         return;
     }
 
-    const std::optional<QSize> nativeSize = deviceSize(request->region, effectiveScale);
-    if (!nativeSize) {
+    const std::optional<CapturePlan> plan = planCapture(request->region, effectiveScale, request->maxDimension);
+    if (!plan) {
         failCapture(request, QStringLiteral("capture dimensions are invalid"));
         return;
     }
-    if (!captureSizeWithinLimits(*nativeSize)) {
+    if (!captureSizeWithinLimits(plan->renderSize)) {
         failCapture(request, s_captureSizeLimitReason);
         return;
     }
 
     QList<CapturePart> parts;
     for (const OutputCapture &output : std::as_const(outputs)) {
+        // Each part's rectangle in the canvas, edges rounded once so adjacent
+        // outputs meet on the same pixel; the part is rendered to exactly
+        // that size.
+        const QRect destination = deviceDestination(output.viewport, request->region, plan->renderScale, plan->renderSize);
+        if (destination.isEmpty()) {
+            continue;
+        }
         QImage image;
         QString error;
         if (!renderCapturePart(effects->scene(),
                                effects->openglContext(),
+                               *m_captureTargets,
                                output.output,
                                output.viewport,
+                               plan->renderScale,
+                               destination.size(),
                                selectedWindow,
                                request->windowCapture,
                                m_ownsCompositor,
@@ -3017,18 +3198,18 @@ void SynaraComputerUsePlugin::captureAtRenderOpportunity(std::shared_ptr<Capture
             failCapture(request, error);
             return;
         }
-        parts.append({std::move(image), deviceDestination(output.viewport, request->region, effectiveScale, *nativeSize)});
+        parts.append({std::move(image), destination});
     }
+    m_captureTargetIdle.start();
 
     QPointer<SynaraComputerUsePlugin> receiver(this);
-    const uint maxDimension = request->maxDimension;
     const CaptureFormat format = captureFormat(request->flags);
     m_captureRenderWatchdog.stop();
     m_captureEncodeWatchdog.start(s_captureEncodeDeadlineMilliseconds);
     encodePool()->start(new CaptureEncodeTask(
-        [receiver, request, parts = std::move(parts), nativeSize = *nativeSize, effectiveScale, maxDimension, windowCapture = request->windowCapture, format]() mutable {
+        [receiver, request, parts = std::move(parts), plan = *plan, windowCapture = request->windowCapture, format]() mutable {
             QString error;
-            const EncodedCapture encoded = encodeCapture(parts, nativeSize, effectiveScale, maxDimension, windowCapture, format, &error);
+            const EncodedCapture encoded = encodeCapture(parts, plan, windowCapture, format, &error);
             // Posted to the application, which outlives every plugin, rather
             // than to the plugin: an event posted to an object being destroyed
             // on another thread is a race, and the receiver is only looked at

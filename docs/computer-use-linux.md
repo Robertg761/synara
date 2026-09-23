@@ -153,7 +153,9 @@ drops the caller when the server name changes owner.
   `desktop-interrupted` event so standing task consent does not carry across
   it.
 - Captures render offscreen at the next safe compositor point; the agent's
-  cursor is painted in, the human's never is.
+  cursor is painted in, the human's never is. A downscaled capture is rendered
+  by the GPU at (or near) the delivered size into render targets reused between
+  captures, and PNGs are written at zlib level 1.
 - `healthJson` reports `interfaceVersion` 2 and `features`, the optional
   methods on top of the version 1 set (`captureEx`, `keys`,
   `waitForSettle`, `windowsStateJson`). `keys` sends a word of strokes per
