@@ -261,4 +261,53 @@ describe("KWin install-and-load.sh", () => {
       expect(await readFile(join(sandbox.stubState, "loaded"), "utf8")).toBe(`${installed}\n`);
     });
   });
+
+  describe("build cache across source directories (P2, AppImage)", () => {
+    it("builds again when the same build directory was configured from another mount", async () => {
+      // An AppImage mounts its payload at a new path on every launch, while the
+      // build directory lives in the user's cache and persists.
+      const firstLaunch = await sourceCopy("mount-first");
+      const secondLaunch = await sourceCopy("mount-second");
+      const tree = await fakeKwinTree();
+
+      const first = sandbox.run(
+        join(firstLaunch, "scripts", "install-and-load.sh"),
+        ["--build-only"],
+        scriptEnv(tree),
+      );
+      const second = sandbox.run(
+        join(secondLaunch, "scripts", "install-and-load.sh"),
+        ["--build-only"],
+        scriptEnv(tree),
+      );
+
+      expect(first.status).toBe(0);
+      expect(second.stderr).not.toContain("does not match the source");
+      expect(second.status).toBe(0);
+      const cache = join(
+        sandbox.home,
+        ".cache",
+        "synara",
+        "kwin-computer-use-plugin",
+        "build",
+        "CMakeCache.txt",
+      );
+      expect(await readFile(cache, "utf8")).toContain(
+        `CMAKE_HOME_DIRECTORY:INTERNAL=${secondLaunch}\n`,
+      );
+    });
+
+    it("keeps the cache when the source directory is unchanged", async () => {
+      const source = await sourceCopy("source");
+      const tree = await fakeKwinTree();
+      const script = join(source, "scripts", "install-and-load.sh");
+      const build = join(sandbox.home, ".cache", "synara", "kwin-computer-use-plugin", "build");
+
+      expect(sandbox.run(script, ["--build-only"], scriptEnv(tree)).status).toBe(0);
+      await writeFile(join(build, "CMakeFiles", "marker"), "");
+      expect(sandbox.run(script, ["--build-only"], scriptEnv(tree)).status).toBe(0);
+
+      expect(await readFile(join(build, "CMakeFiles", "marker"), "utf8")).toBe("");
+    });
+  });
 });

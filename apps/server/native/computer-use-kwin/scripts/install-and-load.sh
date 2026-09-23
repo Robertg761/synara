@@ -235,9 +235,30 @@ check_build_dependencies() {
     fi
 }
 
+# The build directory persists in the user's cache, but the source directory
+# need not: a packaged app (an AppImage above all) mounts its payload at a new
+# path on every launch, and CMake refuses a cache generated from another source
+# directory outright ("does not match the source ... used to generate cache").
+# Dropping the cache and CMakeFiles/ is enough for a fresh configure of the
+# same build tree (ninja then recompiles against the new sources). The build
+# directory itself is never removed, since SYNARA_KWIN_BUILD_DIR can name a
+# directory the user owns.
+reset_foreign_cmake_cache() {
+    local cache="$BUILD_DIR/CMakeCache.txt" cached_source physical_source
+    [[ -f "$cache" ]] || return 0
+    cached_source="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache" | head -n 1)" || true
+    physical_source="$(cd -- "$SOURCE_DIR" && pwd -P)"
+    if [[ -z "$cached_source" || "$cached_source" == "$SOURCE_DIR" || "$cached_source" == "$physical_source" ]]; then
+        return 0
+    fi
+    log "the build cache in $BUILD_DIR was configured from $cached_source; reconfiguring it for $SOURCE_DIR"
+    rm -rf -- "$cache" "$BUILD_DIR/CMakeFiles"
+}
+
 build_plugin() {
     check_build_dependencies
     take_build_lock
+    reset_foreign_cmake_cache
     log "configuring the plugin build in $BUILD_DIR"
     cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build "$BUILD_DIR"
