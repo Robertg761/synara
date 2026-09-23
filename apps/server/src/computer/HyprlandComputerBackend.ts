@@ -200,9 +200,10 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
       },
       provisionPlugin:
         options.provisionPlugin ??
-        (({ force, signal }) =>
+        (({ force, signal, onStage }) =>
           provisionHyprlandPlugin({
             ...(signal ? { signal } : {}),
+            ...(onStage ? { onStage } : {}),
             force,
             pluginDirectory,
             listInstalled: () => readdir(pluginDirectory).catch(() => [] as string[]),

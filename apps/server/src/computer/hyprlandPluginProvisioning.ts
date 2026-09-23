@@ -49,6 +49,7 @@ import {
   pluginIdNumber,
   type ProvisionAction,
   type ProvisionResult,
+  type ProvisionStage,
 } from "./kwinPluginProvisioning.ts";
 
 export const HYPRLAND_INSTALL_SCRIPT_PATH =
@@ -263,6 +264,8 @@ export interface HyprlandProvisionDependencies {
   readonly stateRoot: string;
   readonly sourceHash?: () => Promise<string | undefined>;
   readonly writeStamp?: (path: string, record: HyprlandInstallRecord) => Promise<void>;
+  /** Told each stage as the run reaches it; see `ProvisionStage`. */
+  readonly onStage?: (stage: ProvisionStage) => void;
   readonly now?: () => Date;
 }
 
@@ -286,8 +289,12 @@ export async function provisionHyprlandPlugin(
 ): Promise<ProvisionResult> {
   return withProvisioningFileLock(
     join(deps.pluginDirectory, ".synara-provision.lock"),
-    (signal) => provisionHyprlandPluginLocked({ ...deps, signal }),
+    (signal) => {
+      deps.onStage?.("installing");
+      return provisionHyprlandPluginLocked({ ...deps, signal });
+    },
     deps.signal,
+    { onLockRequested: () => deps.onStage?.("waiting-for-lock") },
   );
 }
 
@@ -325,6 +332,7 @@ async function provisionHyprlandPluginLocked(
   // Bytes, not a path: the file that was read is the file that lands, and
   // `installPluginBytes` fsyncs and renames it into place so a compositor
   // scanning the directory can never see a half-written `.so`.
+  deps.onStage?.("building");
   const bytes = await readFile(await deps.buildFromSource(deps.signal));
   deps.signal?.throwIfAborted();
 

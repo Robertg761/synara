@@ -353,6 +353,12 @@ describe("provisioning", () => {
     expect(matching.action).toBe("installed-from-source");
   });
 
+  it("reports each stage it reaches (R14)", async () => {
+    const stages: string[] = [];
+    await provisionHyprlandPlugin(await baseDeps({ onStage: (stage) => stages.push(stage) }));
+    expect(stages).toEqual(["waiting-for-lock", "installing", "building"]);
+  });
+
   it("does nothing when the stamp says the install is already current", async () => {
     let built = 0;
     const deps = await baseDeps({
