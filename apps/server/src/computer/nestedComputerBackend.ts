@@ -109,6 +109,7 @@ const NESTED_DESKTOP_USES = [
   "checkInputReady",
   "clearFocusWindow",
   "click",
+  "defaultObservationRegion",
   "doubleClick",
   "drag",
   "focusWindow",
