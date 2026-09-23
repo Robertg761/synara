@@ -1423,6 +1423,29 @@ describe("ComputerManager and FakeComputerBackend", () => {
       await manager.dispose();
     });
 
+    it("asks the observer again once the backend's capabilities change", async () => {
+      setEnv("SYNARA_CUA_CONDITIONAL_SETTLE", undefined);
+      let known = false;
+      const backend = new ProvenBackend({
+        waitForSettle: () => {
+          if (!known) throw new Error("Unknown tool: waitForSettle");
+          return { settled: true, waitedMs: 0 };
+        },
+      });
+      const manager = new ComputerManager({ backend, actionSettleMs: 60 });
+      await pressThenObserveWindow(manager);
+      await pressThenObserveWindow(manager);
+      // "Unsupported" is remembered for this backend...
+      expect(backend.callsFor("waitForSettle")).toHaveLength(1);
+
+      // ...but not across a new occupant or a reconnect to a newer plugin.
+      known = true;
+      backend.emitCapabilitiesChanged();
+      await pressThenObserveWindow(manager);
+      expect(backend.callsFor("waitForSettle")).toHaveLength(2);
+      await manager.dispose();
+    });
+
     it("uses the backend's own post-action settle policy when it names one", async () => {
       setEnv("SYNARA_CUA_CONDITIONAL_SETTLE", undefined);
       const backend = new ProvenBackend({ waitForSettle: true });

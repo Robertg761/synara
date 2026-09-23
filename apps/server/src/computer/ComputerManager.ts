@@ -454,7 +454,8 @@ export class ComputerManager {
   /**
    * Whether this backend answers `waitForSettle`. "unsupported" is sticky —
    * the driver and the host's tool allowlist are fixed for the backend's
-   * life — but a transient failure (stale target, retired generation,
+   * life, and a `capabilities-changed` (a swapped occupant, a reconnect)
+   * starts a new one — but a transient failure (stale target, retired generation,
    * cancelled call) never flips it: the next action probes again rather than
    * permanently losing the observer over one bad target.
    */
@@ -1183,6 +1184,10 @@ export class ComputerManager {
           this.backendHealth = event.health;
           this.republishAllThreads();
         } else if (event.type === "capabilities-changed") {
+          // Verdicts cached about the backend are about the one that was
+          // there: a slot swap and a reconnect to a newer plugin both land
+          // here, and either may answer what the last one could not.
+          this.observerSettle = "unknown";
           this.republishAllThreads();
         } else if (event.type === "desktop-interrupted") {
           // Locked-use resume policy: consent granted before a lock/sleep/

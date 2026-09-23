@@ -949,6 +949,11 @@ export class FakeComputerBackend implements ComputerBackend {
     this.emit({ type: "desktop-interrupted", pauses });
   }
 
+  /** Reports a changed capability set, as a reconnect or a slot swap does. */
+  emitCapabilitiesChanged(): void {
+    this.emit({ type: "capabilities-changed", capabilities: this.currentCapabilities });
+  }
+
   /** Reports that the desktop this backend drove has ended for good. */
   emitDesktopGone(message = "The fake desktop exited."): void {
     this.emit({ type: "desktop-gone", message });
