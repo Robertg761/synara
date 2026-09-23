@@ -316,7 +316,9 @@ function watchForkExit(child: ReturnType<typeof spawn>): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       stream.destroy();
-      reject(new Error(`${WL_COPY}'s paste-once offer was still open after ${PASTE_OFFER_WATCH_MS}ms.`));
+      reject(
+        new Error(`${WL_COPY}'s paste-once offer was still open after ${PASTE_OFFER_WATCH_MS}ms.`),
+      );
     }, PASTE_OFFER_WATCH_MS);
     timer.unref?.();
     const done = () => {

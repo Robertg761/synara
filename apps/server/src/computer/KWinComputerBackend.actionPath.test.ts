@@ -741,7 +741,11 @@ describe("launch results", () => {
     ],
     [
       "a flatpak export, named by its app id",
-      { command: "/var/lib/flatpak/exports/bin/org.mozilla.firefox", args: [], via: "flatpak-export" },
+      {
+        command: "/var/lib/flatpak/exports/bin/org.mozilla.firefox",
+        args: [],
+        via: "flatpak-export",
+      },
       "org.mozilla.firefox",
     ],
   ] as const)("reports the pid and app id of %s", async (_label, resolution, appId) => {
@@ -870,36 +874,36 @@ describe("paste-once clipboard", () => {
   });
 });
 
-describe("observation scope on a multi-monitor desktop", () => {
-  /** Two 1920x1080 monitors side by side, the left one at a negative x. */
-  function twoMonitors(plugin: FakePlugin, outputs?: readonly unknown[]): void {
-    plugin.features = ["windowsStateJson"];
-    plugin.workspace = { x: -1_920, y: 0, width: 3_840, height: 1_080 };
-    plugin.windowsStateJson = async () =>
-      JSON.stringify({
-        windows: plugin.windows,
-        targetWindowId: plugin.targetWindowId,
-        workspace: plugin.workspace,
-        outputs: outputs ?? [
-          { x: -1_920, y: 0, width: 1_920, height: 1_080 },
-          { x: 0, y: 0, width: 1_920, height: 1_080 },
-        ],
-        locked: false,
-      });
-    plugin.windows = [
-      {
-        id: "right-window",
-        title: "Editor",
-        appName: "org.kde.kate",
-        pid: 7,
-        bounds: { x: 200, y: 100, width: 800, height: 600 },
-        focused: false,
-        minimized: false,
-        visible: true,
-      },
-    ];
-  }
+/** Two 1920x1080 monitors side by side, the left one at a negative x. */
+function twoMonitors(plugin: FakePlugin, outputs?: readonly unknown[]): void {
+  plugin.features = ["windowsStateJson"];
+  plugin.workspace = { x: -1_920, y: 0, width: 3_840, height: 1_080 };
+  plugin.windowsStateJson = async () =>
+    JSON.stringify({
+      windows: plugin.windows,
+      targetWindowId: plugin.targetWindowId,
+      workspace: plugin.workspace,
+      outputs: outputs ?? [
+        { x: -1_920, y: 0, width: 1_920, height: 1_080 },
+        { x: 0, y: 0, width: 1_920, height: 1_080 },
+      ],
+      locked: false,
+    });
+  plugin.windows = [
+    {
+      id: "right-window",
+      title: "Editor",
+      appName: "org.kde.kate",
+      pid: 7,
+      bounds: { x: 200, y: 100, width: 800, height: 600 },
+      focused: false,
+      minimized: false,
+      visible: true,
+    },
+  ];
+}
 
+describe("observation scope on a multi-monitor desktop", () => {
   it("names the monitor holding the agent's target window, in agent space", async () => {
     const plugin = new FakePlugin();
     twoMonitors(plugin);

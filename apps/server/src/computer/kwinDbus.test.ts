@@ -95,6 +95,11 @@ describe("KWin D-Bus calls", () => {
   });
 });
 
+/** A D-Bus method that never answers. */
+function never(): Promise<never> {
+  return new Promise(() => undefined);
+}
+
 describe("connectPlugin owner pinning", () => {
   // A proxy addressed by the well-known name follows the name to whoever owns
   // it next, so a squatter or stale generation taking the name after the
@@ -205,7 +210,6 @@ describe("connectPlugin owner pinning", () => {
   });
 
   it("gives waitForSettle its own timeout plus a margin, and the Ex captures a capture's", async () => {
-    const never = () => new Promise(() => undefined);
     const bus = fakeBus({
       owner: ":1.42",
       methods: { waitForSettle: never, captureRegionEx: never, keys: never },
@@ -248,8 +252,6 @@ describe("connectPlugin owner pinning", () => {
     await dbus.close();
   });
 });
-
-const never = () => new Promise<never>(() => undefined);
 
 describe("session bus lifetime", () => {
   /** A bus that is a real emitter, so an unhandled `error` really throws. */

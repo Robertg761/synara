@@ -1397,7 +1397,8 @@ export class KWinComputerBackend implements ComputerBackend {
     if (plugin?.waitForSettle === undefined) return undefined;
     if (!this.pluginFeature("waitForSettle")) return undefined;
     const misses = this.settleMisses;
-    if (misses.plugin === plugin && misses.count >= PLUGIN_SETTLE_MAX_BLIND_MISSES) return undefined;
+    if (misses.plugin === plugin && misses.count >= PLUGIN_SETTLE_MAX_BLIND_MISSES)
+      return undefined;
     return (options) => this.settleOnPlugin(options);
   }
 
@@ -4110,8 +4111,7 @@ function isProcessId(pid: number | undefined): pid is number {
  * names nothing, and its window is matched by pid alone.
  */
 function launchedAppId(launch: AppLaunchResolution): string | undefined {
-  const file =
-    launch.desktopFile ?? (launch.via === "flatpak-export" ? launch.command : undefined);
+  const file = launch.desktopFile ?? (launch.via === "flatpak-export" ? launch.command : undefined);
   const name = file
     ?.split("/")
     .at(-1)
