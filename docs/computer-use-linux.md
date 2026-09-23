@@ -363,11 +363,16 @@ checked before the KWin bus probe, so a stray test `kwin_wayland` owning
 
 A single-file plugin (`synarahyprlandplugin.cpp` with `sessionauth.h` and
 `capturetransform.h`) built with `make` against the installed Hyprland headers
-through `pkg-config hyprland`, plus sdbus-c++, cairo and pixman. The Hyprland
+through `pkg-config hyprland`, plus sdbus-c++, cairo, pixman, libpng and
+libturbojpeg. The Hyprland
 ABI changes per release, so builds are per exact version; the plugin registers
 as `synara-computer-use` and self-reports its module path in `healthJson`,
 because `hyprctl plugin list` reports names while load and unload address
 plugins by absolute path.
+
+It implements interface version 2: `healthJson` reports `interfaceVersion`
+and the `features` it has (`captureEx`, `keys`, `waitForSettle`,
+`windowsStateJson`), and every version-1 method is unchanged.
 
 Input is direct per-client injection only: raw wire events on the target
 client's own `wl_pointer` and `wl_keyboard` resources with seat-manager serials
@@ -375,10 +380,29 @@ and an xkb modifier mirror. The compositor's seat state is observed, never
 changed; an enter the human's seat sends to a sibling surface of the agent's
 target invalidates the agent's own enter, and every agent action ends by
 handing the shared pointer and keyboard back to the seat with its real focus
-and modifiers. The ghost cursor is drawn with cairo, pixel-matched to the KWin
-item. Capture is an offscreen GPU render composited with the ghost cursor; the
-human's cursor is never in the offscreen scene. `Meta+Shift+Esc` is bound
-through the keybind hook with the same latch semantics as KWin.
+and modifiers. When the human's pointer or keyboard focus is on the very
+surface the agent used, the hand-back re-sends the seat's pointer position and
+modifiers instead, so a bare scroll or key of the human's never lands at the
+agent's spot or under its modifiers. The agent's xkb state takes its locks,
+latches and layout from the seat whenever it holds nothing, so its typing never
+clears the human's CapsLock or NumLock. A button the agent holds grabs its
+pointer to the pressed surface until release, the way a real pointer's implicit
+grab does. Every refusal (human active, unreachable client, lost target) is
+decided before any enter, leave or motion is sent. A `keys` batch hands back
+once, after the batch.
+
+The ghost cursor is drawn with cairo, pixel-matched to the KWin item. Capture
+is an offscreen GPU render; only the pixels the window or region covers are
+read back, transform-aware, into a pixel-pack buffer behind a fence that a loop
+timer polls, so the compositor thread never waits on the GPU. A worker thread
+copies them out, stitches every output straight at the image's final size,
+paints the ghost cursor and encodes (PNG through libpng at zlib level 1, JPEG
+quality 85 through libturbojpeg, or raw 8-bit luma); the human's cursor is
+never in the offscreen scene. A passive capture (flag 1) neither extends the
+idle timer nor repaints the badge. `waitForSettle` observes surface commits
+(including popups and subsurfaces) while a session runs and answers through a
+delayed D-Bus reply and loop timers. `Meta+Shift+Esc` is bound through the
+keybind hook with the same latch semantics as KWin.
 
 ### Backend and provisioning
 
@@ -403,11 +427,18 @@ the KWin ones.
 ### Testing
 
 `.github/workflows/hyprland-plugin.yml` compiles the compositor-free fixtures
-(`tests/focus_test.py`, `capturetransform_test.cpp`) against stub protocol
-resources and builds the whole plugin where Hyprland's headers install. The
+(`tests/focus_test.py` splices the production functions into input, capture
+guard, encoder, stitching, settle and window-id fixtures;
+`capturetransform_test.cpp`) against stub protocol resources and the real codec
+libraries, and builds the whole plugin where Hyprland's headers install. A
+failing fixture exits non-zero instead of aborting, so it dumps no core. The
 backend and host tests drive `hyprctl` and the plugin through fakes.
 Development runs against a disposable Hyprland nested inside a headless
-`kwin_wayland --virtual`, never the desktop the developer is sitting at.
+`kwin_wayland --virtual` (`scripts/dev-instance.sh`: its own Lua config,
+private bus without service activation, scrubbed environment), never the
+desktop the developer is sitting at. `install-and-load.sh` stamps the running
+compositor's version, the one the server compares, and stops before building
+for a Hyprland upgraded on disk but not restarted.
 
 ## Known gaps
 

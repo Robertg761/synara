@@ -4,9 +4,10 @@ The Hyprland twin of `../computer-use-kwin`: the agent drives the human's real
 desktop with its own drawn ghost cursor and its own input path, never the seat
 the human is sitting at. It exposes the identical D-Bus surface —
 `org.synara.ComputerUse` at `/org/synara/ComputerUse`, interface
-`org.synara.ComputerUse1`, the same sixteen methods and `sessionStopped`
-signal — so the server's whole KWin driving path is reused; only loading
-differs (`hyprctl plugin load`, which takes effect live with no relogin).
+`org.synara.ComputerUse1`, the same methods (interface version 2, described in
+`org.synara.ComputerUse.xml`) and `sessionStopped` signal — so the server's
+whole KWin driving path is reused; only loading differs (`hyprctl plugin
+load`, which takes effect live with no relogin).
 
 Build with `make` against the installed Hyprland's headers (`pkg-config
 hyprland`). Hyprland validates a plugin against the exact commit it was
@@ -59,9 +60,12 @@ backend drives the nested instance as well, so no code change is needed to
 point the server at it. `scripts/uninstall.sh` unloads every installed
 generation and removes it.
 
-Run `make test` for the compositor-free input regression fixture: it compiles
-the production input functions against stub protocol resources and checks
-clicks, dragging, scrolling, focus restoration, and refusal cleanup. `make
+Run `make test` for the compositor-free fixtures: they compile the production
+input, capture, encoder and settle functions against stub protocol resources
+(and the real cairo, libpng and libturbojpeg) and check clicks, dragging and
+the implicit grab, scrolling, same-surface and sibling hand-back, modifier and
+lock handling, refusal ordering, partial readback under every output
+transform, the encoded formats, and waitForSettle's timing. `make
 authprobe` builds the standalone session-auth probe, which exposes the plugin's
 token gate over a real bus with no compositor anywhere. Both run in CI
 (`.github/workflows/hyprland-plugin.yml`), along with a plugin build against
