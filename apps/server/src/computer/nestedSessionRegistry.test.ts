@@ -256,6 +256,33 @@ describe("reapStaleNestedSessions", () => {
     expect(fake.torndown).toEqual([BUS_PID]);
   });
 
+  it("ends the accessibility bus and registry a killed server left running", async () => {
+    const stateDirectory = await makeStateDirectory();
+    const launcher = "/usr/lib/at-spi-bus-launcher --launch-immediately";
+    const registry = "/usr/lib/at-spi2-registryd";
+    await writeNestedSessionMarker(
+      marker({
+        processes: [
+          { pid: KWIN_PID, command: KWIN_COMMAND, startTime: "5500", role: "compositor" },
+          { pid: 4101, command: launcher, startTime: "5510", role: "accessibility" },
+          { pid: 4102, command: registry, startTime: "5520", role: "accessibility-registry" },
+          // A registry recorded under the launcher's role is not the launcher.
+          { pid: 4103, command: registry, startTime: "5530", role: "accessibility" },
+        ],
+      }),
+      { stateDirectory },
+    );
+    const fake = host({
+      stateDirectory,
+      living: [KWIN_PID, 4101, 4102, 4103],
+      commands: { [KWIN_PID]: KWIN_COMMAND, 4101: launcher, 4102: registry, 4103: registry },
+      startTimes: { [KWIN_PID]: "5500", 4101: "5510", 4102: "5520", 4103: "5530" },
+    });
+
+    await reapStaleNestedSessions(fake.dependencies);
+    expect(fake.torndown.toSorted()).toEqual([KWIN_PID, 4101, 4102].toSorted());
+  });
+
   it("ends an app the dead server recorded launching", async () => {
     const stateDirectory = await makeStateDirectory();
     const appPid = 91_003;

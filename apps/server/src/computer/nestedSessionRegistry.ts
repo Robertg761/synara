@@ -58,13 +58,20 @@ const EXIT_POLL_TIMEOUT_MS = 5_000;
  * whatever the agent launched, so it is trusted only because this server wrote
  * it down, and still only with a matching argv and start time.
  */
-export type NestedSessionProcessRole = "compositor" | "bus" | "xwayland" | "accessibility" | "app";
+export type NestedSessionProcessRole =
+  | "compositor"
+  | "bus"
+  | "xwayland"
+  | "accessibility"
+  | "accessibility-registry"
+  | "app";
 
 const ROLE_EXECUTABLES: Readonly<Record<Exclude<NestedSessionProcessRole, "app">, string>> = {
   compositor: "kwin_wayland",
   bus: "dbus-daemon",
   xwayland: "Xwayland",
   accessibility: "at-spi-bus-launcher",
+  "accessibility-registry": "at-spi2-registryd",
 };
 
 /** One process of a nested session, with enough identity to re-find it safely. */

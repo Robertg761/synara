@@ -307,8 +307,8 @@ session keeps a marker (`nestedSessionRegistry.ts`) naming its processes from
 the first spawn on, with the server's pid and start time; the next server
 sweeps markers whose owner is gone when its nested backend is constructed and
 again before each boot. The sweep only reads a 0700 directory the user owns,
-only signals `kwin_wayland`, `dbus-daemon`, Xwayland, `at-spi-bus-launcher` or
-recorded apps whose argv and start time still match, and only deletes the
+only signals `kwin_wayland`, `dbus-daemon`, Xwayland, `at-spi-bus-launcher`,
+`at-spi2-registryd` or recorded apps whose argv and start time still match, and only deletes the
 session directory the marker is named after.
 
 ### Lifecycle
@@ -352,9 +352,14 @@ and exists only for debugging; it refuses to start without a host
 AT-SPI is off by default on the nested desktop. `SYNARA_COMPUTER_NESTED_ATSPI=1`
 opts in: the session then starts `at-spi-bus-launcher --launch-immediately`
 itself, with the session's display, bus and runtime directory, so the
-accessibility bus, its registry, and every app that finds them stay inside the
-nested desktop. Without a launcher the session reports no accessibility bus and
-the reader stays off.
+accessibility bus (and `$XDG_RUNTIME_DIR/at-spi/bus`), its registry, and every
+app that finds them stay inside the nested desktop. The launcher runs with
+`ATSPI_DBUS_IMPLEMENTATION=dbus-daemon`: a launcher built for dbus-broker
+activates services as units of the human's systemd user manager, outside the
+session, where the registry never came up. The session also starts
+`at-spi2-registryd` (found next to the launcher) itself, as one of its own
+children, rather than waiting for activation. Without a launcher the session
+reports no accessibility bus and the reader stays off.
 The nested-only variables (`SYNARA_COMPUTER_NESTED*`,
 `SYNARA_COMPUTER_USE_OWNS_COMPOSITOR`, `SYNARA_NESTED_KWIN_TEST`) are listed in
 `turbo.json` with the KWin ones.

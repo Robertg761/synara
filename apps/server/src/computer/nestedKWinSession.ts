@@ -27,7 +27,7 @@
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
@@ -87,6 +87,8 @@ const ATSPI_BUS_LAUNCHER_PATHS = [
   `/usr/lib/${process.arch === "arm64" ? "aarch64" : "x86_64"}-linux-gnu/at-spi2-core/at-spi-bus-launcher`,
 ];
 const ATSPI_BUS_NAME = "org.a11y.Bus";
+/** The AT-SPI registry daemon; distributions install it beside the launcher. */
+const ATSPI_REGISTRY_COMMAND = "at-spi2-registryd";
 const ATSPI_READY_TIMEOUT_MS = 5_000;
 /** How long a just-spawned process may take to become itself before the marker gives up. */
 const MARKER_RECORD_RETRY_MS = 10;
@@ -154,6 +156,11 @@ export interface NestedKWinSessionOptions {
    * found in the usual places when the key is absent.
    */
   readonly accessibilityLauncher?: string | undefined;
+  /**
+   * The `at-spi2-registryd` to run beside it, or explicitly `undefined` for
+   * none; the one next to the launcher when the key is absent.
+   */
+  readonly accessibilityRegistry?: string | undefined;
 }
 
 export interface NestedKWinSession {
@@ -363,12 +370,15 @@ export async function startNestedKWinSession(
         marker.record(pid, "xwayland");
     }
     const coordinates = { runtimeDirectory, busAddress, waylandDisplay, ...xServer };
+    const launcher =
+      "accessibilityLauncher" in options ? options.accessibilityLauncher : findAtspiBusLauncher();
     const accessibility = options.accessibility
       ? await startAccessibilityBus({
-          launcher:
-            "accessibilityLauncher" in options
-              ? options.accessibilityLauncher
-              : findAtspiBusLauncher(),
+          launcher,
+          registry:
+            "accessibilityRegistry" in options
+              ? options.accessibilityRegistry
+              : findAtspiRegistry(launcher),
           env: nestedHelperEnvironment(hostEnv, nestedSessionEnv(coordinates)),
           busAddress,
           spawnProcess,
@@ -1116,12 +1126,30 @@ function findAtspiBusLauncher(exists: (path: string) => boolean = existsSync): s
   return ATSPI_BUS_LAUNCHER_PATHS.find((path) => exists(path));
 }
 
+/** The `at-spi2-registryd` installed beside `launcher`, if any. */
+function findAtspiRegistry(
+  launcher: string | undefined,
+  exists: (path: string) => boolean = existsSync,
+): string | undefined {
+  if (!launcher) return undefined;
+  const registry = join(dirname(launcher), ATSPI_REGISTRY_COMMAND);
+  return exists(registry) ? registry : undefined;
+}
+
 /**
  * Starts an accessibility bus inside the session and reports whether it came
  * up. Explicitly, because the private bus activates nothing: this launcher is
  * the one `org.a11y.Bus` the session's applications and the AT-SPI helper will
  * find, and it runs with the session's display, bus and runtime directory, so
- * its own bus and registry live inside the session too.
+ * its own bus (and `$XDG_RUNTIME_DIR/at-spi/bus`) lives inside the session too.
+ *
+ * The registry is started here as well, as a child of the session. Left to
+ * activation, it never came up: a launcher built for dbus-broker runs the
+ * accessibility bus through `dbus-broker-launch`, which activates services as
+ * units of the user's systemd manager — outside the session, with the human's
+ * bus and runtime directory — and that activation fails. The launcher is told
+ * to use `dbus-daemon` (which the session already requires), so anything else
+ * the accessibility bus activates stays in the session's environment.
  *
  * Never fatal. A desktop without perception is still a desktop; the session
  * reports `accessibility: false` and the reader stays off rather than asking a
@@ -1129,6 +1157,7 @@ function findAtspiBusLauncher(exists: (path: string) => boolean = existsSync): s
  */
 async function startAccessibilityBus(options: {
   readonly launcher: string | undefined;
+  readonly registry: string | undefined;
   readonly env: NodeJS.ProcessEnv;
   readonly busAddress: string;
   readonly spawnProcess: SupervisedSpawn;
@@ -1146,14 +1175,14 @@ async function startAccessibilityBus(options: {
       options.children,
       options.launcher,
       ["--launch-immediately"],
-      options.env,
+      { ...options.env, ATSPI_DBUS_IMPLEMENTATION: "dbus-daemon" },
       ["ignore", "ignore", "pipe"],
     );
   } catch {
     return false;
   }
   options.marker.record(launcher.pid, "accessibility");
-  return await options
+  const up = await options
     .waitForBusName({
       busAddress: options.busAddress,
       name: ATSPI_BUS_NAME,
@@ -1161,6 +1190,24 @@ async function startAccessibilityBus(options: {
       abort: () => launcher.exitDiagnostic() !== undefined,
     })
     .catch(() => false);
+  if (!up || !options.registry) return up;
+  // It finds the accessibility bus through org.a11y.Bus on the session's bus.
+  // No --use-gnome-session: there is no session manager here to register with.
+  try {
+    const registry = start(
+      options.spawnProcess,
+      options.teardownProcessTree,
+      options.children,
+      options.registry,
+      [],
+      options.env,
+      ["ignore", "ignore", "pipe"],
+    );
+    options.marker.record(registry.pid, "accessibility-registry");
+  } catch {
+    // Without it the accessibility bus still activates one on first use.
+  }
+  return true;
 }
 
 /** The host's Wayland socket as a path, which libwayland accepts in WAYLAND_DISPLAY. */

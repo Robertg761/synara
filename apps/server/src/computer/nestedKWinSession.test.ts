@@ -636,27 +636,47 @@ describe("the private bus and the session's own processes", () => {
       harness.options({
         accessibility: true,
         accessibilityLauncher: "/usr/lib/at-spi-bus-launcher",
-        hostEnv: { PATH: "/usr/bin", DISPLAY: ":0", SYNARA_AUTH_TOKEN: "secret" },
+        accessibilityRegistry: "/usr/lib/at-spi2-registryd",
+        hostEnv: {
+          PATH: "/usr/bin",
+          DISPLAY: ":0",
+          SYNARA_AUTH_TOKEN: "secret",
+          XDG_RUNTIME_DIR: "/run/user/1000",
+        },
       }),
     );
     const launcher = harness.spawns[2];
     expect(launcher?.command).toBe("/usr/lib/at-spi-bus-launcher");
     expect(launcher?.args).toEqual(["--launch-immediately"]);
-    // Everything it starts — its own bus, the registry — inherits the
-    // session's coordinates, never the human's.
+    // Everything it starts — its own bus, $XDG_RUNTIME_DIR/at-spi/bus — lives
+    // in the session's coordinates, never the human's; and its accessibility
+    // bus is a dbus-daemon, which activates inside that environment, not
+    // through the human's systemd manager as dbus-broker-launch would.
     expect(launcher?.env).toMatchObject({
       DBUS_SESSION_BUS_ADDRESS: BUS_ADDRESS,
       WAYLAND_DISPLAY: session.waylandDisplay,
       DISPLAY: ":9",
       XDG_RUNTIME_DIR: session.runtimeDirectory,
+      ATSPI_DBUS_IMPLEMENTATION: "dbus-daemon",
     });
+    expect(session.runtimeDirectory).not.toBe("/run/user/1000");
     expect(launcher?.env.SYNARA_AUTH_TOKEN).toBeUndefined();
     expect(harness.busNamesAwaited).toContain("org.a11y.Bus");
+    // The registry is the session's own child, with the same environment.
+    const registry = harness.spawns[3];
+    expect(registry?.command).toBe("/usr/lib/at-spi2-registryd");
+    expect(registry?.args).toEqual([]);
+    expect(registry?.env).toMatchObject({
+      DBUS_SESSION_BUS_ADDRESS: BUS_ADDRESS,
+      XDG_RUNTIME_DIR: session.runtimeDirectory,
+    });
+    expect(registry?.env.SYNARA_AUTH_TOKEN).toBeUndefined();
     expect(session.accessibility).toBe(true);
 
     await session.dispose();
     // Torn down with the session, before the compositor and the bus.
     expect(harness.tornDown).toEqual([
+      registry?.child.pid,
       launcher?.child.pid,
       harness.spawns[1]?.child.pid,
       harness.spawns[0]?.child.pid,
