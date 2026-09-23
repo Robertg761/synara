@@ -1859,7 +1859,7 @@ describe("KWinComputerBackend", () => {
     const state = await backend.getState({ includeScreenshot: true });
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureRegion",
-      args: [0, 0, 5_120, 2_520, 2_048],
+      args: [0, 0, 5_120, 2_520, 1_536],
     });
     expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
     expect(state.screenshot).toMatchObject({
@@ -1881,7 +1881,7 @@ describe("KWinComputerBackend", () => {
     // The single fake window spans (956, 1519) to (1604, 2037).
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureRegion",
-      args: [0, 0, 1_604, 2_037, 2_048],
+      args: [0, 0, 1_604, 2_037, 1_536],
     });
     expect(state.screenshot?.region).toEqual({ x: 0, y: 0, width: 1_604, height: 2_037 });
     await backend.dispose();
@@ -1907,7 +1907,7 @@ describe("KWinComputerBackend", () => {
     });
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureWindow",
-      args: ["window-1", 2_048],
+      args: ["window-1", 1_536],
     });
     await backend.dispose();
   });
@@ -1983,7 +1983,7 @@ describe("KWinComputerBackend", () => {
     });
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureRegion",
-      args: [0, 0, 300, 250, 2_048],
+      args: [0, 0, 300, 250, 1_536],
     });
     await backend.dispose();
   });
@@ -2032,9 +2032,10 @@ describe("KWinComputerBackend", () => {
     const backend = makeBackend(dbus);
     await backend.attachStream(() => undefined);
 
+    // The pane's own budget, not the model's.
     expect(dbus.plugin.calls).toContainEqual({
       method: "captureRegion",
-      args: [0, 0, 5_120, 2_520, 2_048],
+      args: [0, 0, 5_120, 2_520, 1_280],
     });
     expect(dbus.plugin.calls.some((call) => call.method === "captureWindow")).toBe(false);
     await backend.dispose();

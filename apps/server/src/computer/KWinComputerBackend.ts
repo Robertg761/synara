@@ -33,6 +33,7 @@ import { describeErrorMessage } from "@synara/shared/errorMessages";
 import {
   clampComputerMessage,
   ComputerBackendError,
+  DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
   DEFAULT_COMPUTER_ID,
   intersectComputerRects,
   MAX_COMPUTER_CAPTURE_MAX_DIMENSION,
@@ -149,8 +150,13 @@ import {
 
 const DEFAULT_GLIDE_DURATION_MS = 180;
 const DEFAULT_STILL_INTERVAL_MS = 500;
-// Keep Linux capture detail unchanged by the macOS image-budget tuning.
-const DEFAULT_CAPTURE_MAX_DIMENSION = 2_048;
+/**
+ * The pane's still. It is looked at by a person in a panel a fraction of the
+ * screen wide, never pointed at by a model, so it gets its own budget rather
+ * than the model's: fewer pixels to render, encode and ship twice a second.
+ * The pane maps input through the screen size, not the frame's pixels.
+ */
+const DEFAULT_PREVIEW_MAX_DIMENSION = 1_280;
 const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 /** The in-call retry ladder inside one connect attempt. */
 const KWIN_RECONNECT_BASE_DELAY_MS = 250;
@@ -444,6 +450,8 @@ export interface KWinComputerBackendOptions {
   readonly glideDurationMs?: number;
   readonly stillIntervalMs?: number;
   readonly captureMaxDimension?: number;
+  /** Longest side of the pane's stills; see `DEFAULT_PREVIEW_MAX_DIMENSION`. */
+  readonly previewMaxDimension?: number;
   /**
    * Plugin-side session deadline. `0` disables it; see the Phase 3b notes.
    * Falls back to `SYNARA_COMPUTER_IDLE_TIMEOUT_MS`, then to five minutes.
@@ -553,6 +561,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly glideDurationMs: number;
   private readonly stillIntervalMs: number;
   private readonly captureMaxDimension: number;
+  private readonly previewMaxDimension: number;
   private readonly idleTimeoutMs: number;
   private readonly idleReleaseMs: number;
   /** The last plugin call, lease change or pane detach; see `releaseIfIdle`. */
@@ -737,8 +746,14 @@ export class KWinComputerBackend implements ComputerBackend {
     this.runClipboardCommand = options.runClipboardCommand ?? spawnClipboardCommand;
     this.glideDurationMs = Math.max(0, options.glideDurationMs ?? DEFAULT_GLIDE_DURATION_MS);
     this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
+    // The core's model image budget: an image past it is downscaled by the
+    // provider, and every pixel the model then points at maps against a
+    // picture the server never produced (see DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION).
     this.captureMaxDimension = normalizeDimension(
-      options.captureMaxDimension ?? DEFAULT_CAPTURE_MAX_DIMENSION,
+      options.captureMaxDimension ?? DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION,
+    );
+    this.previewMaxDimension = normalizeDimension(
+      options.previewMaxDimension ?? DEFAULT_PREVIEW_MAX_DIMENSION,
     );
     this.idleTimeoutMs = normalizeIdleTimeout(
       options.idleTimeoutMs ?? parseIdleTimeoutEnv(process.env.SYNARA_COMPUTER_IDLE_TIMEOUT_MS),
@@ -2992,7 +3007,13 @@ export class KWinComputerBackend implements ComputerBackend {
     try {
       const region = await this.workspaceRect();
       if (this.capturePending > 0) return;
-      const data = await this.captureRegion(region.x, region.y, region.width, region.height);
+      const data = await this.captureRegion(
+        region.x,
+        region.y,
+        region.width,
+        region.height,
+        this.previewMaxDimension,
+      );
       // Cheap header read, kept for the same reason the screenshot path has it:
       // a payload that is not a PNG must fail here rather than in a decoder in
       // the browser, where the only symptom is a blank pane.
@@ -3957,7 +3978,7 @@ function normalizeIdleTimeout(value: number | undefined): number {
 }
 
 function normalizeDimension(value: number): number {
-  if (!Number.isFinite(value)) return DEFAULT_CAPTURE_MAX_DIMENSION;
+  if (!Number.isFinite(value)) return DEFAULT_COMPUTER_CAPTURE_MAX_DIMENSION;
   return Math.max(1, Math.min(MAX_COMPUTER_CAPTURE_MAX_DIMENSION, Math.floor(value)));
 }
 
