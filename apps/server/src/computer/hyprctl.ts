@@ -137,7 +137,30 @@ export interface LiveHyprlandInstanceOptions {
 }
 
 /**
- * The Hyprland instance to drive right now, or `undefined` when there is none.
+ * What resolving the instance to drive found: the one, none at all, or several
+ * live instances with nothing to choose between them (the inherited one died
+ * and more than one other is running — a restarted session beside a dev-test
+ * instance). Ambiguous is not none: a desktop is there, this module just does
+ * not guess which, so nothing may call it gone.
+ */
+export type HyprlandInstanceResolution =
+  | { readonly kind: "live"; readonly signature: string }
+  | { readonly kind: "none" }
+  | { readonly kind: "ambiguous"; readonly candidates: readonly string[] };
+
+/**
+ * The Hyprland instance to drive right now, or `undefined` when there is none
+ * or several are candidates; see `resolveHyprlandInstance`.
+ */
+export async function resolveLiveHyprlandInstance(
+  options: LiveHyprlandInstanceOptions = {},
+): Promise<string | undefined> {
+  const resolution = await resolveHyprlandInstance(options);
+  return resolution.kind === "live" ? resolution.signature : undefined;
+}
+
+/**
+ * The Hyprland instance to drive right now.
  *
  * Resolved per use rather than once at startup, because the signature this
  * process inherited dies with the compositor: after a Hyprland restart every
@@ -149,24 +172,29 @@ export interface LiveHyprlandInstanceOptions {
  *   another instance — least of all the human's.
  * - Otherwise the inherited `HYPRLAND_INSTANCE_SIGNATURE`, while it is live.
  * - Once it is not, the instance that replaced it: the one live instance under
- *   the same runtime directory. None, or several to choose between, is no
- *   answer. A process that inherited no signature at all was not started in a
- *   Hyprland session and does not go looking for one.
+ *   the same runtime directory. Several to choose between is `ambiguous`, not
+ *   an answer. A process that inherited no signature at all was not started
+ *   in a Hyprland session and does not go looking for one.
  */
-export async function resolveLiveHyprlandInstance(
+export async function resolveHyprlandInstance(
   options: LiveHyprlandInstanceOptions = {},
-): Promise<string | undefined> {
+): Promise<HyprlandInstanceResolution> {
+  const none = { kind: "none" } as const;
   const env = options.env ?? process.env;
   const connects = options.connects ?? socketAcceptsConnections;
   const pinned = options.signature ?? env[SYNARA_HYPRLAND_SIGNATURE_ENV]?.trim();
   if (pinned) {
-    return (await hyprlandInstancePresent(pinned, env, connects)) ? pinned : undefined;
+    return (await hyprlandInstancePresent(pinned, env, connects))
+      ? { kind: "live", signature: pinned }
+      : none;
   }
   const inherited = env[HYPRLAND_SIGNATURE_ENV]?.trim();
-  if (!inherited || !isSignature(inherited)) return undefined;
-  if (await hyprlandInstancePresent(inherited, env, connects)) return inherited;
+  if (!inherited || !isSignature(inherited)) return none;
+  if (await hyprlandInstancePresent(inherited, env, connects)) {
+    return { kind: "live", signature: inherited };
+  }
   const runtimeDir = env.XDG_RUNTIME_DIR?.trim();
-  if (!runtimeDir) return undefined;
+  if (!runtimeDir) return none;
   const list =
     options.listInstances ??
     ((directory: string) => readdir(directory).catch(() => [] as string[]));
@@ -175,7 +203,11 @@ export async function resolveLiveHyprlandInstance(
     if (candidate === inherited || !isSignature(candidate)) continue;
     if (await hyprlandInstancePresent(candidate, env, connects)) live.push(candidate);
   }
-  return live.length === 1 ? live[0] : undefined;
+  const [only, ...others] = live;
+  if (only === undefined) return none;
+  return others.length === 0
+    ? { kind: "live", signature: only }
+    : { kind: "ambiguous", candidates: live };
 }
 
 /** Whether this environment resolves to a live instance; see `resolveLiveHyprlandInstance`. */

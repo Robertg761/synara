@@ -592,3 +592,46 @@ describe("HyprlandComputerBackend plugin upgrade under a running session (N5)", 
     await backend.dispose();
   });
 });
+
+describe("HyprlandComputerBackend with several live instances", () => {
+  it("never calls the desktop gone while instances are running, only ambiguous", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolution: Awaited<ReturnType<NonNullable<HyprlandComputerBackendOptions["resolveInstance"]>>> =
+        "test-instance";
+      let dropConnection: (() => void) | undefined;
+      const backend = await makeBackend({
+        resolveInstance: async () => resolution,
+        dbusFactory: async () =>
+          fakeDbus({
+            nameOwner: async () => ":1.42",
+            listLoadedPluginIds: async () => ["SynaraComputerUsePluginV2"],
+            onDisconnect: (listener) => {
+              dropConnection = listener;
+              return () => undefined;
+            },
+          }),
+      });
+      const gone: string[] = [];
+      backend.onEvent((event) => {
+        if (event.type === "desktop-gone") gone.push(event.message);
+      });
+      await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+
+      // The inherited instance died; the human's new session and a dev-test
+      // instance are both live.
+      resolution = { kind: "ambiguous", candidates: ["session", "dev-test"] };
+      dropConnection?.();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(gone).toEqual([]);
+      expect(backend.health().dormant).toBeUndefined();
+      await expect(backend.probeAvailability()).resolves.toMatchObject({
+        kind: "backend-unavailable",
+        message: expect.stringContaining("2 Hyprland sessions are running"),
+      });
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

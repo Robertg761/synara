@@ -29,7 +29,8 @@ import {
   detectRunningHyprlandVersion,
   hyprlandInstanceEnvironment,
   makeHyprctlRunner,
-  resolveLiveHyprlandInstance,
+  resolveHyprlandInstance,
+  type HyprlandInstanceResolution,
   unloadHyprlandPlugin,
   type HyprctlRunner,
 } from "./hyprctl.ts";
@@ -58,6 +59,14 @@ import { sessionBusNameHasOwner } from "./sessionBusNames.ts";
 const NO_HYPRLAND_MESSAGE =
   "No Hyprland session is running (no instance signature with a live socket), " +
   "so there is no Hyprland desktop to drive.";
+function ambiguousInstanceMessage(state: { readonly candidates: readonly string[] }): string {
+  return (
+    `${state.candidates.length} Hyprland sessions are running and none is the one this server ` +
+    "was started in, so Synara does not guess which to drive. Set " +
+    "SYNARA_HYPRLAND_INSTANCE_SIGNATURE to pick one, or restart Synara inside the session."
+  );
+}
+
 const NO_PLUGIN_ANYWHERE_MESSAGE =
   "Hyprland is running, but this machine has no Synara computer-use plugin: none is installed, " +
   "and the compiler and Hyprland development headers needed to build one are not present. " +
@@ -75,10 +84,11 @@ export interface HyprlandComputerBackendOptions {
   readonly signature?: string;
   readonly runHyprctl?: HyprctlRunner;
   /**
-   * The live instance to drive right now (see `resolveLiveHyprlandInstance`),
-   * replaced in tests to avoid touching the host.
+   * The live instance to drive right now (see `resolveHyprlandInstance`),
+   * replaced in tests to avoid touching the host. A plain signature or
+   * `undefined` stands for a live instance or none.
    */
-  readonly resolveInstance?: () => Promise<string | undefined>;
+  readonly resolveInstance?: () => Promise<string | HyprlandInstanceResolution | undefined>;
   readonly pluginDirectory?: string;
   readonly stateRoot?: string;
   readonly installStampPath?: string;
@@ -111,7 +121,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
   private readonly ref: HyprlandDbusRef;
   private readonly hyprlandPlatform: string;
   private readonly hyprlandEnv: NodeJS.ProcessEnv;
-  private readonly resolveInstance: () => Promise<string | undefined>;
+  private readonly resolveState: () => Promise<HyprlandInstanceResolution>;
   private readonly hyprlandBusNameHasOwner: (name: string) => Promise<boolean>;
   private readonly pluginDirectory: string;
   private readonly hyprlandBuildToolingPresent: () => boolean;
@@ -129,14 +139,18 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
     const resolve =
       options.resolveInstance ??
       (() =>
-        resolveLiveHyprlandInstance({
+        resolveHyprlandInstance({
           env,
           ...(options.signature ? { signature: options.signature } : {}),
         }));
-    const resolveInstance = async () => {
-      const instance = await resolve();
-      ref.instance = instance;
-      return instance;
+    const resolveState = async (): Promise<HyprlandInstanceResolution> => {
+      const answer = await resolve();
+      const state: HyprlandInstanceResolution =
+        typeof answer === "string"
+          ? { kind: "live", signature: answer }
+          : (answer ?? { kind: "none" });
+      ref.instance = state.kind === "live" ? state.signature : undefined;
+      return state;
     };
     const runHyprctl = options.runHyprctl ?? makeHyprctlRunner({ signature: () => ref.instance });
     // Memoized per instance, like the base's KWin probe per connection: a
@@ -200,7 +214,19 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
         // The instance is what the engine compares across connects: gone is
         // a desktop that may be gone for good, and a different one is a
         // restarted compositor the plugin is loaded into again.
-        return { ...dbus, compositorInstance: resolveInstance };
+        return {
+          ...dbus,
+          compositorInstance: async () => {
+            const state = await resolveState();
+            // Several live instances and no way to pick is "cannot tell", not
+            // "none running": the engine must not call the desktop gone (and
+            // re-select away from Hyprland) while one is plainly there.
+            // hyprctl refuses to run unaddressed, so the connect still fails
+            // and the reconnect loop keeps asking.
+            if (state.kind === "ambiguous") throw new Error(ambiguousInstanceMessage(state));
+            return state.kind === "live" ? state.signature : undefined;
+          },
+        };
       },
       provisionPlugin:
         options.provisionPlugin ??
@@ -248,7 +274,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
     this.ref = ref;
     this.hyprlandEnv = env;
     this.hyprlandPlatform = options.platform ?? process.platform;
-    this.resolveInstance = resolveInstance;
+    this.resolveState = resolveState;
     this.hyprlandBusNameHasOwner =
       options.busNameHasOwner ?? ((name) => sessionBusNameHasOwner(name));
     this.pluginDirectory = pluginDirectory;
@@ -271,9 +297,8 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
     if (this.hyprlandPlatform !== "linux") {
       return { kind: "unsupported-platform", platform: this.hyprlandPlatform };
     }
-    if ((await this.resolveInstance()) === undefined) {
-      return { kind: "backend-unavailable", message: NO_HYPRLAND_MESSAGE };
-    }
+    const instance = await this.instanceOrReason();
+    if ("reason" in instance) return { kind: "backend-unavailable", message: instance.reason };
     if (await this.hyprlandBusNameHasOwner(COMPUTER_SERVICE).catch(() => false)) {
       return this.availableAsHyprland();
     }
@@ -299,8 +324,9 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
 
   /** The establishing read, with the backend named as what it actually is. */
   override async availability(): Promise<ComputerAvailability> {
-    if (this.hyprlandPlatform === "linux" && (await this.resolveInstance()) === undefined) {
-      return { kind: "backend-unavailable", message: NO_HYPRLAND_MESSAGE };
+    if (this.hyprlandPlatform === "linux") {
+      const instance = await this.instanceOrReason();
+      if ("reason" in instance) return { kind: "backend-unavailable", message: instance.reason };
     }
     const availability = await super.availability();
     return availability.kind === "available" ? this.availableAsHyprland() : availability;
@@ -319,11 +345,22 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
   protected override async desktopSessionEnvironment(): Promise<
     Readonly<Record<string, string | undefined>>
   > {
-    const instance = await this.resolveInstance();
-    if (instance === undefined) {
-      throw new ComputerBackendError(NO_HYPRLAND_MESSAGE, { retryable: true });
+    const instance = await this.instanceOrReason();
+    if ("reason" in instance) {
+      throw new ComputerBackendError(instance.reason, { retryable: true });
     }
-    return await hyprlandInstanceEnvironment(instance, this.hyprlandEnv);
+    return await hyprlandInstanceEnvironment(instance.signature, this.hyprlandEnv);
+  }
+
+  /** The instance to drive, or why none can be named. */
+  private async instanceOrReason(): Promise<
+    { readonly signature: string } | { readonly reason: string }
+  > {
+    const state = await this.resolveState();
+    if (state.kind === "live") return { signature: state.signature };
+    return {
+      reason: state.kind === "ambiguous" ? ambiguousInstanceMessage(state) : NO_HYPRLAND_MESSAGE,
+    };
   }
 
   /**

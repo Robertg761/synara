@@ -15,6 +15,7 @@ import {
   socketAcceptsConnections,
   listLoadedHyprlandPlugins,
   loadHyprlandPlugin,
+  resolveHyprlandInstance,
   resolveLiveHyprlandInstance,
   unloadHyprlandPlugin,
   type HyprctlRunner,
@@ -100,10 +101,17 @@ describe("hyprlandSessionPresent", () => {
     live = new Set(["new"]);
     listed = ["old", "new", "../escape"];
     expect(await resolve()).toBe("new");
-    // Two candidates is a guess this module does not make.
+    // Two candidates is a guess this module does not make, and not "none".
     live = new Set(["new", "other"]);
     listed = ["old", "new", "other"];
     expect(await resolve()).toBeUndefined();
+    await expect(
+      resolveHyprlandInstance({
+        env,
+        connects: (path) => [...live].some((signature) => socket(signature) === path),
+        listInstances: async () => listed,
+      }),
+    ).resolves.toEqual({ kind: "ambiguous", candidates: ["new", "other"] });
     live = new Set();
     expect(await resolve()).toBeUndefined();
 
