@@ -6,7 +6,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ComputerWindow } from "@synara/contracts";
 
-import { AtspiHelperClient, AtspiHelperUnavailableError } from "./atspiClient.ts";
+import {
+  ATSPI_HELPER_PROTOCOL,
+  AtspiHelperClient,
+  AtspiHelperUnavailableError,
+} from "./atspiClient.ts";
 import { DesktopOperationQueue } from "./DesktopOperationQueue.ts";
 
 class FakeHelperProcess extends EventEmitter {
@@ -16,6 +20,9 @@ class FakeHelperProcess extends EventEmitter {
   readonly kill = vi.fn();
   killed = false;
 }
+
+const EMPTY_TREES = { protocol: ATSPI_HELPER_PROTOCOL, trees: [] };
+const PROBE_OK = { ok: true, protocol: ATSPI_HELPER_PROTOCOL, atspi: true, reason: null };
 
 const WINDOW: ComputerWindow = {
   id: "window-1",
@@ -72,7 +79,7 @@ describe("AtspiHelperClient", () => {
   });
 
   it.each(["stdin", "stdout", "stderr"] as const)("contains an idle %s error", async (name) => {
-    const child = scriptedHelper([], () => ({ trees: [] }));
+    const child = scriptedHelper([], () => EMPTY_TREES);
     const client = new AtspiHelperClient({
       spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
     });
@@ -130,14 +137,14 @@ describe("AtspiHelperClient", () => {
       await vi.advanceTimersByTimeAsync(80);
       expect(ids).toHaveLength(1);
       child.stdout.write(
-        JSON.stringify({ jsonrpc: "2.0", id: ids[0], result: { trees: [] } }) + "\n",
+        JSON.stringify({ jsonrpc: "2.0", id: ids[0], result: EMPTY_TREES }) + "\n",
       );
       await first;
       await vi.advanceTimersByTimeAsync(80);
       expect(ids).toHaveLength(2);
       expect(child.kill).not.toHaveBeenCalled();
       child.stdout.write(
-        JSON.stringify({ jsonrpc: "2.0", id: ids[1], result: { trees: [] } }) + "\n",
+        JSON.stringify({ jsonrpc: "2.0", id: ids[1], result: EMPTY_TREES }) + "\n",
       );
       await second;
     } finally {
@@ -166,7 +173,7 @@ describe("AtspiHelperClient", () => {
       child.stdin.on("data", (chunk) => {
         const message = JSON.parse(chunk.toString()) as { id: number | string };
         child.stdout.write(
-          JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { trees: [] } }) + "\n",
+          JSON.stringify({ jsonrpc: "2.0", id: message.id, result: EMPTY_TREES }) + "\n",
         );
       });
       let spawned = false;
@@ -210,6 +217,7 @@ describe("AtspiHelperClient", () => {
         id: 1,
         method: "set-text",
         params: {
+          protocol: ATSPI_HELPER_PROTOCOL,
           window: {
             id: "window-1",
             title: "Terminal",
@@ -333,13 +341,16 @@ describe("AtspiHelperClient", () => {
         value: null,
         description: null,
         frame: { x: 0, y: 0, width: 640, height: 480 },
-        path: [],
         editable: false,
         children: [],
       },
     };
     let spawns = 0;
-    const child = scriptedHelper([], () => ({ trees: [tree], partial: true }));
+    const child = scriptedHelper([], () => ({
+      protocol: ATSPI_HELPER_PROTOCOL,
+      trees: [tree],
+      partial: true,
+    }));
     const client = new AtspiHelperClient({
       spawnProcess: () => {
         spawns += 1;
@@ -383,14 +394,14 @@ describe("AtspiHelperClient", () => {
       await expect(client.setText({ window: WINDOW, path: [0], text: "x" })).resolves.toBe(false);
       expect(spawns).toBe(1);
 
-      helper = scriptedHelper([], () => ({ ok: true, atspi: true, reason: null }));
+      helper = scriptedHelper([], () => PROBE_OK);
       await client.probe();
       expect(client.unavailableReason()).toBeUndefined();
       expect(spawns).toBe(2);
       helper.stdin.removeAllListeners("data");
       helper.stdin.on("data", (chunk) => {
         const message = JSON.parse(chunk.toString()) as { id: number };
-        helper.stdout.write(JSON.stringify({ id: message.id, result: { trees: [] } }) + "\n");
+        helper.stdout.write(JSON.stringify({ id: message.id, result: EMPTY_TREES }) + "\n");
       });
       await expect(client.readTrees([WINDOW])).resolves.toEqual([]);
       expect(spawns).toBe(2);
@@ -450,8 +461,8 @@ describe("AtspiHelperClient", () => {
   it("does not latch on a helper that dies after it has answered", async () => {
     vi.useFakeTimers();
     let spawns = 0;
-    const first = scriptedHelper([], () => ({ trees: [] }));
-    const second = scriptedHelper([], () => ({ trees: [] }));
+    const first = scriptedHelper([], () => EMPTY_TREES);
+    const second = scriptedHelper([], () => EMPTY_TREES);
     const client = new AtspiHelperClient({
       spawnProcess: () => {
         spawns += 1;
@@ -476,7 +487,12 @@ describe("AtspiHelperClient", () => {
     vi.useFakeTimers();
     let spawns = 0;
     let atspi = false;
-    const child = scriptedHelper([], () => ({ ok: true, atspi, reason: atspi ? null : "gi" }));
+    const child = scriptedHelper([], () => ({
+      ok: true,
+      protocol: ATSPI_HELPER_PROTOCOL,
+      atspi,
+      reason: atspi ? null : "gi",
+    }));
     const client = new AtspiHelperClient({
       spawnProcess: () => {
         spawns += 1;
@@ -501,7 +517,7 @@ describe("AtspiHelperClient", () => {
     }
   });
 
-  it("runs one probe for concurrent callers and tolerates an older helper", async () => {
+  it("runs one probe for concurrent callers and refuses a helper without the probe", async () => {
     const requests: Array<Record<string, unknown>> = [];
     const child = new FakeHelperProcess();
     child.stdin.on("data", (chunk) => {
@@ -523,8 +539,228 @@ describe("AtspiHelperClient", () => {
     try {
       await Promise.all([client.probe(), client.probe()]);
       expect(requests.map((request) => request.method)).toEqual(["probe"]);
-      expect(client.unavailableReason()).toBeUndefined();
+      // A helper that cannot answer the probe is not the build this client
+      // speaks to; reading its trees would be a guess.
+      expect(client.unavailableReason()).toContain("probe failed");
       expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      await client.dispose();
+    }
+  });
+});
+
+describe("AtspiHelperClient availability", () => {
+  /**
+   * R1: libatspi aborted the helper on an unreachable accessibility bus, and
+   * every read respawned it into the same abort — a core dump and a crash
+   * notification each time. A signal before the first tree now latches.
+   */
+  it("latches a helper killed by a signal before its first tree, with a retry window", async () => {
+    let now = 0;
+    let spawns = 0;
+    const helpers: FakeHelperProcess[] = [];
+    const client = new AtspiHelperClient({
+      now: () => now,
+      spawnProcess: () => {
+        spawns += 1;
+        const child = new FakeHelperProcess();
+        child.stdin.on("data", (chunk) => {
+          for (const line of chunk.toString().split("\n").filter(Boolean)) {
+            const message = JSON.parse(line) as { id: number; method: string };
+            if (message.method === "probe") {
+              child.stdout.write(`${JSON.stringify({ id: message.id, result: PROBE_OK })}\n`);
+            } else {
+              child.stderr.write("dbind-ERROR **: AT-SPI: Couldn't connect to accessibility bus\n");
+              child.emit("exit", null, "SIGABRT");
+            }
+          }
+        });
+        helpers.push(child);
+        return child as unknown as ChildProcessWithoutNullStreams;
+      },
+    });
+    try {
+      await client.probe();
+      await expect(client.readTrees([WINDOW])).rejects.toThrow("SIGABRT");
+      expect(client.unavailableReason()).toContain("dbind-ERROR");
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await expect(client.readTrees([WINDOW])).rejects.toThrow(AtspiHelperUnavailableError);
+      }
+      expect(spawns).toBe(1);
+
+      // Past the retry window one request looks again — and the same crash
+      // latches again for twice as long.
+      now += 30_000;
+      expect(client.unavailableReason()).toBeUndefined();
+      await expect(client.readTrees([WINDOW])).rejects.toThrow();
+      await expect(client.readTrees([WINDOW])).rejects.toThrow();
+      expect(spawns).toBe(2);
+      now += 30_000;
+      await expect(client.readTrees([WINDOW])).rejects.toThrow(AtspiHelperUnavailableError);
+      expect(spawns).toBe(2);
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("latches an unreachable accessibility bus without killing the helper", async () => {
+    let now = 0;
+    const requests: Array<Record<string, unknown>> = [];
+    const child = new FakeHelperProcess();
+    child.stdin.on("data", (chunk) => {
+      for (const line of chunk.toString().split("\n").filter(Boolean)) {
+        const message = JSON.parse(line) as { id: number };
+        requests.push(message);
+        child.stdout.write(
+          `${JSON.stringify({
+            id: message.id,
+            error: { code: -32010, message: "org.a11y.Bus is not running" },
+          })}\n`,
+        );
+      }
+    });
+    const client = new AtspiHelperClient({
+      now: () => now,
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+    try {
+      await expect(client.readTrees([WINDOW])).rejects.toThrow(AtspiHelperUnavailableError);
+      expect(client.unavailableReason()).toContain("org.a11y.Bus is not running");
+      await expect(client.setText({ window: WINDOW, path: [0], text: "x" })).resolves.toBe(false);
+      await expect(
+        client.validateNode({ window: WINDOW, path: [0], role: "entry", label: "Name" }),
+      ).resolves.toEqual({ ok: false, reason: "unavailable" });
+      expect(requests).toHaveLength(1);
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("refuses trees from a helper that speaks another protocol", async () => {
+    const child = scriptedHelper([], () => ({ trees: [] }));
+    const client = new AtspiHelperClient({
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+    try {
+      await expect(client.readTrees([WINDOW])).rejects.toThrow(AtspiHelperUnavailableError);
+      expect(client.unavailableReason()).toContain("protocol");
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("latches a probe from an older helper as a protocol mismatch", async () => {
+    const child = scriptedHelper([], () => ({ ok: true, atspi: true, reason: null }));
+    const client = new AtspiHelperClient({
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+    try {
+      await client.probe();
+      expect(client.unavailableReason()).toContain(`needs ${ATSPI_HELPER_PROTOCOL}`);
+    } finally {
+      await client.dispose();
+    }
+  });
+});
+
+describe("AtspiHelperClient requests", () => {
+  it("asks for a cached tree only with an age the caller allows", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const child = scriptedHelper(requests, () => EMPTY_TREES);
+    const client = new AtspiHelperClient({
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+    try {
+      await client.readTrees([WINDOW], { maxAgeMs: 2_500.4 });
+      await client.readTrees([WINDOW], { maxAgeMs: 0 });
+      expect(requests.map((request) => request.params)).toEqual([
+        expect.objectContaining({ protocol: ATSPI_HELPER_PROTOCOL, maxAgeMs: 2_500 }),
+        expect.not.objectContaining({ maxAgeMs: expect.anything() }),
+      ]);
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("validates a node and returns its fresh extents", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const child = scriptedHelper(requests, () => ({
+      ok: true,
+      frame: { x: 1, y: 2, width: 3, height: 4 },
+      clientSize: { width: 640, height: 480 },
+      showing: true,
+    }));
+    const client = new AtspiHelperClient({
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+    try {
+      await expect(
+        client.validateNode({ window: WINDOW, path: [2, 0], role: "button", label: null }),
+      ).resolves.toEqual({
+        ok: true,
+        frame: { x: 1, y: 2, width: 3, height: 4 },
+        clientSize: { width: 640, height: 480 },
+        showing: true,
+      });
+      expect(requests[0]).toMatchObject({
+        method: "validate-node",
+        params: { protocol: ATSPI_HELPER_PROTOCOL, path: [2, 0], role: "button", label: "" },
+      });
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  /**
+   * One helper, one request at a time: a write or a one-window read queued
+   * behind a desktop-wide walk used to wait for all of it, and for every
+   * other desktop-wide walk queued before it.
+   */
+  it("serves writes and scoped reads before queued desktop-wide reads", async () => {
+    const child = new FakeHelperProcess();
+    const methods: string[] = [];
+    const pending: Array<{ id: number; method: string }> = [];
+    child.stdin.on("data", (chunk) => {
+      for (const line of chunk.toString().split("\n").filter(Boolean)) {
+        const message = JSON.parse(line) as {
+          id: number;
+          method: string;
+          params: Record<string, unknown>;
+        };
+        methods.push(
+          message.method === "read-tree"
+            ? `read-tree:${(message.params.windows as unknown[]).length}`
+            : message.method,
+        );
+        pending.push(message);
+      }
+    });
+    const answer = () => {
+      const message = pending.shift()!;
+      child.stdout.write(
+        `${JSON.stringify({
+          id: message.id,
+          result: message.method === "read-tree" ? EMPTY_TREES : { ok: true },
+        })}\n`,
+      );
+    };
+    const client = new AtspiHelperClient({
+      spawnProcess: () => child as unknown as ChildProcessWithoutNullStreams,
+    });
+    const other = { ...WINDOW, id: "window-2" };
+    try {
+      const first = client.readTrees([WINDOW, other]);
+      await vi.waitFor(() => expect(methods).toHaveLength(1));
+      const second = client.readTrees([WINDOW, other]);
+      const write = client.setText({ window: WINDOW, path: [0], text: "x" });
+      const scoped = client.readTrees([WINDOW]);
+      for (let index = 0; index < 4; index += 1) {
+        await vi.waitFor(() => expect(pending).toHaveLength(1));
+        answer();
+      }
+      await Promise.all([first, second, write, scoped]);
+      expect(methods).toEqual(["read-tree:2", "set-text", "read-tree:1", "read-tree:2"]);
     } finally {
       await client.dispose();
     }

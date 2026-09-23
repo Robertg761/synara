@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -10,13 +11,25 @@ import {
   JsonRpcStdioWriter,
 } from "@synara/shared/jsonrpc-stdio";
 
-import type { ComputerWindow } from "@synara/contracts";
-import type { AtspiWindowTree } from "./atspiTreeTargeting.ts";
+import type { ComputerRect, ComputerWindow } from "@synara/contracts";
+import type { AtspiClientSize, AtspiWindowTree } from "./atspiTreeTargeting.ts";
 import { assertDesktopOperationActive, desktopOperationSignal } from "./DesktopOperationQueue.ts";
 
 const HELPER_READ_TREE_METHOD = "read-tree";
 const HELPER_SET_TEXT_METHOD = "set-text";
+const HELPER_VALIDATE_NODE_METHOD = "validate-node";
 const HELPER_PROBE_METHOD = "probe";
+/**
+ * The wire contract `atspi_helper.py` speaks (its `PROTOCOL_VERSION`). Every
+ * request carries it and every reply names it, so a helper from another build
+ * — a stale file, a `SYNARA_ATSPI_HELPER` override — is refused as unavailable
+ * instead of having its trees misread.
+ */
+export const ATSPI_HELPER_PROTOCOL = 2;
+/** The helper could not reach the accessibility bus (it answers; it does not crash). */
+const HELPER_BUS_UNAVAILABLE_ERROR = -32010;
+/** The helper refused this client's protocol version. */
+const HELPER_PROTOCOL_MISMATCH_ERROR = -32011;
 const HELPER_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 /** How much of the helper's stderr to keep for the diagnostic when it dies. */
 const HELPER_STDERR_TAIL_CHARS = 4 * 1024;
@@ -25,6 +38,14 @@ const HELPER_RECONNECT_BASE_DELAY_MS = 250;
 const HELPER_RECONNECT_MAX_DELAY_MS = 5_000;
 /** How long a SIGTERM'd helper has to exit before dispose escalates to SIGKILL. */
 const ATSPI_KILL_GRACE_MS = 1_000;
+/**
+ * How long "unavailable" holds before a request may look again, doubling up to
+ * the cap. A machine that has no accessibility bus now may get one (a session
+ * whose launcher starts late), but rediscovering its absence on every read is
+ * what turned a crashing helper into a respawn storm.
+ */
+const UNAVAILABLE_RETRY_BASE_MS = 30_000;
+const UNAVAILABLE_RETRY_MAX_MS = 5 * 60_000;
 
 /**
  * A semantic text write addressed the same way the tree was read: the window
@@ -73,24 +94,68 @@ export class AtspiHelperUnavailableError extends Error {
   }
 }
 
+/** A node a tree read addressed, checked against the live application at dispatch. */
+export interface AtspiNodeCheck {
+  readonly window: ComputerWindow;
+  readonly path: readonly number[];
+  readonly role: string;
+  readonly label: string | null;
+}
+
+/**
+ * The live node still is the one the tree named: its extents now, in the
+ * window's coordinates, and the window's client size to place them with.
+ */
+export type AtspiNodeValidation =
+  | {
+      readonly ok: true;
+      readonly frame: ComputerRect;
+      readonly clientSize: AtspiClientSize;
+      readonly showing: boolean | null;
+    }
+  | { readonly ok: false; readonly reason: string };
+
+export interface AtspiReadOptions {
+  /**
+   * How old a tree the helper may answer from its event-validated cache. The
+   * helper serves one only when the application has sent no event since the
+   * walk; the caller bounds the age further by what it did itself, because
+   * its own input is the change most likely to have arrived without one yet.
+   */
+  readonly maxAgeMs?: number;
+}
+
 export interface AtspiTreeReader {
   /**
    * Trees for the windows the helper could resolve. A window missing from the
    * result was not found, was ambiguous, or was cut off by the helper's own
    * deadline; the caller derives per-window completeness from which ids came
-   * back.
+   * back and from each tree's own `status`.
    */
-  readonly readTrees: (windows: readonly ComputerWindow[]) => Promise<readonly AtspiWindowTree[]>;
+  readonly readTrees: (
+    windows: readonly ComputerWindow[],
+    options?: AtspiReadOptions,
+  ) => Promise<readonly AtspiWindowTree[]>;
   /** Resolves `false` when the helper refused the write; rejects when it failed. */
   readonly setText: (write: AtspiTextWrite) => Promise<boolean>;
+  /**
+   * Re-reads one node a tree read named — identity by role and label, and
+   * fresh extents — so an action can use a tree without walking it again.
+   * Absent on readers that cannot address nodes.
+   */
+  readonly validateNode?: (check: AtspiNodeCheck) => Promise<AtspiNodeValidation>;
   /**
    * Start the helper once and ask whether it can read trees. Resolves either
    * way; `unavailableReason` carries the outcome. Calling it again re-probes a
    * reader that latched unavailable, which is how a machine that gained
-   * `python-gi` mid-session recovers on the next connect.
+   * `python-gi` or an accessibility bus mid-session recovers on the next
+   * connect.
    */
   readonly probe?: () => Promise<void>;
-  /** Why the reader latched unavailable, or `undefined` while it is usable or unprobed. */
+  /**
+   * Why the reader latched unavailable, or `undefined` while it is usable,
+   * unprobed, or due for another look.
+   */
   readonly unavailableReason?: () => string | undefined;
   readonly dispose: () => Promise<void>;
 }
@@ -109,11 +174,21 @@ export interface AtspiHelperClientOptions {
     command: string,
     args: readonly string[],
   ) => ChildProcessWithoutNullStreams;
+  /** Wall clock for the unavailable latch's retry window; tests move it by hand. */
+  readonly now?: () => number;
+}
+
+type RequestPriority = "high" | "normal";
+
+interface QueuedRequest {
+  readonly start: () => Promise<unknown>;
+  readonly resolve: (value: unknown) => void;
+  readonly reject: (error: unknown) => void;
 }
 
 /**
- * Supervises the small PyGObject AT-SPI reader. The helper is deliberately
- * stateless: a crashed process loses only one perception request and the next
+ * Supervises the small PyGObject AT-SPI reader. The helper keeps only caches
+ * it can rebuild: a crashed process loses one perception request and the next
  * request starts a fresh process after a bounded backoff.
  */
 export class AtspiHelperClient implements AtspiTreeReader {
@@ -122,33 +197,63 @@ export class AtspiHelperClient implements AtspiTreeReader {
   private writer: JsonRpcStdioWriter | null = null;
   private registry: JsonRpcStdioRequestRegistry | null = null;
   private readonly requestTimeoutMs: number;
+  private readonly now: () => number;
   private reconnectFailures = 0;
   private startPromise: Promise<void> | null = null;
   private disposed = false;
-  private requestTail: Promise<unknown> = Promise.resolve();
+  /**
+   * The helper answers one request at a time, so requests wait here. Writes,
+   * node checks and one-window reads go first: a semantic write or a scoped
+   * read must not sit behind a desktop-wide walk it has nothing to do with.
+   */
+  private readonly lanes: Record<RequestPriority, QueuedRequest[]> = { high: [], normal: [] };
+  private requestActive = false;
   private queuedRequests = 0;
   /** Set by the first well-formed reply from any helper process. */
   private answered = false;
+  /** Set by the first tree a helper process delivered. */
+  private treeAnswered = false;
   /**
-   * A permanently unusable helper. Every read would otherwise pay a spawn and
-   * up to five seconds of backoff to rediscover the same missing interpreter,
-   * with its traceback drained unread.
+   * A helper that cannot read trees here. Every read would otherwise pay a
+   * spawn and up to five seconds of backoff to rediscover the same missing
+   * interpreter or bus, with its traceback drained unread. Held until
+   * `retryAt`, after which the next request probes again.
    */
-  private unavailable: { readonly summary: string; readonly stderr: StderrTail } | null = null;
+  private unavailable: {
+    readonly summary: string;
+    readonly stderr: StderrTail;
+    readonly retryAt: number;
+  } | null = null;
+  private unavailableLatches = 0;
   private probePromise: Promise<void> | null = null;
 
   constructor(private readonly options: AtspiHelperClientOptions = {}) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? HELPER_REQUEST_TIMEOUT_MS;
+    this.now = options.now ?? Date.now;
   }
 
-  async readTrees(windows: readonly ComputerWindow[]): Promise<readonly AtspiWindowTree[]> {
+  async readTrees(
+    windows: readonly ComputerWindow[],
+    options: AtspiReadOptions = {},
+  ): Promise<readonly AtspiWindowTree[]> {
     if (windows.length === 0) return [];
-    const result = await this.request(HELPER_READ_TREE_METHOD, {
-      windows: windows.map(helperWindow),
-    });
+    const result = await this.request(
+      HELPER_READ_TREE_METHOD,
+      {
+        protocol: ATSPI_HELPER_PROTOCOL,
+        windows: windows.map(helperWindow),
+        ...(options.maxAgeMs !== undefined && options.maxAgeMs > 0
+          ? { maxAgeMs: Math.round(options.maxAgeMs) }
+          : {}),
+      },
+      windows.length === 1 ? "high" : "normal",
+    );
     if (!isRecord(result) || !Array.isArray(result.trees)) {
       throw new Error("AT-SPI helper returned no tree list.");
     }
+    this.assertProtocol(result);
+    this.treeAnswered = true;
+    this.unavailableLatches = 0;
     // A reply flagged `partial` is the helper stopping at its own deadline
     // with the trees it had: a well-formed answer from a healthy process.
     return result.trees.filter(isAtspiWindowTree);
@@ -157,13 +262,18 @@ export class AtspiHelperClient implements AtspiTreeReader {
   async setText(write: AtspiTextWrite): Promise<boolean> {
     let result: unknown;
     try {
-      result = await this.request(HELPER_SET_TEXT_METHOD, {
-        window: helperWindow(write.window),
-        path: [...write.path],
-        text: write.text,
-        ...(write.role ? { role: write.role } : {}),
-        ...(write.label !== undefined ? { label: write.label ?? "" } : {}),
-      });
+      result = await this.request(
+        HELPER_SET_TEXT_METHOD,
+        {
+          protocol: ATSPI_HELPER_PROTOCOL,
+          window: helperWindow(write.window),
+          path: [...write.path],
+          text: write.text,
+          ...(write.role ? { role: write.role } : {}),
+          ...(write.label !== undefined ? { label: write.label ?? "" } : {}),
+        },
+        "high",
+      );
     } catch (error) {
       // No helper at all is a refusal, not a failure: the caller falls back
       // to keystrokes the same way it does for a control that is not editable.
@@ -173,46 +283,102 @@ export class AtspiHelperClient implements AtspiTreeReader {
     return isRecord(result) && result.ok === true;
   }
 
+  async validateNode(check: AtspiNodeCheck): Promise<AtspiNodeValidation> {
+    let result: unknown;
+    try {
+      result = await this.request(
+        HELPER_VALIDATE_NODE_METHOD,
+        {
+          protocol: ATSPI_HELPER_PROTOCOL,
+          window: helperWindow(check.window),
+          path: [...check.path],
+          role: check.role,
+          label: check.label ?? "",
+        },
+        "high",
+      );
+    } catch (error) {
+      if (error instanceof AtspiHelperUnavailableError) return { ok: false, reason: "unavailable" };
+      throw error;
+    }
+    if (!isRecord(result)) return { ok: false, reason: "no-reply" };
+    if (result.ok === true && isRect(result.frame) && isClientSize(result.clientSize)) {
+      return {
+        ok: true,
+        frame: result.frame as ComputerRect,
+        clientSize: result.clientSize as AtspiClientSize,
+        showing: typeof result.showing === "boolean" ? result.showing : null,
+      };
+    }
+    return { ok: false, reason: typeof result.reason === "string" ? result.reason : "refused" };
+  }
+
   probe(): Promise<void> {
     if (this.probePromise) return this.probePromise;
-    this.probePromise = this.probeNow().finally(() => {
-      this.probePromise = null;
-    });
+    // An explicit probe is a fresh start: the latch, its retry window and the
+    // backoff a dead helper left behind all go, and the outcome replaces them.
+    this.unavailable = null;
+    this.unavailableLatches = 0;
+    this.reconnectFailures = 0;
+    this.probePromise = this.request(HELPER_PROBE_METHOD, {}, "high")
+      .then(
+        (result) => this.noteProbe(result),
+        (error: unknown) => this.noteProbeFailure(error),
+      )
+      .finally(() => {
+        this.probePromise = null;
+      });
     return this.probePromise;
   }
 
   unavailableReason(): string | undefined {
-    if (!this.unavailable) return undefined;
+    if (!this.unavailable || this.now() >= this.unavailable.retryAt) return undefined;
+    return this.unavailableText();
+  }
+
+  private unavailableText(): string {
+    if (!this.unavailable) return "AT-SPI helper unavailable";
     const stderr = this.unavailable.stderr.text();
     return stderr ? `${this.unavailable.summary}\n${stderr}` : this.unavailable.summary;
   }
 
-  private async probeNow(): Promise<void> {
-    if (this.disposed) throw new Error("AT-SPI helper is disposed.");
-    // An explicit probe is a fresh start: the latch and the backoff a dead
-    // helper left behind both go, and the outcome below replaces them.
-    this.unavailable = null;
-    this.reconnectFailures = 0;
-    try {
-      const result = await this.request(HELPER_PROBE_METHOD, {});
-      if (isRecord(result) && result.ok === true && result.atspi === false) {
-        const reason = typeof result.reason === "string" ? result.reason : "unknown import error";
-        this.latchUnavailable(`PyGObject AT-SPI bindings are unavailable: ${reason}`);
-      }
-    } catch (error) {
-      // An error envelope is a live helper answering; an older build without
-      // the probe method still reads trees.
-      if (error instanceof AtspiHelperMethodError) return;
-      if (!this.unavailable) {
-        this.latchUnavailable(
-          `AT-SPI helper probe failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+  private noteProbe(result: unknown): void {
+    if (!isRecord(result) || result.protocol !== ATSPI_HELPER_PROTOCOL) {
+      this.latchUnavailable(protocolMismatch(isRecord(result) ? result.protocol : undefined));
+      return;
     }
+    if (result.atspi === false) {
+      const reason = typeof result.reason === "string" ? result.reason : "unknown reason";
+      this.latchUnavailable(`AT-SPI is unavailable: ${reason}`);
+      return;
+    }
+    // The retry window keeps growing until a tree actually arrives: a helper
+    // that probes fine and then dies on every walk is still broken.
+    this.unavailable = null;
+  }
+
+  private noteProbeFailure(error: unknown): void {
+    // A latch set on the way here (a helper that died, a bus it could not
+    // reach) already says more than the probe's own error does.
+    if (this.unavailable) return;
+    this.latchUnavailable(
+      `AT-SPI helper probe failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 
   private latchUnavailable(summary: string, stderr = new StderrTail()): void {
-    this.unavailable = { summary, stderr };
+    const delay = Math.min(
+      UNAVAILABLE_RETRY_MAX_MS,
+      UNAVAILABLE_RETRY_BASE_MS * 2 ** this.unavailableLatches,
+    );
+    this.unavailableLatches += 1;
+    this.unavailable = { summary, stderr, retryAt: this.now() + delay };
+  }
+
+  private assertProtocol(result: Record<string, unknown>): void {
+    if (result.protocol === ATSPI_HELPER_PROTOCOL) return;
+    this.latchUnavailable(protocolMismatch(result.protocol));
+    throw new AtspiHelperUnavailableError(this.unavailableText());
   }
 
   async dispose(): Promise<void> {
@@ -225,36 +391,80 @@ export class AtspiHelperClient implements AtspiTreeReader {
     this.framer = null;
     this.writer = null;
     this.registry = null;
+    for (const queued of [...this.lanes.high.splice(0), ...this.lanes.normal.splice(0)]) {
+      queued.reject(new Error("AT-SPI helper is disposed."));
+    }
     if (process) terminateHelper(process);
     await this.startPromise?.catch(() => undefined);
     this.startPromise = null;
   }
 
-  private request(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private request(
+    method: string,
+    params: Record<string, unknown>,
+    priority: RequestPriority,
+  ): Promise<unknown> {
     if (this.disposed) return Promise.reject(new Error("AT-SPI helper is disposed."));
     if (this.queuedRequests >= 64)
       return Promise.reject(new Error("AT-SPI request queue is full."));
     this.queuedRequests += 1;
     const signal = desktopOperationSignal();
-    const result = this.requestTail
-      .then(() => {
-        signal?.throwIfAborted();
-        return this.requestNow(method, params);
-      })
-      .finally(() => {
-        this.queuedRequests -= 1;
-      });
-    this.requestTail = result.catch(() => undefined);
-    return result;
+    // Run in the caller's async context, not whichever request happened to
+    // finish before it: the operation checks below read that context.
+    const start = AsyncResource.bind(() => {
+      signal?.throwIfAborted();
+      return this.requestNow(method, params);
+    });
+    return new Promise<unknown>((resolve, reject) => {
+      this.lanes[priority].push({ start, resolve, reject });
+      this.pumpRequests();
+    }).finally(() => {
+      this.queuedRequests -= 1;
+    });
+  }
+
+  private pumpRequests(): void {
+    if (this.requestActive) return;
+    const next = this.lanes.high.shift() ?? this.lanes.normal.shift();
+    if (!next) return;
+    this.requestActive = true;
+    void (async () => {
+      try {
+        next.resolve(await next.start());
+      } catch (error) {
+        next.reject(error);
+      } finally {
+        this.requestActive = false;
+        this.pumpRequests();
+      }
+    })();
   }
 
   private async requestNow(method: string, params: Record<string, unknown>): Promise<unknown> {
     if (this.disposed) throw new Error("AT-SPI helper is disposed.");
     if (this.unavailable && method !== HELPER_PROBE_METHOD) {
-      throw new AtspiHelperUnavailableError(
-        this.unavailableReason() ?? "AT-SPI helper unavailable",
-      );
+      if (this.now() < this.unavailable.retryAt) {
+        throw new AtspiHelperUnavailableError(this.unavailableText());
+      }
+      // The retry window passed: one probe decides whether this request runs.
+      try {
+        this.noteProbe(await this.transportRequest(HELPER_PROBE_METHOD, {}));
+      } catch (error) {
+        if (!(this.unavailable && this.now() < this.unavailable.retryAt)) {
+          this.latchUnavailable(
+            `AT-SPI helper probe failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (this.unavailable) throw new AtspiHelperUnavailableError(this.unavailableText());
     }
+    return await this.transportRequest(method, params);
+  }
+
+  private async transportRequest(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
     await this.ensureStarted();
     // Restart backoff can outlive the operation's permission or cancellation.
     // Check again before sending a write to the replacement helper.
@@ -276,6 +486,18 @@ export class AtspiHelperClient implements AtspiTreeReader {
       // cleared exactly as it would be for a success. Only the request failed.
       if (error instanceof AtspiHelperMethodError) {
         this.reconnectFailures = 0;
+        if (
+          error.code === HELPER_BUS_UNAVAILABLE_ERROR ||
+          error.code === HELPER_PROTOCOL_MISMATCH_ERROR
+        ) {
+          // Nothing about this machine changes by asking again right away.
+          this.latchUnavailable(
+            error.code === HELPER_PROTOCOL_MISMATCH_ERROR
+              ? protocolMismatch(undefined, error.message)
+              : `AT-SPI is unavailable: ${error.message}`,
+          );
+          throw new AtspiHelperUnavailableError(this.unavailableText());
+        }
         throw error;
       }
       this.resetProcess(error instanceof Error ? error : new Error(String(error)));
@@ -372,8 +594,15 @@ export class AtspiHelperClient implements AtspiTreeReader {
       if (this.process !== child) return;
       const summary = `AT-SPI helper exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`;
       // A non-zero exit before the first reply is an interpreter that could
-      // not run the script at all — a missing module, an unreadable file.
-      if (!this.answered && typeof code === "number" && code !== 0) {
+      // not run the script at all — a missing module, an unreadable file. A
+      // signal before the first tree is a helper the desktop kills, the way
+      // libatspi aborted on an unreachable bus: respawning it for every read
+      // is a crash loop with a core dump each time. Our own kills never get
+      // here — they detach the process first.
+      if (
+        (!this.answered && typeof code === "number" && code !== 0) ||
+        (!this.treeAnswered && signal !== null)
+      ) {
         this.latchUnavailable(summary, stderr);
       }
       const trace = stderr.text();
@@ -473,7 +702,12 @@ function parseJson(line: string): unknown {
 function isAtspiWindowTree(value: unknown): value is AtspiWindowTree {
   if (!isRecord(value)) return false;
   return (
-    typeof value.windowId === "string" && isClientSize(value.clientSize) && isAtspiNode(value.root)
+    typeof value.windowId === "string" &&
+    isClientSize(value.clientSize) &&
+    isAtspiNode(value.root) &&
+    isAtspiWindowTreeStatus(value.status) &&
+    (value.truncated === undefined || typeof value.truncated === "boolean") &&
+    (value.reason === undefined || typeof value.reason === "string")
   );
 }
 
@@ -489,6 +723,12 @@ function isClientSize(value: unknown): boolean {
   );
 }
 
+function isAtspiWindowTreeStatus(value: unknown): boolean {
+  return (
+    value === undefined || value === "complete" || value === "partial" || value === "unavailable"
+  );
+}
+
 function isAtspiNode(value: unknown): boolean {
   if (!isRecord(value)) return false;
   return (
@@ -497,19 +737,23 @@ function isAtspiNode(value: unknown): boolean {
     (value.value === null || typeof value.value === "string") &&
     (value.description === null || typeof value.description === "string") &&
     isRect(value.frame) &&
-    isNodePath(value.path) &&
+    (value.i === undefined || isChildIndex(value.i)) &&
     (value.editable === undefined || typeof value.editable === "boolean") &&
+    (value.truncated === undefined || typeof value.truncated === "boolean") &&
     Array.isArray(value.children) &&
     value.children.every(isAtspiNode)
   );
 }
 
-/** A helper build without semantic addressing simply omits the path. */
-function isNodePath(value: unknown): boolean {
-  if (value === undefined) return true;
+function isChildIndex(value: unknown): boolean {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function protocolMismatch(protocol: unknown, detail?: string): string {
   return (
-    Array.isArray(value) &&
-    value.every((index) => typeof index === "number" && Number.isInteger(index) && index >= 0)
+    `The AT-SPI helper speaks protocol ${JSON.stringify(protocol ?? "unknown")}; this server ` +
+    `needs ${ATSPI_HELPER_PROTOCOL}. The helper script does not match this build` +
+    (detail ? `: ${detail}` : ".")
   );
 }
 
