@@ -342,6 +342,14 @@ const KWIN_VERSION_PATTERN = /\d+(?:\.\d+)+/;
  */
 const WINDOW_SNAPSHOT_TTL_MS = 75;
 /**
+ * The post-action settle on a plugin that answers `waitForSettle` from surface
+ * commits: the target has repainted after the input and then stayed quiet
+ * this long, capped for a window that never stops repainting (a video, a
+ * spinner). Most of a click used to be the fixed 300 ms guess this replaces.
+ */
+const PLUGIN_SETTLE_QUIET_MS = 100;
+const PLUGIN_SETTLE_TIMEOUT_MS = 1_500;
+/**
  * Interface-version-2 capabilities a plugin advertises in `healthJson`. A
  * method is used only when its feature is listed: an installed plugin that
  * predates it keeps the version-1 path.
@@ -563,6 +571,11 @@ export class KWinComputerBackend implements ComputerBackend {
   readonly dedicatedSeat = true;
   /** AT-SPI exposes no settable selection this backend can read back. */
   readonly textRangeSelection = false;
+  /** See `PLUGIN_SETTLE_QUIET_MS`; used only while `waitForSettle` is offered. */
+  readonly actionSettle = {
+    quietMs: PLUGIN_SETTLE_QUIET_MS,
+    timeoutMs: PLUGIN_SETTLE_TIMEOUT_MS,
+  } as const;
 
   protected readonly integrationName: string;
   /** What an empty availability or health message degrades to. */
@@ -1332,6 +1345,47 @@ export class KWinComputerBackend implements ComputerBackend {
       ...(screenshot ? { screenshot } : {}),
       capturedAt: new Date(this.now()).toISOString(),
     };
+  }
+
+  /**
+   * The compositor-observed settle, offered only while the loaded plugin
+   * advertises `waitForSettle`: the manager reads this member by presence and
+   * falls back to its fixed post-action wait when it is absent, which is what
+   * an older plugin gets.
+   */
+  get waitForSettle(): ComputerBackend["waitForSettle"] {
+    if (this.connectedPlugin()?.waitForSettle === undefined) return undefined;
+    if (!this.pluginFeature("waitForSettle")) return undefined;
+    return (options) => this.settleOnPlugin(options);
+  }
+
+  /**
+   * Waits for `windowId` to repaint after the agent's last input and then
+   * stay quiet for `quietMs`, bounded by `timeoutMs`. Pure observation: no
+   * input, no session start. A plugin that cannot observe the window at all
+   * (it is gone, or no session is running) answers unsettled at once; that
+   * gets the blind wait the plugin could not replace rather than none.
+   */
+  private async settleOnPlugin(options: {
+    readonly windowId: string;
+    readonly timeoutMs: number;
+    readonly quietMs: number;
+  }): Promise<{ readonly settled: boolean; readonly waitedMs: number }> {
+    const plugin = await this.ensurePlugin({ start: false });
+    const waitForSettle = this.pluginFeature("waitForSettle") ? plugin.waitForSettle : undefined;
+    if (!waitForSettle) {
+      throw new ComputerBackendError(
+        `The loaded Synara ${this.integrationName} plugin cannot observe a window settling.`,
+      );
+    }
+    const timeoutMs = clampMilliseconds(options.timeoutMs);
+    const quietMs = Math.min(clampMilliseconds(options.quietMs), timeoutMs);
+    const [settled, elapsedMs] = readSettleReply(
+      await this.pluginValue(() => waitForSettle(options.windowId, quietMs, timeoutMs)),
+    );
+    if (settled || elapsedMs > 0 || quietMs === 0) return { settled, waitedMs: elapsedMs };
+    await this.sleep(quietMs);
+    return { settled: false, waitedMs: quietMs };
   }
 
   private reportAtspiUnavailable(reason: string): void {
@@ -3984,6 +4038,26 @@ function readByteArray(value: unknown): Uint8Array {
     return Uint8Array.from(unwrapped as number[]);
   }
   throw new ComputerBackendError("Synara computer capture returned invalid PNG bytes.");
+}
+
+/** `waitForSettle`'s `(bu)` reply: settled, and how long the plugin waited. */
+function readSettleReply(value: unknown): readonly [settled: boolean, elapsedMs: number] {
+  const reply = unwrapDbusValue(value);
+  if (
+    !Array.isArray(reply) ||
+    reply.length !== 2 ||
+    typeof reply[0] !== "boolean" ||
+    typeof reply[1] !== "number" ||
+    !Number.isFinite(reply[1])
+  ) {
+    throw new ComputerBackendError("Synara computer settle returned an invalid reply.");
+  }
+  return [reply[0], Math.max(0, reply[1])];
+}
+
+/** A wait length the plugin's `u` argument can carry. */
+function clampMilliseconds(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.min(0xffff_ffff, Math.floor(value))) : 0;
 }
 
 /** A `captureWindowEx`/`captureRegionEx` reply: the bytes and their MIME type. */

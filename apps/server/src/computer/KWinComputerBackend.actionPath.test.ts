@@ -356,3 +356,86 @@ describe("preview stills", () => {
     await operation;
   });
 });
+
+describe("compositor-observed settle", () => {
+  it("is offered only while the loaded plugin advertises waitForSettle", async () => {
+    const old = makeBackend(new FakePlugin());
+    await old.availability();
+    expect(old.waitForSettle).toBeUndefined();
+
+    const plugin = new FakePlugin();
+    plugin.features = ["waitForSettle"];
+    const backend = makeBackend(plugin);
+    expect(backend.waitForSettle).toBeUndefined();
+    await backend.availability();
+    plugin.settleAnswer = [true, 42];
+    await expect(
+      backend.waitForSettle!({ windowId: "window-1", quietMs: 100, timeoutMs: 1_500 }),
+    ).resolves.toEqual({ settled: true, waitedMs: 42 });
+    expect(plugin.calls).toContainEqual({
+      method: "waitForSettle",
+      args: ["window-1", 100, 1_500],
+    });
+  });
+
+  it("waits blind for the quiet window when the plugin cannot observe the target", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["waitForSettle"];
+    plugin.settleAnswer = [false, 0];
+    const sleeps: number[] = [];
+    const backend = makeBackend(plugin, {
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+      },
+    });
+    await backend.availability();
+    await expect(
+      backend.waitForSettle!({ windowId: "gone", quietMs: 100, timeoutMs: 1_500 }),
+    ).resolves.toEqual({ settled: false, waitedMs: 100 });
+    expect(sleeps).toEqual([100]);
+  });
+
+  it("replaces the manager's fixed post-action wait with a short commit-driven one", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["waitForSettle"];
+    plugin.settleAnswer = [true, 30];
+    const backend = makeBackend(plugin, { glideDurationMs: 0 });
+    const manager = new (await import("./ComputerManager.ts")).ComputerManager({ backend });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await backend.availability();
+      await manager.withAgentActivity("thread-a", async () => {
+        await manager.pressKey("thread-a", "enter");
+        await manager.captureActionScreenshot("window-1");
+      });
+      expect(plugin.calls).toContainEqual({
+        method: "waitForSettle",
+        args: ["window-1", 100, 1_500],
+      });
+      // No blind 300 ms timer ran beside it.
+      expect(timers.mock.calls.some((call) => call[1] === 300)).toBe(false);
+    } finally {
+      timers.mockRestore();
+      await manager.dispose();
+    }
+  });
+
+  it("keeps the fixed post-action wait on a plugin without waitForSettle", async () => {
+    const plugin = new FakePlugin();
+    const backend = makeBackend(plugin, { glideDurationMs: 0 });
+    const manager = new (await import("./ComputerManager.ts")).ComputerManager({ backend });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await backend.availability();
+      await manager.withAgentActivity("thread-a", async () => {
+        await manager.pressKey("thread-a", "enter");
+        await manager.captureActionScreenshot("window-1");
+      });
+      expect(callsOf(plugin, "waitForSettle")).toBe(0);
+      expect(timers.mock.calls.some((call) => call[1] === 300)).toBe(true);
+    } finally {
+      timers.mockRestore();
+      await manager.dispose();
+    }
+  });
+});
