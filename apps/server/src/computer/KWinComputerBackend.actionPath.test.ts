@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { KWinComputerBackend, type KWinComputerBackendOptions } from "./KWinComputerBackend.ts";
 import type { AtspiTreeReader } from "./atspiClient.ts";
-import { FakeDbus, FakePlugin } from "./computerPluginTestDoubles.ts";
+import { FakeDbus, FakePlugin, pngOfSize } from "./computerPluginTestDoubles.ts";
 import { withPaneInput } from "./paneInput.ts";
 
 const atspi: AtspiTreeReader = {
@@ -230,5 +230,129 @@ describe("one window snapshot per desktop operation", () => {
     await backend.listWindows();
     expect(counts).toEqual({ stateJson: 1, windowsJson: 1 });
     expect(callsOf(plugin, "windowsStateJson")).toBe(0);
+  });
+});
+
+const PNG_A = pngOfSize(10, 10);
+const PNG_B = pngOfSize(10, 11);
+const JPEG_BYTES = Uint8Array.of(0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46);
+
+describe("preview stills", () => {
+  it("asks a captureEx plugin for passive JPEG stills at the preview budget", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["captureEx"];
+    plugin.captureMime = "image/jpeg";
+    plugin.captureBytes = JPEG_BYTES;
+    plugin.workspace = { x: 0, y: 0, width: 1_920, height: 1_080 };
+    const backend = makeBackend(plugin);
+    const frames: { mimeType?: string; data: Uint8Array }[] = [];
+    await backend.attachStream((frame) => frames.push(frame));
+    expect(plugin.calls).toContainEqual({
+      method: "captureRegionEx",
+      args: [0, 0, 1_920, 1_080, 1_280, 1 | 2],
+    });
+    expect(callsOf(plugin, "captureRegion")).toBe(0);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.mimeType).toBe("image/jpeg");
+    // The session was never started for watching.
+    expect(callsOf(plugin, "start")).toBe(0);
+  });
+
+  it("refuses a still whose bytes are not the image they claim to be", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["captureEx"];
+    plugin.captureMime = "image/jpeg";
+    const backend = makeBackend(plugin);
+    const frames: unknown[] = [];
+    await backend.attachStream((frame) => frames.push(frame));
+    expect(frames).toEqual([]);
+  });
+
+  it("keeps PNG stills from captureRegion on a plugin without captureEx", async () => {
+    const plugin = new FakePlugin();
+    plugin.workspace = { x: 0, y: 0, width: 1_920, height: 1_080 };
+    const backend = makeBackend(plugin);
+    const frames: { mimeType?: string }[] = [];
+    await backend.attachStream((frame) => frames.push(frame));
+    expect(plugin.calls).toContainEqual({
+      method: "captureRegion",
+      args: [0, 0, 1_920, 1_080, 1_280],
+    });
+    expect(callsOf(plugin, "captureRegionEx")).toBe(0);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.mimeType).toBeUndefined();
+  });
+
+  it("slows an idle pane to one still every two seconds and wakes on an action", async () => {
+    vi.useFakeTimers({ now: 0 });
+    const plugin = new FakePlugin();
+    const backend = makeBackend(plugin, { now: () => Date.now() });
+    await backend.attachStream(() => undefined);
+    const captures = () => callsOf(plugin, "captureRegion");
+    await vi.advanceTimersByTimeAsync(2_000);
+    // 500 ms ticks until four identical stills, then the idle interval.
+    expect(captures()).toBe(1 + 4);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(captures()).toBe(1 + 5);
+
+    const { DesktopOperationQueue } = await import("./DesktopOperationQueue.ts");
+    await new DesktopOperationQueue().run(() => backend.click({ x: 10, y: 10 }));
+    const afterAction = captures();
+    await vi.advanceTimersByTimeAsync(600);
+    expect(captures()).toBeGreaterThan(afterAction);
+  });
+
+  it("holds stills while a desktop operation runs and takes one right after it", async () => {
+    vi.useFakeTimers({ now: 0 });
+    const plugin = new FakePlugin();
+    const backend = makeBackend(plugin, { now: () => Date.now() });
+    await backend.attachStream(() => undefined);
+    const captures = () => callsOf(plugin, "captureRegion");
+    const { DesktopOperationQueue } = await import("./DesktopOperationQueue.ts");
+    const release = Promise.withResolvers<void>();
+    const operation = new DesktopOperationQueue().run(async () => {
+      await backend.moveCursor({ x: 10, y: 10 });
+      await release.promise;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const during = captures();
+    await vi.advanceTimersByTimeAsync(900);
+    expect(captures()).toBe(during);
+    release.resolve();
+    await operation;
+    await vi.advanceTimersByTimeAsync(60);
+    expect(captures()).toBe(during + 1);
+  });
+
+  it("lets a still through a long operation once a second", async () => {
+    vi.useFakeTimers({ now: 0 });
+    const plugin = new FakePlugin();
+    let frame = 0;
+    // Changing stills, so the idle backoff stays out of the picture.
+    plugin.captureRegion = async () => {
+      plugin.calls.push({ method: "captureRegion", args: [] });
+      frame += 1;
+      return frame % 2 === 0 ? PNG_A : PNG_B;
+    };
+    const backend = makeBackend(plugin, { now: () => Date.now() });
+    await backend.attachStream(() => undefined);
+    const captures = () => callsOf(plugin, "captureRegion");
+    const { DesktopOperationQueue } = await import("./DesktopOperationQueue.ts");
+    const release = Promise.withResolvers<void>();
+    const operation = new DesktopOperationQueue().run(async () => {
+      for (let tick = 0; tick < 30; tick += 1) {
+        await backend.listWindows();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      await release.promise;
+    });
+    const before = captures();
+    await vi.advanceTimersByTimeAsync(3_000);
+    const during = captures() - before;
+    expect(during).toBeGreaterThanOrEqual(2);
+    expect(during).toBeLessThanOrEqual(4);
+    release.resolve();
+    await vi.advanceTimersByTimeAsync(100);
+    await operation;
   });
 });

@@ -4,7 +4,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { StillFrameDedupe } from "./stillFrameDedupe.ts";
+import { StillFramePublisher, type StillFrameCapture } from "./stillFramePublisher.ts";
 import { COMPUTER_MODIFIER_KEY_NAMES } from "@synara/shared/computerKeyNames";
 import {
   assertDesktopOperationActive,
@@ -85,6 +85,7 @@ import {
   COMPUTER_SERVICE,
   COMPUTER_SERVICE_OWNER_MISMATCH_ERROR,
   createSessionKWinComputerDbus,
+  COMPUTER_CAPTURE_FLAGS,
   isCaptureMethod,
   KWIN_SERVICE,
   KWinDbusTimeoutError,
@@ -198,6 +199,26 @@ const DEFAULT_IDLE_RELEASE_MINUTES = 10;
 const MAX_IDLE_CHECK_INTERVAL_MS = 60_000;
 const MIN_IDLE_CHECK_INTERVAL_MS = 250;
 const CAPTURE_RECOVERY_MAX_MS = 30_000;
+/**
+ * The idle pane: after this many stills identical to the one it already
+ * shows, the capture cadence drops to `STILL_IDLE_INTERVAL_MS` until something
+ * changes, an action runs or a window moves. An idle desktop costs a quarter
+ * of the encodes, and the compositor a quarter of the repaints.
+ */
+const STILL_IDLE_AFTER_UNCHANGED = 4;
+const STILL_IDLE_INTERVAL_MS = 2_000;
+/**
+ * The longest stills wait behind one desktop operation before one goes out
+ * anyway: a still in the middle of an action only queues in front of the
+ * action's own capture, but a long wait or launch must not freeze the pane.
+ */
+const STILL_PAUSE_MAX_MS = 1_000;
+/**
+ * An operation context this backend has not heard from for this long no
+ * longer holds stills back, whatever its flag says (a context made for a
+ * cleanup that cannot be cancelled never clears it).
+ */
+const SERVED_OPERATION_STALE_MS = 3_000;
 /** How long a passive availability answer stays good. */
 const PROBE_MEMO_MS = 3_000;
 /**
@@ -695,11 +716,16 @@ export class KWinComputerBackend implements ComputerBackend {
   private disposed = false;
   private readonly provisionAbort = new AbortController();
   private refusedInstance: string | undefined;
-  private streamListener: ComputerFrameListener | undefined;
-  private streamTimer: ReturnType<typeof setInterval> | undefined;
-  private streamGeneration = 0;
-  private stillInFlight = false;
-  private readonly stillDedupe = new StillFrameDedupe();
+  /** The pane's still loop; see `captureStill`. */
+  private readonly stills: StillFramePublisher;
+  /** Whether a pane is attached to `stills`: watching holds off the idle release. */
+  private streamAttached = false;
+  /**
+   * Desktop operations this backend served, with when it last heard from
+   * each, so stills can wait while one runs; see `stillsShouldWait`.
+   */
+  private readonly servedOperations = new Map<{ readonly active: boolean }, number>();
+  private stillsPausedSince: number | undefined;
   private captureQueue: Promise<void> = Promise.resolve();
   private capturePending = 0;
   private startPromise: Promise<void> | undefined;
@@ -710,7 +736,6 @@ export class KWinComputerBackend implements ComputerBackend {
   ) => ChildProcess;
   private readonly resolveApp: AppLaunchResolver;
   private readonly runClipboardCommand: ClipboardCommandRunner;
-  private nextSequence = 1;
   private currentPoint: ComputerPoint | null = null;
   /**
    * Where the workspace's top-left sat in global coordinates at the last
@@ -718,9 +743,11 @@ export class KWinComputerBackend implements ComputerBackend {
    * `readWindows` for why the agent speaks a 0-based space at all.
    */
   private lastAgentOrigin: ComputerPoint = { x: 0, y: 0 };
-  private readonly windowChanges = new WindowListChangeNotifier((windows) =>
-    this.emit({ type: "windows-changed", windows }),
-  );
+  private readonly windowChanges = new WindowListChangeNotifier((windows) => {
+    // A window changed: whatever the pane shows is about to be stale.
+    this.stills.wake();
+    this.emit({ type: "windows-changed", windows });
+  });
   private readonly eventListeners = new Set<ComputerBackendEventListener>();
 
   constructor(options: KWinComputerBackendOptions = {}) {
@@ -866,6 +893,27 @@ export class KWinComputerBackend implements ComputerBackend {
               loadedPluginId,
             );
           });
+    this.stills = new StillFramePublisher({
+      capture: () => this.captureStill(),
+      // Watching is not driving: opening the pane must neither start the
+      // agent session nor keep an idle one alive, so stills never start it.
+      prepare: async () => {
+        await this.ensurePlugin({ start: false });
+        this.stillFailures = 0;
+        // A pane opened onto a capture path already called broken asks again.
+        if (this.pluginHealth?.capture === false) this.scheduleCaptureRecovery();
+      },
+      isCaptureAvailable: () => !this.disposed && this.pluginHealth?.capture === true,
+      // Delivered once, to the stream listener the manager attached. The
+      // manager is the only consumer of stills; emitting the same frame a
+      // second time as an event handed every observer a copy nobody read.
+      emit: () => undefined,
+      now: () => this.now(),
+      intervalMs: this.stillIntervalMs,
+      idleIntervalMs: Math.max(this.stillIntervalMs, STILL_IDLE_INTERVAL_MS),
+      idleAfterUnchanged: STILL_IDLE_AFTER_UNCHANGED,
+      paused: () => this.stillsShouldWait(),
+    });
     this.healthState = new ComputerHealthState({
       readStatus: () => ({
         status: this.connectedPlugin()
@@ -1836,42 +1884,21 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   async attachStream(listener: ComputerFrameListener): Promise<void> {
-    const generation = ++this.streamGeneration;
-    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
-    this.streamTimer = undefined;
-    this.streamListener = undefined;
-    // Watching is not driving: opening the pane must neither start the agent
-    // session nor keep an idle one alive, so stills never start the plugin.
-    await this.ensurePlugin({ start: false });
-    if (this.disposed || generation !== this.streamGeneration) return;
-    this.streamListener = listener;
-    this.stillFailures = 0;
-    this.stillDedupe.reset();
-    // A pane opened onto a capture path already called broken asks again.
-    if (this.pluginHealth?.capture === false) this.scheduleCaptureRecovery();
-    await this.publishStillFrame();
-    // A replacement or detach can also arrive during the first capture.
-    if (this.disposed || generation !== this.streamGeneration) return;
-    this.streamTimer = setInterval(() => {
-      void this.publishStillFrame();
-    }, this.stillIntervalMs);
-    this.streamTimer.unref?.();
+    // Watching counts as use for the idle release (S9) from the moment the
+    // pane asks, before the first still is even captured.
+    this.streamAttached = true;
+    await this.stills.attach(listener);
   }
 
   async detachStream(): Promise<void> {
     this.lastPluginUseAt = this.now();
-    this.streamGeneration += 1;
+    this.streamAttached = false;
     this.cancelCaptureRecovery();
-    this.stillDedupe.reset();
-    this.streamListener = undefined;
-    if (this.streamTimer !== undefined) clearInterval(this.streamTimer);
-    this.streamTimer = undefined;
+    await this.stills.detach();
   }
 
   async requestKeyframe(): Promise<void> {
-    if (!this.streamListener) return;
-    this.stillDedupe.deferForce();
-    await this.publishStillFrame();
+    await this.stills.requestKeyframe();
   }
 
   async captureWindow(
@@ -2025,6 +2052,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private async ensurePlugin(
     options: { readonly start?: boolean; readonly automatic?: boolean } = {},
   ): Promise<KWinComputerPluginApi> {
+    this.noteOperation();
     const plugin = await this.ensureConnectedPlugin(options.automatic === true);
     if (options.start !== false) await this.startPlugin(plugin);
     return plugin;
@@ -2983,62 +3011,68 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   /**
-   * One workspace still, straight out of the plugin and onto the wire.
+   * One workspace still for the pane, straight out of the plugin and onto the
+   * wire.
    *
    * Nothing here goes through `captureWorkspaceScreenshot`: that builds a
    * `ComputerScreenshot`, whose payload is base64, and a frame carries raw
-   * bytes. Round-tripping a multi-megabyte PNG through base64 and back — twice
-   * a second, forever, while anyone is watching the pane — cost two full copies
-   * and an encode per frame to arrive back at the bytes the capture already
-   * returned. The rect comes from the cached workspace geometry for the same
+   * bytes. The rect comes from the cached workspace geometry for the same
    * reason: a window enumeration per frame is a window enumeration per frame.
+   *
+   * A plugin with `captureEx` renders it as a passive JPEG — not agent
+   * activity, so an open pane neither keeps the session alive nor repaints
+   * the badge, and an encode an order of magnitude cheaper than PNG. Model
+   * screenshots never take this path; they stay PNG.
    */
-  private async publishStillFrame(): Promise<void> {
-    const listener = this.streamListener;
-    const generation = this.streamGeneration;
-    if (
-      !listener ||
-      this.pluginHealth?.capture !== true ||
-      this.stillInFlight ||
-      this.capturePending > 0
-    )
-      return;
-    this.stillInFlight = true;
+  private async captureStill(): Promise<StillFrameCapture | undefined> {
+    // An agent capture is queued: it goes first, and this tick is skipped.
+    if (this.capturePending > 0) return undefined;
     try {
       const region = await this.workspaceRect();
-      if (this.capturePending > 0) return;
-      const data = await this.captureRegion(
-        region.x,
-        region.y,
-        region.width,
-        region.height,
-        this.previewMaxDimension,
-      );
-      // Cheap header read, kept for the same reason the screenshot path has it:
-      // a payload that is not a PNG must fail here rather than in a decoder in
-      // the browser, where the only symptom is a blank pane.
-      readPngDimensions(data, { source: this.captureSource });
-      if (this.disposed || generation !== this.streamGeneration || this.streamListener !== listener)
-        return;
+      if (this.capturePending > 0) return undefined;
+      const still = await this.capturePreview(region);
       this.noteStillSuccess();
-      if (!this.stillDedupe.shouldPublish(data, this.stillDedupe.takeForce(false))) return;
-      // Delivered once, to the stream listener the manager attached. The
-      // manager is the only consumer of stills; emitting the same frame a
-      // second time as an event handed every observer a copy nobody read.
-      listener({
-        sequence: this.nextSequence++,
-        timestampMs: this.now(),
-        // Every frame is a complete PNG still. There is no H.264 codec config
-        // or delta frame in Tier 1, so the envelope remains keyframe-only.
-        keyframe: true,
-        codecConfig: false,
-        data,
-      });
+      return still;
     } catch (error) {
       this.noteStillFailure(error);
-    } finally {
-      this.stillInFlight = false;
+      throw error;
     }
+  }
+
+  private async capturePreview(region: ComputerRect): Promise<StillFrameCapture> {
+    const plugin = await this.ensurePlugin({ start: false });
+    this.assertCaptureSupported();
+    const captureRegionEx = this.pluginFeature("captureEx") ? plugin.captureRegionEx : undefined;
+    if (captureRegionEx) {
+      const flags = COMPUTER_CAPTURE_FLAGS.passive | COMPUTER_CAPTURE_FLAGS.jpeg;
+      const captured = readCaptureEx(
+        await this.enqueueCapture(() =>
+          this.pluginValue(() =>
+            captureRegionEx(
+              region.x,
+              region.y,
+              region.width,
+              region.height,
+              this.previewMaxDimension,
+              flags,
+            ),
+          ),
+        ),
+      );
+      return previewStill(captured, this.captureSource);
+    }
+    const data = await this.captureRegion(
+      region.x,
+      region.y,
+      region.width,
+      region.height,
+      this.previewMaxDimension,
+    );
+    // Cheap header read, kept for the same reason the screenshot path has it:
+    // a payload that is not a PNG must fail here rather than in a decoder in
+    // the browser, where the only symptom is a blank pane.
+    readPngDimensions(data, { source: this.captureSource });
+    return { data, mimeType: "image/png" };
   }
 
   private noteStillSuccess(): void {
@@ -3069,7 +3103,7 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   private scheduleCaptureRecovery(): void {
-    if (this.captureRecoveryTimer !== undefined || this.disposed || !this.streamListener) return;
+    if (this.captureRecoveryTimer !== undefined || this.disposed || !this.streamAttached) return;
     const delayMs = this.captureRecoveryDelayMs;
     this.captureRecoveryDelayMs = Math.min(CAPTURE_RECOVERY_MAX_MS, delayMs * 2);
     this.captureRecoveryTimer = setTimeout(() => {
@@ -3091,7 +3125,7 @@ export class KWinComputerBackend implements ComputerBackend {
    * reconnect loop's, whose fresh health read answers this too.
    */
   private async recoverCapture(): Promise<void> {
-    if (this.disposed || !this.streamListener) return;
+    if (this.disposed || !this.streamAttached) return;
     if (this.pluginHealth?.capture === true) {
       this.stillFailures = 0;
       return;
@@ -3100,10 +3134,48 @@ export class KWinComputerBackend implements ComputerBackend {
     const health = plugin ? await this.readPluginHealth(plugin).catch(() => undefined) : undefined;
     if (health?.capture === true) {
       this.stillFailures = 0;
-      await this.publishStillFrame();
+      await this.stills.publish({ force: true });
       return;
     }
     this.scheduleCaptureRecovery();
+  }
+
+  /**
+   * Remembers the desktop operation this call belongs to, so the pane's
+   * stills wait while it runs; see `stillsShouldWait`.
+   */
+  private noteOperation(): void {
+    const operation = desktopOperationContext();
+    if (operation?.active !== true) return;
+    const known = this.servedOperations.has(operation);
+    this.servedOperations.set(operation, this.now());
+    // An action is starting: the pane goes back to the fast cadence.
+    if (!known) this.stills.wake();
+  }
+
+  /**
+   * Whether the pane's still should wait: a desktop operation this backend is
+   * serving is still running. A still captured in the middle of an action
+   * queues in front of the action's own observation (the plugin captures one
+   * at a time) and shows a half-finished desktop; the publisher takes one the
+   * moment the operation ends instead. A long operation lets one through every
+   * `STILL_PAUSE_MAX_MS`, so a wait or a slow launch never freezes the pane.
+   */
+  private stillsShouldWait(): boolean {
+    const now = this.now();
+    for (const [operation, at] of this.servedOperations) {
+      if (!operation.active || now - at > SERVED_OPERATION_STALE_MS) {
+        this.servedOperations.delete(operation);
+      }
+    }
+    if (this.servedOperations.size === 0) {
+      this.stillsPausedSince = undefined;
+      return false;
+    }
+    this.stillsPausedSince ??= now;
+    if (now - this.stillsPausedSince < STILL_PAUSE_MAX_MS) return true;
+    this.stillsPausedSince = now;
+    return false;
   }
 
   private async pressButton(code: number): Promise<void> {
@@ -3189,7 +3261,7 @@ export class KWinComputerBackend implements ComputerBackend {
   private idlePlugin(): KWinComputerPluginApi | undefined {
     const plugin = this.connectedPlugin();
     if (!plugin || this.disposed || this.connectPromise || this.startPromise) return undefined;
-    if (this.drivingAgent !== null || this.streamListener !== undefined) return undefined;
+    if (this.drivingAgent !== null || this.streamAttached) return undefined;
     if (this.pluginCallsInFlight > 0 || this.capturePending > 0) return undefined;
     if (this.now() - this.lastPluginUseAt < this.idleReleaseMs) return undefined;
     return plugin;
@@ -3912,6 +3984,42 @@ function readByteArray(value: unknown): Uint8Array {
     return Uint8Array.from(unwrapped as number[]);
   }
   throw new ComputerBackendError("Synara computer capture returned invalid PNG bytes.");
+}
+
+/** A `captureWindowEx`/`captureRegionEx` reply: the bytes and their MIME type. */
+interface CaptureEx {
+  readonly bytes: Uint8Array;
+  readonly mime: string;
+}
+
+function readCaptureEx(value: unknown): CaptureEx {
+  const reply = unwrapDbusValue(value);
+  if (!Array.isArray(reply) || reply.length !== 2 || typeof reply[1] !== "string") {
+    throw new ComputerBackendError("Synara computer capture returned an invalid reply.");
+  }
+  return { bytes: readByteArray(reply[0]), mime: reply[1] };
+}
+
+const JPEG_SIGNATURE = [0xff, 0xd8, 0xff] as const;
+
+/**
+ * A preview still as the pane receives it. Checked here for the reason the
+ * PNG header read exists: a payload that is not what it claims must fail on
+ * the server, not in a decoder in the browser where a blank pane is the only
+ * symptom.
+ */
+function previewStill(captured: CaptureEx, source: string): StillFrameCapture {
+  if (captured.mime === "image/jpeg") {
+    if (!JPEG_SIGNATURE.every((byte, index) => captured.bytes[index] === byte)) {
+      throw new ComputerBackendError(`${source} did not return a usable JPEG image.`);
+    }
+    return { data: captured.bytes, mimeType: "image/jpeg" };
+  }
+  if (captured.mime === "image/png") {
+    readPngDimensions(captured.bytes, { source });
+    return { data: captured.bytes, mimeType: "image/png" };
+  }
+  throw new ComputerBackendError(`${source} returned ${captured.mime} for a preview still.`);
 }
 
 /**

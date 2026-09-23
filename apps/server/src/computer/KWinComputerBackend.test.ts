@@ -3024,21 +3024,21 @@ describe("KWinComputerBackend", () => {
     }
   });
 
-  it("clears the old stream timer before attaching a replacement listener", async () => {
+  it("keeps one still loop when a replacement listener attaches", async () => {
     vi.useFakeTimers();
-    const clearInterval = vi.spyOn(globalThis, "clearInterval");
     try {
       const dbus = new FakeDbus();
       const backend = makeBackend(dbus, { stillIntervalMs: 100 });
       await backend.attachStream(() => undefined);
-      const firstTimer = (backend as unknown as { streamTimer: ReturnType<typeof setInterval> })
-        .streamTimer;
-
       await backend.attachStream(() => undefined);
-      expect(clearInterval).toHaveBeenCalledWith(firstTimer);
+      const captures = () =>
+        dbus.plugin.calls.filter((call) => call.method === "captureRegion").length;
+      const attached = captures();
+      await vi.advanceTimersByTimeAsync(350);
+      // One tick per interval: the first listener's loop did not survive.
+      expect(captures() - attached).toBe(3);
       await backend.dispose();
     } finally {
-      clearInterval.mockRestore();
       vi.useRealTimers();
     }
   });
