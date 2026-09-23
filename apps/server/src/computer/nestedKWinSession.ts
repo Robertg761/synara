@@ -27,11 +27,17 @@
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
-import { desktopApplicationEnvironment } from "./desktopAppEnvironment.ts";
+import {
+  desktopApplicationEnvironment,
+  singleInstanceLaunch,
+  withIsolatedProfile,
+  type AgentLaunch,
+} from "./desktopAppEnvironment.ts";
 import {
   createNestedSessionDirectory,
   currentServerIdentity,
@@ -247,6 +253,9 @@ export async function startNestedKWinSession(
   const waylandDisplay = options.socketName ?? `synara-${sessionId.split("-").at(-1)}`;
   const children: SupervisedProcess[] = [];
   const launchedApps = new Set<ChildProcess>();
+  // Profiles made for Flatpak apps inside their own ~/.var/app; everything
+  // else lives in the runtime directory and goes with it.
+  const agentProfiles = new Set<string>();
   // Resolved from the ambient runtime directory, before this session invents
   // one of its own: a marker written inside a private directory that this
   // session's own teardown deletes is a marker only a live server can find,
@@ -277,6 +286,8 @@ export async function startNestedKWinSession(
     for (const child of children.toReversed()) await child.terminate();
     await marker?.remove();
     if (runtimeDirectory) await rm(runtimeDirectory, { recursive: true, force: true });
+    for (const profile of agentProfiles) await rm(profile, { recursive: true, force: true });
+    agentProfiles.clear();
   };
 
   try {
@@ -408,6 +419,7 @@ export async function startNestedKWinSession(
         spawnIntoSession(
           session,
           launchedApps,
+          agentProfiles,
           sessionMarker,
           app,
           args,
@@ -664,12 +676,19 @@ export function nestedKWinBackendOptions(
 function spawnIntoSession(
   session: NestedKWinSession,
   launchedApps: Set<ChildProcess>,
+  agentProfiles: Set<string>,
   marker: SessionMarkerWriter,
-  app: string,
-  args: readonly string[],
+  requestedApp: string,
+  requestedArgs: readonly string[],
   spawnOptions: Partial<DesktopSpawnOptions> | undefined,
   spawnApplication?: NestedKWinSessionOptions["spawnApplication"],
 ): ChildProcess {
+  const { command: app, args } = isolatedFromHostInstances(
+    { command: requestedApp, args: requestedArgs },
+    session,
+    spawnOptions?.env?.HOME ?? process.env.HOME ?? homedir(),
+    agentProfiles,
+  );
   // The caller's environment has already been scrubbed once by the backend;
   // scrubbing again is idempotent and keeps this safe for any other caller.
   // The session's own coordinates go on top, because a launch into the nested
@@ -696,6 +715,58 @@ function spawnIntoSession(
   child.once("exit", forget);
   child.once("error", forget);
   return child;
+}
+
+/**
+ * A single-instance program launched into the nested desktop with a profile
+ * of its own. The nested session shares the human's home, so Chromium, an
+ * Electron app or LibreOffice started with the default profile finds the
+ * human's running instance through that profile (or the temp directory it
+ * derives its pipe from), hands it the launch and exits — and the window
+ * opens on the human's desktop. With a profile of its own it can only find
+ * instances the agent started in this session. The profile is per session:
+ * in the session's runtime directory, or for a Flatpak app, which sees only
+ * its own `~/.var/app/<id>`, under that app's cache (removed with the
+ * session). A desktop entry launched through `gio` takes no arguments, so
+ * such a program is refused there rather than launched unbound.
+ */
+function isolatedFromHostInstances(
+  launch: AgentLaunch,
+  session: NestedKWinSession,
+  home: string,
+  agentProfiles: Set<string>,
+): AgentLaunch {
+  const program = singleInstanceLaunch(launch);
+  if (!program) return launch;
+  const refuse = (why: string) =>
+    new ComputerBackendError(
+      `${program.name} keeps one running instance per profile, and ${why}, so it would open ` +
+        "on the human's desktop instead of the agent's. It was not started.",
+    );
+  if (program.desktopEntry) {
+    throw refuse(
+      "its desktop entry cannot be given a separate profile; launch the program by name instead",
+    );
+  }
+  const sessionDirectory = session.runtimeDirectory;
+  if (!sessionDirectory) throw refuse("this desktop has no private directory to keep one in");
+  const profileName = program.name.replace(/[^A-Za-z0-9._-]/g, "_");
+  let profile: string;
+  if (program.flatpakAppId) {
+    profile = join(
+      home,
+      ".var",
+      "app",
+      program.flatpakAppId,
+      "cache",
+      "synara-agent-profiles",
+      basename(sessionDirectory),
+    );
+    agentProfiles.add(profile);
+  } else {
+    profile = join(sessionDirectory, "profiles", profileName);
+  }
+  return withIsolatedProfile(launch, program, profile);
 }
 
 function requireSession(resolveSession: () => NestedKWinSession | undefined): NestedKWinSession {

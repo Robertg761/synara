@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
-import { readdir, readFile, rm, stat } from "node:fs/promises";
-import { mkdtempSync } from "node:fs";
-import { join } from "node:path";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
+import { existsSync, mkdtempSync } from "node:fs";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
@@ -834,6 +834,69 @@ describe("launching applications into a session", () => {
     // Still pointed at the nested session rather than the human's.
     expect(env.DBUS_SESSION_BUS_ADDRESS).toBe(BUS_ADDRESS);
     expect(env.WAYLAND_DISPLAY).toBe(session.waylandDisplay);
+    await session.dispose();
+  });
+
+  it("gives a single-instance app a profile of its own, never the human's", async () => {
+    // With the shared home, Chromium would find the human's running browser
+    // through its default profile, hand it the launch, and the window would
+    // open on their desktop.
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(harness.options());
+    session.spawnApp("/usr/bin/chromium", [
+      "--user-data-dir=/home/human/.config/chromium",
+      "https://example.org",
+    ]);
+    session.spawnApp("/usr/bin/soffice", ["--writer"]);
+
+    const runtimeDirectory = session.runtimeDirectory ?? "";
+    expect(runtimeDirectory).not.toBe("");
+    expect(harness.apps[0]?.args).toEqual([
+      "https://example.org",
+      `--user-data-dir=${join(runtimeDirectory, "profiles", "chromium")}`,
+    ]);
+    expect(harness.apps[1]?.args).toEqual([
+      "--writer",
+      `-env:UserInstallation=file://${join(runtimeDirectory, "profiles", "soffice")}`,
+    ]);
+    // Anything else is launched as asked.
+    session.spawnApp("kcalc", ["--foo"]);
+    expect(harness.apps[2]?.args).toEqual(["--foo"]);
+    await session.dispose();
+  });
+
+  it("keeps a Flatpak app's profile inside its sandbox and removes it with the session", async () => {
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(harness.options());
+    const home = await mkdtemp(join(tmpdir(), "synara-nested-home-"));
+    try {
+      session.spawnApp("flatpak", ["run", "com.google.Chrome"], { env: { HOME: home } });
+      const runtimeDirectory = session.runtimeDirectory ?? "";
+      const profile = join(
+        home,
+        ".var/app/com.google.Chrome/cache/synara-agent-profiles",
+        basename(runtimeDirectory),
+      );
+      expect(harness.apps[0]?.args).toEqual([
+        "run",
+        "com.google.Chrome",
+        `--user-data-dir=${profile}`,
+      ]);
+      await mkdir(profile, { recursive: true });
+      await session.dispose();
+      expect(existsSync(profile)).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a single-instance app's desktop entry, which takes no profile", async () => {
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(harness.options());
+    expect(() =>
+      session.spawnApp("/usr/bin/gio", ["launch", "/usr/share/applications/chromium.desktop"]),
+    ).toThrow(/human's desktop/);
+    expect(harness.apps).toHaveLength(0);
     await session.dispose();
   });
 
