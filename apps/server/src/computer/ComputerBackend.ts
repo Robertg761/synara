@@ -225,6 +225,16 @@ export type ComputerBackendEvent =
        */
       readonly pauses: readonly string[];
     }
+  /**
+   * The desktop this backend was bound to no longer exists and will not come
+   * back on its own — the compositor instance it drove exited, as when a
+   * Hyprland session ends while the server keeps running. Distinct from a
+   * reconnect, which the backend handles itself. The service may re-run
+   * backend selection and swap in whatever it picks, except for a backend an
+   * explicit override named, which stays and reports. `message` says what
+   * was lost.
+   */
+  | { readonly type: "desktop-gone"; readonly message: string }
   | { readonly type: "frame"; readonly frame: ComputerStreamFrame };
 
 /**

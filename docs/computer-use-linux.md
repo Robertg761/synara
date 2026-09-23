@@ -39,10 +39,43 @@ The core is shared with the macOS Cua backend and lives in
   in the manager before the lease is claimed and the window restacked and
   aimed for a dispatch the backend would refuse anyway.
 
+Optional performance and reliability hooks. Each is absent on the Cua backend,
+which keeps its behaviour exactly:
+
+- `launchApp` results may name `appId` (the desktop or flatpak id windows
+  report as `appName`) beside `pid`. Window readiness then accepts a window of
+  that app, or of the launch name, when none carries the pid, because a
+  flatpak or `gio launch` wrapper hands the window to another process. Without
+  `appId` the pid rule stays exact.
+- `writeClipboardForPaste(text)`: a single-use clipboard offer
+  (`wl-copy --paste-once`) whose `consumed` promise settles once the paste
+  target read it. Paste restores the human's clipboard then, bounded at
+  `COMPUTER_PASTE_CONSUME_TIMEOUT_MS` (2 s), instead of after the fixed 250 ms.
+- `captureLuma(request)`: raw 8-bit luma for the scroll-measurement baseline
+  nobody looks at. Same geometry and scale as `captureScreenshot(request)`,
+  luma as `decodePngLuma` computes it; a failure falls back to the PNG
+  baseline.
+- `defaultObservationRegion()`: the output an untargeted model observation
+  photographs when no window holds the agent's focus, instead of the whole
+  multi-monitor workspace. The backend's own `getState` screenshot should
+  scope the same way.
+- `ComputerStreamFrame.mimeType`: a preview frame may be `image/jpeg`; the
+  frame envelope carries the type and the pane decodes it as such. Model
+  screenshots stay PNG. `StillFramePublisher` capture callbacks return
+  `{ data, mimeType }` for a non-PNG still.
+- The `desktop-gone` backend event: the desktop the backend was bound to has
+  ended for good (a Hyprland instance exited). The service re-runs selection
+  and swaps in a different tier; an explicit override is never re-selected.
+
 ## Backend selection
 
-`Layers/ComputerService.ts` resolves the backend once at startup, with no
-fallback in any direction once a choice is made:
+`Layers/ComputerService.ts` resolves the backend at startup, with no
+fallback in any direction once a choice is made. On Linux selection asks the
+session bus, so it runs off the startup path: the service waits at most
+`COMPUTER_SELECTION_STARTUP_BUDGET_MS` (1.5 s, shared with the passive probe),
+and past that starts the manager on a slot (`switchableComputerBackend.ts`)
+that reports `checking` availability and takes the selected backend when
+selection answers. The guidance profile is registered again when it does.
 
 1. `SYNARA_COMPUTER_BACKEND`, when set. `fake` and `cua` are platform-neutral;
    the Linux tiers are refused off Linux. An unknown value is not ignored: it

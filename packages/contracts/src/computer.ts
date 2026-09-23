@@ -303,6 +303,16 @@ export const ComputerAvailability = Schema.Union([
     kind: Schema.Literal("backend-unavailable"),
     message: TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH)),
   }),
+  /**
+   * The server is still finding out which desktop it drives. Startup does not
+   * wait on that question — a wedged session bus could stall it for tens of
+   * seconds — so for that window the answer is "not yet", which is neither a
+   * failure to report nor a setup to offer; it ends by itself.
+   */
+  Schema.Struct({
+    kind: Schema.Literal("checking"),
+    message: TrimmedNonEmptyString.check(Schema.isMaxLength(COMPUTER_MESSAGE_MAX_LENGTH)),
+  }),
 ]);
 export type ComputerAvailability = typeof ComputerAvailability.Type;
 
