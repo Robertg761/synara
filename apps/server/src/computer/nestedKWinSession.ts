@@ -188,6 +188,12 @@ export interface NestedKWinSession {
    */
   readonly exited: () => string | undefined;
   /**
+   * How many applications the agent launched here are still running. A
+   * session with any is never shut down for being idle: the app is the
+   * agent's work in progress. Optional only so test doubles can leave it out.
+   */
+  readonly liveApplicationCount?: () => number;
+  /**
    * Launches an application into this session and keeps it, so the app dies
    * with the desktop it was launched into rather than outliving it as an
    * orphan nothing can find.
@@ -368,6 +374,7 @@ export async function startNestedKWinSession(
       // the *first* ending is the reason worth reporting: the second is this
       // module's own teardown signal.
       exited: () => firstExit ?? kwin.exitDiagnostic() ?? bus.exitDiagnostic(),
+      liveApplicationCount: () => launchedApps.size,
       spawnApp: (app, args, spawnOptions) =>
         spawnIntoSession(
           session,

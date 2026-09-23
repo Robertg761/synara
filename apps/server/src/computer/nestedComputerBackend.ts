@@ -34,7 +34,12 @@
  * settings panel's Set up — boots a fresh session, exactly like
  * first use did.
  */
-import type { ComputerAvailability, ComputerCapabilities } from "@synara/contracts";
+import type {
+  ComputerAvailability,
+  ComputerCapabilities,
+  ComputerScreenSize,
+  ComputerWindow,
+} from "@synara/contracts";
 import { COMPUTER_NESTED_KWIN_BACKEND } from "@synara/contracts";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -47,6 +52,7 @@ import {
 
 import { NO_COMPUTER_CAPABILITIES, ComputerBackendError } from "./ComputerBackend.ts";
 import { type AtspiTreeReader } from "./atspiClient.ts";
+import type { ComputerFrameListener } from "./ComputerBackend.ts";
 import {
   KWinComputerBackend,
   PluginProvisioningError,
@@ -81,6 +87,45 @@ import { CLIPBOARD_SETUP_INCOMPLETE_MESSAGE, wlClipboardToolsPresent } from "./w
 
 const KWIN_COMMAND = "kwin_wayland";
 const INSTALLED_PLUGIN_FILE = /^SynaraComputerUsePluginV\d+\.so$/;
+/** How long a nested desktop may sit unused before it is shut down. */
+const DEFAULT_IDLE_SHUTDOWN_MINUTES = 10;
+/** The longest gap between idle checks, so a shutdown is at most this late. */
+const MAX_IDLE_CHECK_INTERVAL_MS = 60_000;
+const MIN_IDLE_CHECK_INTERVAL_MS = 250;
+
+/**
+ * Every backend method that is a real use of the desktop: each one boots a
+ * parked session, holds off the idle shutdown while it runs, and restarts the
+ * idle clock when it ends. `availability`, `listWindows` and `getScreenSize`
+ * are not here: they are what every state publish reads, and they answer a
+ * parked desktop without booting it (see the overrides below).
+ */
+const NESTED_DESKTOP_USES = [
+  "captureRegion",
+  "captureScreenshot",
+  "captureWindow",
+  "checkInputReady",
+  "clearFocusWindow",
+  "click",
+  "doubleClick",
+  "drag",
+  "focusWindow",
+  "getState",
+  "hotkey",
+  "launchApp",
+  "moveCursor",
+  "performAction",
+  "pressKey",
+  "raiseWindow",
+  "readClipboard",
+  "requestKeyframe",
+  "rightClick",
+  "scroll",
+  "selectText",
+  "setValue",
+  "typeText",
+  "writeClipboard",
+] as const satisfies readonly (keyof KWinComputerBackend)[];
 /**
  * Only the windowed mode blames a closed window: the headless desktop has no
  * window anyone could have closed, so naming one would send the user hunting
@@ -140,6 +185,26 @@ export interface NestedComputerBackendOptions {
    * tests, which must never read or signal the host's process table.
    */
   readonly sweepStaleSessions?: () => Promise<unknown>;
+  /**
+   * How long the desktop may sit unused before it is shut down; `0` keeps it
+   * up for the server's lifetime. Defaults to
+   * `SYNARA_COMPUTER_NESTED_IDLE_MINUTES` from `hostEnv`, else ten minutes.
+   */
+  readonly idleShutdownMs?: number;
+}
+
+/**
+ * `SYNARA_COMPUTER_NESTED_IDLE_MINUTES` as milliseconds: `0` disables the idle
+ * shutdown, a positive number of minutes (fractions allowed) sets it, and
+ * anything else — a typo included — keeps the default rather than either
+ * extreme.
+ */
+export function parseNestedIdleShutdownEnv(value: string | undefined): number {
+  const fallback = DEFAULT_IDLE_SHUTDOWN_MINUTES * 60_000;
+  if (value === undefined || value.trim() === "") return fallback;
+  const minutes = Number(value.trim());
+  if (!Number.isFinite(minutes) || minutes < 0) return fallback;
+  return Math.round(minutes * 60_000);
 }
 
 /** Mutable box shared with the closures handed to the base constructor. */
@@ -171,6 +236,17 @@ export class NestedComputerBackend extends KWinComputerBackend {
   private provisionRun: Promise<string> | undefined;
   /** The sweep started at construction; every boot waits for it first. */
   private readonly staleSweep: Promise<void>;
+  private readonly idleShutdownMs: number;
+  private idleTimer: ReturnType<typeof setInterval> | undefined;
+  /** Desktop uses running right now; the idle shutdown waits for zero. */
+  private usesInFlight = 0;
+  private lastUseAt = Date.now();
+  private previewAttached = false;
+  private leaseHeld = false;
+  /** Shut down for being idle: dormant by choice, and booted by the next use. */
+  private parked = false;
+  private parking: Promise<void> | undefined;
+  private lastSize: NestedSize | undefined;
 
   constructor(options: NestedComputerBackendOptions = {}) {
     const ref: NestedSessionRef = { session: undefined, backend: undefined };
@@ -237,6 +313,20 @@ export class NestedComputerBackend extends KWinComputerBackend {
             () => undefined,
           )
         : Promise.resolve();
+    this.idleShutdownMs = Math.max(
+      0,
+      options.idleShutdownMs ??
+        parseNestedIdleShutdownEnv(hostEnv.SYNARA_COMPUTER_NESTED_IDLE_MINUTES),
+    );
+    // Instance wrappers rather than one override per method: the list above is
+    // the whole policy, and a method added to it is tracked the same way.
+    const methods = this as unknown as Record<string, unknown>;
+    for (const name of NESTED_DESKTOP_USES) {
+      const original = methods[name];
+      if (typeof original !== "function") continue;
+      methods[name] = (...args: unknown[]) =>
+        this.duringUse(() => (original as (...a: unknown[]) => Promise<unknown>).apply(this, args));
+    }
   }
 
   /**
@@ -259,12 +349,53 @@ export class NestedComputerBackend extends KWinComputerBackend {
     return { kind: "available", backend: COMPUTER_NESTED_KWIN_BACKEND };
   }
 
-  /** The establishing read, with the backend named as what it actually is. */
+  /**
+   * The establishing read, with the backend named as what it actually is.
+   *
+   * A desktop parked for being idle is not booted to answer it: every state
+   * publish makes this read, and a desktop that reboots because a panel
+   * refreshed was never idle at all. It answers from the passive probe, which
+   * is what a boot would find, and the next real use boots it.
+   */
   override async availability(): Promise<ComputerAvailability> {
-    const availability = await super.availability();
+    if (this.parked && !this.ref.session) return this.probeAvailability();
+    const availability = await this.duringUse(() => super.availability(), "observation");
     return availability.kind === "available"
       ? { kind: "available", backend: COMPUTER_NESTED_KWIN_BACKEND }
       : availability;
+  }
+
+  /** A parked desktop is an empty one; reading its windows must not boot it. */
+  override async listWindows(): Promise<readonly ComputerWindow[]> {
+    if (this.parked && !this.ref.session) return [];
+    return await this.duringUse(() => super.listWindows(), "observation");
+  }
+
+  /** A parked desktop keeps the size it had, and the next boot gets it back. */
+  override async getScreenSize(): Promise<ComputerScreenSize> {
+    if (this.parked && !this.ref.session && this.lastSize) {
+      return { width: this.lastSize.width, height: this.lastSize.height, scale: 1 };
+    }
+    return await this.duringUse(() => super.getScreenSize(), "observation");
+  }
+
+  /** The pane watching is a use: the desktop stays up while anyone looks at it. */
+  override async attachStream(listener: ComputerFrameListener): Promise<void> {
+    this.previewAttached = true;
+    await this.duringUse(() => super.attachStream(listener));
+  }
+
+  override async detachStream(): Promise<void> {
+    this.previewAttached = false;
+    this.lastUseAt = Date.now();
+    await super.detachStream();
+  }
+
+  /** A named driver is a held lease; its release restarts the idle clock. */
+  override async setDrivingAgent(name: string | null): Promise<void> {
+    this.leaseHeld = Boolean(name?.trim());
+    this.lastUseAt = Date.now();
+    await super.setDrivingAgent(name);
   }
 
   /**
@@ -279,7 +410,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
    * passive probe until there is a real verdict.
    */
   async statusAvailability(): Promise<ComputerAvailability> {
-    if (this.sessionStart) return this.probeAvailability();
+    if (this.sessionStart || this.parked) return this.probeAvailability();
     if (this.sessionStarted && (!this.ref.session || this.ref.session.exited() !== undefined))
       return { kind: "backend-unavailable", message: desktopDormantMessage(this.mode) };
     return this.probeAvailability();
@@ -325,6 +456,8 @@ export class NestedComputerBackend extends KWinComputerBackend {
    */
   override async dispose(): Promise<void> {
     this.disposing = true;
+    this.stopIdleTimer();
+    await this.parking;
     const pending = this.sessionStart;
     await super.dispose();
     const booted = pending ? await pending.catch(() => undefined) : undefined;
@@ -418,6 +551,88 @@ export class NestedComputerBackend extends KWinComputerBackend {
     return installed.length > 0;
   }
 
+  /**
+   * Runs one call to the desktop. A `use` holds off the idle shutdown while
+   * it runs and restarts the idle clock; an `observation` — a state publish's
+   * read — only holds it off, so a panel refreshing never keeps an otherwise
+   * idle desktop alive.
+   */
+  private async duringUse<T>(run: () => Promise<T>, kind: "use" | "observation" = "use"): Promise<T> {
+    this.usesInFlight += 1;
+    if (kind === "use") this.lastUseAt = Date.now();
+    try {
+      return await run();
+    } finally {
+      this.usesInFlight -= 1;
+      if (kind === "use") this.lastUseAt = Date.now();
+    }
+  }
+
+  private startIdleTimer(): void {
+    this.stopIdleTimer();
+    if (this.idleShutdownMs <= 0) return;
+    const interval = Math.min(
+      MAX_IDLE_CHECK_INTERVAL_MS,
+      Math.max(MIN_IDLE_CHECK_INTERVAL_MS, Math.floor(this.idleShutdownMs / 4)),
+    );
+    this.idleTimer = setInterval(() => {
+      void this.shutDownIfIdle().catch(() => undefined);
+    }, interval);
+    this.idleTimer.unref?.();
+  }
+
+  private stopIdleTimer(): void {
+    if (this.idleTimer !== undefined) clearInterval(this.idleTimer);
+    this.idleTimer = undefined;
+  }
+
+  /**
+   * Whether nothing is using the desktop: no call in flight, no pane watching,
+   * no lease held, no app the agent launched still running, nothing booting
+   * or being set up, and no use for the whole idle period.
+   */
+  private idleSession(): NestedKWinSession | undefined {
+    const session = this.ref.session;
+    if (!session || session.exited() !== undefined) return undefined;
+    if (this.disposing || this.parking || this.sessionStart || this.provisionRun) return undefined;
+    if (this.usesInFlight > 0 || this.previewAttached || this.leaseHeld) return undefined;
+    if ((session.liveApplicationCount?.() ?? 0) > 0) return undefined;
+    if (Date.now() - this.lastUseAt < this.idleShutdownMs) return undefined;
+    return session;
+  }
+
+  /**
+   * S9: a nested desktop nobody is using is ~260 MB of compositor, Xwayland
+   * and bus doing nothing. Shut down, it reboots in about a second on the
+   * next real use — exactly as first use did — so holding it costs more than
+   * dropping it.
+   *
+   * The session's own windows are the last check: an app that forked and let
+   * its launcher exit still has work on screen, and that is not idle.
+   */
+  private async shutDownIfIdle(): Promise<void> {
+    if (!this.idleSession()) return;
+    const windows = await super.listWindows().catch(() => undefined);
+    if (windows === undefined || windows.length > 0) {
+      this.lastUseAt = Date.now();
+      return;
+    }
+    // Everything above was asynchronous; anything that started meanwhile wins.
+    const session = this.idleSession();
+    if (!session) return;
+    this.ref.session = undefined;
+    this.parked = true;
+    this.stopIdleTimer();
+    this.releaseConnection();
+    this.parking = session
+      .dispose()
+      .catch(() => undefined)
+      .finally(() => {
+        this.parking = undefined;
+      });
+    await this.parking;
+  }
+
   /** What the base class's lazy `dbusFactory` resolves to: session, then bus. */
   private async connectToNestedSession(context: KWinDbusConnectContext): Promise<KWinComputerDbus> {
     const session = await this.ensureSession(context.automatic);
@@ -425,6 +640,8 @@ export class NestedComputerBackend extends KWinComputerBackend {
   }
 
   private async ensureSession(automatic: boolean): Promise<NestedKWinSession> {
+    // A shutdown in progress finishes before anything boots its replacement.
+    if (this.parking) await this.parking;
     const current = this.ref.session;
     if (current) {
       if (current.exited() === undefined) return current;
@@ -538,6 +755,10 @@ export class NestedComputerBackend extends KWinComputerBackend {
     }
     this.ref.session = session;
     this.sessionStarted = true;
+    this.parked = false;
+    this.lastSize = session.size;
+    this.lastUseAt = Date.now();
+    this.startIdleTimer();
     // The manager caches capabilities until this event: pre-setup they were
     // reported empty so the settings card offered Set up, and the running
     // session is what makes the full set true.

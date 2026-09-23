@@ -5,6 +5,7 @@ import type { ComputerBackendEvent } from "./ComputerBackend.ts";
 import type { KWinComputerDbus } from "./kwinDbus.ts";
 import {
   NestedComputerBackend,
+  parseNestedIdleShutdownEnv,
   type NestedComputerBackendOptions,
 } from "./nestedComputerBackend.ts";
 import {
@@ -23,6 +24,9 @@ const PACMAN_PLAN: SystemPackagePlan = {
   packages: ["kwin", "cmake"],
 };
 
+/** What the fake desktop reports, shared by every fake bus a harness dials. */
+const fakeDesktop = { windowsJson: "[]", stateGate: undefined as Promise<void> | undefined };
+
 /** The narrow slice of the D-Bus surface the connect path exercises. */
 function fakeDbusHandle(loaded: readonly string[] = [PLUGIN_ID]): {
   readonly dbus: KWinComputerDbus;
@@ -32,9 +36,13 @@ function fakeDbusHandle(loaded: readonly string[] = [PLUGIN_ID]): {
     healthJson: async () =>
       JSON.stringify({ ok: true, running: false, capture: true, kwinVersion: "6.7.3" }),
     // An empty desktop, enough for a state read to reach the AT-SPI reader.
-    stateJson: async () => JSON.stringify({ position: { x: 0, y: 0 }, targetWindowId: null }),
-    windowsJson: async () => "[]",
+    stateJson: async () => {
+      await fakeDesktop.stateGate;
+      return JSON.stringify({ position: { x: 0, y: 0 }, targetWindowId: null });
+    },
+    windowsJson: async () => fakeDesktop.windowsJson,
     stop: async () => true,
+    setAgentName: async () => true,
   };
   let disconnectListener: (() => void) | undefined;
   const dbus = {
@@ -106,6 +114,8 @@ function makeHarness(
     readonly atspiMode?: NestedAtspiMode;
     readonly createAtspiClient?: (env: NodeJS.ProcessEnv) => AtspiTreeReader;
     readonly sweepStaleSessions?: () => Promise<unknown>;
+    readonly idleShutdownMs?: number;
+    readonly liveApplications?: () => number;
   } = {},
 ): Harness {
   const sessionStarts: NestedKWinSessionOptions[] = [];
@@ -145,6 +155,7 @@ function makeHarness(
         pluginId: PLUGIN_ID,
         xDisplay: ":7",
         exited: () => exitReason,
+        liveApplicationCount: () => options.liveApplications?.() ?? 0,
         spawnApp: () => {
           throw new Error("no application is launched in this suite");
         },
@@ -172,6 +183,8 @@ function makeHarness(
     startSession,
     // Never the host's own marker directory or process table.
     sweepStaleSessions: options.sweepStaleSessions ?? (async () => []),
+    // Off unless a test is about it: the suite drives fake clocks a long way.
+    idleShutdownMs: options.idleShutdownMs ?? 0,
     connectDbus: async (busAddress) => {
       const handle = fakeDbusHandle([PLUGIN_ID]);
       dbusHandles.push(handle);
@@ -333,6 +346,140 @@ describe("stale sessions a crashed server left behind", () => {
     });
     await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
     await harness.backend.dispose();
+  });
+});
+
+describe("idle shutdown", () => {
+  const IDLE_MS = 60_000;
+
+  async function withFakeClock(run: () => Promise<void>): Promise<void> {
+    vi.useFakeTimers();
+    fakeDesktop.windowsJson = "[]";
+    fakeDesktop.stateGate = undefined;
+    try {
+      await run();
+    } finally {
+      fakeDesktop.windowsJson = "[]";
+      fakeDesktop.stateGate = undefined;
+      vi.useRealTimers();
+    }
+  }
+
+  it("reads SYNARA_COMPUTER_NESTED_IDLE_MINUTES, with 0 turning it off", () => {
+    expect(parseNestedIdleShutdownEnv(undefined)).toBe(600_000);
+    expect(parseNestedIdleShutdownEnv("")).toBe(600_000);
+    expect(parseNestedIdleShutdownEnv("3")).toBe(180_000);
+    expect(parseNestedIdleShutdownEnv("0.5")).toBe(30_000);
+    expect(parseNestedIdleShutdownEnv("0")).toBe(0);
+    expect(parseNestedIdleShutdownEnv("-1")).toBe(600_000);
+    expect(parseNestedIdleShutdownEnv("ten")).toBe(600_000);
+  });
+
+  it("shuts an unused desktop down and boots it again on the next real use", async () => {
+    await withFakeClock(async () => {
+      const harness = makeHarness({ idleShutdownMs: IDLE_MS });
+      await harness.backend.getState({});
+      expect(harness.sessionStarts).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(IDLE_MS / 2);
+      expect(harness.disposedSessions).toEqual([]);
+      await vi.advanceTimersByTimeAsync(IDLE_MS);
+      expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
+
+      // Parked, not dead: the settings card and every state publish read it
+      // without booting it, and nobody is told to click Set up.
+      await expect(harness.backend.statusAvailability()).resolves.toMatchObject({
+        kind: "available",
+      });
+      await expect(harness.backend.availability()).resolves.toMatchObject({
+        kind: "available",
+      });
+      await expect(harness.backend.listWindows()).resolves.toEqual([]);
+      await expect(harness.backend.getScreenSize()).resolves.toEqual({
+        width: 1920,
+        height: 1080,
+        scale: 1,
+      });
+      expect(harness.sessionStarts).toHaveLength(1);
+      // The reconnect loop does not reboot it either.
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 5);
+      expect(harness.sessionStarts).toHaveLength(1);
+
+      await harness.backend.getState({});
+      expect(harness.sessionStarts).toHaveLength(2);
+      expect(harness.backend.health().status).toBe("connected");
+      await harness.backend.dispose();
+    });
+  });
+
+  it("keeps the desktop while a lease is held, the pane watches, or an app runs", async () => {
+    await withFakeClock(async () => {
+      let apps = 0;
+      const harness = makeHarness({ idleShutdownMs: IDLE_MS, liveApplications: () => apps });
+      await harness.backend.getState({});
+
+      await harness.backend.setDrivingAgent("Agent");
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
+      expect(harness.disposedSessions).toEqual([]);
+      await harness.backend.setDrivingAgent(null);
+
+      apps = 1;
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
+      expect(harness.disposedSessions).toEqual([]);
+      apps = 0;
+
+      // The fake plugin cannot capture; the pane is attached all the same.
+      await harness.backend.attachStream(() => undefined).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
+      expect(harness.disposedSessions).toEqual([]);
+      await harness.backend.detachStream();
+
+      // An app that forked and let its launcher exit still has a window.
+      fakeDesktop.windowsJson = JSON.stringify([
+        { id: "w1", title: "kcalc", appName: "kcalc", bounds: { x: 0, y: 0, width: 10, height: 10 } },
+      ]);
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
+      expect(harness.disposedSessions).toEqual([]);
+      fakeDesktop.windowsJson = "[]";
+
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
+      expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
+      await harness.backend.dispose();
+    });
+  });
+
+  it("never shuts down under a call that is still running", async () => {
+    await withFakeClock(async () => {
+      const harness = makeHarness({ idleShutdownMs: IDLE_MS });
+      await harness.backend.getState({});
+      let release: (() => void) | undefined;
+      fakeDesktop.stateGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const slow = harness.backend.getState({});
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 3);
+      expect(harness.disposedSessions).toEqual([]);
+
+      release?.();
+      fakeDesktop.stateGate = undefined;
+      await slow;
+      // The idle clock restarts when the call ends, not when it began.
+      await vi.advanceTimersByTimeAsync(IDLE_MS / 2);
+      expect(harness.disposedSessions).toEqual([]);
+      await vi.advanceTimersByTimeAsync(IDLE_MS);
+      expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
+      await harness.backend.dispose();
+    });
+  });
+
+  it("is off at 0", async () => {
+    await withFakeClock(async () => {
+      const harness = makeHarness({ idleShutdownMs: 0 });
+      await harness.backend.getState({});
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+      expect(harness.disposedSessions).toEqual([]);
+      await harness.backend.dispose();
+    });
   });
 });
 

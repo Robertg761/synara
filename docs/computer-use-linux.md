@@ -299,6 +299,13 @@ it. `capabilities()` reports the empty set until `kwin_wayland` and an
 installed plugin exist, so the panel can offer Set up, and the full KWin set
 afterwards (`capabilities-changed`).
 
+A desktop nobody uses is shut down after `SYNARA_COMPUTER_NESTED_IDLE_MINUTES`
+(default 10, `0` keeps it up): no call in flight, no pane attached, no lease
+held, no app the agent launched still running, and no window on it. Parked
+that way it is not dormant: status reads, `availability()`, `listWindows()`
+(empty) and `getScreenSize()` (the last size) answer without booting it, and
+the next real use boots it again in about a second.
+
 `SYNARA_COMPUTER_NESTED=window` (or `SYNARA_COMPUTER_BACKEND=nested-window`)
 drops `--virtual` and nests the desktop as an ordinary window of the host
 session. It fails the seat policy on purpose — a window appears on the host —
