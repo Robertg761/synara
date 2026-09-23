@@ -839,7 +839,10 @@ describe("provision", () => {
       kind: "backend-unavailable",
     });
     expect(harness.sessionStarts).toHaveLength(1);
+    // A state publish's read answers passively; it boots nothing.
     await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(harness.sessionStarts).toHaveLength(1);
+    await harness.backend.getState({});
     expect(harness.sessionStarts).toHaveLength(2);
     expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
     await harness.backend.dispose();
@@ -866,7 +869,7 @@ describe("provision", () => {
       expect(harness.sessionStarts).toHaveLength(1);
 
       // The next real use boots a fresh desktop.
-      await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+      await harness.backend.getState({});
       expect(harness.sessionStarts).toHaveLength(2);
       // An exit of the session it already replaced changes nothing.
       harness.startedSessions[0]?.kill("exit code 1, signal null", { busSurvives: true });
@@ -934,8 +937,12 @@ describe("provision", () => {
         lastFailure: { message: expect.stringContaining("its window may have been closed") },
       });
 
-      // Dormant, not dead: the next real use still boots a fresh desktop.
+      // Dormant, not dead: a panel read reopens nothing, and the next real
+      // use still boots a fresh desktop.
       await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+      await expect(harness.backend.listWindows()).resolves.toEqual([]);
+      expect(harness.sessionStarts).toHaveLength(1);
+      await harness.backend.getState({});
       expect(harness.sessionStarts).toHaveLength(2);
       await harness.backend.dispose();
     } finally {

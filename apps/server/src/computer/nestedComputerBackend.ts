@@ -370,7 +370,15 @@ export class NestedComputerBackend extends KWinComputerBackend {
    */
   override async availability(): Promise<ComputerAvailability> {
     if (this.parked && !this.ref.session) return this.probeAvailability();
-    const availability = await this.duringUse(() => super.availability(), "observation");
+    return await this.namedAvailability(false);
+  }
+
+  /** With `explicit`, Set up's read: it boots a parked or closed desktop. */
+  private async namedAvailability(explicit: boolean): Promise<ComputerAvailability> {
+    const availability = await this.duringUse(
+      () => super.readAvailability({ explicit }),
+      explicit ? undefined : "observation",
+    );
     return availability.kind === "available"
       ? { kind: "available", backend: COMPUTER_NESTED_KWIN_BACKEND }
       : availability;
@@ -498,7 +506,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
       }
     }
     steps.push((await this.provisionOnce()).summary);
-    let availability = await this.availability();
+    let availability = await this.namedAvailability(true);
     if (availability.kind !== "available" && this.ref.session) {
       // A session whose processes exited was already reaped and replaced on
       // the way into availability(); reaching here with a session still cached
@@ -507,7 +515,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
       const dead = this.ref.session;
       this.ref.session = undefined;
       await dead.dispose().catch(() => undefined);
-      availability = await this.availability();
+      availability = await this.namedAvailability(true);
     }
     if (availability.kind !== "available") {
       throw new ComputerBackendError(
