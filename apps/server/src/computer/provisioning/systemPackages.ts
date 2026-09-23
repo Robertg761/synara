@@ -16,8 +16,8 @@
  * already present, so over-asking costs nothing but covers the second failure
  * in the same authorization.
  */
-import { spawn } from "node:child_process";
-import { constants, accessSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { constants, accessSync, readFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 
 import { ComputerBackendError } from "../ComputerBackend.ts";
@@ -27,6 +27,11 @@ import { detectLinuxDistribution, type LinuxDistribution } from "./linuxDistribu
 const MAX_INSTALL_OUTPUT_BYTES = 16 * 1024;
 const PKEXEC_DISMISSED_EXIT = 126;
 const PKEXEC_AUTHORIZATION_ERROR_EXIT = 127;
+/**
+ * How long an authorization dialog may sit unanswered. Only the wait for the
+ * dialog has a deadline; once the manager runs, nothing here interrupts it.
+ */
+const AUTHORIZATION_TIMEOUT_MS = 5 * 60_000;
 
 export interface SystemPackagePlan {
   /** The package manager binary, which is also how the distribution is named to the user. */
@@ -190,9 +195,18 @@ export interface PrivilegedRunResult {
   readonly stderr: string;
 }
 
+export interface PrivilegedRunOptions {
+  /**
+   * Cancels the run — but only while it is still waiting for authorization.
+   * Once the package manager runs as root, the run is left to finish.
+   */
+  readonly signal?: AbortSignal | undefined;
+}
+
 export type PrivilegedRunner = (
   command: string,
   args: readonly string[],
+  options?: PrivilegedRunOptions,
 ) => Promise<PrivilegedRunResult>;
 
 /** A pkexec exit that carries the manager's own words, in execFile's shape. */
@@ -210,41 +224,137 @@ class PrivilegedRunFailure extends Error {
   }
 }
 
+export interface PkexecRunnerDependencies {
+  readonly spawnPkexec?: (args: readonly string[]) => ChildProcess;
+  /** Whether a pid is still pkexec waiting for its dialog; see `awaitingAuthorization`. */
+  readonly awaitingAuthorization?: (pid: number) => boolean;
+  readonly signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
+  readonly authorizationTimeoutMs?: number;
+}
+
+/**
+ * Whether `pid` is still pkexec waiting for the authorization dialog rather
+ * than the package manager it becomes.
+ *
+ * pkexec is setuid root but keeps the caller's *real* uid until the dialog is
+ * answered; only then does it take root's real uid as well and exec the
+ * manager in the same pid. So a real uid that is still this user's means no
+ * package manager has started, and ending the process installs nothing. After
+ * that switch the kernel refuses this user's signals anyway, which makes the
+ * race between this check and the signal harmless: the signal either reaches a
+ * pkexec that has not exec'd, or fails.
+ */
+export function awaitingAuthorization(pid: number): boolean {
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, "utf8");
+    const name = /^Name:\s*(\S+)/m.exec(status)?.[1];
+    const realUid = /^Uid:\s*(\d+)/m.exec(status)?.[1];
+    return name === "pkexec" && realUid !== undefined && Number(realUid) === process.getuid?.();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Runs one privileged command, streaming its output instead of buffering it.
  *
- * Neither a timeout nor an output limit belongs here, and the previous
- * `execFile` had both. Both kill `pkexec`, and `pkexec` is not the process
- * doing the work: the package manager runs as root, as a *child* of pkexec, and
- * it keeps running with its transaction half applied and its lock file held.
+ * Neither a timeout on the whole run nor an output limit belongs here. Both
+ * kill `pkexec`, and after authorization `pkexec` *is* the package manager,
+ * running as root with its transaction half applied and its lock file held.
  * The user is then left with a dpkg that demands `--configure -a`, or a pacman
  * whose db.lck no unprivileged process can remove, and Synara's own message
- * says the install timed out. There is no deadline this side of the
- * authorization dialog that is better than letting a slow mirror be slow.
+ * says the install timed out. There is no deadline on the manager that is
+ * better than letting a slow mirror be slow.
+ *
+ * The wait for the dialog is different: nothing has run yet, so ending it
+ * costs nothing, and a dialog nobody answers — the user walked away, or no
+ * polkit agent ever showed one — must not wedge Set up forever. That wait has
+ * a deadline and honours the caller's cancellation; the manager has neither.
  *
  * Output is streamed and only its tail is kept, so a manager that prints a
  * hundred megabytes of progress cannot grow this process's heap either.
  */
-const pkexecRunner: PrivilegedRunner = (command, args) =>
-  new Promise<PrivilegedRunResult>((resolve, reject) => {
-    // pkexec strips the environment anyway; DEBIAN_FRONTEND rides the argv
-    // through `env` below when apt is the manager.
-    const child = spawn("pkexec", [command, ...args], { stdio: ["ignore", "pipe", "pipe"] });
-    const stdout = new OutputTail();
-    const stderr = new OutputTail();
-    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.once("error", (error: NodeJS.ErrnoException) => {
-      reject(new PrivilegedRunFailure(error.code ?? "spawn-failed", stdout.text(), stderr.text()));
-    });
-    child.once("close", (code, signal) => {
-      if (code === 0) {
-        resolve({ stdout: stdout.text(), stderr: stderr.text() });
+export function createPkexecRunner(dependencies: PkexecRunnerDependencies = {}): PrivilegedRunner {
+  const spawnPkexec =
+    dependencies.spawnPkexec ??
+    ((args: readonly string[]) => spawn("pkexec", [...args], { stdio: ["ignore", "pipe", "pipe"] }));
+  const stillAwaiting = dependencies.awaitingAuthorization ?? awaitingAuthorization;
+  const signalProcess =
+    dependencies.signalProcess ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+  const timeoutMs = dependencies.authorizationTimeoutMs ?? AUTHORIZATION_TIMEOUT_MS;
+  return (command, args, options = {}) =>
+    new Promise<PrivilegedRunResult>((resolve, reject) => {
+      const signal = options.signal;
+      if (signal?.aborted) {
+        reject(authorizationCancelledError());
         return;
       }
-      reject(new PrivilegedRunFailure(code ?? signal ?? "unknown", stdout.text(), stderr.text()));
+      // pkexec strips the environment anyway; DEBIAN_FRONTEND rides the argv
+      // through `env` below when apt is the manager.
+      const child = spawnPkexec([command, ...args]);
+      const stdout = new OutputTail();
+      const stderr = new OutputTail();
+      let cancelled: ComputerBackendError | undefined;
+      const cancelWhileUnauthorized = (reason: ComputerBackendError) => {
+        const pid = child.pid;
+        if (cancelled || pid === undefined || child.exitCode !== null) return;
+        if (!stillAwaiting(pid)) return;
+        try {
+          signalProcess(pid, "SIGTERM");
+          cancelled = reason;
+        } catch {
+          // Already the package manager, now root's: it runs to completion.
+        }
+      };
+      const timer = setTimeout(
+        () => cancelWhileUnauthorized(authorizationTimeoutError(timeoutMs)),
+        timeoutMs,
+      );
+      timer.unref?.();
+      const onAbort = () => cancelWhileUnauthorized(authorizationCancelledError());
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const settle = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+      child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+      child.once("error", (error: NodeJS.ErrnoException) => {
+        settle();
+        reject(new PrivilegedRunFailure(error.code ?? "spawn-failed", stdout.text(), stderr.text()));
+      });
+      child.once("close", (code, exitSignal) => {
+        settle();
+        if (cancelled) {
+          reject(cancelled);
+          return;
+        }
+        if (code === 0) {
+          resolve({ stdout: stdout.text(), stderr: stderr.text() });
+          return;
+        }
+        reject(new PrivilegedRunFailure(code ?? exitSignal ?? "unknown", stdout.text(), stderr.text()));
+      });
     });
-  });
+}
+
+const pkexecRunner: PrivilegedRunner = createPkexecRunner();
+
+function authorizationTimeoutError(timeoutMs: number): ComputerBackendError {
+  const minutes = Math.round(timeoutMs / 60_000);
+  return new ComputerBackendError(
+    `Nobody answered the system authorization dialog within ${minutes} minute${minutes === 1 ? "" : "s"}, ` +
+      "so no packages were installed. Click Set up again to retry.",
+    { retryable: true },
+  );
+}
+
+function authorizationCancelledError(): ComputerBackendError {
+  return new ComputerBackendError(
+    "Package installation was cancelled before it was authorized, so no packages were installed.",
+    { retryable: true },
+  );
+}
 
 /** The tail of one stream: enough to quote a failure, bounded against a flood. */
 class OutputTail {
@@ -277,6 +387,7 @@ class OutputTail {
 export async function installSystemPackages(
   plan: SystemPackagePlan,
   run: PrivilegedRunner = pkexecRunner,
+  options: PrivilegedRunOptions = {},
 ): Promise<string> {
   const commandLine = [plan.manager, ...plan.args, ...plan.packages];
   // apt-get is the one manager here that can still stop to ask a debconf
@@ -286,8 +397,10 @@ export async function installSystemPackages(
       ? ["env", "DEBIAN_FRONTEND=noninteractive", ...commandLine]
       : commandLine;
   try {
-    await run(argv[0]!, argv.slice(1));
+    await run(argv[0]!, argv.slice(1), options);
   } catch (error) {
+    // A refusal this module already worded — an unanswered dialog, a cancel.
+    if (error instanceof ComputerBackendError) throw error;
     throw describeInstallFailure(plan, error);
   }
   return `Installed ${plan.packages.join(", ")} with ${plan.manager}.`;

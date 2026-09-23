@@ -1,7 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import type { ChildProcess } from "node:child_process";
+import { PassThrough } from "node:stream";
+
+import { describe, expect, it, vi } from "vitest";
 
 import {
+  awaitingAuthorization,
   commandOnPath,
+  createPkexecRunner,
   installSystemPackages,
   installClipboardSystemPackage,
   planSystemPackageInstall,
@@ -200,5 +206,110 @@ describe("installClipboardSystemPackage", () => {
         },
       ),
     ).rejects.toThrow("Install wl-clipboard with your distribution's package manager");
+  });
+});
+
+/** A pkexec that records signals and ends only when told to. */
+class FakePkexec extends EventEmitter {
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly pid = 4_242_424;
+  exitCode: number | null = null;
+
+  finish(code: number | null, signal: NodeJS.Signals | null = null): void {
+    this.exitCode = code;
+    this.emit("close", code, signal);
+  }
+}
+
+function pkexecHarness(options: { readonly timeoutMs?: number } = {}) {
+  const child = new FakePkexec();
+  const state = { awaiting: true, signals: [] as string[], argv: [] as string[] };
+  const run = createPkexecRunner({
+    spawnPkexec: (args) => {
+      state.argv = [...args];
+      return child as unknown as ChildProcess;
+    },
+    awaitingAuthorization: () => state.awaiting,
+    signalProcess: (_pid, signal) => {
+      if (!state.awaiting) throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      state.signals.push(signal);
+      queueMicrotask(() => child.finish(null, signal));
+    },
+    authorizationTimeoutMs: options.timeoutMs ?? 60_000,
+  });
+  return { child, state, run };
+}
+
+describe("the pkexec runner", () => {
+  const plan: SystemPackagePlan = { manager: "pacman", args: ["-S"], packages: ["kwin"] };
+
+  it("gives up on a dialog nobody answers, which installs nothing", async () => {
+    vi.useFakeTimers();
+    try {
+      const { state, run } = pkexecHarness({ timeoutMs: 300_000 });
+      const install = installSystemPackages(plan, run);
+      const outcome = install.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(state.signals).toEqual(["SIGTERM"]);
+      await expect(outcome).resolves.toMatchObject({
+        message: expect.stringContaining("Nobody answered the system authorization dialog within 5 minutes"),
+        retryable: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never interrupts a package manager that is already running as root", async () => {
+    vi.useFakeTimers();
+    try {
+      const { child, state, run } = pkexecHarness({ timeoutMs: 1_000 });
+      const controller = new AbortController();
+      const install = run("pacman", ["-S", "kwin"], { signal: controller.signal });
+      // Authorized: pkexec has become the manager.
+      state.awaiting = false;
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      controller.abort();
+      expect(state.signals).toEqual([]);
+
+      // A slow mirror is allowed to be slow; the run ends when the manager does.
+      child.finish(0);
+      await expect(install).resolves.toEqual({ stdout: "", stderr: "" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a run that is still waiting for authorization", async () => {
+    const { state, run } = pkexecHarness();
+    const controller = new AbortController();
+    const install = installSystemPackages(plan, run, { signal: controller.signal });
+    controller.abort();
+    await expect(install).rejects.toThrow(/cancelled before it was authorized/);
+    expect(state.signals).toEqual(["SIGTERM"]);
+    expect(state.argv).toEqual(["pacman", "-S", "kwin"]);
+  });
+
+  it("does not start a run that was cancelled before it began", async () => {
+    const { state, run } = pkexecHarness();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(run("pacman", ["-S"], { signal: controller.signal })).rejects.toThrow(
+      /cancelled before it was authorized/,
+    );
+    expect(state.argv).toEqual([]);
+  });
+
+  it("never takes an ordinary process for pkexec awaiting a dialog", () => {
+    expect(awaitingAuthorization(process.pid)).toBe(false);
+    expect(awaitingAuthorization(2 ** 30)).toBe(false);
+  });
+
+  it("still reports the manager's own exit codes", async () => {
+    const { child, run } = pkexecHarness();
+    const install = installSystemPackages(plan, run);
+    child.finish(126);
+    await expect(install).rejects.toThrow(/authorization dialog was dismissed/);
   });
 });
