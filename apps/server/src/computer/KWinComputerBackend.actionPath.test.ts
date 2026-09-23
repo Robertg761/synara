@@ -1041,8 +1041,64 @@ describe("paste-once clipboard", () => {
         "wl-copy --paste-once --type text/plain agent text",
         "wl-copy --type text/plain human text",
       ]);
-      // Neither the fixed 250 ms nor the 2 s bound was waited out.
-      expect(Date.now() - startedAt).toBeLessThan(200);
+      // The 2 s bound was not waited out; the fixed settle is the floor.
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(245);
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("writes the payload again when a clipboard watcher took the offer before the paste", async () => {
+    const plugin = new FakePlugin();
+    const commands: string[] = [];
+    let clipboard = "human text";
+    const backend = makeBackend(plugin, {
+      runClipboardCommand: async (spec) => {
+        commands.push([spec.command, ...spec.args, spec.input ?? ""].join(" ").trim());
+        if (spec.command === "wl-paste") {
+          return { outcome: "exited", code: 0, stdout: clipboard, stderr: "" };
+        }
+        const offer = spec.args.includes("--paste-once");
+        // A history daemon reads every new selection at once; wl-copy
+        // --paste-once serves that one read and exits, leaving nothing.
+        clipboard = offer ? "" : (spec.input ?? "");
+        return {
+          outcome: "exited",
+          code: 0,
+          stdout: "",
+          stderr: "",
+          ...(offer ? { forkExited: Promise.resolve() } : {}),
+        };
+      },
+    });
+    const pastedTexts: string[] = [];
+    const key = plugin.key;
+    plugin.key = async (code, pressed) => {
+      if (code === 47 && pressed) pastedTexts.push(clipboard);
+      return key(code, pressed);
+    };
+    const manager = new (await import("./ComputerManager.ts")).ComputerManager({
+      backend,
+      actionSettleMs: 0,
+    });
+    try {
+      await backend.availability();
+      await manager.withAgentActivity("thread-a", () => manager.paste("thread-a", "first"));
+      await manager.withAgentActivity("thread-a", () => manager.paste("thread-a", "second"));
+      // Ctrl+V found the payload both times, and the human's text came back.
+      expect(pastedTexts).toEqual(["first", "second"]);
+      expect(clipboard).toBe("human text");
+      expect(commands).toEqual([
+        "wl-paste --no-newline --type text",
+        "wl-copy --paste-once --type text/plain first",
+        "wl-copy --type text/plain first",
+        "wl-copy --type text/plain human text",
+        "wl-paste --no-newline --type text",
+        // A watcher was seen: no offer this time.
+        "wl-copy --type text/plain second",
+        "wl-copy --type text/plain human text",
+      ]);
     } finally {
       await manager.dispose();
     }
@@ -1074,12 +1130,13 @@ describe("paste-once clipboard", () => {
     const unpasted = await backend.writeClipboardForPaste("agent text");
     const pasted = await backend.writeClipboardForPaste("pasted text");
     offers.get("pasted text")!.resolve();
-    await pasted.consumed;
+    // Read with no shortcut sent: a watcher's read, reported as unobserved.
+    await expect(pasted.consumed).rejects.toThrow(/watcher/);
     expect(ended).toEqual([]);
     await backend.dispose();
     // Only the offer still on the clipboard; a consumed one is forgotten.
     expect(ended).toEqual(["agent text"]);
-    await unpasted.consumed;
+    await unpasted.consumed.catch(() => undefined);
   });
 });
 

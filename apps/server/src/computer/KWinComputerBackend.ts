@@ -809,6 +809,16 @@ export class KWinComputerBackend implements ComputerBackend {
   private readonly runClipboardCommand: ClipboardCommandRunner;
   /** Paste-once offers still on the clipboard; see `writeClipboardForPaste`. */
   private readonly pasteOffers = new Set<() => void>();
+  /** The newest paste offer, until the paste shortcut is dispatched. */
+  private pendingPaste:
+    | { readonly text: string; dispatched: boolean; takenEarly: boolean }
+    | undefined;
+  /**
+   * A clipboard watcher (Klipper, a `wl-paste --watch` history daemon) read a
+   * paste-once offer before its paste: offers are pointless on this desktop,
+   * and a plain write is what the paste gets from then on.
+   */
+  private clipboardWatched = false;
   private currentPoint: ComputerPoint | null = null;
   /**
    * Where the workspace's top-left sat in global coordinates at the last
@@ -2040,6 +2050,7 @@ export class KWinComputerBackend implements ComputerBackend {
         `pressing ${keys.join("+")}`,
       );
     }
+    await this.dispatchPendingPaste();
     await pressHotkeyStrokes({ sink: this.inputSink(plugin), strokes });
     return {};
   }
@@ -2087,6 +2098,13 @@ export class KWinComputerBackend implements ComputerBackend {
    * application could miss. The restore itself replaces an unread offer.
    */
   async writeClipboardForPaste(text: string): Promise<ComputerClipboardPasteOffer> {
+    if (this.clipboardWatched) {
+      // A watcher reads every offer the moment it appears, so none could
+      // report the paste: the payload is written plainly and the manager's
+      // bounded wait decides the restore.
+      await writeWlClipboard(this.runClipboardCommand, text);
+      return { consumed: unobservedPaste() };
+    }
     const offer = await writeWlClipboardForPaste(this.runClipboardCommand, text);
     // The offer must not outlive the backend: one nobody pasted by dispose is
     // withdrawn, not left for the human's next paste.
@@ -2094,7 +2112,36 @@ export class KWinComputerBackend implements ComputerBackend {
     const settled = () => this.pasteOffers.delete(offer.withdraw);
     offer.consumed.then(settled, settled);
     if (this.disposed) offer.withdraw();
-    return { consumed: offer.consumed };
+    // Read before the shortcut went out is a watcher's read, not the paste's
+    // (see `dispatchPendingPaste`), and reports nothing.
+    const pending = { text, dispatched: false, takenEarly: false };
+    this.pendingPaste = pending;
+    const early = () => {
+      if (!pending.dispatched) pending.takenEarly = true;
+    };
+    offer.consumed.then(early, early);
+    const consumed = offer.consumed.then(() => {
+      if (pending.takenEarly) throw new Error("A clipboard watcher read the offer before the paste.");
+    });
+    consumed.catch(() => undefined);
+    return { consumed };
+  }
+
+  /**
+   * Called as the paste shortcut is about to go out. An offer a clipboard
+   * watcher already read is gone from the clipboard (wl-copy serves one read
+   * and exits; a history daemon does not own the selection after it), so the
+   * shortcut would paste nothing, or the watcher's stale copy: the payload is
+   * written again, plainly, first, and later pastes skip the offer.
+   */
+  private async dispatchPendingPaste(): Promise<void> {
+    const paste = this.pendingPaste;
+    this.pendingPaste = undefined;
+    if (!paste) return;
+    paste.dispatched = true;
+    if (!paste.takenEarly) return;
+    this.clipboardWatched = true;
+    await writeWlClipboard(this.runClipboardCommand, paste.text);
   }
 
   /** Replace the complete value through EditableText; insertion is a separate operation. */
@@ -2512,6 +2559,7 @@ export class KWinComputerBackend implements ComputerBackend {
     await this.atspi.dispose().catch(() => undefined);
     for (const withdraw of this.pasteOffers) withdraw();
     this.pasteOffers.clear();
+    this.pendingPaste = undefined;
     this.eventListeners.clear();
   }
 
@@ -4272,6 +4320,13 @@ async function readInstallStamp(path: string): Promise<string | undefined> {
 function stampCompositorVersion(stamp: string | undefined, key: string): string | undefined {
   const line = stamp?.split("\n").find((entry) => entry.startsWith(`${key}=`));
   return line ? (KWIN_VERSION_PATTERN.exec(line.slice(key.length + 1))?.[0] ?? undefined) : undefined;
+}
+
+/** A paste nothing can observe: the manager falls back to its bounded wait. */
+function unobservedPaste(): Promise<void> {
+  const consumed = Promise.reject(new Error("This paste cannot be observed."));
+  consumed.catch(() => undefined);
+  return consumed;
 }
 
 /** Reads the `plugin_id=` line both installers record. */
