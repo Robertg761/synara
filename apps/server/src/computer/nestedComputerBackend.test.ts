@@ -430,6 +430,34 @@ describe("idle shutdown", () => {
     });
   });
 
+  it("stops the session's accessibility helper with the desktop", async () => {
+    await withFakeClock(async () => {
+      const clients: Array<{ disposed: boolean }> = [];
+      const harness = makeHarness({
+        idleShutdownMs: IDLE_MS,
+        atspiMode: "session",
+        createAtspiClient: () => {
+          const record = { disposed: false };
+          clients.push(record);
+          return {
+            readTrees: async () => [],
+            setText: async () => false,
+            dispose: async () => {
+              record.disposed = true;
+            },
+          };
+        },
+      });
+      await harness.backend.getState({ includeTree: true });
+      expect(clients).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(IDLE_MS * 2);
+      expect(harness.disposedSessions).toEqual(["unix:abstract=fake-1"]);
+      expect(clients[0]?.disposed).toBe(true);
+      await harness.backend.dispose();
+    });
+  });
+
   it("keeps the desktop while a lease is held, the pane watches, or an app runs", async () => {
     await withFakeClock(async () => {
       let apps = 0;
@@ -878,6 +906,35 @@ describe("provision", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("gives the AT-SPI helper the session's environment, never the host's accessibility bus", async () => {
+    const envs: NodeJS.ProcessEnv[] = [];
+    const harness = makeHarness({
+      atspiMode: "session",
+      hostEnv: {
+        PATH: "/usr/bin",
+        WAYLAND_DISPLAY: "wayland-0",
+        AT_SPI_BUS_ADDRESS: "unix:path=/run/user/1000/at-spi/bus_0",
+        SYNARA_AUTH_TOKEN: "secret",
+        SYNARA_ATSPI_EVENTS: "0",
+      },
+      createAtspiClient: (env) => {
+        envs.push(env);
+        return { readTrees: async () => [], setText: async () => false, dispose: async () => {} };
+      },
+    });
+    await harness.backend.getState({ includeTree: true });
+    expect(envs).toHaveLength(1);
+    expect(envs[0]).toMatchObject({
+      PATH: "/usr/bin",
+      DBUS_SESSION_BUS_ADDRESS: "unix:abstract=fake-1",
+      WAYLAND_DISPLAY: "synara-nested-test",
+      SYNARA_ATSPI_EVENTS: "0",
+    });
+    expect(envs[0]).not.toHaveProperty("AT_SPI_BUS_ADDRESS");
+    expect(envs[0]).not.toHaveProperty("SYNARA_AUTH_TOKEN");
+    await harness.backend.dispose();
   });
 
   it("recreates the AT-SPI client for the replacement session after the desktop dies", async () => {

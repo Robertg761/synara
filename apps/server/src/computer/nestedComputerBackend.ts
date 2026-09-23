@@ -276,6 +276,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
         mode,
         ...(options.atspiMode !== undefined ? { atspiMode: options.atspiMode } : {}),
         ...(options.createAtspiClient ? { createAtspiClient: options.createAtspiClient } : {}),
+        hostEnv,
       }),
       ...(options.platform !== undefined ? { platform: options.platform } : {}),
       ...(options.linuxDistribution ? { linuxDistribution: options.linuxDistribution } : {}),

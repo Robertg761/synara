@@ -591,6 +591,11 @@ export interface NestedBackendOptions {
    * seam: the default spawns the Python helper against that session's bus.
    */
   readonly createAtspiClient?: (env: NodeJS.ProcessEnv) => AtspiTreeReader;
+  /**
+   * The server's environment, scrubbed into what the session's AT-SPI helper
+   * starts with (see `nestedAtspiEnvironment`). Defaults to `process.env`.
+   */
+  readonly hostEnv?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -718,7 +723,9 @@ function nestedAtspiReader(
 ): AtspiTreeReader {
   if ((options.atspiMode ?? "off") !== "session") return unavailableAtspiReader();
   const createClient =
-    options.createAtspiClient ?? ((env: NodeJS.ProcessEnv) => new AtspiHelperClient({ env }));
+    options.createAtspiClient ??
+    ((env: NodeJS.ProcessEnv) => new AtspiHelperClient({ env, inheritEnv: false }));
+  const hostEnv = options.hostEnv ?? process.env;
   let current:
     | { readonly session: NestedKWinSession; readonly client: AtspiTreeReader }
     | undefined;
@@ -732,7 +739,7 @@ function nestedAtspiReader(
     // No accessibility bus in the session means nothing answers org.a11y.Bus,
     // and a helper asked to read trees there has nothing to read.
     if (!session || session.accessibility === false) return undefined;
-    current ??= { session, client: createClient(nestedSessionEnv(session)) };
+    current ??= { session, client: createClient(nestedAtspiEnvironment(session, hostEnv)) };
     return current.client;
   };
   return {
@@ -749,12 +756,41 @@ function nestedAtspiReader(
     // Only the current session's client can have latched; a replaced session
     // starts over with a fresh one.
     unavailableReason: () => current?.client.unavailableReason?.(),
+    // A client belongs to one session: letting the desktop go (idle shutdown,
+    // a desktop that ended) ends its helper too, and the next read builds a
+    // client for whatever session is current then.
+    release: async () => {
+      const stale = current;
+      current = undefined;
+      await stale?.client.dispose();
+    },
     dispose: async () => {
       const stale = current;
       current = undefined;
       await stale?.client.dispose();
     },
   };
+}
+
+/**
+ * The AT-SPI helper's whole environment for one nested session: the session
+ * helpers' allowlist of the server's own (`nestedHelperEnvironment`: no
+ * tokens, no host `AT_SPI_BUS_ADDRESS`, which would point it at the human's
+ * accessibility bus) with the session's coordinates on top, plus the Python
+ * and helper knobs it reads.
+ */
+export function nestedAtspiEnvironment(
+  session: Parameters<typeof nestedSessionEnv>[0],
+  hostEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const helperKnobs: Record<string, string> = {};
+  for (const [name, value] of Object.entries(hostEnv)) {
+    if (value === undefined) continue;
+    if (name === "PYTHONPATH" || name === "PYTHONHOME" || name.startsWith("SYNARA_ATSPI_")) {
+      helperKnobs[name] = value;
+    }
+  }
+  return nestedHelperEnvironment(hostEnv, { ...helperKnobs, ...nestedSessionEnv(session) });
 }
 
 /** wl-clipboard against the nested compositor's own seat rather than seat0. */
