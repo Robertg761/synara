@@ -5,11 +5,15 @@
  * through its stdio with the malformed input a live client can produce and
  * check that each line costs exactly one reply and never the process.
  *
- * Nothing here touches a live accessibility bus: the unit tests fake Atspi,
- * and the framing tests only send requests the helper answers before reaching
- * the desktop, under an environment that points AT-SPI at a dead socket.
+ * Nothing here touches a live accessibility bus: the unit tests fake the
+ * D-Bus transport, and the process tests run under an environment that points
+ * AT-SPI at a dead socket — or at a private session bus with no accessibility
+ * bus launcher on it — which is also how they prove that an unreachable bus is
+ * an error reply and never a crashed helper.
  */
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -19,6 +23,13 @@ const HELPER_PATH = join(HELPER_DIR, "atspi_helper.py");
 const UNITTEST_FILE = "atspi_helper_test.py";
 const PYTHON = process.env.SYNARA_ATSPI_PYTHON ?? "python3";
 const hasPython = spawnSync(PYTHON, ["--version"], { stdio: "ignore" }).status === 0;
+const hasGi =
+  hasPython &&
+  spawnSync(PYTHON, ["-c", "from gi.repository import Gio, GLib"], { stdio: "ignore" }).status ===
+    0;
+const hasDbusDaemon = spawnSync("dbus-daemon", ["--version"], { stdio: "ignore" }).status === 0;
+const BUS_UNAVAILABLE_ERROR = -32010;
+const PROTOCOL_MISMATCH_ERROR = -32011;
 /** Bound on one reply from a freshly spawned helper, interpreter start included. */
 const REPLY_TIMEOUT_MS = 20_000;
 const HELPER_ENV: NodeJS.ProcessEnv = {
@@ -72,7 +83,7 @@ describe.skipIf(!hasPython)("atspi_helper.py", () => {
         // A valid request the helper refuses on its parameters, before it
         // would touch the desktop.
         const reply = await helper.exchange('{"jsonrpc":"2.0","method":"set-text","params":{}}\n');
-        expectErrorReply(reply, null);
+        expectErrorReply(reply, null, PROTOCOL_MISMATCH_ERROR);
       });
     });
 
@@ -83,23 +94,111 @@ describe.skipIf(!hasPython)("atspi_helper.py", () => {
       });
     });
 
-    it("answers probe with whether AT-SPI imported, without touching the desktop", async () => {
+    it("answers probe with the protocol and why the bus is unreachable", async () => {
       await withHelper(async (helper) => {
         const reply = await helper.exchange('{"jsonrpc":"2.0","id":8,"method":"probe"}\n');
-        expect(reply).toMatchObject({ jsonrpc: "2.0", id: 8 });
-        const result = (reply as { result: Record<string, unknown> }).result;
-        expect(result.ok).toBe(true);
-        expect(typeof result.atspi).toBe("boolean");
-        expect(result.atspi ? result.reason === null : typeof result.reason === "string").toBe(
-          true,
-        );
+        expect(reply).toMatchObject({
+          jsonrpc: "2.0",
+          id: 8,
+          result: { ok: true, protocol: 2, atspi: false },
+        });
+        expect(typeof (reply as { result: { reason: unknown } }).result.reason).toBe("string");
       });
     });
   });
+
+  // R1: libatspi aborted the process (dbind-ERROR, SIGABRT, a core dump) on
+  // the first tree read against a bus that was not there. The helper must
+  // answer instead, every time, and stay alive for the next request.
+  describe.skipIf(!hasGi)("with no accessibility bus", () => {
+    it("fails a tree read with a bus-unavailable error and keeps running", async () => {
+      await withHelper(async (helper) => {
+        for (const id of [11, 12]) {
+          const reply = await helper.exchange(readTreeLine(id));
+          expectErrorReply(reply, id, BUS_UNAVAILABLE_ERROR);
+        }
+      });
+    });
+
+    it.skipIf(!hasDbusDaemon)(
+      "reports a session bus without org.a11y.Bus as unavailable",
+      async () => {
+        const bus = startPrivateSessionBus();
+        try {
+          await withHelper(
+            async (helper) => {
+              const probe = await helper.exchange('{"jsonrpc":"2.0","id":21,"method":"probe"}\n');
+              expect(probe).toMatchObject({ id: 21, result: { atspi: false } });
+              expect((probe as { result: { reason: string } }).result.reason).toMatch(
+                /org\.a11y\.Bus/,
+              );
+              const reply = await helper.exchange(readTreeLine(22));
+              expectErrorReply(reply, 22, BUS_UNAVAILABLE_ERROR);
+            },
+            {
+              ...HELPER_ENV,
+              AT_SPI_BUS_ADDRESS: undefined,
+              DBUS_SESSION_BUS_ADDRESS: bus.address,
+            },
+          );
+        } finally {
+          bus.stop();
+        }
+      },
+    );
+  });
 });
 
-function expectErrorReply(reply: unknown, id: number | null): void {
-  expect(reply).toMatchObject({ jsonrpc: "2.0", id, error: { code: -32000 } });
+function readTreeLine(id: number): string {
+  return `${JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    method: "read-tree",
+    params: { protocol: 2, windows: [{ id: "w", title: "Editor", pid: 1 }] },
+  })}\n`;
+}
+
+/** A throwaway session bus with no service activation, so nothing answers org.a11y.Bus. */
+function startPrivateSessionBus(): { readonly address: string; readonly stop: () => void } {
+  const directory = mkdtempSync(join(tmpdir(), "synara-atspi-bus-"));
+  const config = join(directory, "session.conf");
+  writeFileSync(
+    config,
+    [
+      '<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"',
+      ' "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">',
+      "<busconfig><type>session</type>",
+      `<listen>unix:dir=${directory}</listen>`,
+      '<policy context="default"><allow send_destination="*" eavesdrop="true"/>',
+      '<allow eavesdrop="true"/><allow own="*"/></policy>',
+      "</busconfig>",
+    ].join("\n"),
+  );
+  const daemon = spawnSync(
+    "dbus-daemon",
+    ["--config-file", config, "--fork", "--print-address=1", "--print-pid=1"],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+  const [address, pid] = daemon.stdout.trim().split("\n");
+  if (daemon.status !== 0 || !address || !pid) {
+    rmSync(directory, { recursive: true, force: true });
+    throw new Error(`dbus-daemon did not start: ${daemon.stderr}`);
+  }
+  return {
+    address,
+    stop: () => {
+      try {
+        process.kill(Number(pid), "SIGTERM");
+      } catch {
+        // Already gone.
+      }
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+function expectErrorReply(reply: unknown, id: number | null, code = -32000): void {
+  expect(reply).toMatchObject({ jsonrpc: "2.0", id, error: { code } });
   expect(typeof (reply as { error: { message: unknown } }).error.message).toBe("string");
   expect(reply).not.toHaveProperty("result");
 }
@@ -109,8 +208,11 @@ function expectErrorReply(reply: unknown, id: number | null): void {
  * final probe must be answered by the very next line, which also shows the
  * exchange before it produced exactly one reply and nothing trailing.
  */
-async function withHelper(body: (helper: HelperSession) => Promise<void>): Promise<void> {
-  const helper = new HelperSession();
+async function withHelper(
+  body: (helper: HelperSession) => Promise<void>,
+  env: NodeJS.ProcessEnv = HELPER_ENV,
+): Promise<void> {
+  const helper = new HelperSession(env);
   try {
     await body(helper);
     const reply = await helper.exchange('{"jsonrpc":"2.0","id":99,"method":"probe"}\n');
@@ -130,10 +232,10 @@ class HelperSession {
   private stderr = "";
   private exit: string | null = null;
 
-  constructor() {
+  constructor(env: NodeJS.ProcessEnv) {
     this.child = spawn(PYTHON, ["-u", HELPER_PATH], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: HELPER_ENV,
+      env,
     });
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => {
