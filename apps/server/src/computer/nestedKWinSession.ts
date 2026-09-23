@@ -502,8 +502,19 @@ function nestedAtspiReader(
     return current.client;
   };
   return {
-    readTrees: async (windows) => (await (await ready())?.readTrees(windows)) ?? [],
+    readTrees: async (windows, readOptions) =>
+      (await (await ready())?.readTrees(windows, readOptions)) ?? [],
     setText: async (write) => (await (await ready())?.setText(write)) ?? false,
+    validateNode: async (check) => {
+      const client = await ready();
+      return (await client?.validateNode?.(check)) ?? { ok: false, reason: "unavailable" };
+    },
+    probe: async () => {
+      await (await ready())?.probe?.();
+    },
+    // Only the current session's client can have latched; a replaced session
+    // starts over with a fresh one.
+    unavailableReason: () => current?.client.unavailableReason?.(),
     dispose: async () => {
       const stale = current;
       current = undefined;
