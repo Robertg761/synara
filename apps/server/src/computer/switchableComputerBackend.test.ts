@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { ComputerManager } from "./ComputerManager.ts";
+
 import type { ComputerBackendEvent } from "./ComputerBackend.ts";
 import { FakeComputerBackend } from "./FakeComputerBackend.ts";
 import { CheckingComputerBackend, SwitchableComputerBackend } from "./switchableComputerBackend.ts";
@@ -60,5 +62,66 @@ describe("SwitchableComputerBackend", () => {
     occupant.emitDesktopGone("Instance exited.");
     expect(gone).toEqual(["Instance exited."]);
     expect(events).toEqual(["desktop-gone"]);
+  });
+});
+
+describe("replacing the desktop under the manager", () => {
+  it("runs the swap between operations and ends the one that was in flight", async () => {
+    const first = new FakeComputerBackend();
+    const second = new FakeComputerBackend();
+    const slot = new SwitchableComputerBackend(first);
+    const manager = new ComputerManager({ backend: slot.backend, actionSettleMs: 0 });
+    const targeted = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    try {
+      // An action that has targeted the old desktop and is about to send
+      // its input when the desktop is replaced.
+      const action = manager.withAgentActivity("thread-1", async () => {
+        await manager.moveCursor("thread-1", { x: 5, y: 5 });
+        targeted.resolve();
+        await resume.promise;
+        return await manager.click("thread-1", { x: 10, y: 10 });
+      });
+      await targeted.promise;
+      let swapped = false;
+      const replacing = manager
+        .replaceDesktop(() => slot.swap(second, { desktopChanged: true }))
+        .then(() => {
+          swapped = true;
+        });
+      await Promise.resolve();
+      // The swap waits for the operation; it does not land inside it.
+      expect(swapped).toBe(false);
+      expect(slot.current).toBe(first);
+      resume.resolve();
+
+      await expect(action).rejects.toMatchObject({ retryable: true });
+      await replacing;
+      expect(slot.current).toBe(second);
+      // Nothing of the old action reached either desktop after the swap began.
+      expect(first.callsFor("click")).toHaveLength(0);
+      expect(second.callsFor("click")).toHaveLength(0);
+
+      // The next operation runs on the new desktop.
+      await manager.withAgentActivity("thread-1", () =>
+        manager.click("thread-1", { x: 10, y: 10 }),
+      );
+      expect(second.callsFor("click")).toHaveLength(1);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("swaps at once when nothing runs", async () => {
+    const first = new FakeComputerBackend();
+    const second = new FakeComputerBackend();
+    const slot = new SwitchableComputerBackend(first);
+    const manager = new ComputerManager({ backend: slot.backend, actionSettleMs: 0 });
+    try {
+      await manager.replaceDesktop(() => slot.swap(second));
+      expect(slot.current).toBe(second);
+    } finally {
+      await manager.dispose();
+    }
   });
 });

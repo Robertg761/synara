@@ -1066,6 +1066,46 @@ export class ComputerManager {
   }
 
   /**
+   * Replaces the desktop under the manager: `swap` (a slot's occupant change)
+   * runs as one exclusive desktop operation, after every live agent
+   * operation has been aborted with a retryable "the desktop changed" reason.
+   *
+   * The slot resolves each backend member against its occupant at the moment
+   * of the call, so a swap landing between an action's targeting and its
+   * input would send the rest of that action — computed against the old
+   * desktop — to the new one. Aborting ends live operations at their next
+   * checkpoint; the exclusive transaction waits for them (and anything queued
+   * ahead) to finish, so no operation straddles the two desktops. Operations
+   * queued behind the swap start on the new occupant.
+   *
+   * A queue that is closed or full cannot take the swap; it then runs
+   * directly, since a desktop that is gone has to be replaced regardless.
+   */
+  async replaceDesktop(swap: () => Promise<void>): Promise<void> {
+    if (this.disposed) {
+      await swap();
+      return;
+    }
+    const reason = new ComputerBackendError(
+      "The desktop changed while this operation ran; nothing more was sent to it. Observe the new desktop before retrying.",
+      { retryable: true },
+    );
+    for (const live of this.activeAuthorities.values()) {
+      for (const controller of live) controller.abort(reason);
+    }
+    let ran = false;
+    try {
+      await this.operations.run(async () => {
+        ran = true;
+        await withoutDesktopCancellation(swap);
+      });
+    } catch (error) {
+      if (ran) throw error;
+      await swap();
+    }
+  }
+
+  /**
    * The manager side of the physical Escape interrupt, relayed from the
    * desktop's monitor route (or invoked directly by tests).
    *
