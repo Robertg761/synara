@@ -23,6 +23,7 @@
  *
  * @module computer/stillFramePublisher
  */
+import type { ComputerFrameMimeType } from "@synara/contracts";
 import type { ComputerFrameListener, ComputerStreamFrame } from "./ComputerBackend.ts";
 import { createHash } from "node:crypto";
 
@@ -116,17 +117,28 @@ export class StillFrameDedupe {
   }
 }
 
+/**
+ * One encoded still with its image type, for a backend whose preview stills
+ * are not PNG (a JPEG preview encodes an order of magnitude faster). A bare
+ * byte array is a PNG.
+ */
+export interface StillFrameCapture {
+  readonly data: Uint8Array;
+  readonly mimeType: ComputerFrameMimeType;
+}
+
 export interface StillFramePublisherOptions {
   /**
    * Captures one still of the current target — the exact window the task is
-   * using, or one browser tab — as raw PNG bytes.
+   * using, or one browser tab — as raw PNG bytes, or as a `StillFrameCapture`
+   * naming another image type.
    *
    * `undefined` means "skip this frame without treating it as a failure": there
    * is no target to capture, or the backend noticed mid-capture that publishing
    * is no longer appropriate. A throw is a real failure and is what the retry
    * bound applies to.
    */
-  readonly capture: (force: boolean) => Promise<Uint8Array | undefined>;
+  readonly capture: (force: boolean) => Promise<Uint8Array | StillFrameCapture | undefined>;
   /**
    * Whether a capture could succeed at all right now. Checked before every
    * publish so a backend whose capture grant is missing never spends a round
@@ -215,8 +227,10 @@ export class StillFramePublisher {
     if (options.force === true) this.forceRetries = 0;
     const force = this.dedupe.takeForce(options.force === true);
     try {
-      const bytes = await this.options.capture(force);
-      if (bytes === undefined) return;
+      const captured = await this.options.capture(force);
+      if (captured === undefined) return;
+      const bytes = captured instanceof Uint8Array ? captured : captured.data;
+      const mimeType = captured instanceof Uint8Array ? undefined : captured.mimeType;
       if (this.attachmentGeneration !== generation) return;
       // An idle target encodes the same bytes every tick; republishing them
       // spends about a megabyte of socket to convey nothing.
@@ -225,11 +239,12 @@ export class StillFramePublisher {
       const frame: ComputerStreamFrame = {
         sequence: this.nextSequence++,
         timestampMs: this.options.now(),
-        // Every frame is a complete PNG still. There is no H.264 codec config or
+        // Every frame is a complete still. There is no H.264 codec config or
         // delta frame in Tier 1, so the envelope stays keyframe-only.
         keyframe: true,
         codecConfig: false,
         data: bytes,
+        ...(mimeType !== undefined && mimeType !== "image/png" ? { mimeType } : {}),
       };
       listener(frame);
       this.options.emit(frame);

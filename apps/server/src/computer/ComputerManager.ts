@@ -1159,6 +1159,7 @@ export class ComputerManager {
               timestampMs: frame.timestampMs,
               keyframe: frame.keyframe,
               codecConfig: frame.codecConfig,
+              ...(frame.mimeType !== undefined ? { mimeType: frame.mimeType } : {}),
             },
             payload: frame.data,
           }),

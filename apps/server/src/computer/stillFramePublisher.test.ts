@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { StillFramePublisher } from "./stillFramePublisher.ts";
+import { StillFramePublisher, type StillFrameCapture } from "./stillFramePublisher.ts";
 import type { ComputerStreamFrame } from "./ComputerBackend.ts";
 
 const FRAME_A = new Uint8Array([1, 2, 3]);
@@ -14,7 +14,7 @@ interface Harness {
 }
 
 function makePublisher(
-  capture: (force: boolean) => Promise<Uint8Array | undefined>,
+  capture: (force: boolean) => Promise<Uint8Array | StillFrameCapture | undefined>,
   options: {
     readonly captureAvailable?: () => boolean;
     readonly intervalMs?: number;
@@ -43,6 +43,28 @@ function makePublisher(
 }
 
 describe("StillFramePublisher", () => {
+  it("tags a non-PNG still with its image type and leaves a PNG still untagged", async () => {
+    const stills: (Uint8Array | StillFrameCapture)[] = [
+      { data: FRAME_A, mimeType: "image/jpeg" },
+      FRAME_B,
+      { data: FRAME_A, mimeType: "image/png" },
+    ];
+    const harness = makePublisher(async () => stills.shift());
+    try {
+      await harness.publisher.attach((frame) => harness.frames.push(frame));
+      await harness.publisher.publish();
+      await harness.publisher.publish();
+      expect(harness.frames.map((frame) => [Array.from(frame.data), frame.mimeType])).toEqual([
+        [Array.from(FRAME_A), "image/jpeg"],
+        [Array.from(FRAME_B), undefined],
+        [Array.from(FRAME_A), undefined],
+      ]);
+      expect(harness.observed).toEqual(harness.frames);
+    } finally {
+      await harness.publisher.detach();
+    }
+  });
+
   it("does not start capturing when detached during preparation", async () => {
     vi.useFakeTimers();
     const preparation = Promise.withResolvers<void>();

@@ -11,6 +11,7 @@ import {
   type ComputerCapabilities,
   type ComputerCursorPosition,
   type ComputerDeliveryVerification,
+  type ComputerFrameMimeType,
   type ComputerHealth,
   type ComputerId,
   type ComputerInputModifier,
@@ -117,6 +118,11 @@ export interface ComputerStreamFrame {
   readonly keyframe: boolean;
   readonly codecConfig: boolean;
   readonly data: Uint8Array;
+  /**
+   * The still's image type, carried to the pane per frame. Absent means PNG.
+   * Only the preview may use JPEG: every screenshot a model reads stays PNG.
+   */
+  readonly mimeType?: ComputerFrameMimeType;
 }
 
 export interface ComputerResolvedTarget {

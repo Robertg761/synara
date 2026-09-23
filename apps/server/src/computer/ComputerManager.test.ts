@@ -2629,6 +2629,14 @@ describe("ComputerManager and FakeComputerBackend", () => {
     expect(decodeComputerFrame(sink.received[0]!).ok).toBe(true);
     backend.emitFrame(false, false, Uint8Array.of(7, 8));
     expect(sink.received).toHaveLength(3);
+    // A backend's JPEG preview still reaches the pane labelled as one.
+    backend.emitFrame(true, false, Uint8Array.of(0xff, 0xd8), "image/jpeg");
+    const jpeg = decodeComputerFrame(sink.received[3]!);
+    expect(jpeg.ok && jpeg.frame.header.mimeType).toBe("image/jpeg");
+    expect(decodeComputerFrame(sink.received[2]!)).toMatchObject({
+      ok: true,
+      frame: { header: { mimeType: "image/png" } },
+    });
 
     unsubscribe();
     await manager.flushStreamTransitions();

@@ -1263,15 +1263,27 @@ export const ComputerActionEvent = Schema.Struct({
 });
 export type ComputerActionEvent = typeof ComputerActionEvent.Type;
 
+/**
+ * The image format of one preview frame. Model-facing screenshots are always
+ * PNG; the live preview may carry JPEG, which a backend encodes an order of
+ * magnitude faster and ships at a fraction of the size. Absent means PNG.
+ */
+export const ComputerFrameMimeType = Schema.Literals(["image/png", "image/jpeg"]);
+export type ComputerFrameMimeType = typeof ComputerFrameMimeType.Type;
+
+export const ComputerFrameHeader = Schema.Struct({
+  computerId: ComputerId,
+  sequence: NonNegativeInt,
+  timestampMs: Schema.Finite,
+  keyframe: Schema.Boolean,
+  codecConfig: Schema.Boolean,
+  mimeType: Schema.optional(ComputerFrameMimeType),
+});
+export type ComputerFrameHeader = typeof ComputerFrameHeader.Type;
+
 export const ComputerFrameEvent = Schema.Struct({
   type: Schema.Literal("computer.frame"),
-  header: Schema.Struct({
-    computerId: ComputerId,
-    sequence: NonNegativeInt,
-    timestampMs: Schema.Finite,
-    keyframe: Schema.Boolean,
-    codecConfig: Schema.Boolean,
-  }),
+  header: ComputerFrameHeader,
 });
 export type ComputerFrameEvent = typeof ComputerFrameEvent.Type;
 
@@ -1313,20 +1325,13 @@ export const COMPUTER_FRAME_MAGIC = 0x5343;
 export const COMPUTER_FRAME_VERSION = 1;
 export const COMPUTER_FRAME_MAX_COMPUTER_ID_BYTES = 255;
 
-export const ComputerFrameHeader = Schema.Struct({
-  computerId: ComputerId,
-  sequence: NonNegativeInt,
-  timestampMs: Schema.Finite,
-  keyframe: Schema.Boolean,
-  codecConfig: Schema.Boolean,
-});
-export type ComputerFrameHeader = typeof ComputerFrameHeader.Type;
-
 export const ComputerFrameDecodeErrorReason = Schema.Literals([
   "too-short",
   "bad-magic",
   "unsupported-version",
   "truncated-computer-id",
   "invalid-computer-id",
+  /** The frame names an image format this build cannot display. */
+  "unsupported-format",
 ]);
 export type ComputerFrameDecodeErrorReason = typeof ComputerFrameDecodeErrorReason.Type;
