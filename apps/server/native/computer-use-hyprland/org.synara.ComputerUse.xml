@@ -8,9 +8,15 @@
   compositors through one proxy, so the method set, signatures and error
   names here must stay identical to that file. The Hyprland plugin registers
   every method below with sdbus-c++ in setupDbus() of synarahyprlandplugin.cpp;
-  captureWindow and captureRegion are asynchronous on the bus (the PNG is
-  encoded off the compositor thread and the reply follows), which changes
-  nothing for a caller.
+  the capture methods and waitForSettle are asynchronous on the bus (the image
+  is encoded off the compositor thread, a settle wait is a timer, and the
+  reply follows), which changes nothing for a caller.
+
+  Interface version 2 added the methods marked "version 2" below. healthJson
+  reports "interfaceVersion" and lists the ones a build implements in
+  "features" ("captureEx", "keys", "waitForSettle", "windowsStateJson"); a
+  caller uses a version-2 method only when it is listed, so an older plugin
+  keeps working with a newer server.
 
   Every method but healthJson answers org.synara.ComputerUse.Error.Unauthorized
   until the calling connection has authenticated. Other errors a method can
@@ -40,6 +46,12 @@
       <arg name="json" type="s" direction="out"/>
     </method>
     <method name="windowsJson">
+      <arg name="json" type="s" direction="out"/>
+    </method>
+    <!-- Version 2: {"windows": <windowsJson's array>, "targetWindowId": <id or
+         null>, "workspace": {x, y, width, height}, "locked": <bool>} in one
+         call. -->
+    <method name="windowsStateJson">
       <arg name="json" type="s" direction="out"/>
     </method>
 
@@ -102,6 +114,15 @@
       <arg name="pressed" type="b" direction="in"/>
       <arg name="delivered" type="b" direction="out"/>
     </method>
+    <!-- Version 2: (keyCode, pressed) strokes in order, each with every check
+         `key` makes. A refusal of the first stroke is the call's error,
+         exactly as `key` answers it; after that the call stops at the first
+         stroke not delivered and returns how many were. At most 256 strokes
+         (org.freedesktop.DBus.Error.InvalidArgs beyond). -->
+    <method name="keys">
+      <arg name="strokes" type="a(ub)" direction="in"/>
+      <arg name="delivered" type="u" direction="out"/>
+    </method>
 
     <!-- Capture. PNG bytes; maxDimension 0 keeps native pixels. Failures are
          errors, never an empty array. -->
@@ -117,6 +138,29 @@
       <arg name="height" type="u" direction="in"/>
       <arg name="maxDimension" type="u" direction="in"/>
       <arg name="png" type="ay" direction="out"/>
+    </method>
+    <!-- Version 2: the captures above with flags, answering the image and its
+         MIME type. Flags: 1 passive (an observer's frame: not agent activity,
+         no idle-timer reset, no badge repaint), 2 JPEG quality 85
+         ("image/jpeg"), 4 raw 8-bit luma ("image/x-luma8; width=<w>;
+         height=<h>", rows top to bottom, no padding; outranks 2). Neither 2
+         nor 4: PNG at fast compression ("image/png"). Errors as above. -->
+    <method name="captureWindowEx">
+      <arg name="windowId" type="s" direction="in"/>
+      <arg name="maxDimension" type="u" direction="in"/>
+      <arg name="flags" type="u" direction="in"/>
+      <arg name="image" type="ay" direction="out"/>
+      <arg name="mime" type="s" direction="out"/>
+    </method>
+    <method name="captureRegionEx">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+      <arg name="width" type="u" direction="in"/>
+      <arg name="height" type="u" direction="in"/>
+      <arg name="maxDimension" type="u" direction="in"/>
+      <arg name="flags" type="u" direction="in"/>
+      <arg name="image" type="ay" direction="out"/>
+      <arg name="mime" type="s" direction="out"/>
     </method>
 
     <!-- A running session ended: request, idle-timeout, user-release, or

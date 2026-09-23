@@ -65,12 +65,14 @@
 #include <poll.h>
 #include <sdbus-c++/sdbus-c++.h>
 #include <sys/eventfd.h>
+#include <turbojpeg.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -1955,8 +1957,18 @@ std::string modulePath() {
 // D-Bus methods
 // ---------------------------------------------------------------------------
 
+// The interface revision and the optional methods this build implements, in
+// lock step with the KWin plugin: the server calls one of these only when it
+// is listed here, and falls back to the version-1 methods otherwise, so an
+// installed older plugin keeps working with a newer server.
+constexpr int         INTERFACE_VERSION    = 2;
+constexpr const char* INTERFACE_FEATURES[] = {"captureEx", "keys", "windowsStateJson"};
+
 std::string healthJson() {
     ensureReleaseShortcut();
+    JsonArr features;
+    for (const char* feature : INTERFACE_FEATURES)
+        features.str(feature);
     JsonObj health;
     health
         // Direct injection needs nothing prepared beyond the seat manager the
@@ -1968,7 +1980,9 @@ std::string healthJson() {
         .str("interface", INTERFACE_NAME)
         .str("build", SYNARA_CU_BUILD_ID)
         .str("compositor", "hyprland")
-        .str("hyprlandVersion", g.hyprlandVersion);
+        .str("hyprlandVersion", g.hyprlandVersion)
+        .num("interfaceVersion", INTERFACE_VERSION)
+        .raw("features", features.build());
     // healthJson answers anyone on the session bus. The .so this instance was
     // loaded from (`hyprctl plugin list` reports only names while load/unload
     // address paths, so this is how the server learns which installed build
@@ -2132,6 +2146,20 @@ std::string windowsJson() {
     return windows.build();
 }
 
+// windowsJson and the targeting and desktop facts the server otherwise reads
+// from stateJson and healthJson next to it, in one round trip and one
+// compositor-thread pass, so the four can never disagree with each other.
+std::string windowsStateJson() {
+    const std::string windows = windowsJson();
+    const auto        target  = g.targetWindow.lock();
+    return JsonObj{}
+        .raw("windows", windows)
+        .raw("targetWindowId", target ? "\"" + jsonEscape(windowId(target)) + "\"" : "null")
+        .raw("workspace", rectJson(workspaceGeometry()))
+        .boolean("locked", sessionLocked())
+        .build();
+}
+
 void requireControlAvailable() {
     if (g.releasedByUser)
         throw sdbus::Error(sdbus::Error::Name{ERR_RELEASED}, "computer control was released with " + releaseShortcutText() + "; pressing it again resumes");
@@ -2231,12 +2259,24 @@ bool resetInputDelivery() {
 
 // Focus preparation is shared by motion, clicks, scrolls, and keys. Hand back
 // only after the complete operation, including refusals and exceptions. Held
-// buttons and modifiers retain their enter until the matching release.
+// buttons and modifiers retain their enter until the matching release. Nested
+// scopes hand back once, when the outermost one ends: a batch of keystrokes
+// is one agent burst, and nothing of the human's can run between its strokes
+// (the whole batch is one handler on the compositor thread), so handing the
+// objects back after every stroke would only add wire traffic.
 struct InputFocusHandback {
+    static inline int depth = 0;
+    InputFocusHandback() {
+        ++depth;
+    }
     ~InputFocusHandback() {
+        if (--depth > 0)
+            return;
         returnKeyboardToSeat();
         returnPointerToSeat();
     }
+    InputFocusHandback(const InputFocusHandback&)            = delete;
+    InputFocusHandback& operator=(const InputFocusHandback&) = delete;
 };
 
 bool movePointer(double x, double y) {
@@ -2447,6 +2487,41 @@ bool injectKey(uint32_t keyCode, bool pressed) {
     return true;
 }
 
+// Strokes per `keys` call: a word or a short line per round trip, and a bound
+// on how long one handler can hold the compositor thread.
+constexpr size_t MAX_KEY_STROKES = 256;
+
+// `keys`: each (keyCode, pressed) stroke goes through injectKey with every
+// per-stroke check a single `key` makes. The first stroke's refusal is the
+// call's error, exactly as `key` would answer it; after that the batch stops
+// at the first stroke that is not delivered and reports how many were, so the
+// caller knows precisely what the target received. One hand-back covers the
+// whole batch (see InputFocusHandback).
+uint32_t injectKeys(const std::vector<sdbus::Struct<uint32_t, bool>>& strokes) {
+    if (strokes.size() > MAX_KEY_STROKES)
+        throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.InvalidArgs"},
+                           std::format("keys takes at most {} strokes per call, got {}", MAX_KEY_STROKES, strokes.size()));
+    requireUnlockedSession();
+    const InputFocusHandback handback;
+    uint32_t                 delivered = 0;
+    for (const auto& stroke : strokes) {
+        bool sent = false;
+        if (delivered == 0) {
+            sent = injectKey(std::get<0>(stroke), std::get<1>(stroke));
+        } else {
+            try {
+                sent = injectKey(std::get<0>(stroke), std::get<1>(stroke));
+            } catch (const sdbus::Error&) {
+                sent = false;
+            }
+        }
+        if (!sent)
+            break;
+        ++delivered;
+    }
+    return delivered;
+}
+
 // ---------------------------------------------------------------------------
 // Capture pipeline. The GL side is minimal — render offscreen at the
 // monitor's own resolution, read the pixels back — and everything else
@@ -2633,9 +2708,99 @@ std::vector<uint8_t> encodePng(cairo_surface_t* surface) {
     return png;
 }
 
+// The capture flags of captureWindowEx and captureRegionEx, the same bits in
+// the KWin plugin. Without a format bit the image is PNG. Luma outranks JPEG
+// when a caller sets both: it is the cheaper answer to the narrower question.
+constexpr uint32_t CAPTURE_FLAG_PASSIVE = 1;
+constexpr uint32_t CAPTURE_FLAG_JPEG    = 2;
+constexpr uint32_t CAPTURE_FLAG_LUMA    = 4;
+constexpr int      JPEG_QUALITY         = 85;
+
+enum class CaptureFormat : uint8_t {
+    Png,
+    Jpeg,
+    Luma,
+};
+
+CaptureFormat captureFormat(uint32_t flags) {
+    if (flags & CAPTURE_FLAG_LUMA)
+        return CaptureFormat::Luma;
+    if (flags & CAPTURE_FLAG_JPEG)
+        return CaptureFormat::Jpeg;
+    return CaptureFormat::Png;
+}
+
+// A cairo ARGB32 surface is premultiplied, so its colour channels already
+// are the image composited over black: exactly what a format without alpha
+// should show for a window capture's transparent surround.
+std::vector<uint8_t> encodeJpeg(cairo_surface_t* surface) {
+    const int  w      = cairo_image_surface_get_width(surface);
+    const int  h      = cairo_image_surface_get_height(surface);
+    const int  stride = cairo_image_surface_get_stride(surface);
+    tjhandle   tj     = tj3Init(TJINIT_COMPRESS);
+    if (!tj)
+        captureFailed("JPEG encoder could not be created");
+    tj3Set(tj, TJPARAM_QUALITY, JPEG_QUALITY);
+    tj3Set(tj, TJPARAM_SUBSAMP, TJSAMP_420);
+    tj3Set(tj, TJPARAM_FASTDCT, 1);
+    // ARGB32 is a native-endian word per pixel: B, G, R, X in memory on a
+    // little-endian machine.
+    constexpr int pixelFormat = std::endian::native == std::endian::little ? TJPF_BGRX : TJPF_XRGB;
+    unsigned char* jpeg = nullptr;
+    size_t         size = 0;
+    const int      rc   = tj3Compress8(tj, cairo_image_surface_get_data(surface), w, stride, h, pixelFormat, &jpeg, &size);
+    std::vector<uint8_t> out;
+    if (rc == 0 && jpeg && size > 0)
+        out.assign(jpeg, jpeg + size);
+    const std::string reason = rc == 0 ? "" : tj3GetErrorStr(tj);
+    tj3Free(jpeg);
+    tj3Destroy(tj);
+    if (out.empty())
+        captureFailed("JPEG encoding failed: " + reason);
+    return out;
+}
+
+// One byte of BT.601 luma per pixel, rows top to bottom with no padding: the
+// cheapest answer to "did anything on screen change", for a caller that
+// compares frames rather than looks at them.
+std::vector<uint8_t> encodeLuma(cairo_surface_t* surface) {
+    const int            w      = cairo_image_surface_get_width(surface);
+    const int            h      = cairo_image_surface_get_height(surface);
+    const int            stride = cairo_image_surface_get_stride(surface);
+    const unsigned char* data   = cairo_image_surface_get_data(surface);
+    std::vector<uint8_t> out(size_t(w) * size_t(h));
+    for (int y = 0; y < h; ++y) {
+        const auto* row = reinterpret_cast<const uint32_t*>(data + size_t(y) * stride);
+        uint8_t*    dst = out.data() + size_t(y) * w;
+        for (int x = 0; x < w; ++x) {
+            const uint32_t p = row[x];
+            dst[x]           = static_cast<uint8_t>((77 * ((p >> 16) & 0xff) + 150 * ((p >> 8) & 0xff) + 29 * (p & 0xff) + 128) >> 8);
+        }
+    }
+    return out;
+}
+
+// The encoded image and its MIME type, as the Ex methods return them.
+struct SEncodedImage {
+    std::vector<uint8_t> bytes;
+    std::string          mime;
+};
+
+SEncodedImage encodeCaptureImage(cairo_surface_t* surface, CaptureFormat format) {
+    cairo_surface_flush(surface);
+    switch (format) {
+        case CaptureFormat::Jpeg: return {encodeJpeg(surface), "image/jpeg"};
+        case CaptureFormat::Luma:
+            return {encodeLuma(surface),
+                    std::format("image/x-luma8; width={}; height={}", cairo_image_surface_get_width(surface), cairo_image_surface_get_height(surface))};
+        case CaptureFormat::Png: break;
+    }
+    return {encodePng(surface), "image/png"};
+}
+
 // Downscales so the longest side fits maxDimension (0 = uncapped), then
 // encodes. Consumes the surface.
-std::vector<uint8_t> finishCapture(cairo_surface_t* surface, uint32_t maxDimension) {
+SEncodedImage finishCapture(cairo_surface_t* surface, uint32_t maxDimension, CaptureFormat format) {
     const int w       = cairo_image_surface_get_width(surface);
     const int h       = cairo_image_surface_get_height(surface);
     const int largest = std::max(w, h);
@@ -2655,15 +2820,15 @@ std::vector<uint8_t> finishCapture(cairo_surface_t* surface, uint32_t maxDimensi
         cairo_surface_destroy(surface);
         surface = scaled;
     }
-    std::vector<uint8_t> png;
+    SEncodedImage image;
     try {
-        png = encodePng(surface);
+        image = encodeCaptureImage(surface, format);
     } catch (...) {
         cairo_surface_destroy(surface);
         throw;
     }
     cairo_surface_destroy(surface);
-    return png;
+    return image;
 }
 
 // The capture's native size: `region` in global logical coordinates at
@@ -2719,16 +2884,21 @@ struct SCaptureLayer {
 };
 
 struct SCaptureJob {
-    sdbus::Result<std::vector<uint8_t>> result;
-    uint64_t                            epoch = 0;
-    CBox                                region;
-    double                              scale        = 1;
-    uint32_t                            maxDimension = 0;
-    bool                                opaque       = true;
-    SGhostSnapshot                      ghost;
-    std::vector<SCaptureLayer>          layers;
-    std::vector<uint8_t>                png;
-    std::string                         error;
+    // The call to answer: captureWindow/captureRegion reply with the bytes
+    // alone, the Ex methods (`extended`) with the bytes and their MIME type.
+    sdbus::Result<std::vector<uint8_t>>              reply;
+    sdbus::Result<std::vector<uint8_t>, std::string> replyEx;
+    bool                                             extended = false;
+    uint64_t                                         epoch    = 0;
+    CBox                                             region;
+    double                                           scale        = 1;
+    uint32_t                                         maxDimension = 0;
+    bool                                             opaque       = true;
+    CaptureFormat                                    format       = CaptureFormat::Png;
+    SGhostSnapshot                                   ghost;
+    std::vector<SCaptureLayer>                       layers;
+    SEncodedImage                                    image;
+    std::string                                      error;
 };
 
 struct SCaptureWorker {
@@ -2753,7 +2923,7 @@ void driveDbus();
 // monitor-sized pixel copies in the queue.
 constexpr size_t CAPTURE_QUEUE_LIMIT = 2;
 
-UP<SCaptureJob> newCaptureJob(const CBox& region, double scale, uint32_t maxDimension, bool opaque) {
+UP<SCaptureJob> newCaptureJob(const CBox& region, double scale, uint32_t maxDimension, bool opaque, uint32_t flags) {
     int nativeW = 0, nativeH = 0;
     captureNativeSize(region, scale, nativeW, nativeH);
     {
@@ -2767,11 +2937,12 @@ UP<SCaptureJob> newCaptureJob(const CBox& region, double scale, uint32_t maxDime
     job->scale        = scale;
     job->maxDimension = maxDimension;
     job->opaque       = opaque;
+    job->format       = captureFormat(flags);
     job->ghost        = ghostSnapshot();
     return job;
 }
 
-// Worker-thread side: pixels in, PNG out. Nothing here reads `g`.
+// Worker-thread side: pixels in, encoded image out. Nothing here reads `g`.
 void encodeCapture(SCaptureJob& job) {
     cairo_surface_t* target = captureTarget(job.region, job.scale);
     cairo_t*         cr     = cairo_create(target);
@@ -2803,7 +2974,7 @@ void encodeCapture(SCaptureJob& job) {
     drawGhostCursorOverlay(cr, job.ghost, job.region, job.scale);
     cairo_destroy(cr);
     cairo_surface_flush(target);
-    job.png = finishCapture(target, job.maxDimension);
+    job.image = finishCapture(target, job.maxDimension, job.format);
 }
 
 void captureWorkerMain() {
@@ -2843,12 +3014,19 @@ void replyCapture(SCaptureJob& job) {
     // Sending can fail if the connection has gone; this runs inside Wayland
     // loop callbacks, where an escaping exception would end the compositor.
     try {
+        std::optional<sdbus::Error> error;
         if (job.epoch != g.lockEpoch)
-            job.result.returnError(sdbus::Error(sdbus::Error::Name{ERR_SESSION_LOCKED}, "The desktop session was locked while the capture was in progress."));
+            error = sdbus::Error(sdbus::Error::Name{ERR_SESSION_LOCKED}, "The desktop session was locked while the capture was in progress.");
         else if (!job.error.empty())
-            job.result.returnError(sdbus::Error(sdbus::Error::Name{ERR_CAPTURE}, job.error));
+            error = sdbus::Error(sdbus::Error::Name{ERR_CAPTURE}, job.error);
+        if (error && job.extended)
+            job.replyEx.returnError(*error);
+        else if (error)
+            job.reply.returnError(*error);
+        else if (job.extended)
+            job.replyEx.returnResults(job.image.bytes, job.image.mime);
         else
-            job.result.returnResults(job.png);
+            job.reply.returnResults(job.image.bytes);
     } catch (const sdbus::Error& e) {
         Log::logger->log(Log::ERR, "[synara] capture reply failed: {}", e.what());
     }
@@ -2881,9 +3059,10 @@ void ensureCaptureWorker() {
     captureWorker.thread     = std::thread(captureWorkerMain);
 }
 
-void submitCapture(sdbus::Result<std::vector<uint8_t>>&& result, UP<SCaptureJob> job) {
+// The job carries the call it answers (`reply` or `replyEx`), set by the
+// handler that admitted it.
+void submitCapture(UP<SCaptureJob> job) {
     ensureCaptureWorker();
-    job->result = std::move(result);
     {
         std::lock_guard lock(captureWorker.mutex);
         captureWorker.pending.push_back(std::move(job));
@@ -2906,7 +3085,7 @@ void stopCaptureWorker() {
     for (auto* queue : {&captureWorker.pending, &captureWorker.done}) {
         for (auto& job : *queue) {
             job->error = "the plugin is unloading";
-            job->png.clear();
+            job->image = {};
             replyCapture(*job);
         }
         queue->clear();
@@ -2921,15 +3100,23 @@ void stopCaptureWorker() {
     }
 }
 
+// A capture is agent activity - it extends the idle timer and holds the
+// badge - unless the caller marks it passive: an observer's frame (the
+// preview pane's stream) must neither keep an otherwise idle session alive
+// forever nor repaint the badge on every tick.
+void noteCaptureActivity(uint32_t flags) {
+    if (g.running && !(flags & CAPTURE_FLAG_PASSIVE))
+        noteActivity();
+}
+
 // Compositor-thread side of a window capture: admission and the one
 // offscreen render. Hyprland's own single-window snapshot renders the window
 // with its decorations and popups at its real position on a transparent
 // monitor-sized canvas.
-UP<SCaptureJob> captureWindow(const std::string& windowId, uint32_t maxDimension) {
+UP<SCaptureJob> captureWindow(const std::string& windowId, uint32_t maxDimension, uint32_t flags) {
     requireControlAvailable();
     requireUnlockedSession();
-    if (g.running)
-        noteActivity();
+    noteCaptureActivity(flags);
     if (!g_pHyprRenderer || !g_pHyprOpenGL)
         captureFailed("render unavailable");
     const auto window = findWindowById(windowId);
@@ -2941,7 +3128,7 @@ UP<SCaptureJob> captureWindow(const std::string& windowId, uint32_t maxDimension
     const auto region = intersectBoxes(windowBounds(window), workspaceGeometry());
     if (!region)
         captureFailed("window has nothing on screen to capture");
-    auto job = newCaptureJob(*region, monitor->m_scale, maxDimension, false);
+    auto job = newCaptureJob(*region, monitor->m_scale, maxDimension, false, flags);
 
     const auto fb = g_pHyprRenderer->makeSnapshotFB(window);
     if (!fb)
@@ -2952,11 +3139,10 @@ UP<SCaptureJob> captureWindow(const std::string& windowId, uint32_t maxDimension
 
 // Compositor-thread side of a region capture: every intersecting monitor is
 // rendered at its own scale; the worker stitches them at the sharpest one.
-UP<SCaptureJob> captureRegion(int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t maxDimension) {
+UP<SCaptureJob> captureRegion(int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t maxDimension, uint32_t flags) {
     requireControlAvailable();
     requireUnlockedSession();
-    if (g.running)
-        noteActivity();
+    noteCaptureActivity(flags);
     if (!g_pHyprRenderer || !g_pHyprOpenGL)
         captureFailed("render unavailable");
     const auto region = intersectBoxes(CBox{double(x), double(y), double(width), double(height)}, workspaceGeometry());
@@ -2976,7 +3162,7 @@ UP<SCaptureJob> captureRegion(int32_t x, int32_t y, uint32_t width, uint32_t hei
     if (monitors.empty())
         captureFailed("no monitor covers the region");
 
-    auto job = newCaptureJob(*region, scale, maxDimension, true);
+    auto job = newCaptureJob(*region, scale, maxDimension, true, flags);
     for (const auto& mon : monitors)
         job->layers.push_back({renderMonitorPixels(mon), unsigned(mon->m_transform), mon->logicalBox(), double(mon->m_scale)});
     return job;
@@ -3125,18 +3311,41 @@ void setupDbus() {
                     sdbus::registerMethod("button").implementedAs([](uint32_t button, bool pressed) { g.authentication->require(); return injectButton(button, pressed); }),
                     sdbus::registerMethod("axis").implementedAs([](double horizontal, double vertical) { g.authentication->require(); return injectAxis(horizontal, vertical); }),
                     sdbus::registerMethod("key").implementedAs([](uint32_t keyCode, bool pressed) { g.authentication->require(); return injectKey(keyCode, pressed); }),
+                    sdbus::registerMethod("keys").implementedAs([](const std::vector<sdbus::Struct<uint32_t, bool>>& strokes) { g.authentication->require(); return injectKeys(strokes); }),
+                    sdbus::registerMethod("windowsStateJson").implementedAs([]() { g.authentication->require(); return windowsStateJson(); }),
                     // Asynchronous on the bus: the handler returns once the
                     // GPU work is done and the reply follows from
                     // onCaptureDone. An exception thrown here still becomes
                     // the error reply, exactly as for the synchronous methods.
                     sdbus::registerMethod("captureWindow").implementedAs([](sdbus::Result<std::vector<uint8_t>> result, const std::string& id, uint32_t maxDimension) {
                         g.authentication->require();
-                        submitCapture(std::move(result), captureWindow(id, maxDimension));
+                        auto job   = captureWindow(id, maxDimension, 0);
+                        job->reply = std::move(result);
+                        submitCapture(std::move(job));
                     }),
                     sdbus::registerMethod("captureRegion").implementedAs([](sdbus::Result<std::vector<uint8_t>> result, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t maxDimension) {
                         g.authentication->require();
-                        submitCapture(std::move(result), captureRegion(x, y, width, height, maxDimension));
+                        auto job   = captureRegion(x, y, width, height, maxDimension, 0);
+                        job->reply = std::move(result);
+                        submitCapture(std::move(job));
                     }),
+                    sdbus::registerMethod("captureWindowEx")
+                        .implementedAs([](sdbus::Result<std::vector<uint8_t>, std::string> result, const std::string& id, uint32_t maxDimension, uint32_t flags) {
+                            g.authentication->require();
+                            auto job      = captureWindow(id, maxDimension, flags);
+                            job->replyEx  = std::move(result);
+                            job->extended = true;
+                            submitCapture(std::move(job));
+                        }),
+                    sdbus::registerMethod("captureRegionEx")
+                        .implementedAs([](sdbus::Result<std::vector<uint8_t>, std::string> result, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t maxDimension,
+                                          uint32_t flags) {
+                            g.authentication->require();
+                            auto job      = captureRegion(x, y, width, height, maxDimension, flags);
+                            job->replyEx  = std::move(result);
+                            job->extended = true;
+                            submitCapture(std::move(job));
+                        }),
                     sdbus::registerSignal("sessionStopped").withParameters<std::string>("reason"))
         .forInterface(sdbus::InterfaceName{INTERFACE_NAME});
 

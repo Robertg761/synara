@@ -97,14 +97,22 @@ def definitions(source, names):
     return "\n\n".join(parts)
 
 
-def compile_and_run(fixture_name, production, prefix):
+def compile_and_run(fixture_name, production, prefix, packages=()):
+    """Splices `production` into the fixture, builds it and runs it.
+
+    `packages` are pkg-config names the fixture links for real (the codec
+    libraries), never anything of Hyprland's.
+    """
     fixture = (ROOT / "tests" / fixture_name).read_text()
     assert "// PRODUCTION_DEFINITIONS" in fixture, f"{fixture_name} has no splice point"
+    flags = []
+    if packages:
+        flags = subprocess.run(["pkg-config", "--cflags", "--libs", *packages], check=True, capture_output=True, text=True).stdout.split()
     with tempfile.TemporaryDirectory(prefix=prefix) as directory:
         cpp = Path(directory) / "fixture.cpp"
         cpp.write_text(fixture.replace("// PRODUCTION_DEFINITIONS", production))
         binary = Path(directory) / "fixture-test"
-        subprocess.run(["g++", STANDARD, "-Wall", "-Wextra", str(cpp), "-o", str(binary)], check=True)
+        subprocess.run(["g++", STANDARD, "-Wall", "-Wextra", str(cpp), "-o", str(binary), *flags], check=True)
         subprocess.run([str(binary)], check=True)
 
 
@@ -147,7 +155,7 @@ class FocusRegressionTest(unittest.TestCase):
     def test_capture_respects_emergency_release(self):
         production = definitions(self.source, [
             "sessionLocked", "requireControlAvailable", "requireUnlockedSession",
-            "captureWindow", "captureRegion",
+            "noteCaptureActivity", "captureWindow", "captureRegion",
         ])
         compile_and_run("capture_guard_fixture.cpp", production, "synara-capture-guard-test-")
 
@@ -171,9 +179,17 @@ class FocusRegressionTest(unittest.TestCase):
             "clearKeyboardDelivery", "updateKeyboardFocus", ("InputFocusHandback", "struct"),
             "clearFocusWindow", "resetInputDelivery",
             "movePointer", "injectButton", "takeDiscreteSteps", "scrollAxisValue",
-            "scrollValue120", "injectAxis", "injectKey",
+            "scrollValue120", "injectAxis", "injectKey", ("MAX_KEY_STROKES", "variable"), "injectKeys",
         ])
         compile_and_run("focus_fixture.cpp", production, "synara-focus-test-")
+
+    def test_capture_encoders(self):
+        production = definitions(self.source, [
+            ("CAPTURE_FLAG_PASSIVE", "variable"), ("CAPTURE_FLAG_JPEG", "variable"), ("CAPTURE_FLAG_LUMA", "variable"),
+            ("JPEG_QUALITY", "variable"), ("CaptureFormat", "enum"), "captureFormat",
+            "encodePng", "encodeJpeg", "encodeLuma", ("SEncodedImage", "struct"), "encodeCaptureImage",
+        ])
+        compile_and_run("codec_fixture.cpp", production, "synara-codec-test-", packages=("cairo", "libturbojpeg"))
 
     def test_window_identity(self):
         production = definitions(self.source, [
@@ -200,14 +216,20 @@ class IntrospectionTest(unittest.TestCase):
         declared = {method.get("name") for method in interface.findall("method")}
         self.assertEqual(declared, registered)
         self.assertEqual({signal.get("name") for signal in interface.findall("signal")}, signals)
-        # Every method returns exactly one value, and the reply of every
-        # non-JSON, non-capture, non-authenticate method is a boolean.
+        # The reply shapes: JSON and authenticate answer a string, the version-1
+        # captures the bytes alone and the Ex captures the bytes and their MIME
+        # type, `keys` a count, `waitForSettle` a verdict and the time waited,
+        # and every other method a boolean.
+        replies = {
+            "authenticate": ["s"], "healthJson": ["s"], "stateJson": ["s"], "windowsJson": ["s"],
+            "windowsStateJson": ["s"], "captureWindow": ["ay"], "captureRegion": ["ay"],
+            "captureWindowEx": ["ay", "s"], "captureRegionEx": ["ay", "s"], "keys": ["u"],
+            "waitForSettle": ["b", "u"],
+        }
         for method in interface.findall("method"):
-            outs = [arg for arg in method.findall("arg") if arg.get("direction") == "out"]
-            self.assertEqual(len(outs), 1, method.get("name"))
             name = method.get("name")
-            expected = "s" if name in {"authenticate", "healthJson", "stateJson", "windowsJson"} else "ay" if name.startswith("capture") else "b"
-            self.assertEqual(outs[0].get("type"), expected, name)
+            outs = [arg.get("type") for arg in method.findall("arg") if arg.get("direction") == "out"]
+            self.assertEqual(outs, replies.get(name, ["b"]), name)
 
     def test_xml_matches_kwin_declaration(self):
         kwin = ROOT.parent / "computer-use-kwin" / "org.synara.ComputerUse.xml"

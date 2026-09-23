@@ -63,8 +63,9 @@ void transformCapturePixels(std::vector<uint8_t>&, int&, int&, unsigned) { unexp
 // admission must fail before one is ever made.
 struct SCaptureLayer { SCapturePixels pixels; unsigned transform; CBox box; double scale; };
 struct SCaptureJob { std::vector<SCaptureLayer> layers; };
+constexpr uint32_t CAPTURE_FLAG_PASSIVE = 1;
 template <typename T> using UP = std::unique_ptr<T>;
-UP<SCaptureJob> newCaptureJob(const CBox&, double, uint32_t, bool) { unexpectedRender(); }
+UP<SCaptureJob> newCaptureJob(const CBox&, double, uint32_t, bool, uint32_t) { unexpectedRender(); }
 
 // PRODUCTION_DEFINITIONS
 
@@ -104,8 +105,8 @@ void expectRendererCheck(auto action) {
 }
 
 int main() {
-    const auto windowCapture = [] { captureWindow("window", 1024); };
-    const auto regionCapture = [] { captureRegion(0, 0, 100, 100, 1024); };
+    const auto windowCapture = [] { captureWindow("window", 1024, 0); };
+    const auto regionCapture = [] { captureRegion(0, 0, 100, 100, 1024, 0); };
     g.releasedByUser = true;
     for (const bool running : {false, true}) {
         g.running = running;
@@ -144,5 +145,10 @@ int main() {
     expectRendererCheck(windowCapture);
     expectRendererCheck(regionCapture);
     check(activityCalls == 2, "resumed capture did not restore activity updates");
+    // A passive capture is an observer's frame: admitted like any other, but
+    // it neither extends the session nor repaints the badge.
+    expectRendererCheck([] { captureWindow("window", 1024, CAPTURE_FLAG_PASSIVE); });
+    expectRendererCheck([] { captureRegion(0, 0, 100, 100, 1024, CAPTURE_FLAG_PASSIVE | 2); });
+    check(activityCalls == 2, "passive capture counted as agent activity");
     std::cout << "Emergency release and session lock block both capture paths before activity and renderer access.\n";
 }

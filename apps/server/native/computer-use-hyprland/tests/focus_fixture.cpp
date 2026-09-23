@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -18,6 +19,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace sdbus {
@@ -26,6 +28,7 @@ struct Error : std::runtime_error {
     std::string name;
     Error(Name name, const std::string& message) : std::runtime_error(message), name(name.value) {}
 };
+template <typename... T> using Struct = std::tuple<T...>;
 }
 constexpr const char* ERR_HUMAN_ACTIVE = "org.synara.ComputerUse.Error.HumanActive";
 constexpr const char* ERR_SESSION_LOCKED = "org.synara.ComputerUse.Error.SessionLocked";
@@ -75,6 +78,9 @@ CWLSurfaceResource* keyboardEntered = nullptr;
 int buttonEvents = 0, axisEvents = 0, discreteSteps = 0, keyEvents = 0, pointerEnters = 0, keyboardEnters = 0;
 int pointerVersion = 9;
 bool refuse = false, reachable = true;
+// Strokes refuseIfHumanActive lets through before it starts refusing; -1 for
+// never. Lets a batch be refused part-way.
+int refuseAfter = -1;
 struct HitTest { SP<CWLSurfaceResource> windowSurfaceAt(Vector2D, PHLWINDOW, Vector2D& local) { local = {7, 9}; return hitSurface; } };
 struct ViewState { HitTest& hitTest() { static HitTest h; return h; } };
 namespace Desktop { ViewState* viewState() { static ViewState v; return &v; } }
@@ -134,7 +140,11 @@ bool requireRunning() { return true; }
 struct InputManagerFixture { bool held = false; bool hasHeldButtons() { return held; } } inputManager;
 auto* g_pInputManager = &inputManager;
 void requireReachableClient(PHLWINDOW, const char*) { if (!reachable) throw std::runtime_error("unreachable"); }
-void refuseIfHumanActive(PHLWINDOW) { if (refuse) throw std::runtime_error("human active"); }
+void refuseIfHumanActive(PHLWINDOW) {
+    if (refuseAfter == 0) refuse = true;
+    if (refuseAfter > 0) --refuseAfter;
+    if (refuse) throw sdbus::Error(sdbus::Error::Name{ERR_HUMAN_ACTIVE}, "human active");
+}
 SP<CWLSurfaceResource> windowMainSurface(PHLWINDOW) { return hitSurface; }
 void directPointerButtonEvent(SP<CWLSurfaceResource> surface, uint32_t, bool) {
     check(pointerEntered == surface.get(), "button misdirected"); ++buttonEvents;
@@ -340,6 +350,38 @@ int main() {
     clearKeyboardDelivery();
     check(keyEvents == before + 2 && g.pressedKeys.empty(), "held keys were not released");
     check(keyboardEntered == human.get(), "key release did not hand the keyboard back");
+
+    // keys: a batch is one agent burst. Every stroke is delivered in order to
+    // the target, and the keyboard is handed back once, after the batch,
+    // instead of after every stroke.
+    seat.m_state.keyboardFocus = human;
+    keyboardEntered = human.get();
+    g.directKeyboardSurface.reset();
+    g.directKeyboardNeedsEnter = true;
+    before = keyEvents;
+    int entersBefore = keyboardEnters;
+    using Stroke = sdbus::Struct<uint32_t, bool>;
+    check(injectKeys({Stroke{30, true}, Stroke{30, false}, Stroke{31, true}, Stroke{31, false}}) == 4, "batch not delivered");
+    check(keyEvents == before + 4 && keyboardEntered == human.get() && g.pressedKeys.empty(), "batch misdirected or not handed back");
+    check(keyboardEnters == entersBefore + 2, "batch handed the keyboard back between strokes");
+    check(injectKeys({}) == 0, "empty batch delivered something");
+    // The first stroke's refusal is the call's error, like `key`'s...
+    refuse = true;
+    before = keyEvents;
+    expectHumanActive([] { injectKeys({Stroke{30, true}}); }, "first-stroke refusal was not the batch's error");
+    check(keyEvents == before && keyboardEntered == human.get(), "refused batch sent input");
+    refuse = false;
+    // ... and a later one ends the batch with the count delivered so far.
+    refuseAfter = 1;
+    check(injectKeys({Stroke{30, true}, Stroke{31, true}, Stroke{31, false}}) == 1, "batch did not stop at the refused stroke");
+    check(keyEvents == before + 1, "strokes after the refusal were sent");
+    refuse = false;
+    refuseAfter = -1;
+    clearKeyboardDelivery();
+    check(g.pressedKeys.empty() && keyboardEntered == human.get(), "partial batch left keys held");
+    bool tooMany = false;
+    try { injectKeys(std::vector<Stroke>(257, Stroke{30, true})); } catch (const sdbus::Error& error) { tooMany = error.name == "org.freedesktop.DBus.Error.InvalidArgs"; }
+    check(tooMany && keyEvents == before + 2, "oversized batch was not refused up front");
 
     // ResetInputDelivery: everything held goes, addressed correctly, the
     // target is forgotten, and both shared objects are the seat's again.
