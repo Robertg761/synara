@@ -693,6 +693,38 @@ describe("launch results", () => {
     expect(result.appId).toBe(appId);
   });
 
+  it.each([
+    ["reports a launch whose window took activation", 4_242, true],
+    ["does not blame the launch for the human moving their own focus", 99, undefined],
+  ] as const)("%s", async (_label, activePid, expected) => {
+    const plugin = new FakePlugin();
+    plugin.windows = [{ ...plugin.windows[0]!, active: true }];
+    const launchedWindow = {
+      id: "launched",
+      title: "New",
+      appName: "org.example.New",
+      pid: activePid,
+      bounds: { x: 0, y: 0, width: 400, height: 300 },
+      focused: false,
+      minimized: false,
+      visible: true,
+      active: true,
+    };
+    const backend = makeBackend(plugin, {
+      spawnProcess: () => {
+        const child = Object.assign(new EventEmitter(), { pid: 4_242, unref: () => undefined });
+        queueMicrotask(() => {
+          plugin.windows = [{ ...plugin.windows[0]!, active: false }, launchedWindow];
+          child.emit("spawn");
+        });
+        return child as unknown as ChildProcess;
+      },
+    });
+    await backend.availability();
+    const result = await backend.launchApp("new", []);
+    expect(result.focusChangedDuringLaunch).toBe(expected);
+  });
+
   it("lets the manager find a launched window whose app name differs from the launch name", async () => {
     const plugin = new FakePlugin();
     plugin.windows = [

@@ -1277,7 +1277,7 @@ export class KWinComputerBackend implements ComputerBackend {
       const state = await this.readPluginState(plugin);
       return { payload: await plugin.windowsJson(), targetWindowId: state.targetWindowId };
     }
-    const document = asRecord(parseJsonPayload(await windowsState()));
+    const document = asRecord(parseJsonPayload(await this.pluginValue(() => windowsState())));
     const locked = document.locked === true;
     this.noteSessionLock(locked);
     if (locked) throw this.sessionLockedError(SESSION_LOCKED_MESSAGE);
@@ -1514,6 +1514,9 @@ export class KWinComputerBackend implements ComputerBackend {
 
   async launchApp(app: string, args: readonly string[]): Promise<ComputerLaunchAppResult> {
     await this.ensurePlugin();
+    // Which window was active before, so a launch that takes activation is
+    // reported (the manager pauses background input on it).
+    const activeBefore = await this.activeWindow().catch(() => undefined);
     // The last moment to refuse: after this the process exists whatever the
     // caller does with the cancellation.
     assertDesktopOperationActive();
@@ -1587,14 +1590,33 @@ export class KWinComputerBackend implements ComputerBackend {
     // process it started, and — when that process may only be a launcher
     // handing the window on — the app identity its windows will report.
     const appId = launchedAppId(launch);
+    const pid = isProcessId(child.pid) ? child.pid : undefined;
+    this.noteDesktopChange();
+    const activeAfter = await this.activeWindow().catch(() => undefined);
+    // Only a window of this launch counts: the human moving their own focus
+    // meanwhile is not the launch taking activation. A window that maps after
+    // the grace is not seen here; this is the change the launch made while
+    // the call was still running.
+    const focusChanged =
+      activeAfter !== undefined &&
+      activeAfter.id !== activeBefore?.id &&
+      ((pid !== undefined && activeAfter.pid === pid) ||
+        (appId !== undefined && activeAfter.appName === appId));
     return {
       computerId: this.computerId,
       app,
       resolvedCommand: launch.command,
-      ...(isProcessId(child.pid) ? { pid: child.pid } : {}),
+      ...(pid !== undefined ? { pid } : {}),
       ...(appId ? { appId } : {}),
+      ...(focusChanged ? { focusChangedDuringLaunch: true } : {}),
       window: null,
     } as ComputerLaunchAppResult;
+  }
+
+  /** The window the compositor has active, if any. */
+  private async activeWindow(): Promise<ComputerWindow | undefined> {
+    const [windows] = await this.readWindows();
+    return windows.find((window) => window.active === true);
   }
 
   async click(

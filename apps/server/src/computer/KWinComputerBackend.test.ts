@@ -2870,10 +2870,8 @@ describe("KWinComputerBackend", () => {
     await backend.focusWindow("window-1");
 
     const launch = backend.launchApp("missing-program", []);
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      if (spawned) break;
-      await Promise.resolve();
-    }
+    // The launch reads the active window before it spawns.
+    await vi.waitFor(() => expect(spawned).toBe(true));
     expect(spawned).toBe(true);
     expect(child.unref).toHaveBeenCalledTimes(1);
     child.emit("error", new Error("spawn failed: ENOENT"));
