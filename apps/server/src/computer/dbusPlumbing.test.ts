@@ -218,15 +218,4 @@ describe("watching a D-Bus connection", () => {
     });
     expect(() => bus.dropTransport()).not.toThrow();
   });
-
-  it("detaches everything it attached", () => {
-    const bus = withFakeDbusTransport(new EventEmitter());
-    const watch = watchDbusConnection(bus);
-    expect(bus.listenerCount("error")).toBe(1);
-    expect(bus._connection.listenerCount("end")).toBe(1);
-    watch.detach();
-    expect(bus.listenerCount("error")).toBe(0);
-    expect(bus.listenerCount("disconnect")).toBe(0);
-    expect(bus._connection.listenerCount("end")).toBe(0);
-  });
 });

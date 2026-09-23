@@ -111,13 +111,13 @@ async function withSessionBus<T>(
     // only says that it broke.
     throw asError(dropped?.cause ?? dropped ?? error);
   } finally {
-    // Disconnecting can itself surface as an 'error' event on the bus
-    // (ECONNRESET during close is routine), so the handlers stay attached
-    // through it — removing them first would turn that into an unhandled
-    // 'error' on a bare EventEmitter, which crashes the process.
+    // Disconnecting can surface as an 'error' event on the bus (ECONNRESET
+    // during close is routine), during disconnect() or after it returns, once
+    // the socket actually closes. So the watch's handlers are never removed:
+    // an 'error' on a bare EventEmitter is an uncaught exception, and the
+    // released watch ignores whatever arrives. They go with the bus object.
     connection.release(() => new Error("The session-bus probe is over."));
     bus.disconnect();
-    connection.detach();
   }
 }
 

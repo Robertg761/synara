@@ -124,12 +124,6 @@ export interface DbusConnectionWatch {
    * `onClosed` listener fires. A no-op once the connection has ended.
    */
   readonly release: (reason: () => Error) => void;
-  /**
-   * Removes every listener the watch attached. Only for a connection whose
-   * own `error` listeners outlive it: removing the last one turns a late
-   * socket error into an uncaught exception.
-   */
-  readonly detach: () => void;
 }
 
 /** Starts watching `bus` (a `dbus-next` MessageBus). */
@@ -161,11 +155,8 @@ export function watchDbusConnection(bus: object): DbusConnectionWatch {
     end(() => error, error);
   };
 
-  const attached: Array<readonly [Emitter, string, (...args: unknown[]) => void]> = [];
   const listen = (target: unknown, event: string, handler: (...args: unknown[]) => void) => {
-    if (!isEmitter(target)) return;
-    target.on(event, handler);
-    attached.push([target, event, handler]);
+    if (isEmitter(target)) target.on(event, handler);
   };
   const onError = (error: unknown, detail?: unknown) => {
     if (!isMessageLevelBusError(error, detail)) drop(error);
@@ -210,9 +201,6 @@ export function watchDbusConnection(bus: object): DbusConnectionWatch {
       return () => listeners.delete(listener);
     },
     release: (reason) => end(reason, undefined),
-    detach: () => {
-      for (const [target, event, handler] of attached.splice(0)) target.off(event, handler);
-    },
   };
 }
 
@@ -240,14 +228,10 @@ function isMessageLevelBusError(error: unknown, detail: unknown): boolean {
 
 interface Emitter {
   on(event: string, handler: (...args: unknown[]) => void): unknown;
-  off(event: string, handler: (...args: unknown[]) => void): unknown;
 }
 
 function isEmitter(value: unknown): value is Emitter {
   return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { on?: unknown }).on === "function" &&
-    typeof (value as { off?: unknown }).off === "function"
+    typeof value === "object" && value !== null && typeof (value as { on?: unknown }).on === "function"
   );
 }

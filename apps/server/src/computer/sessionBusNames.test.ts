@@ -50,9 +50,6 @@ describe("sessionBusNamesHaveOwners", () => {
     expect(fake.sessionBus).toHaveBeenCalledTimes(1);
     expect(fake.nameHasOwner.mock.calls).toEqual([["org.kde.KWin"], ["org.synara.ComputerUse"]]);
     expect(fake.disconnect).toHaveBeenCalledTimes(1);
-    // Nothing is left listening on a connection that no longer exists.
-    expect(fake.bus.listenerCount("error")).toBe(0);
-    expect(fake.bus.listenerCount("disconnect")).toBe(0);
   });
 
   it("opens no connection for an empty question", async () => {
@@ -136,7 +133,18 @@ describe("sessionBusNamesHaveOwners", () => {
     await expect(
       sessionBusNamesHaveOwners(["org.kde.KWin"], { dbusModule: fake.dbusModule }),
     ).resolves.toEqual([true]);
-    expect(fake.bus.listenerCount("error")).toBe(0);
+  });
+
+  it("keeps the error listener attached after disconnecting", async () => {
+    // The socket closes after disconnect() returns, so a reset reported then
+    // lands on a bus whose probe is long over; with no listener left, that
+    // `error` would be an uncaught exception.
+    const fake = fakeSessionBus(() => Promise.resolve(true));
+    await expect(
+      sessionBusNamesHaveOwners(["org.kde.KWin"], { dbusModule: fake.dbusModule }),
+    ).resolves.toEqual([true]);
+    expect(fake.bus.listenerCount("error")).toBeGreaterThan(0);
+    expect(() => fake.bus.emit("error", new Error("read ECONNRESET"))).not.toThrow();
   });
 });
 
