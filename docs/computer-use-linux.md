@@ -193,6 +193,41 @@ application; partial results carry a marker rather than failing the read.
 `atspiTreeTargeting.ts` fuses each tree with the plugin's window bounds into
 the desktop-space `ComputerUiNode` tree the manager exposes.
 
+### Engine behaviour
+
+The same engine drives all three Linux backends.
+
+- Connection: a dead bus is noticed from the socket itself (dbus-next never
+  emits `disconnect`), and every call waiting on it fails at once. Reconnects
+  back off from 250 ms to 30 s, and the backoff restarts only after a
+  connection stayed up 30 s or carried an input. A plugin the human unloaded
+  from the same compositor instance is not reloaded until the next real use;
+  a restarted compositor gets it back. A compositor missing for 60 s is
+  reported once as `desktop-gone`.
+- Action path: a window list read once serves the whole desktop operation
+  (75 ms, dropped on any input, focus or raise), through `windowsStateJson`
+  when offered. No glide under a pixel, for the human's pane input, or on the
+  nested desktop. Text goes through `keys` a word at a time. Model captures
+  use the core's 1536 px budget. `launchApp` reports the pid, the app id a
+  launcher hands off to, and whether one of its windows took activation.
+- Settle: with `waitForSettle`, an action waits until the target window has
+  repainted and stayed quiet for 100 ms, capped at 1.5 s. A window that has
+  not repainted at all 300 ms after the input is taken as unchanged. After
+  three such actions in a row the manager's fixed wait comes back.
+- Preview: stills are passive JPEGs (`captureRegionEx`) at a 1280 px budget
+  through `StillFramePublisher`. They slow from 500 ms to 2 s after four
+  identical frames, wake on actions and window changes, and wait while a
+  desktop operation runs. Five failed stills mark capture unavailable. A
+  locked session or a timed-out capture does not count toward that, and
+  health is re-read with backoff until capture works again.
+- Typing is refused before any key on layouts the US-QWERTY table cannot
+  type: Dvorak, Colemak, `intl`, `alt-intl` and non-US layouts. The short
+  name (`us`) and the descriptive one a keymap without a layout list
+  reports (`English (US)`) both count as plain US.
+- Paste offers the text once (`wl-copy --paste-once`) and restores the
+  human's clipboard as soon as it has been read. Any offer still open when
+  the backend is disposed is withdrawn.
+
 ### Provisioning and packaging
 
 Everything except distribution packages installs under the user's home,
