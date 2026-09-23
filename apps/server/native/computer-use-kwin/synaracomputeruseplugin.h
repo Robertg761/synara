@@ -152,18 +152,13 @@ public:
     /**
      * Sends the strokes in order, each checked exactly as key() checks one,
      * and stops at the first that is not delivered. Returns how many were; a
-     * refusal of the first is an error, as it is from key(). At most
+     * refusal of the first is an error, as it is from key(). A partial batch
+     * leaves the keys it pressed held: the caller releases them. At most
      * s_maxKeyStrokes per call.
      */
     Q_INVOKABLE uint keys(const QList<SynaraKeyStroke> &strokes);
     Q_INVOKABLE QByteArray captureWindow(const QString &windowId, uint maxDimension);
     Q_INVOKABLE QByteArray captureRegion(int x, int y, uint width, uint height, uint maxDimension);
-    /**
-     * captureWindow and captureRegion with `flags` (1 passive, 2 JPEG, 4 raw
-     * luma, which outranks JPEG; see CaptureFlag) and the MIME type of the
-     * bytes as a second reply argument. Errors and refusals are the version 1
-     * methods'.
-     */
     /**
      * Replies once the window (any window, for an empty id) has committed new
      * content after the agent's last input, or after this call when no input
@@ -172,6 +167,12 @@ public:
      * reply driven by damage and timers: the compositor thread never waits.
      */
     Q_INVOKABLE bool waitForSettle(const QString &windowId, uint quietMs, uint timeoutMs, uint &elapsedMs);
+    /**
+     * captureWindow and captureRegion with `flags` (1 passive, 2 JPEG, 4 raw
+     * luma, which outranks JPEG; see CaptureFlag) and the MIME type of the
+     * bytes as a second reply argument. Errors and refusals are the version 1
+     * methods'.
+     */
     Q_INVOKABLE QByteArray captureWindowEx(const QString &windowId, uint maxDimension, uint flags, QString &mime);
     Q_INVOKABLE QByteArray captureRegionEx(int x, int y, uint width, uint height, uint maxDimension, uint flags, QString &mime);
 

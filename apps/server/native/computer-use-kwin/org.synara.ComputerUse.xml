@@ -119,7 +119,9 @@
     <!-- Feature keys: (keyCode, pressed) strokes in order, each checked
          exactly as key() checks one. Stops at the first stroke that is not
          delivered and returns how many were; a refusal of the first stroke is
-         an error, as from key(). More than 256 strokes answer
+         an error, as from key(). A batch that stops early does not release
+         the keys its delivered strokes pressed: the caller knows which they
+         are and releases them. More than 256 strokes answer
          org.freedesktop.DBus.Error.InvalidArgs. -->
     <method name="keys">
       <arg name="strokes" type="a(ub)" direction="in"/>
