@@ -1,7 +1,7 @@
 // The extended captures' admission and the passive flag, driven through the
 // production entry points against a modelled plugin: which refusals come
-// first, which flag combinations are refused, and that a passive frame is not
-// agent activity (R9: an open preview kept an abandoned session alive).
+// first, how flags pick the format, and that a passive frame is not agent
+// activity (R9: an open preview kept an abandoned session alive).
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -86,7 +86,7 @@ struct SynaraComputerUsePlugin {
     void queueCapture(std::shared_ptr<CaptureRequest> request) { queued.push_back(std::move(request)); }
     Window* findWindowById(const QString&) { return &window; }
 
-    bool admitCapture(uint flags);
+    bool admitCapture();
     void startCapture(std::shared_ptr<CaptureRequest> request, uint maxDimension, uint flags, bool extended);
     std::string captureWindow(const QString& windowId, uint maxDimension);
     std::string captureWindowEx(const QString& windowId, uint maxDimension, uint flags, QString& mime);
@@ -125,17 +125,21 @@ int main() {
             plugin.captureWindowEx("w", 0, 0, mime);
             check(plugin.activity == 0 && plugin.queued.size() == 1, "a stopped session still captures, without activity");
         }
-        for (uint flags : {8u, CaptureJpeg | CaptureLuma, 0x80000000u}) {
+        // The Hyprland plugin's rules: luma outranks JPEG, unknown bits are
+        // ignored.
+        check(captureFormat(0) == CaptureFormat::Png && captureFormat(CapturePassive) == CaptureFormat::Png, "no format flag is a PNG");
+        check(captureFormat(CaptureJpeg) == CaptureFormat::Jpeg, "2 is JPEG");
+        check(captureFormat(CaptureLuma) == CaptureFormat::Luma && captureFormat(CaptureJpeg | CaptureLuma) == CaptureFormat::Luma, "4 is luma, and wins over 2");
+        {
             SynaraComputerUsePlugin plugin;
-            plugin.captureRegionEx(0, 0, 10, 10, 0, flags, mime);
-            check(plugin.errors.size() == 1 && plugin.errors[0] == "InvalidArgs", "an invalid flag combination is InvalidArgs");
-            check(plugin.queued.empty() && !plugin.delayed && plugin.activity == 0, "a refused capture queues nothing");
+            plugin.captureRegionEx(0, 0, 10, 10, 0, 8u | CapturePassive, mime);
+            check(plugin.errors.empty() && plugin.queued.size() == 1 && plugin.activity == 0, "unknown bits are ignored, the known ones still apply");
         }
         {
             SynaraComputerUsePlugin plugin;
             plugin.m_releasedByUser = true;
-            plugin.captureWindowEx("w", 0, 8, mime);
-            check(plugin.errors.size() == 1 && plugin.errors[0] == s_releasedErrorName, "the release latch refuses before the flags are looked at");
+            plugin.captureWindowEx("w", 0, CapturePassive, mime);
+            check(plugin.errors.size() == 1 && plugin.errors[0] == s_releasedErrorName, "the release latch refuses a passive capture too");
             SynaraComputerUsePlugin locked;
             locked.locked = true;
             locked.captureWindowEx("w", 0, CapturePassive, mime);

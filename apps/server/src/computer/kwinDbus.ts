@@ -101,8 +101,8 @@ export const COMPUTER_PLUGIN_METHOD_SIGNATURES: Readonly<
 const SETTLE_MAX_TIMEOUT_MS = 30_000;
 
 /**
- * `flags` for `captureWindowEx`/`captureRegionEx` (feature `captureEx`). JPEG
- * and luma exclude each other; without either the bytes are a PNG.
+ * `flags` for `captureWindowEx`/`captureRegionEx` (feature `captureEx`). Luma
+ * outranks JPEG; without either the bytes are a PNG. Unknown bits are ignored.
  */
 export const COMPUTER_CAPTURE_FLAGS = {
   /** An observer's frame: not agent activity, so the idle deadline and badge are untouched. */
@@ -170,7 +170,8 @@ export interface KWinComputerPluginApi {
    * elapsedMs]` once the window (any window for `""`) has committed new
    * content after the agent's last input and then stayed quiet for
    * `quietMs`, or `[false, elapsedMs]` at `timeoutMs` (the plugin clamps it to
-   * 30 s). The call's own deadline must outlast `timeoutMs`.
+   * 30 s), and `[false, 0]` at once with no session running or no such
+   * window. The call's own deadline outlasts `timeoutMs`.
    */
   readonly waitForSettle?: (
     windowId: string,

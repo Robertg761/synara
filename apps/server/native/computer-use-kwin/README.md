@@ -144,11 +144,10 @@ plugin keeps working with a newer server. Every version 1 method is unchanged.
   back, and an open preview can no longer keep an abandoned session alive.
   `2` encodes JPEG at quality 85 (`image/jpeg`), `4` raw 8-bit luma
   (`image/x-luma8; width=<w>; height=<h>`, row-major, no padding) for
-  measuring rather than showing. Without either it is the same PNG as the
-  version 1 methods (`image/png`). JPEG and luma are flattened onto black, since
-  neither has alpha. Unknown bits, or `2` with `4`, answer
-  `org.freedesktop.DBus.Error.InvalidArgs`; every other refusal and error is
-  exactly the version 1 methods'.
+  measuring rather than showing; `4` outranks `2`. Without either it is the
+  same PNG as the version 1 methods (`image/png`). JPEG and luma are flattened
+  onto black, since neither has alpha. Unknown bits are ignored, and every
+  refusal and error is exactly the version 1 methods', as on Hyprland.
 - `keys(a(ub) strokes) -> u` (feature `keys`): up to 256 `(keyCode, pressed)`
   strokes in order, each checked exactly as `key` checks one (target, path,
   reachability, the human-active guard with its release exemption). It stops
@@ -161,15 +160,16 @@ plugin keeps working with a newer server. Every version 1 method is unchanged.
   action and the observation of it. It replies once the window (any window,
   for an empty id) has committed new content after the agent's last input and
   then stayed quiet for `quietMs`, and with `settled` false at `timeoutMs`
-  (clamped to 30 seconds) or when the window closes. "New content" is
+  (clamped to 30 seconds) or when the window closes, and at once when no
+  session is running or the id names no usable window. "New content" is
   `Window::damaged`: a commit that changes pixels anywhere in the window's
   surface tree, so a client that commits every frame only to request the next
-  frame callback still reads as quiet. Each wait consumes the input it answers
-  for: a second wait with no input in between, or one before any input, waits
+  frame callback still reads as quiet. A wait answers for the agent's last
+  input until one settles on it; after that, or before any input, a wait asks
   for content committed after the call itself. The reply is delayed and driven
   by the damage signal and one timer per wait; the compositor thread never
-  blocks. An unknown id answers `InvalidArgs`, more than 16 waits in flight
-  `LimitsExceeded`, a lock `SessionLocked`.
+  blocks. More than 16 waits in flight answer `LimitsExceeded`, a lock
+  `SessionLocked`.
 
 `healthJson` also carries `xAuthority`: the cookie file of the Xwayland this
 compositor started, read from KWin's own environment the same way `xDisplay`

@@ -149,15 +149,16 @@ public:
     Q_INVOKABLE QByteArray captureRegion(int x, int y, uint width, uint height, uint maxDimension);
     /**
      * captureWindow and captureRegion with `flags` (1 passive, 2 JPEG, 4 raw
-     * luma; see CaptureFlag) and the MIME type of the bytes as a second reply
-     * argument. Errors and refusals are the version 1 methods'.
+     * luma, which outranks JPEG; see CaptureFlag) and the MIME type of the
+     * bytes as a second reply argument. Errors and refusals are the version 1
+     * methods'.
      */
     /**
      * Replies once the window (any window, for an empty id) has committed new
      * content after the agent's last input, or after this call when no input
      * is pending, and then stayed quiet for `quietMs`; `settled` false at
-     * `timeoutMs`. A delayed reply driven by damage and timers: the
-     * compositor thread never waits.
+     * `timeoutMs`, and at once with no session or no such window. A delayed
+     * reply driven by damage and timers: the compositor thread never waits.
      */
     Q_INVOKABLE bool waitForSettle(const QString &windowId, uint quietMs, uint timeoutMs, uint &elapsedMs);
     Q_INVOKABLE QByteArray captureWindowEx(const QString &windowId, uint maxDimension, uint flags, QString &mime);
@@ -366,7 +367,7 @@ private:
     void finishSettle(SettleRequest *request, bool settled);
     void retireSettleTimer(SettleRequest *request);
     void failSettleRequests(const QString &errorName, const QString &reason);
-    bool admitCapture(uint flags);
+    bool admitCapture();
     void startCapture(std::shared_ptr<CaptureRequest> request, uint maxDimension, uint flags, bool extended);
     void releaseCaptureTargets();
     void watchRenderLoop(LogicalOutput *output);
@@ -476,11 +477,13 @@ private:
     std::array<quint32, 64> m_agentSerials = {};
     size_t m_agentSerialNext = 0;
     // waitForSettle's clock (nanoseconds), each window's last damaged commit
-    // and any window's, and the agent input no wait has consumed yet (-1).
+    // and any window's, the agent's last input and the latest input a wait
+    // settled on (-1 for none).
     QElapsedTimer m_settleClock;
     QHash<Window *, qint64> m_windowDamageNs;
     qint64 m_anyDamageNs = -1;
-    qint64 m_pendingAgentInputNs = -1;
+    qint64 m_lastAgentInputNs = -1;
+    qint64 m_settledAgentInputNs = -1;
     std::vector<std::unique_ptr<SettleRequest>> m_settleRequests;
 };
 

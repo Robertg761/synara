@@ -675,7 +675,8 @@ static bool isWindowVisibleForCapture(const Window *window)
 
 /**
  * What captureWindowEx and captureRegionEx take in `flags`. Without JPEG or
- * LUMA the bytes are a PNG, as from captureWindow and captureRegion.
+ * LUMA the bytes are a PNG, as from captureWindow and captureRegion; with
+ * both, luma wins. Unknown bits are ignored, as the Hyprland plugin does.
  */
 enum CaptureFlag : uint {
     // An observer's frame (the preview): not agent activity, so it neither
@@ -685,7 +686,6 @@ enum CaptureFlag : uint {
     // Raw 8-bit luma, row-major and unpadded, for measuring rather than looking.
     CaptureLuma = 4,
 };
-static constexpr uint s_captureKnownFlags = CapturePassive | CaptureJpeg | CaptureLuma;
 static constexpr int s_jpegQuality = 85;
 
 enum class CaptureFormat {
@@ -696,10 +696,10 @@ enum class CaptureFormat {
 
 static CaptureFormat captureFormat(uint flags)
 {
-    if (flags & CaptureJpeg) {
-        return CaptureFormat::Jpeg;
+    if (flags & CaptureLuma) {
+        return CaptureFormat::Luma;
     }
-    return flags & CaptureLuma ? CaptureFormat::Luma : CaptureFormat::Png;
+    return flags & CaptureJpeg ? CaptureFormat::Jpeg : CaptureFormat::Png;
 }
 
 struct EncodedCapture
@@ -2679,17 +2679,15 @@ bool SynaraComputerUsePlugin::waitForSettle(const QString &windowId, uint quietM
     if (refuseIfSessionLocked()) {
         return false;
     }
-    Window *window = nullptr;
-    if (!windowId.isEmpty()) {
-        window = findWindowById(windowId);
-        if (!window || window->isDeleted()) {
-            sendErrorReply(QDBusError::InvalidArgs, QStringLiteral("unknown window %1").arg(windowId));
-            return false;
-        }
+    Window *window = windowId.isEmpty() ? nullptr : findWindowById(windowId);
+    // Nothing to observe: no session, or no such window to watch. Answered
+    // unsettled at once rather than as an error, as the Hyprland plugin does.
+    if (!m_running || (!windowId.isEmpty() && !presentWindow(window))) {
+        return false;
     }
     if (m_settleRequests.size() >= s_maxSettleWaits) {
         sendErrorReply(QDBusError::LimitsExceeded,
-                       QStringLiteral("%1 waits are already in flight").arg(s_maxSettleWaits));
+                       QStringLiteral("at most %1 waitForSettle calls may be pending at once").arg(s_maxSettleWaits));
         return false;
     }
     setDelayedReply(true);
@@ -2698,10 +2696,11 @@ bool SynaraComputerUsePlugin::waitForSettle(const QString &windowId, uint quietM
     auto request = std::make_unique<SettleRequest>(connection(), message());
     request->window = window;
     request->anyWindow = window == nullptr;
-    // The input this wait answers for is consumed by it: a second wait with no
-    // input in between asks for content committed after itself.
-    request->baselineNs = m_pendingAgentInputNs >= 0 ? m_pendingAgentInputNs : now;
-    m_pendingAgentInputNs = -1;
+    // An input no settled wait has covered yet is what this one waits out;
+    // with none, whatever happens after the call. A wait that times out
+    // leaves its input pending for the next.
+    const bool inputPending = m_lastAgentInputNs >= 0 && m_lastAgentInputNs > m_settledAgentInputNs;
+    request->baselineNs = inputPending ? m_lastAgentInputNs : now;
     request->startedNs = now;
     request->quietNs = qint64(quietMs) * 1000000;
     request->deadlineNs = now + qint64(std::min(timeoutMs, s_maxSettleTimeoutMs)) * 1000000;
@@ -2719,7 +2718,7 @@ bool SynaraComputerUsePlugin::waitForSettle(const QString &windowId, uint quietM
 
 void SynaraComputerUsePlugin::noteAgentInput()
 {
-    m_pendingAgentInputNs = m_settleClock.nsecsElapsed();
+    m_lastAgentInputNs = m_settleClock.nsecsElapsed();
 }
 
 /**
@@ -2803,6 +2802,9 @@ void SynaraComputerUsePlugin::finishSettle(SettleRequest *request, bool settled)
     }
     std::unique_ptr<SettleRequest> owned = std::move(*it);
     m_settleRequests.erase(it);
+    if (settled && owned->baselineNs == m_lastAgentInputNs) {
+        m_settledAgentInputNs = std::max(m_settledAgentInputNs, owned->baselineNs);
+    }
     retireSettleTimer(owned.get());
     const qint64 elapsedMs = (m_settleClock.nsecsElapsed() - owned->startedNs) / 1000000;
     owned->connection.send(owned->message.createReply(QVariantList{settled, uint(std::clamp<qint64>(elapsedMs, 0, std::numeric_limits<uint>::max()))}));
@@ -2829,7 +2831,7 @@ void SynaraComputerUsePlugin::failSettleRequests(const QString &errorName, const
 
 QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint maxDimension)
 {
-    if (!admitCapture(0)) {
+    if (!admitCapture()) {
         return {};
     }
     auto request = std::make_shared<CaptureRequest>(connection(), message());
@@ -2841,7 +2843,7 @@ QByteArray SynaraComputerUsePlugin::captureWindow(const QString &windowId, uint 
 
 QByteArray SynaraComputerUsePlugin::captureRegion(int x, int y, uint width, uint height, uint maxDimension)
 {
-    if (!admitCapture(0)) {
+    if (!admitCapture()) {
         return {};
     }
     auto request = std::make_shared<CaptureRequest>(connection(), message());
@@ -2853,7 +2855,7 @@ QByteArray SynaraComputerUsePlugin::captureRegion(int x, int y, uint width, uint
 QByteArray SynaraComputerUsePlugin::captureWindowEx(const QString &windowId, uint maxDimension, uint flags, QString &mime)
 {
     Q_UNUSED(mime)
-    if (!admitCapture(flags)) {
+    if (!admitCapture()) {
         return {};
     }
     auto request = std::make_shared<CaptureRequest>(connection(), message());
@@ -2866,7 +2868,7 @@ QByteArray SynaraComputerUsePlugin::captureWindowEx(const QString &windowId, uin
 QByteArray SynaraComputerUsePlugin::captureRegionEx(int x, int y, uint width, uint height, uint maxDimension, uint flags, QString &mime)
 {
     Q_UNUSED(mime)
-    if (!admitCapture(flags)) {
+    if (!admitCapture()) {
         return {};
     }
     auto request = std::make_shared<CaptureRequest>(connection(), message());
@@ -2877,9 +2879,9 @@ QByteArray SynaraComputerUsePlugin::captureRegionEx(int x, int y, uint width, ui
 
 /**
  * The refusals every capture method shares, in order, before anything is
- * queued: the caller, the release latch, the lock, and the flags.
+ * queued: the caller, the release latch and the lock.
  */
-bool SynaraComputerUsePlugin::admitCapture(uint flags)
+bool SynaraComputerUsePlugin::admitCapture()
 {
     if (!m_auth.permits(*this)) return false;
     if (!calledFromDBus()) {
@@ -2895,13 +2897,6 @@ bool SynaraComputerUsePlugin::admitCapture(uint flags)
         return false;
     }
     if (refuseIfSessionLocked()) {
-        return false;
-    }
-    if ((flags & ~s_captureKnownFlags) != 0 || ((flags & CaptureJpeg) && (flags & CaptureLuma))) {
-        sendErrorReply(QDBusError::InvalidArgs,
-                       QStringLiteral("capture flags %1 are not a valid combination: 1 passive, and at most one "
-                                      "of 2 JPEG and 4 luma")
-                           .arg(flags));
         return false;
     }
     return true;

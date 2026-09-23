@@ -129,9 +129,10 @@
          empty id) has committed new content after the agent's last input -
          or after this call, when no input is waiting for a settle - and then
          stayed quiet for quietMs; settled is false at timeoutMs (clamped to
-         30 s) or when the window closes. A delayed reply: the compositor
-         never waits on it. An unknown id answers
-         org.freedesktop.DBus.Error.InvalidArgs; more than 16 waits in flight
+         30 s) or when the window closes, and at once when no session is
+         running or windowId names no usable window. elapsedMs is the time
+         the call waited. A delayed reply: the compositor never waits on it.
+         More than 16 waits in flight answer
          org.freedesktop.DBus.Error.LimitsExceeded. -->
     <method name="waitForSettle">
       <arg name="windowId" type="s" direction="in"/>
@@ -161,10 +162,10 @@
          MIME type as a second reply argument. Flags: 1 passive (an
          observer's frame: not agent activity, so the idle deadline and the
          badge are untouched), 2 JPEG quality 85 ("image/jpeg"), 4 raw 8-bit
-         luma ("image/x-luma8; width=<w>; height=<h>", row-major, unpadded).
-         Without 2 or 4 it is a PNG ("image/png"). Unknown bits, or 2 with 4,
-         answer org.freedesktop.DBus.Error.InvalidArgs; every other error is
-         the version 1 methods'. -->
+         luma ("image/x-luma8; width=<w>; height=<h>", row-major, unpadded;
+         outranks 2). Without 2 or 4 it is a PNG at fast compression
+         ("image/png"). Unknown bits are ignored. Errors are the version 1
+         methods'. -->
     <method name="captureWindowEx">
       <arg name="windowId" type="s" direction="in"/>
       <arg name="maxDimension" type="u" direction="in"/>
