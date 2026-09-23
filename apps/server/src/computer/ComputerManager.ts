@@ -66,6 +66,7 @@ import {
   type ComputerBackend,
   type ComputerGuidanceProfile,
   type ComputerBackendActionResult,
+  type ComputerClipboardPasteOffer,
   type ComputerBrowserCallResult,
   type ComputerCaptureRequest,
   type ComputerStreamFrame,
@@ -175,6 +176,14 @@ export const COMPUTER_ACTION_OBSERVER_SETTLE_QUIET_MS = COMPUTER_ACTION_SETTLE_M
  * reaches for their own clipboard next is not racing us.
  */
 export const COMPUTER_PASTE_RESTORE_MS = 250;
+/**
+ * The longest paste waits for a backend that can observe the paste
+ * (`writeClipboardForPaste`) to report the payload read before restoring
+ * anyway. Long enough for a slow toolkit to service the request, short enough
+ * that a shortcut the target ignored does not hold the human's clipboard
+ * hostage.
+ */
+export const COMPUTER_PASTE_CONSUME_TIMEOUT_MS = 2_000;
 
 /**
  * Trailing-edge window on the republish that a backend window change triggers.
@@ -3497,8 +3506,13 @@ export class ComputerManager {
       const read = this.backend.readClipboard?.bind(this.backend);
       const write = this.backend.writeClipboard?.bind(this.backend);
       if (!read || !write) throw clipboardUnsupportedError();
+      const writeForPaste = this.backend.writeClipboardForPaste?.bind(this.backend);
       const previous = await timedComputerLeg("dispatch", () => read().catch(() => undefined));
-      await timedComputerLeg("dispatch", () => write(text));
+      const offer = await timedComputerLeg(
+        "dispatch",
+        (): Promise<ComputerClipboardPasteOffer | void> =>
+          writeForPaste ? writeForPaste(text) : write(text),
+      );
       let restored = false;
       let result: ComputerBackendActionResult | void;
       try {
@@ -3513,13 +3527,7 @@ export class ComputerManager {
         // is already on the clipboard either way, and leaving it there leaks
         // the agent's text into the next paste the human makes.
         if (previous !== undefined) {
-          await timedComputerLeg(
-            "settle",
-            () =>
-              new Promise<void>((resolve) => {
-                setTimeout(resolve, COMPUTER_PASTE_RESTORE_MS);
-              }),
-          );
+          await timedComputerLeg("settle", () => pasteConsumed(offer));
           restored = await write(previous).then(
             () => true,
             () => false,
@@ -5385,6 +5393,27 @@ async function measureScrollTravelFromPng(
   ]);
   if (!decodedBefore || !decodedAfter) return undefined;
   return estimateVerticalTravel(decodedBefore, decodedAfter);
+}
+
+/**
+ * The wait between a paste shortcut and putting the human's clipboard back.
+ * A backend that can observe the paste (`writeClipboardForPaste`) ends it the
+ * moment the target has read the payload, bounded for a paste that never
+ * reads; every other backend keeps the fixed settle.
+ */
+async function pasteConsumed(offer: ComputerClipboardPasteOffer | void): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<void>((resolve) => {
+    timer = setTimeout(
+      resolve,
+      offer ? COMPUTER_PASTE_CONSUME_TIMEOUT_MS : COMPUTER_PASTE_RESTORE_MS,
+    );
+  });
+  try {
+    await (offer ? Promise.race([offer.consumed.catch(() => bound), bound]) : bound);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Scroll telemetry is a reading, not a measurement instrument: two decimals is all it means. */

@@ -274,6 +274,16 @@ export interface ComputerBrowserBackend {
   endThread?(threadId: string): Promise<void>;
 }
 
+/** One pending single-use clipboard offer; see `ComputerBackend.writeClipboardForPaste`. */
+export interface ComputerClipboardPasteOffer {
+  /**
+   * Resolves once a paste target has read the payload. Rejects, or never
+   * settles, when the offer ended some other way (replaced, the helper died);
+   * the manager treats both as "not observed" and falls back to its bound.
+   */
+  readonly consumed: Promise<void>;
+}
+
 export type ComputerFrameListener = (frame: ComputerStreamFrame) => void;
 export type ComputerBackendEventListener = (event: ComputerBackendEvent) => void;
 
@@ -810,6 +820,24 @@ export interface ComputerBackend {
   readClipboard?(): Promise<string>;
   /** Writes the same shared system clipboard `readClipboard` reads. */
   writeClipboard?(text: string): Promise<void>;
+  /**
+   * Writes `text` to the shared clipboard for exactly one paste, and says when
+   * that paste has read it.
+   *
+   * Paste has to put the human's clipboard back, and without this the manager
+   * can only guess when the target application has finished reading the
+   * payload (`COMPUTER_PASTE_RESTORE_MS`): a slow app reads after the guess and
+   * pastes the human's text instead. A backend whose clipboard can serve a
+   * single request and observe it (Wayland's `wl-copy --paste-once`) implements
+   * this; the manager then restores as soon as `consumed` settles, bounded by
+   * `COMPUTER_PASTE_CONSUME_TIMEOUT_MS` for a paste that never reads.
+   *
+   * The method resolves once the payload is on the clipboard, like
+   * `writeClipboard`. The backend owns the offer's lifetime: a later
+   * `writeClipboard` (the restore) must replace an unconsumed offer, and the
+   * offer must not outlive the backend. Absent means the fixed restore wait.
+   */
+  writeClipboardForPaste?(text: string): Promise<ComputerClipboardPasteOffer>;
   setValue(
     target: ComputerResolvedTarget,
     value: string,

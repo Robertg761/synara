@@ -14,7 +14,12 @@ import {
   type ComputerBackendActionResult,
 } from "./ComputerBackend.ts";
 import { computerApprovalGate } from "./ComputerApprovalGate.ts";
-import { COMPUTER_CONTROL_ENABLE_TIMEOUT_MS, ComputerManager } from "./ComputerManager.ts";
+import {
+  COMPUTER_CONTROL_ENABLE_TIMEOUT_MS,
+  COMPUTER_PASTE_CONSUME_TIMEOUT_MS,
+  COMPUTER_PASTE_RESTORE_MS,
+  ComputerManager,
+} from "./ComputerManager.ts";
 import {
   ComputerCallContext,
   ComputerCallTiming,
@@ -4852,4 +4857,74 @@ it("thread removal completes on a wedged stop — the teardown wait is bounded",
   } finally {
     vi.useRealTimers();
   }
+});
+
+describe("paste clipboard restore", () => {
+  /** Records when the human's text went back, relative to the paste call. */
+  class RestoreTimingBackend extends FakeComputerBackend {
+    pasteStartedAt = Number.NaN;
+    restoredAfterMs: number | undefined;
+    override async writeClipboard(text: string) {
+      if (text === "human text" && !Number.isNaN(this.pasteStartedAt)) {
+        this.restoredAfterMs ??= performance.now() - this.pasteStartedAt;
+      }
+      await super.writeClipboard(text);
+    }
+  }
+
+  /** A backend whose clipboard can serve one paste and report when it did. */
+  class PasteOnceBackend extends RestoreTimingBackend {
+    consume: (() => void) | undefined;
+    async writeClipboardForPaste(text: string) {
+      await super.writeClipboard(text);
+      return {
+        consumed: new Promise<void>((resolve) => {
+          this.consume = resolve;
+        }),
+      };
+    }
+  }
+
+  async function pasteRestoredAfterMs(backend: RestoreTimingBackend): Promise<number> {
+    await backend.writeClipboard("human text");
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    try {
+      backend.pasteStartedAt = performance.now();
+      await expect(manager.paste("thread-1", "agent text")).resolves.toMatchObject({
+        clipboardRestored: true,
+      });
+      expect(await backend.readClipboard()).toBe("human text");
+      return backend.restoredAfterMs!;
+    } finally {
+      await manager.dispose();
+    }
+  }
+
+  it("keeps the fixed restore wait on a backend that cannot observe the paste", async () => {
+    const backend = new RestoreTimingBackend();
+    const restoredAfter = await pasteRestoredAfterMs(backend);
+    expect(restoredAfter).toBeGreaterThanOrEqual(COMPUTER_PASTE_RESTORE_MS - 5);
+    expect(restoredAfter).toBeLessThan(COMPUTER_PASTE_CONSUME_TIMEOUT_MS);
+  });
+
+  it("restores only once a paste-once offer reports the payload read", async () => {
+    const backend = new PasteOnceBackend();
+    // A slow app: it reads the offer well after the fixed guess would have put
+    // the human's text back under it.
+    const hotkey = backend.hotkey.bind(backend);
+    backend.hotkey = async (...args) => {
+      const result = await hotkey(...args);
+      setTimeout(() => backend.consume?.(), 600);
+      return result;
+    };
+    const restoredAfter = await pasteRestoredAfterMs(backend);
+    expect(restoredAfter).toBeGreaterThanOrEqual(600 - 5);
+    expect(restoredAfter).toBeLessThan(COMPUTER_PASTE_CONSUME_TIMEOUT_MS - 500);
+  });
+
+  it("restores at the bound when a paste-once offer is never read", async () => {
+    const backend = new PasteOnceBackend();
+    const restoredAfter = await pasteRestoredAfterMs(backend);
+    expect(restoredAfter).toBeGreaterThanOrEqual(COMPUTER_PASTE_CONSUME_TIMEOUT_MS - 5);
+  });
 });
