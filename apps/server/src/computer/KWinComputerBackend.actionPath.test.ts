@@ -473,6 +473,46 @@ describe("compositor-observed settle", () => {
     ]);
   });
 
+  it("gives the fixed wait back after three settles in a row that saw no repaint at all", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["waitForSettle"];
+    plugin.waitForSettle = async (windowId, quietMs, timeoutMs) => {
+      plugin.calls.push({ method: "waitForSettle", args: [windowId, quietMs, timeoutMs] });
+      return [false, timeoutMs] as const;
+    };
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const options = { windowId: "window-1", quietMs: 100, timeoutMs: 1_500, quietWithinMs: 300 };
+    for (let miss = 0; miss < 3; miss += 1) {
+      await expect(backend.waitForSettle!(options)).resolves.toEqual({
+        settled: false,
+        waitedMs: 1_500,
+      });
+    }
+    // The manager's fixed post-action wait from here on.
+    expect(backend.waitForSettle).toBeUndefined();
+  });
+
+  it("keeps observing when a settle between the misses saw a repaint", async () => {
+    const plugin = new FakePlugin();
+    plugin.features = ["waitForSettle"];
+    const answers: (readonly [boolean, number])[] = [
+      [false, 300],
+      [false, 1_200],
+      [false, 300],
+      [false, 1_200],
+      [true, 40],
+      [false, 300],
+      [false, 1_200],
+    ];
+    plugin.waitForSettle = async () => answers.shift()!;
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const options = { windowId: "window-1", quietMs: 100, timeoutMs: 1_500, quietWithinMs: 300 };
+    for (let settle = 0; settle < 4; settle += 1) await backend.waitForSettle!(options);
+    expect(backend.waitForSettle).toBeDefined();
+  });
+
   it("waits blind rather than to the cap for a window the compositor is not painting", async () => {
     const plugin = new FakePlugin();
     plugin.features = ["waitForSettle"];

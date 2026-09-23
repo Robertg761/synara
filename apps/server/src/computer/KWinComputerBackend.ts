@@ -365,6 +365,14 @@ const PLUGIN_SETTLE_QUIET_MS = 100;
 const PLUGIN_SETTLE_QUIET_WITHIN_MS = 300;
 const PLUGIN_SETTLE_TIMEOUT_MS = 1_500;
 /**
+ * Consecutive settles of visible windows that saw no repaint at all before the
+ * cap, after which the plugin is taken not to be observing (a compositor that
+ * paces the client's frames elsewhere, a tracking fault) and the manager's
+ * fixed wait comes back for the rest of that plugin's life. A real desktop
+ * repaints after nearly every action, so a run of these is not the apps.
+ */
+const PLUGIN_SETTLE_MAX_BLIND_MISSES = 3;
+/**
  * Interface-version-2 capabilities a plugin advertises in `healthJson`. A
  * method is used only when its feature is listed: an installed plugin that
  * predates it keeps the version-1 path.
@@ -723,6 +731,11 @@ export class KWinComputerBackend implements ComputerBackend {
   private captureRecoveryDelayMs = CAPTURE_RECOVERY_BASE_MS;
   /** The last window explicitly aimed or raised by a caller. */
   private lastAimedWindowId: string | undefined;
+  /** See `PLUGIN_SETTLE_MAX_BLIND_MISSES`; counted per plugin instance. */
+  private settleMisses: { plugin: KWinComputerPluginApi | undefined; count: number } = {
+    plugin: undefined,
+    count: 0,
+  };
   /**
    * The window list the current desktop operation already read, reused by
    * that operation's later reads until any input, focus or raise changes the
@@ -1380,8 +1393,11 @@ export class KWinComputerBackend implements ComputerBackend {
    * an older plugin gets.
    */
   get waitForSettle(): ComputerBackend["waitForSettle"] {
-    if (this.connectedPlugin()?.waitForSettle === undefined) return undefined;
+    const plugin = this.connectedPlugin();
+    if (plugin?.waitForSettle === undefined) return undefined;
     if (!this.pluginFeature("waitForSettle")) return undefined;
+    const misses = this.settleMisses;
+    if (misses.plugin === plugin && misses.count >= PLUGIN_SETTLE_MAX_BLIND_MISSES) return undefined;
     return (options) => this.settleOnPlugin(options);
   }
 
@@ -1431,7 +1447,10 @@ export class KWinComputerBackend implements ComputerBackend {
       return { settled: false, waitedMs: blindMs };
     }
     const [quiet, quietWaitMs] = await wait(quietMs, quietBound);
-    if (quiet) return { settled: true, waitedMs: quietWaitMs };
+    if (quiet) {
+      this.settleMisses = { plugin, count: 0 };
+      return { settled: true, waitedMs: quietWaitMs };
+    }
     if (quietWaitMs === 0 && quietMs > 0) {
       await this.sleep(quietMs);
       return { settled: false, waitedMs: quietMs };
@@ -1439,6 +1458,8 @@ export class KWinComputerBackend implements ComputerBackend {
     const remaining = timeoutMs - quietWaitMs;
     if (remaining <= 0) return { settled: false, waitedMs: quietWaitMs };
     const [changed, changeWaitMs] = await wait(0, remaining);
+    const misses = this.settleMisses.plugin === plugin ? this.settleMisses.count : 0;
+    this.settleMisses = { plugin, count: changed ? 0 : misses + 1 };
     return { settled: changed, waitedMs: quietWaitMs + changeWaitMs };
   }
 
