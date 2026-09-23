@@ -1499,8 +1499,9 @@ std::string keyboardLayoutName() {
 // server's typing gate compares: the active entry of the layout list the
 // keymap was built from (`kb_layout`, a comma list). A keymap that did not
 // come from a layout list - a file, or a virtual keyboard's own map - has no
-// short names; the descriptive name stands in so the refusal can still say
-// which layout it saw, and the server treats it as not US-compatible.
+// short names; the descriptive name stands in, which the server's gate reads
+// as it reads the short one: plain US passes, anything else is refused and
+// named in the refusal.
 std::string keyboardLayout() {
     const auto keyboard = seatKeyboard();
     if (!keyboard)
