@@ -473,6 +473,113 @@ describe("compositor-observed settle", () => {
     ]);
   });
 
+  describe("with a first-change bound (the post-action policy)", () => {
+    const options = {
+      windowId: "window-1",
+      quietMs: 100,
+      timeoutMs: 1_500,
+      changeWithinMs: 300,
+    } as const;
+
+    function answering(
+      plugin: FakePlugin,
+      answers: {
+        readonly first: readonly [boolean, number];
+        readonly quiet?: readonly [boolean, number];
+        readonly changed: boolean;
+      },
+    ): void {
+      plugin.waitForSettle = async (windowId, quietMs, timeoutMs) => {
+        plugin.calls.push({ method: "waitForSettle", args: [windowId, quietMs, timeoutMs] });
+        if (timeoutMs === 300) return answers.first;
+        if (timeoutMs === 0) return [answers.changed, 0] as const;
+        // The rest-of-the-bound quiet wait; never answered when nothing changed.
+        return answers.quiet ?? new Promise<never>(() => undefined);
+      };
+    }
+
+    it("settles a window that repainted and went quiet within the bound at once", async () => {
+      const plugin = new FakePlugin();
+      plugin.features = ["waitForSettle"];
+      answering(plugin, { first: [true, 130], changed: true });
+      const backend = makeBackend(plugin);
+      await backend.availability();
+      await expect(backend.waitForSettle!(options)).resolves.toEqual({
+        settled: true,
+        waitedMs: 130,
+      });
+      expect(callsOf(plugin, "waitForSettle")).toBe(1);
+    });
+
+    it("takes a window that has not repainted at all by the bound as unchanged", async () => {
+      // Was: the rest of the 1.5 s cap for a first frame that never came.
+      const plugin = new FakePlugin();
+      plugin.features = ["waitForSettle"];
+      answering(plugin, { first: [false, 300], changed: false });
+      const backend = makeBackend(plugin);
+      await backend.availability();
+      await expect(backend.waitForSettle!(options)).resolves.toEqual({
+        settled: true,
+        waitedMs: 300,
+      });
+      // The quiet wait goes out before the question that would retire the
+      // input, so it still measures from the action.
+      expect(plugin.calls.filter((call) => call.method === "waitForSettle")).toEqual([
+        { method: "waitForSettle", args: ["window-1", 100, 300] },
+        { method: "waitForSettle", args: ["window-1", 100, 1_200] },
+        { method: "waitForSettle", args: ["window-1", 0, 0] },
+      ]);
+    });
+
+    it("waits out the quiet of a window that did repaint, up to the cap", async () => {
+      const plugin = new FakePlugin();
+      plugin.features = ["waitForSettle"];
+      answering(plugin, { first: [false, 300], quiet: [true, 140], changed: true });
+      const backend = makeBackend(plugin);
+      await backend.availability();
+      await expect(backend.waitForSettle!(options)).resolves.toEqual({
+        settled: true,
+        waitedMs: 440,
+      });
+
+      answering(plugin, { first: [false, 300], quiet: [false, 1_200], changed: true });
+      await expect(backend.waitForSettle!(options)).resolves.toEqual({
+        settled: false,
+        waitedMs: 1_500,
+      });
+      // Both saw a repaint: still observing.
+      expect(backend.waitForSettle).toBeDefined();
+    });
+
+    it("gives the fixed wait back after three settles in a row saw no repaint", async () => {
+      const plugin = new FakePlugin();
+      plugin.features = ["waitForSettle"];
+      answering(plugin, { first: [false, 300], changed: false });
+      const backend = makeBackend(plugin);
+      await backend.availability();
+      for (let miss = 0; miss < 3; miss += 1) await backend.waitForSettle!(options);
+      expect(backend.waitForSettle).toBeUndefined();
+    });
+
+    it("waits the bound blind for a window the compositor is not painting", async () => {
+      const plugin = new FakePlugin();
+      plugin.features = ["waitForSettle"];
+      plugin.windows = [{ ...plugin.windows[0]!, visible: false }];
+      const sleeps: number[] = [];
+      const backend = makeBackend(plugin, {
+        sleep: async (milliseconds) => {
+          sleeps.push(milliseconds);
+        },
+      });
+      await backend.availability();
+      await expect(backend.waitForSettle!(options)).resolves.toEqual({
+        settled: false,
+        waitedMs: 300,
+      });
+      expect(sleeps).toEqual([300]);
+    });
+  });
+
   it("gives the fixed wait back after three settles in a row that saw no repaint at all", async () => {
     const plugin = new FakePlugin();
     plugin.features = ["waitForSettle"];

@@ -358,15 +358,14 @@ const WINDOW_SNAPSHOT_TTL_MS = 75;
 /**
  * The post-action settle on a plugin that answers `waitForSettle` from surface
  * commits: the target has repainted since the input and then stayed quiet
- * this long. Quiet is looked for only as long as the fixed 300 ms guess this
- * replaces used to wait: an animation (GTK's overlay scrollbar under any
- * pointer motion, a button transition) repaints every frame and never goes
- * quiet, and it is photographed then, as before. A window that has not
- * repainted at all by then gets up to the cap for its first frame — a slow
- * application is no longer photographed before it updates.
+ * this long, measured on the target window alone. A window that has not
+ * repainted at all within the fixed 300 ms guess this replaces is taken as
+ * unchanged — most clicks that change nothing visible (a label, empty space)
+ * would otherwise hold the observation for the whole cap — and one that has
+ * repainted is waited on for its quiet up to the cap.
  */
 const PLUGIN_SETTLE_QUIET_MS = 100;
-const PLUGIN_SETTLE_QUIET_WITHIN_MS = 300;
+const PLUGIN_SETTLE_CHANGE_WITHIN_MS = 300;
 const PLUGIN_SETTLE_TIMEOUT_MS = 1_500;
 /**
  * Consecutive settles of visible windows that saw no repaint at all before the
@@ -602,7 +601,7 @@ export class KWinComputerBackend implements ComputerBackend {
   readonly actionSettle = {
     quietMs: PLUGIN_SETTLE_QUIET_MS,
     timeoutMs: PLUGIN_SETTLE_TIMEOUT_MS,
-    quietWithinMs: PLUGIN_SETTLE_QUIET_WITHIN_MS,
+    changeWithinMs: PLUGIN_SETTLE_CHANGE_WITHIN_MS,
   } as const;
 
   protected readonly integrationName: string;
@@ -1412,17 +1411,20 @@ export class KWinComputerBackend implements ComputerBackend {
    * quiet is waited for only that long; then a second wait with no quiet
    * window answers at once for a window that has repainted since the input
    * (it is animating) and otherwise waits out the rest of `timeoutMs` for its
-   * first repaint. A settled wait is what retires the input in the plugin, so
-   * the second wait still measures from the action. Pure observation: no
-   * input, no session start. A plugin that cannot observe the window at all
-   * (it is gone, or no session is running) answers unsettled at once; that
-   * gets the blind wait the plugin could not replace rather than none.
+   * first repaint. With `changeWithinMs`, a window that has not repainted at
+   * all by then is settled there instead (see `settleAfterNoChange`). A
+   * settled wait is what retires the input in the plugin, so a later wait
+   * still measures from the action. Pure observation: no input, no session
+   * start. A plugin that cannot observe the window at all (it is gone, or no
+   * session is running) answers unsettled at once; that gets the blind wait
+   * the plugin could not replace rather than none.
    */
   private async settleOnPlugin(options: {
     readonly windowId: string;
     readonly timeoutMs: number;
     readonly quietMs: number;
     readonly quietWithinMs?: number;
+    readonly changeWithinMs?: number;
   }): Promise<{ readonly settled: boolean; readonly waitedMs: number }> {
     const plugin = await this.ensurePlugin({ start: false });
     const waitForSettle = this.pluginFeature("waitForSettle") ? plugin.waitForSettle : undefined;
@@ -1441,17 +1443,21 @@ export class KWinComputerBackend implements ComputerBackend {
       options.quietWithinMs === undefined
         ? timeoutMs
         : Math.min(clampMilliseconds(options.quietWithinMs), timeoutMs);
+    const changeBound =
+      options.changeWithinMs === undefined
+        ? undefined
+        : Math.min(clampMilliseconds(options.changeWithinMs), quietBound);
     // A compositor does not paint a window nobody can see (another workspace,
     // minimized), and a client paints on the compositor's frame callbacks, so
     // there are no commits to observe: the blind wait, not the whole cap.
     const [windows] = await this.readWindows();
     const target = windows.find((window) => window.id === options.windowId);
     if (target && (!target.visible || target.minimized)) {
-      const blindMs = options.quietWithinMs === undefined ? quietMs : quietBound;
+      const blindMs = changeBound ?? (options.quietWithinMs === undefined ? quietMs : quietBound);
       await this.sleep(blindMs);
       return { settled: false, waitedMs: blindMs };
     }
-    const [quiet, quietWaitMs] = await wait(quietMs, quietBound);
+    const [quiet, quietWaitMs] = await wait(quietMs, changeBound ?? quietBound);
     if (quiet) {
       this.settleMisses = { plugin, count: 0 };
       return { settled: true, waitedMs: quietWaitMs };
@@ -1460,12 +1466,47 @@ export class KWinComputerBackend implements ComputerBackend {
       await this.sleep(quietMs);
       return { settled: false, waitedMs: quietMs };
     }
+    if (changeBound !== undefined) {
+      return await this.settleAfterNoChange(plugin, wait, quietMs, quietBound - quietWaitMs, quietWaitMs);
+    }
     const remaining = timeoutMs - quietWaitMs;
     if (remaining <= 0) return { settled: false, waitedMs: quietWaitMs };
     const [changed, changeWaitMs] = await wait(0, remaining);
     const misses = this.settleMisses.plugin === plugin ? this.settleMisses.count : 0;
     this.settleMisses = { plugin, count: changed ? 0 : misses + 1 };
     return { settled: changed, waitedMs: quietWaitMs + changeWaitMs };
+  }
+
+  /**
+   * The rest of a settle whose target was not quiet by `changeWithinMs`: did
+   * it change at all? The plugin cannot say without retiring the input (a
+   * settled wait does), so the quiet wait for the rest of the bound goes out
+   * first, measuring from the action, and then a zero-length wait asks
+   * whether anything has been committed since the input. D-Bus delivers the
+   * two in order, so the quiet wait holds its reference before the question
+   * can retire it. Nothing committed: the action changed nothing this window
+   * paints, and it is settled now; the quiet wait is left to end on its own
+   * (it has no effect once answered). Something did: its quiet is waited for,
+   * and a window still repainting at the bound is an animation, photographed
+   * as it is.
+   */
+  private async settleAfterNoChange(
+    plugin: KWinComputerPluginApi,
+    wait: (quietMs: number, timeoutMs: number) => Promise<readonly [boolean, number]>,
+    quietMs: number,
+    quietRemainingMs: number,
+    waitedMs: number,
+  ): Promise<{ readonly settled: boolean; readonly waitedMs: number }> {
+    const quiet = quietRemainingMs > 0 ? wait(quietMs, quietRemainingMs) : undefined;
+    // Never unhandled, whichever way the question below goes.
+    quiet?.catch(() => undefined);
+    const [changed] = await wait(0, 0);
+    const misses = this.settleMisses.plugin === plugin ? this.settleMisses.count : 0;
+    this.settleMisses = { plugin, count: changed ? 0 : misses + 1 };
+    if (!changed) return { settled: true, waitedMs };
+    if (!quiet) return { settled: false, waitedMs };
+    const [settled, quietWaitMs] = await quiet;
+    return { settled, waitedMs: waitedMs + quietWaitMs };
   }
 
   private reportAtspiUnavailable(reason: string): void {
