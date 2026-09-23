@@ -259,7 +259,10 @@ export function makeWsComputerHandlers(
         "Failed to launch computer application",
       ),
     [COMPUTER_WS_METHODS.click]: (input) =>
-      attempt(() => withPaneInput(() => manager.click(undefined, input)), "Failed to click on computer"),
+      attempt(
+        () => withPaneInput(() => manager.click(undefined, input)),
+        "Failed to click on computer",
+      ),
     [COMPUTER_WS_METHODS.doubleClick]: (input) =>
       attempt(
         () => withPaneInput(() => manager.doubleClick(undefined, input)),
@@ -278,7 +281,9 @@ export function makeWsComputerHandlers(
     [COMPUTER_WS_METHODS.drag]: (input) =>
       attempt(
         () =>
-          withPaneInput(() => manager.drag(undefined, input.from, input.to, input.durationMs ?? 250)),
+          withPaneInput(() =>
+            manager.drag(undefined, input.from, input.to, input.durationMs ?? 250),
+          ),
         "Failed to drag on computer",
       ),
     [COMPUTER_WS_METHODS.scroll]: (input) =>
@@ -313,7 +318,10 @@ export function makeWsComputerHandlers(
     [COMPUTER_WS_METHODS.getThreadState]: (input) =>
       attempt(() => manager.getThreadState(input.threadId), "Failed to read computer state"),
     [COMPUTER_WS_METHODS.inputClick]: (input) =>
-      attempt(() => withPaneInput(() => userInputClick(manager, input)), "Failed to click on computer"),
+      attempt(
+        () => withPaneInput(() => userInputClick(manager, input)),
+        "Failed to click on computer",
+      ),
     [COMPUTER_WS_METHODS.inputScroll]: (input) =>
       attempt(
         () =>

@@ -1426,7 +1426,9 @@ describe("ComputerManager and FakeComputerBackend", () => {
     it("uses the backend's own post-action settle policy when it names one", async () => {
       setEnv("SYNARA_CUA_CONDITIONAL_SETTLE", undefined);
       const backend = new ProvenBackend({ waitForSettle: true });
-      Object.assign(backend, { actionSettle: { quietMs: 25, timeoutMs: 1_500, quietWithinMs: 250 } });
+      Object.assign(backend, {
+        actionSettle: { quietMs: 25, timeoutMs: 1_500, quietWithinMs: 250 },
+      });
       const manager = new ComputerManager({ backend, actionSettleMs: 60 });
       await pressThenObserveWindow(manager);
       expect(backend.callsFor("waitForSettle")[0]?.args[0]).toMatchObject({
