@@ -4269,6 +4269,26 @@ describe("KWinComputerBackend reconnect timer", () => {
     }
   });
 
+  it("keeps checking after the service answered from the wrong owner", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      const backend = makeBackend(dbus, { random: () => 1 });
+      await backend.availability();
+      // Mid-reload: KWin lists the plugin, but nothing owns the service yet.
+      let ownerless = 3;
+      const nameOwner = dbus.nameOwner;
+      dbus.nameOwner = async (name: string) =>
+        ownerless-- > 0 ? undefined : nameOwner(name);
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(KWIN_RECONNECT_MAX_DELAY_MS);
+      expect(backend.health().status).toBe("connected");
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("halves the delay at the low end of the jitter range", async () => {
     vi.useFakeTimers();
     try {

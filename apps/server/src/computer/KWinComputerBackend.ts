@@ -1861,7 +1861,7 @@ export class KWinComputerBackend implements ComputerBackend {
         if (isDormantBackendError(error)) {
           this.standDownReconnect();
           this.dormant = true;
-        } else if (!isMethodLevelDbusError(error) && !(error instanceof PluginProvisioningError)) {
+        } else if (!endsSupervision(error)) {
           this.scheduleReconnect();
         }
         this.recordHealthFailure(error);
@@ -2523,7 +2523,7 @@ export class KWinComputerBackend implements ComputerBackend {
         // worth another timer (a dormant desktop stands the loop down there);
         // re-arming here for a method-level refusal or a provisioning failure
         // would undo that decision.
-        if (isMethodLevelDbusError(error) || error instanceof PluginProvisioningError) {
+        if (endsSupervision(error)) {
           this.reconnecting = false;
           this.publishHealth();
         }
@@ -3450,6 +3450,19 @@ class ServiceOwnerMismatchError extends ComputerBackendError {
     super(message);
     this.name = "ServiceOwnerMismatchError";
   }
+}
+
+/**
+ * Whether a failed connect is one no timer can fix: a provisioning failure,
+ * or a refusal about the call rather than the connection. A service owner
+ * mismatch is method-level for the in-call ladder (see the class), but not
+ * terminal: the owner can be a generation caught mid-reload, so the timer
+ * checks again from scratch, as the next explicit action would.
+ */
+function endsSupervision(error: unknown): boolean {
+  if (error instanceof PluginProvisioningError) return true;
+  if (dbusErrorType(error) === COMPUTER_SERVICE_OWNER_MISMATCH_ERROR) return false;
+  return isMethodLevelDbusError(error);
 }
 
 export function assertServiceOwnerPresent(owner: string | undefined): void {
