@@ -168,7 +168,7 @@ class FocusRegressionTest(unittest.TestCase):
     def test_input_delivery_and_handback(self):
         production = definitions(self.source, [
             ("ReleaseMode", "enum"),
-            "sendPointerEnter", "sendPointerLeave", "humanHoldsButton", "leaveSeatSiblingBeforePointerEnter",
+            "sendPointerEnter", "sendPointerLeave", "sendPointerMotion", "restoreSeatPointerPosition", "humanHoldsButton", "leaveSeatSiblingBeforePointerEnter",
             "deliverReleases", "deferReleases", "deliverDeferredReleases", "settleDeferredReleases",
             "releasePressedButtons", "directPointerLeave", "returnPointerToSeat",
             "handBackPointerBeforeHumanEvent", "directPointerMotion", "clearPointerDelivery",

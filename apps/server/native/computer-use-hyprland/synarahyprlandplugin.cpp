@@ -434,6 +434,11 @@ struct SState {
     // Where the agent's pointer last was in directPointerSurface's coordinates:
     // what an enter re-stamped under P2 quotes.
     Vector2D                      directPointerLocal;
+    // Set once the seat's own position has been re-sent on a surface the
+    // agent and the human's seat share (N3): the client's pointer is back
+    // where the human's is, so there is nothing to hand back again until
+    // the agent next moves there.
+    bool                          directPointerHandedBack = false;
     std::vector<SDeferredRelease> deferredReleases;
     WP<CWLSurfaceResource>        directKeyboardSurface;
     bool                          directKeyboardNeedsEnter = true;
@@ -1025,17 +1030,45 @@ void sendPointerLeave(const SP<CWLSurfaceResource>& surface) {
     }
 }
 
-// Where the human's pointer is, in the coordinates of the surface the seat
-// has entered: the position the seat itself would quote in an enter.
-Vector2D seatPointerLocal(const SP<CWLSurfaceResource>& surface) {
-    if (!g_pInputManager)
-        return {};
-    const auto global = g_pInputManager->getMouseCoordsInternal();
+// A global desktop point in `surface`'s own coordinates.
+Vector2D surfaceLocalPosition(const SP<CWLSurfaceResource>& surface, const Vector2D& global) {
     if (const auto hlSurface = surface->m_hlSurface.lock()) {
         if (const auto box = hlSurface->getSurfaceBoxGlobal())
             return global - box->pos();
     }
     return {};
+}
+
+// Where the human's pointer is, in the coordinates of the surface the seat
+// has entered: the position the seat itself would quote in an enter.
+Vector2D seatPointerLocal(const SP<CWLSurfaceResource>& surface) {
+    if (!g_pInputManager)
+        return {};
+    return surfaceLocalPosition(surface, g_pInputManager->getMouseCoordsInternal());
+}
+
+void sendPointerMotion(const SP<CWLSurfaceResource>& surface, const Vector2D& local) {
+    const uint32_t time = directTimestampMs();
+    for (wl_resource* resource : clientInputResources(surface->client(), "wl_pointer")) {
+        wl_pointer_send_motion(resource, time, wl_fixed_from_double(local.x), wl_fixed_from_double(local.y));
+        if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION)
+            wl_pointer_send_frame(resource);
+    }
+}
+
+// The hand-back when there is no other surface to hand back to (N3): the
+// human's pointer is on the very surface the agent's events went to, so the
+// enter is shared and stays, but the client's idea of where the pointer is
+// on that surface is the agent's last motion. wl_pointer.axis and .button
+// carry no position, so the human's next scroll or click - with no motion of
+// theirs in between - would land at the agent's spot. Re-sending the seat's
+// position puts it back under the human's hand; the agent's next event sends
+// its own motion first, as every agent pointer event does.
+void restoreSeatPointerPosition(const SP<CWLSurfaceResource>& surface) {
+    if (g.directPointerHandedBack)
+        return;
+    g.directPointerHandedBack = true;
+    sendPointerMotion(surface, seatPointerLocal(surface));
 }
 
 // Re-sends the seat's own wl_pointer.enter for the surface the human's pointer
@@ -1170,9 +1203,12 @@ void directPointerLeave(bool forgetSurface = true) {
     if (!surface || !entered)
         return;
     // Never revoke a focus the human is holding: if their pointer sits on this
-    // surface, the enter the client believes in is the seat's, not ours.
-    if (g_pSeatManager && g_pSeatManager->m_state.pointerFocus.lock() == surface)
+    // surface, the enter the client believes in is the seat's, not ours - but
+    // the position it holds is the agent's, and goes back to the human's.
+    if (g_pSeatManager && g_pSeatManager->m_state.pointerFocus.lock() == surface) {
+        restoreSeatPointerPosition(surface);
         return;
+    }
     sendPointerLeave(surface);
     // A leave from our surface leaves the client with no entered surface at
     // all, even when the human's pointer is on a sibling window of it.
@@ -1197,8 +1233,14 @@ void returnPointerToSeat() {
         return;
     const auto agentSurface = g.directPointerSurface.lock();
     const auto seatSurface  = g_pSeatManager->m_state.pointerFocus.lock();
-    if (!agentSurface || !seatSurface || seatSurface == agentSurface || seatSurface->client() != agentSurface->client())
+    if (!agentSurface || !seatSurface || seatSurface->client() != agentSurface->client())
         return;
+    if (seatSurface == agentSurface) {
+        // One surface, one enter: only the position is the agent's (N3).
+        if (!g.directPointerNeedsEnter)
+            restoreSeatPointerPosition(agentSurface);
+        return;
+    }
     // Keep the logical target and its fractional scroll while returning the
     // protocol object. The next motion must enter again before sending input.
     directPointerLeave(false);
@@ -1220,8 +1262,14 @@ void handBackPointerBeforeHumanEvent() {
         return;
     const auto agentSurface = g.directPointerSurface.lock();
     const auto seatSurface  = g_pSeatManager->m_state.pointerFocus.lock();
-    if (!agentSurface || !seatSurface || seatSurface == agentSurface || seatSurface->client() != agentSurface->client())
+    if (!agentSurface || !seatSurface || seatSurface->client() != agentSurface->client())
         return;
+    if (seatSurface == agentSurface) {
+        // The agent's drag is on the human's own surface: their event must
+        // still land where their pointer is, not at the agent's grab point.
+        restoreSeatPointerPosition(agentSurface);
+        return;
+    }
     g.directPointerNeedsEnter = true;
     sendPointerLeave(agentSurface);
     restoreSeatPointerEnter(agentSurface->client());
@@ -1257,6 +1305,7 @@ void directPointerMotion(const PHLWINDOW& window) {
     g.directPointerSurface = surface;
     g.directPointerNeedsEnter = false;
     g.directPointerLocal      = local;
+    g.directPointerHandedBack = false;
     if (reenter)
         leaveSeatSiblingBeforePointerEnter(surface);
     const uint32_t time   = directTimestampMs();

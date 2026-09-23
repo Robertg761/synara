@@ -62,6 +62,7 @@ struct {
     std::weak_ptr<CWLSurfaceResource> directPointerSurface, directKeyboardSurface, seatPointerFocus, seatKeyboardFocus;
     bool directPointerNeedsEnter = true, directKeyboardNeedsEnter = true;
     Vector2D directPointerLocal;
+    bool directPointerHandedBack = false;
     std::vector<SDeferredRelease> deferredReleases;
     std::weak_ptr<Window> pointerWindow, targetWindow, keyboardWindow;
     std::set<uint32_t> pressedButtons;
@@ -74,6 +75,13 @@ struct {
 SP<CWLSurfaceResource> hitSurface;
 PHLWINDOW hitWindow = std::make_shared<Window>();
 CWLSurfaceResource* pointerEntered = nullptr;
+// Where the client believes its pointer is on the entered surface: the
+// coordinates of the last enter or motion it heard. The agent aims at local
+// (7, 9) of the hit surface; the human's pointer is at (50, 60) of the seat's.
+Vector2D pointerAt, buttonAt, axisAt;
+constexpr Vector2D AGENT_LOCAL{7, 9}, SEAT_LOCAL{50, 60};
+bool samePoint(Vector2D a, Vector2D b) { return a.x == b.x && a.y == b.y; }
+int motions = 0;
 CWLSurfaceResource* keyboardEntered = nullptr;
 int buttonEvents = 0, axisEvents = 0, discreteSteps = 0, keyEvents = 0, pointerEnters = 0, keyboardEnters = 0;
 int pointerVersion = 9;
@@ -82,6 +90,7 @@ bool refuse = false, reachable = true;
 // never. Lets a batch be refused part-way.
 int refuseAfter = -1;
 struct HitTest { SP<CWLSurfaceResource> windowSurfaceAt(Vector2D, PHLWINDOW, Vector2D& local) { local = {7, 9}; return hitSurface; } };
+void check(bool condition, const char* message);
 struct ViewState { HitTest& hitTest() { static HitTest h; return h; } };
 namespace Desktop { ViewState* viewState() { static ViewState v; return &v; } }
 bool usableWindow(PHLWINDOW w) { return bool(w); }
@@ -113,18 +122,36 @@ void enterKeyboard(CWLSurfaceResource* surface) {
 void wl_pointer_send_leave(wl_resource*, uint32_t, wl_resource* surface) {
     if (pointerEntered == surface->surface) pointerEntered = nullptr;
 }
-void wl_pointer_send_enter(wl_resource*, uint32_t, wl_resource* surface, int, int) { enterPointer(surface->surface); }
-void wl_pointer_send_motion(wl_resource*, uint32_t, int, int) { check(pointerEntered == hitSurface.get(), "motion misdirected"); }
+void wl_pointer_send_enter(wl_resource*, uint32_t, wl_resource* surface, int x, int y) {
+    enterPointer(surface->surface);
+    pointerAt = {double(x), double(y)};
+}
+// The agent's motion (at AGENT_LOCAL) must reach the surface it aims at; a
+// hand-back motion (at SEAT_LOCAL) must reach the seat's surface.
+void wl_pointer_send_motion(wl_resource*, uint32_t, int x, int y) {
+    const Vector2D at{double(x), double(y)};
+    if (samePoint(at, SEAT_LOCAL))
+        check(pointerEntered == seat.m_state.pointerFocus.lock().get(), "seat position sent to another surface");
+    else
+        check(pointerEntered == hitSurface.get(), "motion misdirected");
+    pointerAt = at;
+    ++motions;
+}
 void wl_pointer_send_frame(wl_resource*) {}
 void wl_pointer_send_axis_source(wl_resource*, int) {}
 void wl_pointer_send_axis(wl_resource*, uint32_t, int, int) {
     check(pointerEntered == hitSurface.get(), "axis misdirected"); ++axisEvents;
+    axisAt = pointerAt;
 }
 void wl_pointer_send_axis_value120(wl_resource*, int, int) {}
 void wl_pointer_send_axis_discrete(wl_resource*, int, int steps) { discreteSteps += steps; }
 void restoreSeatPointerEnter(wl_client* client) {
-    if (auto surface = seat.m_state.pointerFocus.lock(); surface && surface->client() == client) enterPointer(surface.get());
+    if (auto surface = seat.m_state.pointerFocus.lock(); surface && surface->client() == client) {
+        enterPointer(surface.get());
+        pointerAt = SEAT_LOCAL;
+    }
 }
+Vector2D seatPointerLocal(SP<CWLSurfaceResource>) { return SEAT_LOCAL; }
 struct wl_array { std::vector<uint32_t> keys; };
 void wl_array_init(wl_array*) {}
 void* wl_array_add(wl_array* array, size_t) { array->keys.push_back(0); return &array->keys.back(); }
@@ -148,6 +175,7 @@ void refuseIfHumanActive(PHLWINDOW) {
 SP<CWLSurfaceResource> windowMainSurface(PHLWINDOW) { return hitSurface; }
 void directPointerButtonEvent(SP<CWLSurfaceResource> surface, uint32_t, bool) {
     check(pointerEntered == surface.get(), "button misdirected"); ++buttonEvents;
+    buttonAt = pointerAt;
 }
 void directKeyboardKeyEvent(SP<CWLSurfaceResource> surface, uint32_t, bool) {
     check(keyboardEntered == surface.get(), "key misdirected"); ++keyEvents;
@@ -350,6 +378,43 @@ int main() {
     clearKeyboardDelivery();
     check(keyEvents == before + 2 && g.pressedKeys.empty(), "held keys were not released");
     check(keyboardEntered == human.get(), "key release did not hand the keyboard back");
+
+    // Same surface (N3): the human's pointer sits on the very surface the
+    // agent aims at. The enter is shared and stays, but every agent burst ends
+    // with the seat's position re-sent, so the human's bare scroll or click
+    // lands under their own pointer, not at the agent's last spot.
+    clearPointerDelivery();
+    hitSurface = agent;
+    seat.m_state.pointerFocus = agent;
+    pointerEntered = agent.get();
+    pointerAt = SEAT_LOCAL;
+    onSeatPointerFocusChange();
+    check(movePointer(300, 300), "same-surface move refused");
+    check(pointerEntered == agent.get() && samePoint(pointerAt, SEAT_LOCAL), "same-surface move left the agent's position with the human");
+    check(injectAxis(0, 80) && samePoint(axisAt, AGENT_LOCAL), "same-surface scroll not aimed at the agent's position");
+    check(samePoint(pointerAt, SEAT_LOCAL), "same-surface scroll left the agent's position with the human");
+    before = motions;
+    check(injectKey(30, true) && injectKey(30, false), "key refused");
+    check(motions == before, "position handed back again with nothing to hand back");
+    // Mid-drag the agent stays at its grab point until the human acts; their
+    // event is preceded by their own position, once.
+    check(injectButton(272, true) && samePoint(buttonAt, AGENT_LOCAL) && samePoint(pointerAt, AGENT_LOCAL), "same-surface press misplaced");
+    handBackPointerBeforeHumanEvent();
+    check(pointerEntered == agent.get() && samePoint(pointerAt, SEAT_LOCAL), "human event during a same-surface drag landed at the agent's grab point");
+    before = motions;
+    handBackPointerBeforeHumanEvent();
+    check(motions == before, "same-surface hand-back repeated for every human event");
+    check(injectButton(272, false) && samePoint(buttonAt, AGENT_LOCAL), "same-surface release not at the agent's position");
+    check(g.pressedButtons.empty() && samePoint(pointerAt, SEAT_LOCAL), "same-surface release did not hand the position back");
+    // Leaving the shared surface revokes nothing, but the position goes back.
+    check(movePointer(310, 310) && samePoint(pointerAt, SEAT_LOCAL), "move refused");
+    g.directPointerHandedBack = false;
+    pointerAt = AGENT_LOCAL;
+    clearPointerDelivery();
+    check(pointerEntered == agent.get() && samePoint(pointerAt, SEAT_LOCAL), "leaving the shared surface left the agent's position");
+    seat.m_state.pointerFocus = human;
+    pointerEntered = human.get();
+    onSeatPointerFocusChange();
 
     // keys: a batch is one agent burst. Every stroke is delivered in order to
     // the target, and the keyboard is handed back once, after the batch,
