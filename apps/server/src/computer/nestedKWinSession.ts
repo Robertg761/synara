@@ -25,20 +25,26 @@
  * exactly like first use did.
  */
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { basename, isAbsolute, join } from "node:path";
 
-import { mkdtemp, chmod, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { ComputerBackendError } from "./ComputerBackend.ts";
 import { AtspiHelperClient, type AtspiTreeReader } from "./atspiClient.ts";
 import { desktopApplicationEnvironment } from "./desktopAppEnvironment.ts";
 import {
+  createNestedSessionDirectory,
+  currentServerIdentity,
+  describeNestedSessionProcess,
+  newNestedSessionId,
+  prepareNestedStateDirectory,
+  readChildPids,
+  readProcessCommand,
   reapStaleNestedSessions,
-  readProcessStartTime,
   removeNestedSessionMarker,
   writeNestedSessionMarker,
+  type NestedSessionMarker,
   type NestedSessionProcess,
+  type NestedSessionProcessRole,
   type NestedSessionRegistryDependencies,
 } from "./nestedSessionRegistry.ts";
 import { teardownChildProcessTree } from "../platform/supervisedProcessTeardown.ts";
@@ -71,6 +77,7 @@ import { spawnClipboardCommand, type ClipboardCommandRunner } from "./wlClipboar
 
 const DBUS_DAEMON_COMMAND = "dbus-daemon";
 const KWIN_COMMAND = "kwin_wayland";
+const XWAYLAND_COMMAND = "Xwayland";
 const DEFAULT_NESTED_WIDTH = 1_920;
 const DEFAULT_NESTED_HEIGHT = 1_080;
 const MIN_NESTED_DIMENSION = 64;
@@ -98,7 +105,11 @@ export type NestedSessionMode = "virtual" | "window";
 export interface NestedKWinSessionOptions {
   readonly mode?: NestedSessionMode;
   readonly size?: NestedSize;
-  /** Wayland socket name; generated per session so two servers cannot collide. */
+  /**
+   * Wayland socket name inside the session's private runtime directory;
+   * generated per session, so it is unique even where a consumer forgets the
+   * directory and looks for it beside the human's display.
+   */
   readonly socketName?: string;
   readonly readyTimeoutMs?: number;
   /** The server's own environment, injected so tests do not read the host display. */
@@ -121,6 +132,10 @@ export interface NestedKWinSessionOptions {
 }
 
 export interface NestedKWinSession {
+  /**
+   * The session's private XDG runtime directory, holding its Wayland and bus
+   * sockets. Optional only so test doubles can leave it out.
+   */
   readonly runtimeDirectory?: string;
   readonly busAddress: string;
   readonly waylandDisplay: string;
@@ -166,13 +181,19 @@ export async function startNestedKWinSession(
   const waitForBusName = options.waitForBusName ?? waitForSessionBusName;
   const installedPluginIds = options.installedPluginIds ?? (() => scanInstalledPluginIds());
   const mode = options.mode ?? "virtual";
-  const hostEnv = { ...(options.hostEnv ?? process.env) };
-  let privateRuntimeDirectory: string | undefined;
+  const hostEnv = options.hostEnv ?? process.env;
   const size = normalizeNestedSize(options.size);
-  const waylandDisplay = options.socketName ?? generateSocketName();
+  const sessionId = newNestedSessionId();
+  const waylandDisplay = options.socketName ?? `synara-nested-${sessionId}`;
   const children: SupervisedProcess[] = [];
   const launchedApps = new Set<ChildProcess>();
-  let markerPath: string | undefined;
+  // Resolved from the ambient runtime directory, before this session invents
+  // one of its own: a marker written inside a private directory that this
+  // session's own teardown deletes is a marker only a live server can find,
+  // which is exactly the server that does not need it.
+  const registry: NestedSessionRegistryDependencies = { hostEnv, ...options.registry };
+  let runtimeDirectory: string | undefined;
+  let marker: SessionMarkerWriter | undefined;
   let firstExit: string | undefined;
   let disposal: Promise<void> | undefined;
   const disposeHandle = Symbol(waylandDisplay);
@@ -193,18 +214,8 @@ export async function startNestedKWinSession(
     // Newest first: the compositor is torn down before the bus it announced
     // itself on, which keeps its exit from racing a dead bus.
     for (const child of children.toReversed()) await child.terminate();
-    if (markerPath) await removeNestedSessionMarker(markerPath);
-    if (privateRuntimeDirectory)
-      await rm(privateRuntimeDirectory, { recursive: true, force: true });
-  };
-
-  // Resolved from the ambient runtime directory, before this session invents
-  // one of its own: a marker written inside a private directory that this
-  // session's own teardown deletes is a marker only a live server can find,
-  // which is exactly the server that does not need it.
-  const registry: NestedSessionRegistryDependencies = {
-    hostEnv: { ...hostEnv },
-    ...options.registry,
+    await marker?.remove();
+    if (runtimeDirectory) await rm(runtimeDirectory, { recursive: true, force: true });
   };
 
   try {
@@ -212,11 +223,6 @@ export async function startNestedKWinSession(
     // rather than shut down left a whole desktop running, and this is the only
     // thing that will ever end it.
     await reapStaleNestedSessions(registry).catch(() => undefined);
-    if (!hostEnv.XDG_RUNTIME_DIR) {
-      privateRuntimeDirectory = await mkdtemp(join(tmpdir(), "synara-nested-runtime-"));
-      await chmod(privateRuntimeDirectory, 0o700);
-      hostEnv.XDG_RUNTIME_DIR = privateRuntimeDirectory;
-    }
     if (mode === "window" && !hostEnv.WAYLAND_DISPLAY) {
       throw new ComputerBackendError(
         "A windowed nested session needs a running Wayland session to nest into, and " +
@@ -224,6 +230,24 @@ export async function startNestedKWinSession(
           "use SYNARA_COMPUTER_NESTED=1 for a headless virtual session.",
       );
     }
+    // The session's own XDG runtime directory, private to it: its sockets, the
+    // compositor's Xwayland cookie, and every app it launches live there, not
+    // in the human's runtime directory beside their own display and bus.
+    const stateDirectory = await prepareNestedStateDirectory(registry);
+    runtimeDirectory = await createNestedSessionDirectory(stateDirectory, sessionId, registry);
+    // Written before the first process exists and kept current as each one is
+    // spawned, so a server killed mid-boot still leaves a marker naming
+    // everything it started.
+    marker = new SessionMarkerWriter(
+      {
+        ...currentServerIdentity(registry),
+        sessionId,
+        startedAt: Date.now(),
+        waylandDisplay,
+        runtimeDirectory,
+      },
+      registry,
+    );
 
     const bus = start(
       spawnProcess,
@@ -231,8 +255,9 @@ export async function startNestedKWinSession(
       children,
       DBUS_DAEMON_COMMAND,
       ["--session", "--print-address=1", "--nofork"],
-      hostEnv,
+      { ...hostEnv, XDG_RUNTIME_DIR: runtimeDirectory },
     );
+    marker.record(bus.pid, "bus");
     const busAddress = await bus.readFirstStdoutLine(BUS_ADDRESS_TIMEOUT_MS);
     if (!busAddress.startsWith("unix:")) {
       throw new ComputerBackendError(
@@ -246,11 +271,12 @@ export async function startNestedKWinSession(
       children,
       KWIN_COMMAND,
       compositorArgs(mode, waylandDisplay, size),
-      compositorEnv(busAddress, mode, hostEnv),
+      compositorEnv(busAddress, mode, hostEnv, runtimeDirectory),
       // stdout is the undrained-buffer hazard; stderr stays piped because its
       // diagnostics are what a failed session's error names.
       ["ignore", "ignore", "pipe"],
     );
+    marker.record(kwin.pid, "compositor");
 
     const timeoutMs = options.readyTimeoutMs ?? KWIN_READY_TIMEOUT_MS;
     const ready = await waitForBusName({
@@ -270,8 +296,15 @@ export async function startNestedKWinSession(
     } finally {
       await dbus.close().catch(() => undefined);
     }
+    // KWin forks its Xwayland itself; recorded so a sweep can end an Xwayland
+    // that outlived a compositor killed without its tree.
+    for (const pid of readChildPids(kwin.pid)) {
+      if (basename(readProcessCommand(pid)?.split(" ")[0] ?? "") === XWAYLAND_COMMAND)
+        marker.record(pid, "xwayland");
+    }
+    const sessionMarker = marker;
     const session: NestedKWinSession = {
-      runtimeDirectory: hostEnv.XDG_RUNTIME_DIR,
+      runtimeDirectory,
       busAddress,
       waylandDisplay,
       size,
@@ -283,21 +316,17 @@ export async function startNestedKWinSession(
       // module's own teardown signal.
       exited: () => firstExit ?? kwin.exitDiagnostic() ?? bus.exitDiagnostic(),
       spawnApp: (app, args, spawnOptions) =>
-        spawnIntoSession(session, launchedApps, app, args, spawnOptions, options.spawnApplication),
+        spawnIntoSession(
+          session,
+          launchedApps,
+          sessionMarker,
+          app,
+          args,
+          spawnOptions,
+          options.spawnApplication,
+        ),
       dispose,
     };
-    markerPath = await writeNestedSessionMarker(
-      {
-        serverPid: process.pid,
-        startedAt: Date.now(),
-        waylandDisplay,
-        processes: [describeSessionProcess(kwin), describeSessionProcess(bus)].filter(
-          (entry): entry is NestedSessionProcess => entry !== undefined,
-        ),
-        ...(privateRuntimeDirectory ? { runtimeDirectory: privateRuntimeDirectory } : {}),
-      },
-      registry,
-    ).catch(() => undefined);
     // The self-heal the whole reconnect path depends on. The private bus
     // outlives the compositor by default, so a dead kwin_wayland leaves every
     // D-Bus client holding a connection that is open and useless: no
@@ -329,6 +358,57 @@ export async function startNestedKWinSession(
       : new ComputerBackendError(describeProcessError(error), {
           cause: error,
         });
+  }
+}
+
+/**
+ * The session's marker, rewritten whenever it gains or loses a process.
+ *
+ * Writes are chained so two updates can never land out of order, and each one
+ * is best effort: a marker that could not be written costs a crashed server's
+ * cleanup, never the desktop itself.
+ */
+class SessionMarkerWriter {
+  private readonly processes = new Map<number, NestedSessionProcess>();
+  private chain: Promise<void> = Promise.resolve();
+  private path: string | undefined;
+  private removed = false;
+
+  constructor(
+    private readonly base: Omit<NestedSessionMarker, "processes">,
+    private readonly registry: NestedSessionRegistryDependencies,
+  ) {
+    this.flush();
+  }
+
+  record(pid: number | undefined, role: NestedSessionProcessRole): void {
+    const entry = describeNestedSessionProcess(pid, role, this.registry);
+    if (!entry) return;
+    this.processes.set(entry.pid, entry);
+    this.flush();
+  }
+
+  forget(pid: number | undefined): void {
+    if (pid !== undefined && this.processes.delete(pid)) this.flush();
+  }
+
+  async remove(): Promise<void> {
+    this.removed = true;
+    await this.chain;
+    if (this.path) await removeNestedSessionMarker(this.path);
+  }
+
+  private flush(): void {
+    if (this.removed) return;
+    const marker: NestedSessionMarker = { ...this.base, processes: [...this.processes.values()] };
+    this.chain = this.chain
+      .then(() => writeNestedSessionMarker(marker, this.registry))
+      .then(
+        (path) => {
+          this.path = path;
+        },
+        () => undefined,
+      );
   }
 }
 
@@ -428,6 +508,7 @@ export function nestedKWinBackendOptions(
 function spawnIntoSession(
   session: NestedKWinSession,
   launchedApps: Set<ChildProcess>,
+  marker: SessionMarkerWriter,
   app: string,
   args: readonly string[],
   spawnOptions: Partial<DesktopSpawnOptions> | undefined,
@@ -449,16 +530,16 @@ function spawnIntoSession(
         ...(cwd ? { cwd } : {}),
       });
   launchedApps.add(child);
-  child.once("exit", () => launchedApps.delete(child));
-  child.once("error", () => launchedApps.delete(child));
+  // Recorded as the session's own, so a server that dies without disposing
+  // the session still leaves a marker that names the app for the next sweep.
+  marker.record(child.pid, "app");
+  const forget = () => {
+    launchedApps.delete(child);
+    marker.forget(child.pid);
+  };
+  child.once("exit", forget);
+  child.once("error", forget);
   return child;
-}
-
-/** What the session marker records about one of its own processes. */
-function describeSessionProcess(child: SupervisedProcess): NestedSessionProcess | undefined {
-  const pid = child.pid;
-  if (pid === undefined) return undefined;
-  return { pid, command: child.commandLine, startTime: readProcessStartTime(pid) };
 }
 
 function requireSession(resolveSession: () => NestedKWinSession | undefined): NestedKWinSession {
@@ -723,16 +804,19 @@ function compositorArgs(
  * WAYLAND_DISPLAY or DISPLAY set, kwin_wayland can attach to the very session a
  * nested one exists to stay independent of. A windowed one is the exact
  * opposite — the host WAYLAND_DISPLAY is the socket it nests through, and
- * without it there is no window. DISPLAY goes in both modes, because an X11
- * attach is never what either was asked for.
+ * without it there is no window; it is resolved to a path because the
+ * compositor's runtime directory is the session's own, not the host's. DISPLAY
+ * goes in both modes, because an X11 attach is never what either was asked for.
  */
 function compositorEnv(
   busAddress: string,
   mode: NestedSessionMode,
   hostEnv: NodeJS.ProcessEnv,
+  runtimeDirectory: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...hostEnv,
+    XDG_RUNTIME_DIR: runtimeDirectory,
     DBUS_SESSION_BUS_ADDRESS: busAddress,
     // Nobody but the agent uses this compositor, so the plugin drives its one
     // seat as an ordinary input device instead of adding a second seat nothing
@@ -752,9 +836,18 @@ function compositorEnv(
     // The host's gtk3 Qt theme calls GTK initialization, which requires a
     // display even though this compositor uses its own virtual output.
     delete env.QT_QPA_PLATFORMTHEME;
+  } else {
+    env.WAYLAND_DISPLAY = hostWaylandSocket(hostEnv);
   }
   delete env.DISPLAY;
   return env;
+}
+
+/** The host's Wayland socket as a path, which libwayland accepts in WAYLAND_DISPLAY. */
+function hostWaylandSocket(hostEnv: NodeJS.ProcessEnv): string | undefined {
+  const display = hostEnv.WAYLAND_DISPLAY;
+  if (!display || isAbsolute(display)) return display;
+  return hostEnv.XDG_RUNTIME_DIR ? join(hostEnv.XDG_RUNTIME_DIR, display) : display;
 }
 
 function prependQtPluginRoot(existing: string | undefined): string {
@@ -849,12 +942,4 @@ function registerLiveSession(handle: symbol, pids: LiveSessionPids): void {
 
 function forgetLiveSession(handle: symbol): void {
   LIVE_SESSIONS.delete(handle);
-}
-
-/**
- * The socket lives in the shared XDG runtime directory, so the name has to be
- * unique across servers, and across restarts of this one.
- */
-function generateSocketName(): string {
-  return `synara-nested-${process.pid}-${randomBytes(3).toString("hex")}`;
 }

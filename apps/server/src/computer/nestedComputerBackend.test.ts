@@ -104,6 +104,7 @@ function makeHarness(
     readonly onPluginProvision?: () => void;
     readonly atspiMode?: NestedAtspiMode;
     readonly createAtspiClient?: (env: NodeJS.ProcessEnv) => AtspiTreeReader;
+    readonly sweepStaleSessions?: () => Promise<unknown>;
   } = {},
 ): Harness {
   const sessionStarts: NestedKWinSessionOptions[] = [];
@@ -168,6 +169,8 @@ function makeHarness(
       options.installedKwinVersion ?? options.runningKwinVersion ?? (async () => "6.7.3"),
     hostEnv: options.hostEnv ?? { WAYLAND_DISPLAY: "wayland-0", PATH: "/usr/bin" },
     startSession,
+    // Never the host's own marker directory or process table.
+    sweepStaleSessions: options.sweepStaleSessions ?? (async () => []),
     connectDbus: async (busAddress) => {
       const handle = fakeDbusHandle([PLUGIN_ID]);
       dbusHandles.push(handle);
@@ -281,6 +284,54 @@ describe("capabilities", () => {
   it("needs both artifacts, not either", () => {
     expect(makeHarness({ kwinInstalled: false }).backend.capabilities().input).toBe(false);
     expect(makeHarness({ pluginInstalled: false }).backend.capabilities().input).toBe(false);
+  });
+});
+
+describe("stale sessions a crashed server left behind", () => {
+  it("are swept when the backend is built, not at the first boot", async () => {
+    // A server that never boots a desktop of its own would otherwise leave a
+    // dead server's ~260 MB desktop running for as long as it lives.
+    const sweeps: string[] = [];
+    let finishSweep: (() => void) | undefined;
+    const harness = makeHarness({
+      sweepStaleSessions: () => {
+        sweeps.push("swept");
+        return new Promise<void>((resolve) => {
+          finishSweep = resolve;
+        });
+      },
+    });
+    expect(sweeps).toEqual(["swept"]);
+    expect(harness.sessionStarts).toHaveLength(0);
+
+    // A boot waits for the sweep rather than racing it over the same pids.
+    const availability = harness.backend.availability();
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    expect(harness.sessionStarts).toHaveLength(0);
+    finishSweep?.();
+    await expect(availability).resolves.toMatchObject({ kind: "available" });
+    expect(harness.sessionStarts).toHaveLength(1);
+    expect(sweeps).toHaveLength(1);
+    await harness.backend.dispose();
+  });
+
+  it("are not swept off Linux, and a failed sweep never blocks a boot", async () => {
+    let sweeps = 0;
+    makeHarness({
+      platform: "darwin",
+      sweepStaleSessions: async () => {
+        sweeps += 1;
+      },
+    });
+    expect(sweeps).toBe(0);
+
+    const harness = makeHarness({
+      sweepStaleSessions: async () => {
+        throw new Error("EACCES");
+      },
+    });
+    await expect(harness.backend.availability()).resolves.toMatchObject({ kind: "available" });
+    await harness.backend.dispose();
   });
 });
 

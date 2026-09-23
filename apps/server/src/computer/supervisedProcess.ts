@@ -65,15 +65,6 @@ export class SupervisedProcess {
     return this.child.pid;
   }
 
-  /**
-   * The argv as spawned, joined the way `/proc/<pid>/cmdline` reads it back.
-   * That equality is half of the identity a later sweep checks before it
-   * signals a recorded pid.
-   */
-  get commandLine(): string {
-    return [this.command, ...this.args].join(" ");
-  }
-
   /** A daemon that prints its address and then serves; only the first line matters. */
   readFirstStdoutLine(timeoutMs: number): Promise<string> {
     const stdout = this.child.stdout;

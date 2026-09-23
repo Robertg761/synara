@@ -75,6 +75,7 @@ import {
 } from "./provisioning/systemPackages.ts";
 
 import { kwinDistributionSetupProblem } from "./provisioning/kwinCompatibility.ts";
+import { reapStaleNestedSessions } from "./nestedSessionRegistry.ts";
 import { CLIPBOARD_SETUP_INCOMPLETE_MESSAGE, wlClipboardToolsPresent } from "./wlClipboard.ts";
 
 const KWIN_COMMAND = "kwin_wayland";
@@ -133,6 +134,11 @@ export interface NestedComputerBackendOptions {
   readonly verifiedPrebuiltAvailable?: () => Promise<boolean>;
   readonly planPackages?: () => SystemPackagePlan | undefined;
   readonly installPackages?: (plan: SystemPackagePlan) => Promise<string>;
+  /**
+   * Ends what a crashed server's nested sessions left running. Replaced in
+   * tests, which must never read or signal the host's process table.
+   */
+  readonly sweepStaleSessions?: () => Promise<unknown>;
 }
 
 /** Mutable box shared with the closures handed to the base constructor. */
@@ -161,6 +167,8 @@ export class NestedComputerBackend extends KWinComputerBackend {
   private sessionStarted = false;
   private disposing = false;
   private provisionRun: Promise<string> | undefined;
+  /** The sweep started at construction; every boot waits for it first. */
+  private readonly staleSweep: Promise<void>;
 
   constructor(options: NestedComputerBackendOptions = {}) {
     const ref: NestedSessionRef = { session: undefined, backend: undefined };
@@ -219,6 +227,19 @@ export class NestedComputerBackend extends KWinComputerBackend {
     this.planPackages = options.planPackages ?? (() => planSystemPackageInstall(this.hasCommand));
     this.installPackages = options.installPackages ?? installSystemPackages;
     this.listInstalledPluginIds = installedPluginIds;
+    // A server that was SIGKILLed left its desktop running — a compositor, its
+    // Xwayland and a bus, ~260 MB — and waiting for this server's own first
+    // boot to notice could mean waiting forever. Swept now, in the background:
+    // it reads one private directory and signals nothing it cannot prove.
+    const sweep =
+      options.sweepStaleSessions ?? (() => reapStaleNestedSessions({ hostEnv: this.hostEnv }));
+    this.staleSweep =
+      this.nestedPlatform === "linux"
+        ? sweep().then(
+            () => undefined,
+            () => undefined,
+          )
+        : Promise.resolve();
   }
 
   /**
@@ -475,6 +496,8 @@ export class NestedComputerBackend extends KWinComputerBackend {
 
   private async bootSession(): Promise<NestedKWinSession> {
     await this.assertSetupSupported();
+    // Never two sweeps racing over the same stale pids.
+    await this.staleSweep;
     // The session loads the plugin as part of coming up, so a machine that has
     // never had one gets the silent user-space install first: a shipped binary
     // when one matches, a source build otherwise. The system packages that

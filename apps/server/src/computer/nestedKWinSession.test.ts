@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { readdir, rm, stat } from "node:fs/promises";
+import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -24,6 +24,7 @@ import {
   type NestedKWinSession,
   type NestedKWinSessionOptions,
 } from "./nestedKWinSession.ts";
+import type { NestedSessionMarker } from "./nestedSessionRegistry.ts";
 
 const BUS_ADDRESS = "unix:path=/tmp/synara-nested-test,guid=abc";
 /** What the backend hands a launch: already scrubbed, with the user's home. */
@@ -268,10 +269,24 @@ describe("startNestedKWinSession", () => {
     expect(harness.spawns[1]?.env.WAYLAND_DISPLAY).toBeUndefined();
     expect(harness.spawns[1]?.env.DISPLAY).toBeUndefined();
     expect(harness.spawns[1]?.env.QT_QPA_PLATFORMTHEME).toBeUndefined();
+    await session.dispose();
+  });
+
+  it("gives the session a private runtime directory of its own, and removes it", async () => {
+    // Its sockets and the Xwayland cookie live there rather than beside the
+    // human's own display and bus, even when the host has a runtime directory.
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(
+      harness.options({ hostEnv: { XDG_RUNTIME_DIR: "/run/user/1000" } }),
+    );
     const runtime = session.runtimeDirectory!;
+    expect(runtime.startsWith(harness.stateDirectoryPathForTest())).toBe(true);
     expect((await stat(runtime)).mode & 0o777).toBe(0o700);
+    expect(harness.spawns[0]?.env.XDG_RUNTIME_DIR).toBe(runtime);
     expect(harness.spawns[1]?.env.XDG_RUNTIME_DIR).toBe(runtime);
     expect(nestedSessionEnv(session).XDG_RUNTIME_DIR).toBe(runtime);
+    session.spawnApp("kcalc", [], SPAWN_OPTIONS);
+    expect(harness.apps[0]?.env.XDG_RUNTIME_DIR).toBe(runtime);
     await session.dispose();
     await expect(stat(runtime)).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -282,7 +297,7 @@ describe("startNestedKWinSession", () => {
       harness.options({
         mode: "window",
         socketName: "synara-test-2",
-        hostEnv: { WAYLAND_DISPLAY: "wayland-0", DISPLAY: ":0" },
+        hostEnv: { WAYLAND_DISPLAY: "wayland-0", DISPLAY: ":0", XDG_RUNTIME_DIR: "/run/user/1000" },
       }),
     );
 
@@ -296,7 +311,9 @@ describe("startNestedKWinSession", () => {
       "--height",
       "1080",
     ]);
-    expect(harness.spawns[1]?.env.WAYLAND_DISPLAY).toBe("wayland-0");
+    // A path, because the compositor's runtime directory is the session's own
+    // and a bare name would be looked up there.
+    expect(harness.spawns[1]?.env.WAYLAND_DISPLAY).toBe("/run/user/1000/wayland-0");
     expect(harness.spawns[1]?.env.DISPLAY).toBeUndefined();
     expect(harness.spawns[1]?.env.DBUS_SESSION_BUS_ADDRESS).toBe(BUS_ADDRESS);
 
@@ -424,6 +441,60 @@ describe("a session that loses one of its own processes", () => {
     await session.dispose();
 
     expect(await harness.markers()).toEqual([]);
+  });
+});
+
+describe("the session marker", () => {
+  it("names each process from the moment it is spawned, before the boot finishes", async () => {
+    // A server killed mid-boot must still leave a marker naming what it started.
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const harness = new NestedHarness();
+    const booting = startNestedKWinSession(
+      harness.options({
+        waitForBusName: async () => {
+          await gate;
+          return true;
+        },
+      }),
+    );
+    for (let turn = 0; turn < 50 && harness.spawns.length < 2; turn += 1) await settle();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const marker = await harness.marker();
+    expect(marker?.serverPid).toBe(424_242);
+    expect(marker?.serverStartTime).toBe("31337");
+    expect(marker?.processes.map((entry) => entry.role)).toEqual(["bus", "compositor"]);
+    expect(marker?.processes[1]).toMatchObject({
+      pid: harness.spawns[1]?.child.pid,
+      command: expect.stringMatching(/^kwin_wayland /),
+      startTime: `${harness.spawns[1]?.child.pid}0`,
+    });
+
+    release?.();
+    const session = await booting;
+    await session.dispose();
+    expect(await harness.markers()).toEqual([]);
+  });
+
+  it("records apps the agent launches and forgets the ones that exit", async () => {
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(harness.options());
+    const app = session.spawnApp("kcalc", ["--foo"]) as unknown as FakeChild;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect((await harness.marker())?.processes).toContainEqual(
+      expect.objectContaining({ pid: app.pid, role: "app", command: "kcalc --foo" }),
+    );
+
+    app.end(null, 0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect((await harness.marker())?.processes.map((entry) => entry.role)).toEqual([
+      "bus",
+      "compositor",
+    ]);
+    await session.dispose();
   });
 });
 
@@ -603,7 +674,23 @@ class NestedHarness {
   /** Markers currently on disk for this harness. */
   async markers(): Promise<string[]> {
     if (!this.stateDirectoryPath) return [];
-    return await readdir(this.stateDirectoryPath).catch(() => [] as string[]);
+    const entries = await readdir(this.stateDirectoryPath).catch(() => [] as string[]);
+    return entries.filter((entry) => entry.endsWith(".json") && !entry.startsWith("."));
+  }
+
+  /** The one marker on disk, parsed. */
+  async marker(): Promise<NestedSessionMarker | undefined> {
+    const [name] = await this.markers();
+    if (!name || !this.stateDirectoryPath) return undefined;
+    return JSON.parse(
+      await readFile(join(this.stateDirectoryPath, name), "utf8"),
+    ) as NestedSessionMarker;
+  }
+
+  /** Every process the harness started, by pid, as the marker reads it back. */
+  private commandFor(pid: number): string | undefined {
+    const spawned = [...this.spawns, ...this.apps].find((entry) => entry.child.pid === pid);
+    return spawned ? [spawned.command, ...spawned.args].join(" ") : undefined;
   }
 
   options(overrides: NestedKWinSessionOptions = {}): NestedKWinSessionOptions {
@@ -618,8 +705,10 @@ class NestedHarness {
         stateDirectory: this.stateDirectory(),
         // Nothing in this suite may consult, or act on, a real process table.
         processAlive: () => false,
-        processCommand: () => undefined,
-        processStartTime: () => undefined,
+        processCommand: (pid) => this.commandFor(pid),
+        processStartTime: (pid) => (this.commandFor(pid) ? `${pid}0` : undefined),
+        serverPid: 424_242,
+        serverStartTime: "31337",
       },
       teardownProcessTree: async (input) => {
         this.tornDown.push(input.rootPid);
@@ -640,6 +729,10 @@ class NestedHarness {
       },
       ...overrides,
     };
+  }
+
+  stateDirectoryPathForTest(): string {
+    return this.stateDirectory();
   }
 
   private stateDirectory(): string {
