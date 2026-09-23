@@ -49,6 +49,13 @@ export const DEFAULT_STILL_INTERVAL_MS = 500;
  */
 export const MIN_STILL_INTERVAL_MS = 100;
 
+/**
+ * How often a paused publisher looks again. Only a flag is read per look; the
+ * point is that the still after a desktop operation lands right after it, not
+ * a whole interval later.
+ */
+const PAUSE_POLL_MS = 50;
+
 /** The one clamp both Tier-1 backends apply to their configured interval. */
 export function resolveStillIntervalMs(intervalMs: number | undefined): number {
   return Math.max(MIN_STILL_INTERVAL_MS, intervalMs ?? DEFAULT_STILL_INTERVAL_MS);
@@ -155,6 +162,22 @@ export interface StillFramePublisherOptions {
   readonly emit: (frame: ComputerStreamFrame) => void;
   readonly now: () => number;
   readonly intervalMs: number;
+  /**
+   * The slower cadence a still target that stopped changing drops to: after
+   * `idleAfterUnchanged` consecutive captures identical to the one the pane
+   * already has, ticks come every `idleIntervalMs` instead of every
+   * `intervalMs`, until a capture differs or `wake()` is called. Both unset
+   * keeps one fixed cadence.
+   */
+  readonly idleIntervalMs?: number;
+  readonly idleAfterUnchanged?: number;
+  /**
+   * Whether stills should wait right now, typically because a desktop
+   * operation is running and a still would only queue in front of its own
+   * capture. Checked on every tick; the first tick after it clears publishes
+   * at once and returns to the fast cadence.
+   */
+  readonly paused?: () => boolean;
 }
 
 export class StillFramePublisher {
@@ -164,10 +187,17 @@ export class StillFramePublisher {
 
   private listener: ComputerFrameListener | undefined;
   private attachmentGeneration = 0;
-  private timer: ReturnType<typeof setInterval> | undefined;
+  /** A fixed cadence's interval, or an adaptive one's next tick. */
+  private timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval> | undefined;
+  /** When the scheduled tick is due, for `wake()` to pull it forward. */
+  private dueAt = 0;
   private inFlight = false;
   private nextSequence = 1;
   private forceRetries = 0;
+  /** Consecutive captures identical to the published still; see `idleIntervalMs`. */
+  private unchangedCaptures = 0;
+  /** Whether the last tick found the publisher paused; see `paused`. */
+  private wasPaused = false;
 
   constructor(options: StillFramePublisherOptions) {
     this.options = options;
@@ -183,12 +213,38 @@ export class StillFramePublisher {
     // reuse the same callback or preparations finish out of order.
     if (this.attachmentGeneration !== generation) return;
     this.listener = listener;
+    this.unchangedCaptures = 0;
+    this.wasPaused = false;
     await this.publish({ force: true });
     if (this.attachmentGeneration !== generation) return;
+    if (this.adaptive()) {
+      this.schedule(this.options.intervalMs);
+      return;
+    }
     this.timer = setInterval(() => {
       void this.publish();
     }, this.options.intervalMs);
     this.timer.unref?.();
+  }
+
+  /** Whether the cadence moves at all: a backoff or a pause was configured. */
+  private adaptive(): boolean {
+    return (
+      this.options.paused !== undefined ||
+      (this.options.idleIntervalMs !== undefined && this.options.idleAfterUnchanged !== undefined)
+    );
+  }
+
+  /**
+   * Something on the desktop changed (an action ran, a window moved): back to
+   * the fast cadence, with the next tick no further away than one interval.
+   */
+  wake(): void {
+    this.unchangedCaptures = 0;
+    if (this.timer === undefined || !this.adaptive()) return;
+    if (this.dueAt - this.options.now() > this.options.intervalMs) {
+      this.schedule(this.options.intervalMs);
+    }
   }
 
   async detach(): Promise<void> {
@@ -234,7 +290,11 @@ export class StillFramePublisher {
       if (this.attachmentGeneration !== generation) return;
       // An idle target encodes the same bytes every tick; republishing them
       // spends about a megabyte of socket to convey nothing.
-      if (!this.dedupe.shouldPublish(bytes, force)) return;
+      if (!this.dedupe.shouldPublish(bytes, force)) {
+        this.unchangedCaptures += 1;
+        return;
+      }
+      this.unchangedCaptures = 0;
       this.forceRetries = 0;
       const frame: ComputerStreamFrame = {
         sequence: this.nextSequence++,
@@ -271,7 +331,44 @@ export class StillFramePublisher {
     }
   }
 
+  /** One tick of the loop: wait out a pause, then publish on the cadence. */
+  private tick(): void {
+    this.timer = undefined;
+    if (!this.listener) return;
+    if (this.options.paused?.() === true) {
+      this.wasPaused = true;
+      this.schedule(PAUSE_POLL_MS);
+      return;
+    }
+    if (this.wasPaused) {
+      // The still right after an operation is the one worth having.
+      this.wasPaused = false;
+      this.unchangedCaptures = 0;
+    }
+    // The fast cadence by default; once this tick's capture turns out to be
+    // one more unchanged still past the threshold, the next tick moves out to
+    // the idle interval, measured from this tick.
+    const startedAt = this.options.now();
+    this.schedule(this.options.intervalMs);
+    const timer = this.timer;
+    void this.publish().then(() => {
+      const idleIntervalMs = this.options.idleIntervalMs;
+      const threshold = this.options.idleAfterUnchanged;
+      if (this.timer !== timer || idleIntervalMs === undefined || threshold === undefined) return;
+      if (this.unchangedCaptures < threshold) return;
+      this.schedule(Math.max(0, startedAt + idleIntervalMs - this.options.now()));
+    });
+  }
+
+  private schedule(delayMs: number): void {
+    this.clearTimer();
+    this.dueAt = this.options.now() + delayMs;
+    this.timer = setTimeout(() => this.tick(), delayMs);
+    this.timer.unref?.();
+  }
+
   private clearTimer(): void {
+    // One handle type in Node; clearInterval clears either.
     if (this.timer !== undefined) clearInterval(this.timer);
     this.timer = undefined;
   }
