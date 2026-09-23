@@ -2,7 +2,7 @@ import { createServer } from "node:net";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   HyprlandComputerBackend,
@@ -51,7 +51,7 @@ async function makeBackend(
   const dir = await temp();
   return new HyprlandComputerBackend({
     platform: "linux",
-    sessionPresent: () => true,
+    resolveInstance: async () => "test-instance",
     pluginDirectory: join(dir, "plugins"),
     installStampPath: join(dir, "install.stamp"),
     runHyprctl: async (args) => {
@@ -88,7 +88,7 @@ describe("HyprlandComputerBackend passive probe", () => {
     });
 
     const noSession = await makeBackend({
-      sessionPresent: () => false,
+      resolveInstance: async () => undefined,
       busNameHasOwner: async () => {
         throw new Error("the bus probe must not run without a session");
       },
@@ -228,7 +228,7 @@ describe("HyprlandComputerBackend availability", () => {
 
   it("refuses without dialing anything when no Hyprland session is live", async () => {
     const backend = await makeBackend({
-      sessionPresent: () => false,
+      resolveInstance: async () => undefined,
       dbusFactory: async () => {
         throw new Error("must not connect without a session");
       },
@@ -399,7 +399,7 @@ describe("HyprlandComputerBackend setup gate", () => {
     const directory = await temp();
     const backend = new SetupProbe({
       platform: "linux",
-      sessionPresent: () => true,
+      resolveInstance: async () => "test-instance",
       pluginDirectory: join(directory, "plugins"),
       runHyprctl: async (args) =>
         args.join(" ").endsWith("-j version") ? JSON.stringify({ version: "0.56.2" }) : "",
@@ -421,5 +421,92 @@ describe("HyprlandComputerBackend setup gate", () => {
 
     await expect(backend.setUp()).resolves.toMatchObject({ action: "installed-from-source" });
     await backend.dispose();
+  });
+});
+
+describe("HyprlandComputerBackend across compositor restarts (R6)", () => {
+  class VersionProbe extends HyprlandComputerBackend {
+    runningVersion() {
+      return this.probeRunningKwinVersion();
+    }
+  }
+
+  it("follows the live instance, reloads into a new one and reads its version afresh", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      let instance: string | undefined = "first";
+      const versions: Record<string, string> = { first: "0.56.1", second: "0.56.2" };
+      let versionReads = 0;
+      const directory = await temp();
+      const backend = new VersionProbe({
+        platform: "linux",
+        resolveInstance: async () => instance,
+        pluginDirectory: await installedPluginDirectory("SynaraComputerUsePluginV1.so"),
+        installStampPath: join(directory, "install.stamp"),
+        runHyprctl: async (args) => {
+          if (args.join(" ") !== "-j version") throw new Error(`unexpected ${args.join(" ")}`);
+          versionReads += 1;
+          return JSON.stringify({ version: instance ? versions[instance] : undefined });
+        },
+        busNameHasOwner: async () => false,
+        dbusFactory: async () => dbus as unknown as HyprlandComputerDbus,
+        atspi: {
+          readTrees: async () => [],
+          setText: async () => false,
+          dispose: async () => undefined,
+        },
+      });
+      await backend.listWindows();
+      await expect(backend.runningVersion()).resolves.toBe("0.56.1");
+      await backend.runningVersion();
+      expect(versionReads).toBe(1);
+      const loads = () => dbus.calls.filter((call) => call.method === "LoadPlugin").length;
+      const loadsBefore = loads();
+
+      // Hyprland restarted: the plugin went with the old instance.
+      instance = "second";
+      dbus.loaded = [];
+      dbus.serviceOwner = undefined;
+      dbus.changeServiceOwner(undefined);
+      // The reconnect reads the plugin directory from disk, so it is waited
+      // for rather than timed.
+      await vi.waitFor(() => expect(backend.health().status).toBe("connected"));
+      expect(loads()).toBe(loadsBefore + 1);
+      await expect(backend.runningVersion()).resolves.toBe("0.56.2");
+      expect(versionReads).toBe(2);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports the desktop gone when no instance comes back", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      let instance: string | undefined = "only";
+      const backend = await makeBackend({
+        resolveInstance: async () => instance,
+        pluginDirectory: await installedPluginDirectory("SynaraComputerUsePluginV1.so"),
+        dbusFactory: async () => dbus as unknown as HyprlandComputerDbus,
+      });
+      const gone: string[] = [];
+      backend.onEvent((event) => {
+        if (event.type === "desktop-gone") gone.push(event.message);
+      });
+      await backend.listWindows();
+
+      instance = undefined;
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(gone).toEqual([]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(gone).toEqual([expect.stringContaining("No Hyprland session")]);
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

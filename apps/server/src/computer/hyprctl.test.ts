@@ -14,6 +14,7 @@ import {
   socketAcceptsConnections,
   listLoadedHyprlandPlugins,
   loadHyprlandPlugin,
+  resolveLiveHyprlandInstance,
   unloadHyprlandPlugin,
   type HyprctlRunner,
 } from "./hyprctl.ts";
@@ -80,6 +81,50 @@ describe("hyprlandSessionPresent", () => {
     expect(probed).toEqual(["/run/user/1000/hypr/nested/.socket.sock"]);
   });
 
+  it("follows the instance that replaced a dead inherited one, and only an unambiguous one", async () => {
+    const env = { HYPRLAND_INSTANCE_SIGNATURE: "old", XDG_RUNTIME_DIR: "/run/user/1000" };
+    const socket = (signature: string) => `/run/user/1000/hypr/${signature}/.socket.sock`;
+    let live = new Set(["old"]);
+    let listed = ["old"];
+    const resolve = () =>
+      resolveLiveHyprlandInstance({
+        env,
+        connects: (path) => [...live].some((signature) => socket(signature) === path),
+        listInstances: async () => listed,
+      });
+
+    expect(await resolve()).toBe("old");
+    // Hyprland restarted: the old directory lingers, a new instance is live.
+    live = new Set(["new"]);
+    listed = ["old", "new", "../escape"];
+    expect(await resolve()).toBe("new");
+    // Two candidates is a guess this module does not make.
+    live = new Set(["new", "other"]);
+    listed = ["old", "new", "other"];
+    expect(await resolve()).toBeUndefined();
+    live = new Set();
+    expect(await resolve()).toBeUndefined();
+
+    // A pinned instance never falls back to another one.
+    live = new Set(["new"]);
+    listed = ["old", "new"];
+    expect(
+      await resolveLiveHyprlandInstance({
+        env: { ...env, SYNARA_HYPRLAND_INSTANCE_SIGNATURE: "nested" },
+        connects: (path) => path === socket("new"),
+        listInstances: async () => listed,
+      }),
+    ).toBeUndefined();
+    // Nor does a process that was never started inside a Hyprland session.
+    expect(
+      await resolveLiveHyprlandInstance({
+        env: { XDG_RUNTIME_DIR: "/run/user/1000" },
+        connects: () => true,
+        listInstances: async () => listed,
+      }),
+    ).toBeUndefined();
+  });
+
   it("rejects a signature that could escape the runtime directory", async () => {
     const env = { XDG_RUNTIME_DIR: "/run/user/1000" };
 
@@ -97,7 +142,7 @@ describe("makeHyprctlRunner", () => {
   async function withFakeHyprctl<T>(body: (directory: string) => Promise<T>): Promise<T> {
     const directory = await mkdtemp(join(tmpdir(), "synara-hyprctl-"));
     const script = join(directory, "hyprctl");
-    // Exits 0 whatever it is asked, exactly like the real one.
+    // Exits 0 whatever it is asked, like the real one does for any reply.
     await writeFile(script, '#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done\nexit 0\n');
     await chmod(script, 0o755);
     const previousPath = process.env.PATH;
@@ -137,13 +182,26 @@ describe("makeHyprctlRunner", () => {
     });
   });
 
-  it("lets hyprctl resolve the instance itself when the environment names none", async () => {
+  it("runs nothing when there is no instance to name", async () => {
     await withFakeHyprctl(async () => {
-      const run = makeHyprctlRunner({ env: {} });
-      expect((await run(["plugin", "list"])).split("\n").filter(Boolean)).toEqual([
-        "plugin",
-        "list",
-      ]);
+      // Left to hyprctl, an unnamed call goes to whichever instance its own
+      // environment lookup finds, which can be the human's.
+      await expect(makeHyprctlRunner({ env: {} })(["plugin", "list"])).rejects.toThrow(
+        "no live Hyprland instance",
+      );
+      await expect(
+        makeHyprctlRunner({ signature: () => undefined })(["plugin", "list"]),
+      ).rejects.toThrow("was not run");
+    });
+  });
+
+  it("asks a signature function on every call", async () => {
+    await withFakeHyprctl(async () => {
+      let current = "first";
+      const run = makeHyprctlRunner({ signature: () => current });
+      expect((await run(["version"])).split("\n")[1]).toBe("first");
+      current = "second";
+      expect((await run(["version"])).split("\n")[1]).toBe("second");
     });
   });
 });

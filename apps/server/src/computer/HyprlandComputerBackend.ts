@@ -26,9 +26,8 @@ import { COMPUTER_HYPRLAND_BACKEND, type ComputerAvailability } from "@synara/co
 
 import {
   detectRunningHyprlandVersion,
-  hyprlandInstancePresent,
-  hyprlandInstanceSignature,
   makeHyprctlRunner,
+  resolveLiveHyprlandInstance,
   unloadHyprlandPlugin,
   type HyprctlRunner,
 } from "./hyprctl.ts";
@@ -72,8 +71,11 @@ export interface HyprlandComputerBackendOptions {
    */
   readonly signature?: string;
   readonly runHyprctl?: HyprctlRunner;
-  /** Live-instance check, replaced in tests to avoid touching the host. */
-  readonly sessionPresent?: () => boolean | Promise<boolean>;
+  /**
+   * The live instance to drive right now (see `resolveLiveHyprlandInstance`),
+   * replaced in tests to avoid touching the host.
+   */
+  readonly resolveInstance?: () => Promise<string | undefined>;
   readonly pluginDirectory?: string;
   readonly stateRoot?: string;
   readonly installStampPath?: string;
@@ -89,18 +91,25 @@ export interface HyprlandComputerBackendOptions {
 /** Mutable box shared with the closures handed to the base constructor. */
 interface HyprlandDbusRef {
   dbus: HyprlandComputerDbus | undefined;
+  /**
+   * The instance the newest resolution found, which every hyprctl call is
+   * addressed to. Re-resolved on every connect: a Hyprland restart replaces
+   * the instance, and a signature fixed at construction would address the
+   * dead one forever.
+   */
+  instance: string | undefined;
 }
 
 export class HyprlandComputerBackend extends KWinComputerBackend {
   private readonly ref: HyprlandDbusRef;
   private readonly hyprlandPlatform: string;
-  private readonly sessionPresent: () => boolean | Promise<boolean>;
+  private readonly resolveInstance: () => Promise<string | undefined>;
   private readonly hyprlandBusNameHasOwner: (name: string) => Promise<boolean>;
   private readonly pluginDirectory: string;
   private readonly hyprlandBuildToolingPresent: () => boolean;
 
   constructor(options: HyprlandComputerBackendOptions = {}) {
-    const ref: HyprlandDbusRef = { dbus: undefined };
+    const ref: HyprlandDbusRef = { dbus: undefined, instance: undefined };
     const env = options.env ?? process.env;
     const pluginDirectory = options.pluginDirectory ?? hyprlandPluginDirectory(env);
     const stateRoot = options.stateRoot ?? hyprlandStateRoot(env);
@@ -109,19 +118,47 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
     // the liveness check, every hyprctl call, and the plugin host: they must
     // never disagree, or the backend reports a live desktop it is not talking
     // to — or worse, talks to the human's while reporting the nested one.
-    const signature = options.signature ?? hyprlandInstanceSignature(env);
-    const runHyprctl =
-      options.runHyprctl ?? makeHyprctlRunner({ ...(signature ? { signature } : {}), env });
-    // Memoized like the base's KWin probe: the compositor cannot change under
-    // a live session, and this runs inside connect retries.
-    let versionPromise: Promise<string | undefined> | undefined;
-    const hyprlandVersion = () => (versionPromise ??= detectRunningHyprlandVersion(runHyprctl));
+    const resolve =
+      options.resolveInstance ??
+      (() =>
+        resolveLiveHyprlandInstance({
+          env,
+          ...(options.signature ? { signature: options.signature } : {}),
+        }));
+    const resolveInstance = async () => {
+      const instance = await resolve();
+      ref.instance = instance;
+      return instance;
+    };
+    const runHyprctl = options.runHyprctl ?? makeHyprctlRunner({ signature: () => ref.instance });
+    // Memoized per instance, like the base's KWin probe per connection: a
+    // compositor cannot change version while it runs, and this runs inside
+    // connect retries. A failed read is not memoized, and a new instance —
+    // a restart, possibly into an upgraded Hyprland — is asked afresh.
+    type VersionMemo = {
+      readonly instance: string | undefined;
+      readonly promise: Promise<string | undefined>;
+    };
+    let versionMemo: VersionMemo | undefined;
+    const hyprlandVersion = () => {
+      const instance = ref.instance;
+      if (versionMemo === undefined || versionMemo.instance !== instance) {
+        const memo: VersionMemo = {
+          instance,
+          promise: detectRunningHyprlandVersion(runHyprctl).then((answer) => {
+            if (answer === undefined && versionMemo === memo) versionMemo = undefined;
+            return answer;
+          }),
+        };
+        versionMemo = memo;
+      }
+      return versionMemo.promise;
+    };
     const innerDbusFactory =
       options.dbusFactory ??
       (async () =>
         createSessionHyprlandComputerDbus({
           pluginDirectory,
-          ...(signature ? { signature } : {}),
           runHyprctl,
         }));
     super({
@@ -147,7 +184,10 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
       dbusFactory: async (context) => {
         const dbus = await innerDbusFactory(context);
         ref.dbus = "lastLoadRefusal" in dbus ? (dbus as HyprlandComputerDbus) : undefined;
-        return dbus;
+        // The instance is what the engine compares across connects: gone is
+        // a desktop that may be gone for good, and a different one is a
+        // restarted compositor the plugin is loaded into again.
+        return { ...dbus, compositorInstance: resolveInstance };
       },
       provisionPlugin:
         options.provisionPlugin ??
@@ -192,7 +232,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
     });
     this.ref = ref;
     this.hyprlandPlatform = options.platform ?? process.platform;
-    this.sessionPresent = options.sessionPresent ?? (() => hyprlandInstancePresent(signature, env));
+    this.resolveInstance = resolveInstance;
     this.hyprlandBusNameHasOwner =
       options.busNameHasOwner ?? ((name) => sessionBusNameHasOwner(name));
     this.pluginDirectory = pluginDirectory;
@@ -215,7 +255,7 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
     if (this.hyprlandPlatform !== "linux") {
       return { kind: "unsupported-platform", platform: this.hyprlandPlatform };
     }
-    if (!(await this.sessionPresent())) {
+    if ((await this.resolveInstance()) === undefined) {
       return { kind: "backend-unavailable", message: NO_HYPRLAND_MESSAGE };
     }
     if (await this.hyprlandBusNameHasOwner(COMPUTER_SERVICE).catch(() => false)) {
@@ -243,11 +283,15 @@ export class HyprlandComputerBackend extends KWinComputerBackend {
 
   /** The establishing read, with the backend named as what it actually is. */
   override async availability(): Promise<ComputerAvailability> {
-    if (this.hyprlandPlatform === "linux" && !(await this.sessionPresent())) {
+    if (this.hyprlandPlatform === "linux" && (await this.resolveInstance()) === undefined) {
       return { kind: "backend-unavailable", message: NO_HYPRLAND_MESSAGE };
     }
     const availability = await super.availability();
     return availability.kind === "available" ? this.availableAsHyprland() : availability;
+  }
+
+  protected override get compositorMissingMessage(): string {
+    return NO_HYPRLAND_MESSAGE;
   }
 
   /**

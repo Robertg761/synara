@@ -1,11 +1,14 @@
 /**
  * The `hyprctl` surface the Hyprland backend depends on, isolated because the
- * tool's contract is easy to misread: **hyprctl always exits 0**, success and
- * failure alike, so every answer here is parsed out of the reply text rather
- * than the exit code. `plugin load /path.so` answers `ok` on success and
- * `Plugin <path> could not be loaded: <reason>` on failure — same exit code
- * both ways. This module owns that parsing so nothing else in the tree ever
- * looks at an exit status and draws the wrong conclusion.
+ * tool's contract is easy to misread: **a command the compositor answered
+ * exits 0 whatever the answer was**, so every verdict here is parsed out of
+ * the reply text rather than the exit code. `plugin load /path.so` answers
+ * `ok` on success and `Plugin <path> could not be loaded: <reason>` on
+ * failure — same exit code both ways. A non-zero exit means hyprctl never got
+ * an answer at all: the instance it was pointed at is gone (`-i <dead>` exits
+ * 4 on 0.56) or the binary is missing. This module owns that parsing so
+ * nothing else in the tree ever looks at an exit status and draws the wrong
+ * conclusion.
  *
  * Verified against Hyprland 0.56 (`src/debug/HyprCtl.cpp`): `plugin list -j`
  * reports `{name, author, handle, version, description}` per plugin — no path —
@@ -15,6 +18,7 @@
  * cannot tell the server which installed `.so` is the one answering the bus.
  */
 import { execFile } from "node:child_process";
+import { readdir } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 
@@ -77,12 +81,70 @@ export async function hyprlandInstancePresent(
   return connects(join(runtimeDir, "hypr", signature, ".socket.sock"));
 }
 
-/** The instance this environment resolves to, and whether it is live. */
+export interface LiveHyprlandInstanceOptions {
+  readonly env?: NodeJS.ProcessEnv;
+  /** An explicit instance, as the backend's `signature` option names one. */
+  readonly signature?: string;
+  readonly connects?: (path: string) => boolean | Promise<boolean>;
+  /** The instance directories under `$XDG_RUNTIME_DIR/hypr`; tests replace it. */
+  readonly listInstances?: (directory: string) => Promise<readonly string[]>;
+}
+
+/**
+ * The Hyprland instance to drive right now, or `undefined` when there is none.
+ *
+ * Resolved per use rather than once at startup, because the signature this
+ * process inherited dies with the compositor: after a Hyprland restart every
+ * `hyprctl -i <old>` fails and nothing recovers until the server restarts.
+ *
+ * - A pinned instance (the backend's `signature`, or
+ *   `SYNARA_HYPRLAND_INSTANCE_SIGNATURE`) is the only candidate. Pinning is
+ *   how dev-testing is kept on a nested compositor, so it never falls back to
+ *   another instance — least of all the human's.
+ * - Otherwise the inherited `HYPRLAND_INSTANCE_SIGNATURE`, while it is live.
+ * - Once it is not, the instance that replaced it: the one live instance under
+ *   the same runtime directory. None, or several to choose between, is no
+ *   answer. A process that inherited no signature at all was not started in a
+ *   Hyprland session and does not go looking for one.
+ */
+export async function resolveLiveHyprlandInstance(
+  options: LiveHyprlandInstanceOptions = {},
+): Promise<string | undefined> {
+  const env = options.env ?? process.env;
+  const connects = options.connects ?? socketAcceptsConnections;
+  const pinned = options.signature ?? env[SYNARA_HYPRLAND_SIGNATURE_ENV]?.trim();
+  if (pinned) {
+    return (await hyprlandInstancePresent(pinned, env, connects)) ? pinned : undefined;
+  }
+  const inherited = env[HYPRLAND_SIGNATURE_ENV]?.trim();
+  if (!inherited || !isSignature(inherited)) return undefined;
+  if (await hyprlandInstancePresent(inherited, env, connects)) return inherited;
+  const runtimeDir = env.XDG_RUNTIME_DIR?.trim();
+  if (!runtimeDir) return undefined;
+  const list =
+    options.listInstances ??
+    ((directory: string) => readdir(directory).catch(() => [] as string[]));
+  const live: string[] = [];
+  for (const candidate of await list(join(runtimeDir, "hypr"))) {
+    if (candidate === inherited || !isSignature(candidate)) continue;
+    if (await hyprlandInstancePresent(candidate, env, connects)) live.push(candidate);
+  }
+  return live.length === 1 ? live[0] : undefined;
+}
+
+/** Whether this environment resolves to a live instance; see `resolveLiveHyprlandInstance`. */
 export async function hyprlandSessionPresent(
   env: NodeJS.ProcessEnv = process.env,
   connects: (path: string) => boolean | Promise<boolean> = socketAcceptsConnections,
+  listInstances?: (directory: string) => Promise<readonly string[]>,
 ): Promise<boolean> {
-  return hyprlandInstancePresent(hyprlandInstanceSignature(env), env, connects);
+  return (
+    (await resolveLiveHyprlandInstance({
+      env,
+      connects,
+      ...(listInstances ? { listInstances } : {}),
+    })) !== undefined
+  );
 }
 
 export function socketAcceptsConnections(path: string): Promise<boolean> {
@@ -103,12 +165,13 @@ export type HyprctlRunner = (args: readonly string[]) => Promise<string>;
 
 export interface HyprctlOptions {
   /**
-   * An explicit instance signature (`hyprctl -i`), for driving a compositor
-   * other than the one this process inherited — the dev-test nested instance.
-   * Absent, the instance is resolved from the environment (`env` below), which
-   * still prefers the Synara override over the inherited signature.
+   * The instance signature (`hyprctl -i`) every call is addressed to: a fixed
+   * one, or a function asked per call — the backend's, which follows the live
+   * instance across compositor restarts. Absent, the instance is resolved from
+   * the environment (`env` below), which prefers the Synara override over the
+   * inherited signature.
    */
-  readonly signature?: string;
+  readonly signature?: string | (() => string | undefined);
   readonly env?: NodeJS.ProcessEnv;
 }
 
@@ -116,20 +179,33 @@ export interface HyprctlOptions {
  * Every call is addressed to a named instance rather than left to hyprctl's own
  * environment lookup: the two disagree exactly when the override is set, and a
  * call that silently lands on the human's compositor instead of the dev-test
- * one is the failure this whole module exists to prevent.
+ * one is the failure this whole module exists to prevent. With no instance to
+ * name, nothing is run at all.
  */
 export function makeHyprctlRunner(options: HyprctlOptions = {}): HyprctlRunner {
-  const signature = options.signature ?? hyprlandInstanceSignature(options.env ?? process.env);
+  const fixed =
+    options.signature === undefined
+      ? hyprlandInstanceSignature(options.env ?? process.env)
+      : options.signature;
   return (args) =>
     new Promise((resolve, reject) => {
-      const fullArgs = signature ? ["-i", signature, ...args] : [...args];
+      const signature = typeof fixed === "function" ? fixed() : fixed;
+      if (!signature) {
+        reject(
+          new Error(
+            `hyprctl ${args.join(" ")} was not run: no live Hyprland instance to address.`,
+          ),
+        );
+        return;
+      }
       execFile(
         "hyprctl",
-        fullArgs,
+        ["-i", signature, ...args],
         { timeout: HYPRCTL_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
         (error, stdout) => {
-          // hyprctl itself never exits non-zero; an error here means the binary
-          // is missing, was killed by the timeout, or the socket write failed.
+          // A reply, whatever it says, exits 0. An error here means no reply:
+          // the instance is gone (a non-zero exit), the binary is missing, or
+          // the timeout killed it.
           if (error) reject(new Error(`hyprctl ${args.join(" ")} failed: ${error.message}`));
           else resolve(stdout);
         },
