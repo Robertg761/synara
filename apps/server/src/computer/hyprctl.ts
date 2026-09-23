@@ -192,9 +192,7 @@ export function makeHyprctlRunner(options: HyprctlOptions = {}): HyprctlRunner {
       const signature = typeof fixed === "function" ? fixed() : fixed;
       if (!signature) {
         reject(
-          new Error(
-            `hyprctl ${args.join(" ")} was not run: no live Hyprland instance to address.`,
-          ),
+          new Error(`hyprctl ${args.join(" ")} was not run: no live Hyprland instance to address.`),
         );
         return;
       }

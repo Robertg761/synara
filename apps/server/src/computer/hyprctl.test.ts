@@ -28,6 +28,8 @@ function runner(replies: Record<string, string>): HyprctlRunner {
   };
 }
 
+const socket = (signature: string) => `/run/user/1000/hypr/${signature}/.socket.sock`;
+
 describe("hyprlandSessionPresent", () => {
   it("refuses a stale socket inode left by a crashed compositor", async () => {
     const directory = await mkdtemp(join(tmpdir(), "synara-socket-"));
@@ -83,7 +85,6 @@ describe("hyprlandSessionPresent", () => {
 
   it("follows the instance that replaced a dead inherited one, and only an unambiguous one", async () => {
     const env = { HYPRLAND_INSTANCE_SIGNATURE: "old", XDG_RUNTIME_DIR: "/run/user/1000" };
-    const socket = (signature: string) => `/run/user/1000/hypr/${signature}/.socket.sock`;
     let live = new Set(["old"]);
     let listed = ["old"];
     const resolve = () =>
