@@ -234,14 +234,26 @@ selects it ahead of detection; `SYNARA_COMPUTER_BACKEND=nested` forces it.
 
 ### Session
 
-`nestedKWinSession.ts` starts a private `dbus-daemon --session`, then
-`kwin_wayland --virtual --xwayland --no-global-shortcuts` on that bus, waits for
-`org.kde.KWin`, unloads every loaded Synara plugin id and loads the newest
-installed one. Size comes from `SYNARA_COMPUTER_NESTED_SIZE` (`WxH`, default
-1920x1080). The compositor's environment carries the private bus,
-`SYNARA_COMPUTER_USE_OWNS_COMPOSITOR=1`, and the user's plugin root on
-`QT_PLUGIN_PATH` (no env script, no relogin); `DISPLAY` and `WAYLAND_DISPLAY`
-are dropped so a virtual compositor can never attach to the human's session.
+`nestedKWinSession.ts` gives each session a private runtime directory
+(`$XDG_RUNTIME_DIR/synara-nested-sessions/<id>`, mode 0700; the user's cache
+directory when there is no runtime directory, never `/tmp`), starts a private
+`dbus-daemon` there, then `kwin_wayland --virtual --xwayland
+--no-global-shortcuts` on that bus, waits for `org.kde.KWin`, unloads every
+loaded Synara plugin id and loads the newest installed one. Size comes from
+`SYNARA_COMPUTER_NESTED_SIZE` (`WxH`, default 1920x1080).
+
+The bus runs a generated `--config-file`, not the stock `session.conf`: session
+type, `unix:dir=` in the session's runtime directory, `EXTERNAL` auth and no
+service directories, so nothing is ever activated on it. A portal,
+notification or `org.a11y.Bus` call from an app in the nested desktop fails
+with `ServiceUnknown` instead of starting a service with the bus's environment.
+The bus and the compositor get an allowlisted environment (`PATH`, `HOME`,
+locale, the `XDG_*` base directories, cursor theme, graphics-driver selection)
+plus the session's own runtime directory and bus: never the human's
+`WAYLAND_DISPLAY`, `DISPLAY` or `XAUTHORITY`, a compositor signature, the host
+session bus, or Synara's secrets. The compositor also gets
+`SYNARA_COMPUTER_USE_OWNS_COMPOSITOR=1` and the user's plugin root on
+`QT_PLUGIN_PATH` (no env script, no relogin).
 
 With `SYNARA_COMPUTER_USE_OWNS_COMPOSITOR=1` the plugin adds a virtual input
 device to the compositor's own pipeline instead of a second seat: focus follows
@@ -281,9 +293,12 @@ session. It fails the seat policy on purpose â€” a window appears on the host â€
 and exists only for debugging; it refuses to start without a host
 `WAYLAND_DISPLAY` rather than falling back to virtual.
 
-AT-SPI is off by default on the nested desktop because the accessibility
-registry is per user, not per bus, and would otherwise read the human's
-desktop into the nested window list; `SYNARA_COMPUTER_NESTED_ATSPI=1` opts in.
+AT-SPI is off by default on the nested desktop. `SYNARA_COMPUTER_NESTED_ATSPI=1`
+opts in: the session then starts `at-spi-bus-launcher --launch-immediately`
+itself, with the session's display, bus and runtime directory, so the
+accessibility bus, its registry, and every app that finds them stay inside the
+nested desktop. Without a launcher the session reports no accessibility bus and
+the reader stays off.
 The nested-only variables (`SYNARA_COMPUTER_NESTED*`,
 `SYNARA_COMPUTER_USE_OWNS_COMPOSITOR`, `SYNARA_NESTED_KWIN_TEST`) are listed in
 `turbo.json` with the KWin ones.
@@ -376,7 +391,5 @@ Development runs against a disposable Hyprland nested inside a headless
 - The plugin is built per compositor version, so every KWin release needs a
   new build; a KWin upgrade leaves no plugin loaded until the next login
   provisions one.
-- The nested session's private `dbus-daemon` inherits the host environment
-  with service activation on.
 - On Hyprland, the pointer and modifier hand-back after an action aimed at a
   surface the human is also using is best effort.

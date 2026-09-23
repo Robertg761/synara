@@ -25,7 +25,8 @@
  * exactly like first use did.
  */
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
-import { rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { rm, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 
 import { ComputerBackendError } from "./ComputerBackend.ts";
@@ -76,6 +77,17 @@ import {
 import { spawnClipboardCommand, type ClipboardCommandRunner } from "./wlClipboard.ts";
 
 const DBUS_DAEMON_COMMAND = "dbus-daemon";
+const BUS_CONFIG_FILE = "bus.conf";
+/** Where distributions install the accessibility bus launcher; it is never on PATH. */
+const ATSPI_BUS_LAUNCHER_PATHS = [
+  "/usr/libexec/at-spi-bus-launcher",
+  "/usr/lib/at-spi-bus-launcher",
+  "/usr/lib/at-spi2-core/at-spi-bus-launcher",
+  "/usr/libexec/at-spi2-core/at-spi-bus-launcher",
+  `/usr/lib/${process.arch === "arm64" ? "aarch64" : "x86_64"}-linux-gnu/at-spi2-core/at-spi-bus-launcher`,
+];
+const ATSPI_BUS_NAME = "org.a11y.Bus";
+const ATSPI_READY_TIMEOUT_MS = 5_000;
 const KWIN_COMMAND = "kwin_wayland";
 const XWAYLAND_COMMAND = "Xwayland";
 const DEFAULT_NESTED_WIDTH = 1_920;
@@ -129,6 +141,16 @@ export interface NestedKWinSessionOptions {
   readonly waitForBusName?: typeof waitForSessionBusName;
   /** Where session markers are written and swept; a test seam for both. */
   readonly registry?: NestedSessionRegistryDependencies;
+  /**
+   * Start an accessibility bus inside the session, so AT-SPI perception reads
+   * this desktop's applications. Off unless the backend's AT-SPI mode is on.
+   */
+  readonly accessibility?: boolean;
+  /**
+   * The `at-spi-bus-launcher` to run, or explicitly `undefined` for none;
+   * found in the usual places when the key is absent.
+   */
+  readonly accessibilityLauncher?: string | undefined;
 }
 
 export interface NestedKWinSession {
@@ -147,6 +169,12 @@ export interface NestedKWinSession {
    * this session. Undefined only if the compositor started without one.
    */
   readonly xDisplay: string | undefined;
+  /**
+   * Whether the session runs its own accessibility bus. Without one, nothing
+   * answers `org.a11y.Bus` on the private bus — no service is ever activated
+   * there — so AT-SPI perception must not be attempted at all.
+   */
+  readonly accessibility?: boolean;
   /**
    * How one of the session's own processes ended, or `undefined` while both
    * still run. The session's bus address dies with them and never comes back,
@@ -249,13 +277,19 @@ export async function startNestedKWinSession(
       registry,
     );
 
+    // Never the stock session.conf: its service directories would let any app
+    // on this bus activate a portal, a notification daemon or an a11y bus —
+    // started by the bus daemon, outside this session's control, on whatever
+    // display the daemon's environment names.
+    const busConfig = join(runtimeDirectory, BUS_CONFIG_FILE);
+    await writeFile(busConfig, nestedBusConfig(runtimeDirectory), { mode: 0o600 });
     const bus = start(
       spawnProcess,
       options.teardownProcessTree,
       children,
       DBUS_DAEMON_COMMAND,
-      ["--session", "--print-address=1", "--nofork"],
-      { ...hostEnv, XDG_RUNTIME_DIR: runtimeDirectory },
+      ["--config-file", busConfig, "--print-address=1", "--nofork"],
+      nestedHelperEnvironment(hostEnv, { XDG_RUNTIME_DIR: runtimeDirectory }),
     );
     marker.record(bus.pid, "bus");
     const busAddress = await bus.readFirstStdoutLine(BUS_ADDRESS_TIMEOUT_MS);
@@ -302,14 +336,28 @@ export async function startNestedKWinSession(
       if (basename(readProcessCommand(pid)?.split(" ")[0] ?? "") === XWAYLAND_COMMAND)
         marker.record(pid, "xwayland");
     }
+    const coordinates = { runtimeDirectory, busAddress, waylandDisplay, xDisplay };
+    const accessibility = options.accessibility
+      ? await startAccessibilityBus({
+          launcher:
+            "accessibilityLauncher" in options
+              ? options.accessibilityLauncher
+              : findAtspiBusLauncher(),
+          env: nestedHelperEnvironment(hostEnv, nestedSessionEnv(coordinates)),
+          busAddress,
+          spawnProcess,
+          teardownProcessTree: options.teardownProcessTree,
+          children,
+          marker,
+          waitForBusName,
+        })
+      : false;
     const sessionMarker = marker;
     const session: NestedKWinSession = {
-      runtimeDirectory,
-      busAddress,
-      waylandDisplay,
+      ...coordinates,
       size,
       pluginId,
-      xDisplay,
+      accessibility,
       // The compositor is what the human can close; the bus daemon only dies
       // with the server or a crash. Either one ending ends the session, and
       // the *first* ending is the reason worth reporting: the second is this
@@ -438,11 +486,12 @@ export function nestedSessionEnv(session: {
 /**
  * Whether the nested session's own accessibility perception is used.
  *
- * `off` is the default because the AT-SPI registry is per-user, not per session
- * bus: without a registry inside the nested session the helper either fails or,
- * worse, reads the human's real desktop and fuses it into the nested window
- * list. Hosts that do activate a registry on the nested bus — a CI container
- * with no ambient desktop — opt back in.
+ * `session` starts an accessibility bus inside the session (the private bus
+ * activates nothing, so it never appears on its own), which keeps both the
+ * applications and the AT-SPI helper on the nested desktop rather than the
+ * human's. `off` stays the default: perception on a nested desktop reads only
+ * applications that enable accessibility, and costs a bus daemon and a
+ * registry per session.
  */
 export type NestedAtspiMode = "off" | "session";
 
@@ -578,7 +627,9 @@ function nestedAtspiReader(
       current = undefined;
       await stale.client.dispose().catch(() => undefined);
     }
-    if (!session) return undefined;
+    // No accessibility bus in the session means nothing answers org.a11y.Bus,
+    // and a helper asked to read trees there has nothing to read.
+    if (!session || session.accessibility === false) return undefined;
     current ??= { session, client: createClient(nestedSessionEnv(session)) };
     return current.client;
   };
@@ -800,9 +851,10 @@ function compositorArgs(
 }
 
 /**
- * A virtual compositor must not inherit the ambient display: with
- * WAYLAND_DISPLAY or DISPLAY set, kwin_wayland can attach to the very session a
- * nested one exists to stay independent of. A windowed one is the exact
+ * The compositor's environment: the helper allowlist plus the session's own
+ * bus and runtime directory. A virtual compositor must not inherit the ambient
+ * display: with WAYLAND_DISPLAY or DISPLAY set, kwin_wayland can attach to the
+ * very session a nested one exists to stay independent of. A windowed one is the exact
  * opposite — the host WAYLAND_DISPLAY is the socket it nests through, and
  * without it there is no window; it is resolved to a path because the
  * compositor's runtime directory is the session's own, not the host's. DISPLAY
@@ -814,8 +866,7 @@ function compositorEnv(
   hostEnv: NodeJS.ProcessEnv,
   runtimeDirectory: string,
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...hostEnv,
+  return nestedHelperEnvironment(hostEnv, {
     XDG_RUNTIME_DIR: runtimeDirectory,
     DBUS_SESSION_BUS_ADDRESS: busAddress,
     // Nobody but the agent uses this compositor, so the plugin drives its one
@@ -830,17 +881,168 @@ function compositorEnv(
     // are not Plasma, so the same root has to ride the environment here or the
     // freshly installed plugin is invisible to the very KWin booted to load it.
     QT_PLUGIN_PATH: prependQtPluginRoot(hostEnv.QT_PLUGIN_PATH),
-  };
-  if (mode === "virtual") {
-    delete env.WAYLAND_DISPLAY;
-    // The host's gtk3 Qt theme calls GTK initialization, which requires a
-    // display even though this compositor uses its own virtual output.
-    delete env.QT_QPA_PLATFORMTHEME;
-  } else {
-    env.WAYLAND_DISPLAY = hostWaylandSocket(hostEnv);
+    // The helper environment never carries a display; the windowed mode is
+    // the one deliberate exception, because nesting is what it was asked for.
+    ...(mode === "window" ? { WAYLAND_DISPLAY: hostWaylandSocket(hostEnv) } : {}),
+  });
+}
+
+/** Exact variable names the session's own helpers inherit from the server. */
+const HELPER_ENVIRONMENT_NAMES: ReadonlySet<string> = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LANGUAGE",
+  "TZ",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_STATE_HOME",
+  "XDG_CONFIG_DIRS",
+  "XDG_DATA_DIRS",
+  "XCURSOR_THEME",
+  "XCURSOR_SIZE",
+  "XCURSOR_PATH",
+  "DRI_PRIME",
+]);
+
+/** Locale and graphics-driver selection, which the compositor needs to render at all. */
+const HELPER_ENVIRONMENT_PREFIXES: readonly string[] = ["LC_", "MESA_", "LIBGL_", "__GLX_", "__EGL_", "VK_"];
+
+/**
+ * The environment of the session's own processes — its bus daemon, its
+ * compositor, its accessibility bus — as an allowlist over the server's.
+ *
+ * Narrower than what a launched application gets, because these processes
+ * start others on their own (KWin starts Xwayland; a bus could start anything)
+ * and whatever they inherit, those inherit too. The server's environment
+ * carries the human's display (`WAYLAND_DISPLAY`, `DISPLAY`, `XAUTHORITY`),
+ * their compositor's signature (`HYPRLAND_INSTANCE_SIGNATURE`, `SWAYSOCK`),
+ * their session bus and session identity, and Synara's own secrets; none of
+ * that may reach a process whose whole job is to be somewhere else.
+ * `overrides` are the session's own coordinates and are applied verbatim.
+ */
+export function nestedHelperEnvironment(
+  hostEnv: NodeJS.ProcessEnv,
+  overrides: Readonly<Record<string, string | undefined>> = {},
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(hostEnv)) {
+    if (value === undefined) continue;
+    if (
+      HELPER_ENVIRONMENT_NAMES.has(name) ||
+      HELPER_ENVIRONMENT_PREFIXES.some((prefix) => name.startsWith(prefix))
+    ) {
+      env[name] = value;
+    }
   }
-  delete env.DISPLAY;
+  for (const [name, value] of Object.entries(overrides)) {
+    if (value === undefined) delete env[name];
+    else env[name] = value;
+  }
   return env;
+}
+
+/**
+ * The private bus's configuration: a session bus listening only inside the
+ * session's own runtime directory, authenticating by uid, and with no service
+ * directories at all — so nothing is ever activated on it. A call to a name
+ * nobody owns (a portal, a notification daemon, `org.a11y.Bus`) fails with
+ * `ServiceUnknown` instead of starting a process with this bus's environment.
+ */
+export function nestedBusConfig(runtimeDirectory: string): string {
+  const address = xmlEscape(`unix:dir=${escapeDbusAddressValue(runtimeDirectory)}`);
+  return [
+    '<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"',
+    ' "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">',
+    "<busconfig>",
+    "  <type>session</type>",
+    "  <keep_umask/>",
+    `  <listen>${address}</listen>`,
+    "  <auth>EXTERNAL</auth>",
+    '  <policy context="default">',
+    '    <allow send_destination="*" eavesdrop="true"/>',
+    '    <allow eavesdrop="true"/>',
+    '    <allow own="*"/>',
+    "  </policy>",
+    "</busconfig>",
+    "",
+  ].join("\n");
+}
+
+/** A D-Bus address value: bytes outside the optionally-escaped set become %XX. */
+function escapeDbusAddressValue(value: string): string {
+  let escaped = "";
+  for (const byte of Buffer.from(value, "utf8")) {
+    const character = String.fromCharCode(byte);
+    escaped += /[-0-9A-Za-z_/.*]/.test(character)
+      ? character
+      : `%${byte.toString(16).padStart(2, "0")}`;
+  }
+  return escaped;
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+/** The installed `at-spi-bus-launcher`, if any. */
+function findAtspiBusLauncher(exists: (path: string) => boolean = existsSync): string | undefined {
+  return ATSPI_BUS_LAUNCHER_PATHS.find((path) => exists(path));
+}
+
+/**
+ * Starts an accessibility bus inside the session and reports whether it came
+ * up. Explicitly, because the private bus activates nothing: this launcher is
+ * the one `org.a11y.Bus` the session's applications and the AT-SPI helper will
+ * find, and it runs with the session's display, bus and runtime directory, so
+ * its own bus and registry live inside the session too.
+ *
+ * Never fatal. A desktop without perception is still a desktop; the session
+ * reports `accessibility: false` and the reader stays off rather than asking a
+ * bus that is not there.
+ */
+async function startAccessibilityBus(options: {
+  readonly launcher: string | undefined;
+  readonly env: NodeJS.ProcessEnv;
+  readonly busAddress: string;
+  readonly spawnProcess: SupervisedSpawn;
+  readonly teardownProcessTree: ProcessTreeTeardown | undefined;
+  readonly children: SupervisedProcess[];
+  readonly marker: SessionMarkerWriter;
+  readonly waitForBusName: typeof waitForSessionBusName;
+}): Promise<boolean> {
+  if (!options.launcher) return false;
+  let launcher: SupervisedProcess;
+  try {
+    launcher = start(
+      options.spawnProcess,
+      options.teardownProcessTree,
+      options.children,
+      options.launcher,
+      ["--launch-immediately"],
+      options.env,
+      ["ignore", "ignore", "pipe"],
+    );
+  } catch {
+    return false;
+  }
+  options.marker.record(launcher.pid, "accessibility");
+  return await options
+    .waitForBusName({
+      busAddress: options.busAddress,
+      name: ATSPI_BUS_NAME,
+      timeoutMs: ATSPI_READY_TIMEOUT_MS,
+      abort: () => launcher.exitDiagnostic() !== undefined,
+    })
+    .catch(() => false);
 }
 
 /** The host's Wayland socket as a path, which libwayland accepts in WAYLAND_DISPLAY. */

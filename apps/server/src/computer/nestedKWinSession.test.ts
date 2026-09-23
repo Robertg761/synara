@@ -14,6 +14,8 @@ import type { KWinComputerDbus, KWinComputerPluginApi } from "./kwinDbus.ts";
 import {
   NestedPluginLoadRefusedError,
   nestedAtspiMode,
+  nestedBusConfig,
+  nestedHelperEnvironment,
   nestedKWinBackendOptions,
   nestedModeLabel,
   nestedSessionEnv,
@@ -201,7 +203,16 @@ describe("startNestedKWinSession", () => {
     expect(session.waylandDisplay).toBe("synara-test-1");
     expect(session.pluginId).toBe("SynaraComputerUsePluginV3");
     expect(harness.spawns[0]?.command).toBe("dbus-daemon");
-    expect(harness.spawns[0]?.args).toEqual(["--session", "--print-address=1", "--nofork"]);
+    // A generated configuration, never the stock session.conf with its
+    // service directories.
+    expect(harness.spawns[0]?.args).toEqual([
+      "--config-file",
+      join(session.runtimeDirectory!, "bus.conf"),
+      "--print-address=1",
+      "--nofork",
+    ]);
+    const config = await readFile(join(session.runtimeDirectory!, "bus.conf"), "utf8");
+    expect(config).toBe(nestedBusConfig(session.runtimeDirectory!));
     expect(harness.spawns[1]?.command).toBe("kwin_wayland");
     expect(harness.spawns[1]?.args).toEqual([
       "--virtual",
@@ -444,6 +455,167 @@ describe("a session that loses one of its own processes", () => {
   });
 });
 
+describe("the private bus and the session's own processes", () => {
+  it("activates nothing: no service directories, a private socket, uid authentication", () => {
+    const config = nestedBusConfig("/run/user/1000/synara-nested-sessions/1-0a1b2c3d");
+    expect(config).toContain("<type>session</type>");
+    expect(config).toContain(
+      "<listen>unix:dir=/run/user/1000/synara-nested-sessions/1-0a1b2c3d</listen>",
+    );
+    expect(config).toContain("<auth>EXTERNAL</auth>");
+    expect(config).not.toMatch(/servicedir|servicehelper|<include/);
+    // Escaped once for the address and once for the XML it sits in.
+    expect(nestedBusConfig("/home/a b&c")).toContain("<listen>unix:dir=/home/a%20b%26c</listen>");
+  });
+
+  it("gives the bus and the compositor none of the human's display or the server's secrets", async () => {
+    const harness = new NestedHarness();
+    const hostEnv: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin",
+      HOME: "/home/agent",
+      LANG: "C.UTF-8",
+      LC_ALL: "C.UTF-8",
+      MESA_LOADER_DRIVER_OVERRIDE: "iris",
+      XDG_CONFIG_HOME: "/home/agent/.config",
+      XDG_RUNTIME_DIR: "/run/user/1000",
+      QT_PLUGIN_PATH: "/opt/qt/plugins",
+      WAYLAND_DISPLAY: "wayland-1",
+      DISPLAY: ":0",
+      XAUTHORITY: "/run/user/1000/xauth_human",
+      HYPRLAND_INSTANCE_SIGNATURE: "human-signature",
+      SWAYSOCK: "/run/user/1000/sway.sock",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+      XDG_CURRENT_DESKTOP: "Hyprland",
+      XDG_SESSION_TYPE: "wayland",
+      XDG_SESSION_ID: "2",
+      AT_SPI_BUS_ADDRESS: "unix:path=/run/user/1000/at-spi/bus",
+      SYNARA_AUTH_TOKEN: "secret",
+      OPENAI_API_KEY: "secret",
+      NODE_OPTIONS: "--require /tmp/x.js",
+      ELECTRON_RUN_AS_NODE: "1",
+      QT_QPA_PLATFORMTHEME: "gtk3",
+    };
+    const session = await startNestedKWinSession(harness.options({ hostEnv }));
+    const [bus, kwin] = harness.spawns;
+    for (const env of [bus?.env ?? {}, kwin?.env ?? {}]) {
+      for (const leaked of [
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "XAUTHORITY",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+        "SWAYSOCK",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "XDG_SESSION_ID",
+        "AT_SPI_BUS_ADDRESS",
+        "SYNARA_AUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "NODE_OPTIONS",
+        "ELECTRON_RUN_AS_NODE",
+        "QT_QPA_PLATFORMTHEME",
+      ]) {
+        expect(env[leaked], leaked).toBeUndefined();
+      }
+      expect(env).toMatchObject({
+        PATH: "/usr/bin",
+        HOME: "/home/agent",
+        LANG: "C.UTF-8",
+        LC_ALL: "C.UTF-8",
+        XDG_CONFIG_HOME: "/home/agent/.config",
+        XDG_RUNTIME_DIR: session.runtimeDirectory,
+      });
+    }
+    // The bus is not a client of any bus; the compositor is a client of this one.
+    expect(bus?.env.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+    expect(kwin?.env).toMatchObject({
+      DBUS_SESSION_BUS_ADDRESS: BUS_ADDRESS,
+      SYNARA_COMPUTER_USE_OWNS_COMPOSITOR: "1",
+      MESA_LOADER_DRIVER_OVERRIDE: "iris",
+    });
+    expect(kwin?.env.QT_PLUGIN_PATH?.endsWith(":/opt/qt/plugins")).toBe(true);
+    await session.dispose();
+  });
+
+  it("allows only the session's own coordinates over the allowlist", () => {
+    expect(
+      nestedHelperEnvironment(
+        { PATH: "/usr/bin", WAYLAND_DISPLAY: "wayland-1", SYNARA_AUTH_TOKEN: "x" },
+        { WAYLAND_DISPLAY: "synara-nested-1", PATH: undefined },
+      ),
+    ).toEqual({ WAYLAND_DISPLAY: "synara-nested-1" });
+  });
+
+  it("starts an accessibility bus inside the session when perception is on", async () => {
+    const harness = new NestedHarness();
+    const session = await startNestedKWinSession(
+      harness.options({
+        accessibility: true,
+        accessibilityLauncher: "/usr/lib/at-spi-bus-launcher",
+        hostEnv: { PATH: "/usr/bin", DISPLAY: ":0", SYNARA_AUTH_TOKEN: "secret" },
+      }),
+    );
+    const launcher = harness.spawns[2];
+    expect(launcher?.command).toBe("/usr/lib/at-spi-bus-launcher");
+    expect(launcher?.args).toEqual(["--launch-immediately"]);
+    // Everything it starts — its own bus, the registry — inherits the
+    // session's coordinates, never the human's.
+    expect(launcher?.env).toMatchObject({
+      DBUS_SESSION_BUS_ADDRESS: BUS_ADDRESS,
+      WAYLAND_DISPLAY: session.waylandDisplay,
+      DISPLAY: ":9",
+      XDG_RUNTIME_DIR: session.runtimeDirectory,
+    });
+    expect(launcher?.env.SYNARA_AUTH_TOKEN).toBeUndefined();
+    expect(harness.busNamesAwaited).toContain("org.a11y.Bus");
+    expect(session.accessibility).toBe(true);
+
+    await session.dispose();
+    // Torn down with the session, before the compositor and the bus.
+    expect(harness.tornDown).toEqual([launcher?.child.pid, harness.spawns[1]?.child.pid, harness.spawns[0]?.child.pid]);
+  });
+
+  it("reports no accessibility bus when perception is off or no launcher exists", async () => {
+    const off = new NestedHarness();
+    const offSession = await startNestedKWinSession(off.options());
+    expect(off.spawns).toHaveLength(2);
+    expect(offSession.accessibility).toBe(false);
+    await offSession.dispose();
+
+    const missing = new NestedHarness();
+    const missingSession = await startNestedKWinSession(
+      missing.options({ accessibility: true, accessibilityLauncher: undefined }),
+    );
+    expect(missingSession.accessibility).toBe(false);
+    await missingSession.dispose();
+  });
+
+  it("never asks a session without an accessibility bus for trees", async () => {
+    const created: NodeJS.ProcessEnv[] = [];
+    const session = {
+      busAddress: BUS_ADDRESS,
+      waylandDisplay: "synara-nested-1",
+      size: { width: 1_920, height: 1_080 },
+      pluginId: "SynaraComputerUsePluginV3",
+      xDisplay: undefined,
+      accessibility: false,
+      exited: () => undefined,
+      spawnApp: () => {
+        throw new Error("not launched in this test");
+      },
+      dispose: async () => undefined,
+    } satisfies NestedKWinSession;
+    const options = nestedKWinBackendOptions(() => session, {
+      atspiMode: "session",
+      createAtspiClient: (env) => {
+        created.push(env);
+        return unavailableAtspiReader();
+      },
+    });
+    await expect(options.atspi?.readTrees([])).resolves.toEqual([]);
+    expect(created).toEqual([]);
+  });
+});
+
 describe("the session marker", () => {
   it("names each process from the moment it is spawned, before the boot finishes", async () => {
     // A server killed mid-boot must still leave a marker naming what it started.
@@ -660,6 +832,8 @@ class NestedHarness {
   readonly apps: FakeSpawn[] = [];
   /** Process trees the teardown was asked to end, in order. */
   readonly tornDown: number[] = [];
+  /** Every bus name the session waited for, in order. */
+  readonly busNamesAwaited: string[] = [];
   readonly dbus: FakeDbus;
   /** A private marker directory, so no test ever reads a real host's. */
   private stateDirectoryPath: string | undefined;
@@ -721,6 +895,7 @@ class NestedHarness {
         this.harnessOptions.installed ?? ["SynaraComputerUsePluginV2", "SynaraComputerUsePluginV3"],
       connectDbus: async () => this.dbus,
       waitForBusName: async (waitOptions) => {
+        this.busNamesAwaited.push(waitOptions.name);
         // The real wait polls, so it always gives a compositor that is dying a
         // chance to be noticed before it reports the name.
         await new Promise((resolve) => setTimeout(resolve, 5));

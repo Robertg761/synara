@@ -151,6 +151,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
   private readonly ref: NestedSessionRef;
   private readonly mode: NestedSessionMode;
   private readonly size: NestedSize | undefined;
+  private readonly accessibility: boolean;
   private readonly nestedPlatform: string;
   private readonly hostEnv: NodeJS.ProcessEnv;
   private readonly startSession: (options: NestedKWinSessionOptions) => Promise<NestedKWinSession>;
@@ -213,6 +214,7 @@ export class NestedComputerBackend extends KWinComputerBackend {
     this.ref = ref;
     this.mode = mode;
     this.size = options.size;
+    this.accessibility = options.atspiMode === "session";
     this.nestedPlatform = options.platform ?? process.platform;
     this.hostEnv = hostEnv;
     this.startSession = options.startSession ?? startNestedKWinSession;
@@ -517,6 +519,9 @@ export class NestedComputerBackend extends KWinComputerBackend {
       mode: this.mode,
       hostEnv: this.hostEnv,
       installedPluginIds: this.listInstalledPluginIds,
+      // Perception needs an accessibility bus inside the session, and the
+      // private bus activates nothing, so the session starts one explicitly.
+      accessibility: this.accessibility,
       ...(this.size ? { size: this.size } : {}),
     });
     if (this.disposing) {

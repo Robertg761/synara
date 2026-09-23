@@ -347,6 +347,8 @@ describe("lazy session boot", () => {
     // The default session is headless: real use must never pop a window
     // onto the host desktop.
     expect(harness.sessionStarts[0]?.mode).toBe("virtual");
+    // Perception is off by default, so the session starts no accessibility bus.
+    expect(harness.sessionStarts[0]?.accessibility).toBe(false);
   });
 
   it("boots once and reuses the session across reads", async () => {
@@ -692,6 +694,9 @@ describe("provision", () => {
     await harness.backend.getState({ includeTree: true });
     expect(clients).toHaveLength(1);
     expect(clients[0]?.env.DBUS_SESSION_BUS_ADDRESS).toBe("unix:abstract=fake-1");
+    // The private bus activates nothing, so the session is asked to start the
+    // accessibility bus the client will read from.
+    expect(harness.sessionStarts[0]?.accessibility).toBe(true);
 
     // The compositor dies and the next real use boots a replacement with a
     // bus of its own; a client still bound to the old address would answer
