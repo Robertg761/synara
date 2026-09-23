@@ -27,6 +27,11 @@ export interface ComputerHealthStatusReading {
    * exactly as it did before the field existed.
    */
   readonly backgroundInputDegraded?: boolean;
+  /**
+   * Set only by a backend that let its desktop or connection go on purpose
+   * and brings it back on the next use; see `ComputerHealth.dormant`.
+   */
+  readonly dormant?: boolean;
 }
 
 export interface ComputerHealthStateOptions {
@@ -89,6 +94,7 @@ export class ComputerHealthState {
       ...(reading.backgroundInputDegraded === undefined
         ? {}
         : { backgroundInputDegraded: reading.backgroundInputDegraded }),
+      ...(reading.dormant === true ? { dormant: true } : {}),
     };
   }
 
@@ -140,6 +146,7 @@ export function sameComputerHealth(left: ComputerHealth, right: ComputerHealth):
     left.reconnects === right.reconnects &&
     left.captureAvailable === right.captureAvailable &&
     left.backgroundInputDegraded === right.backgroundInputDegraded &&
+    left.dormant === right.dormant &&
     left.lastFailure?.at === right.lastFailure?.at &&
     left.lastFailure?.message === right.lastFailure?.message
   );

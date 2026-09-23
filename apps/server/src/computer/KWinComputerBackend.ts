@@ -505,6 +505,12 @@ export class KWinComputerBackend implements ComputerBackend {
   /** A retry is pending or running, which is what `reconnecting` reports. */
   private reconnecting = false;
   /**
+   * The connection was let go on purpose — an idle release, a desktop the
+   * factory reported dormant — and the next real use connects again. Health
+   * says so, so a panel does not report a lost desktop that is only idle.
+   */
+  private dormant = false;
+  /**
    * Whether a plugin connection has ever been established. The supervision
    * timer only runs after one has: before that, a failure is a setup problem
    * — nothing installed, a refused load, a missing compositor — and retrying
@@ -688,6 +694,9 @@ export class KWinComputerBackend implements ComputerBackend {
             ? "reconnecting"
             : "unavailable",
         captureAvailable: this.pluginHealth?.capture === true,
+        ...(this.dormant && !this.connectedPlugin() && !this.reconnecting
+          ? { dormant: true }
+          : {}),
       }),
       emit: (health) => this.emit({ type: "health-changed", health }),
       now: () => this.now(),
@@ -1743,6 +1752,7 @@ export class KWinComputerBackend implements ComputerBackend {
         // is about the call, not the connection. Neither is worth a timer.
         if (isDormantBackendError(error)) {
           this.standDownReconnect();
+          this.dormant = true;
         } else if (!isMethodLevelDbusError(error) && !(error instanceof PluginProvisioningError)) {
           this.scheduleReconnect();
         }
@@ -2176,6 +2186,7 @@ export class KWinComputerBackend implements ComputerBackend {
     this.pluginHealth = health;
     this.reconnectFailures = 0;
     this.reconnecting = false;
+    this.dormant = false;
     this.hasEverConnected = true;
     this.healthState.recordConnected();
     this.publishHealth();
@@ -2204,6 +2215,7 @@ export class KWinComputerBackend implements ComputerBackend {
   protected releaseConnection(): void {
     this.standDownReconnect();
     this.invalidateConnection();
+    this.dormant = true;
     this.publishHealth();
   }
 

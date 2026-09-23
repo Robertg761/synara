@@ -3165,6 +3165,7 @@ describe("KWinComputerBackend dormant desktop", () => {
       expect(factoryCalls).toBe(1);
       expect(backend.health()).toMatchObject({
         status: "unavailable",
+        dormant: true,
         lastFailure: { message: "The desktop is not running." },
       });
 
@@ -3175,6 +3176,43 @@ describe("KWinComputerBackend dormant desktop", () => {
       await backend.dispose();
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("reports a connection it let go of on purpose as dormant until the next use", async () => {
+    class Releasing extends KWinComputerBackend {
+      release(): void {
+        this.releaseConnection();
+      }
+    }
+    const dbus = new FakeDbus();
+    dbus.loaded = ["SynaraComputerUsePluginV10"];
+    const backend = new Releasing({
+      dbus,
+      atspi,
+      platform: "linux",
+      sessionType: "wayland",
+      installedPluginIds: async () => ["SynaraComputerUsePluginV10"],
+      sleep: async () => undefined,
+      clipboardToolsPresent: () => true,
+    });
+    const published: ComputerHealth[] = [];
+    backend.onEvent((event) => {
+      if (event.type === "health-changed") published.push(event.health);
+    });
+    try {
+      await backend.listWindows();
+      expect(backend.health().dormant).toBeUndefined();
+
+      backend.release();
+      expect(backend.health()).toMatchObject({ status: "unavailable", dormant: true });
+      expect(published.at(-1)).toMatchObject({ status: "unavailable", dormant: true });
+
+      await backend.listWindows();
+      expect(backend.health().status).toBe("connected");
+      expect(backend.health().dormant).toBeUndefined();
+    } finally {
+      await backend.dispose();
     }
   });
 });
