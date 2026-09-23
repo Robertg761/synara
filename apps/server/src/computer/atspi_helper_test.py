@@ -797,6 +797,18 @@ class TreeCacheTest(unittest.TestCase):
         self.session._on_signal(self.dest, gone=True)
         self.assertNotIn("cached", self.read())
 
+    def test_drops_walks_too_old_to_serve(self):
+        self.warm()
+        self.assertEqual(len(self.session.trees.entries), 1)
+        self.clock.now += HELPER.TREE_CACHE_MAX_SECONDS + 1
+        self.session.trees.expire()
+        self.assertEqual(len(self.session.trees.entries), 0)
+
+    def test_keeps_no_walks_when_events_are_off(self):
+        session = session_for(self.desktop, events=False)
+        read(session, request("w", "Window", 5), maxAgeMs=5000)
+        self.assertEqual(len(session.trees.entries), 0)
+
     def test_registers_for_events_only_when_a_caller_accepts_cached_trees(self):
         self.read(max_age_ms=0)
         self.assertEqual(self.desktop.registered, [])

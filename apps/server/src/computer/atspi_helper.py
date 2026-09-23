@@ -1143,7 +1143,16 @@ class CachedTree:
 
 
 class TreeCache:
-    def __init__(self):
+    """Walked trees by window, bounded in count and in age.
+
+    An entry older than TREE_CACHE_MAX_SECONDS can never be served, so it is
+    not kept either: a dense Chromium tree is megabytes, and a helper that
+    lives as long as the desktop connection would otherwise hold its last 64
+    walks for hours.
+    """
+
+    def __init__(self, clock=None):
+        self.clock = clock or time.monotonic
         self.entries = collections.OrderedDict()
 
     @staticmethod
@@ -1159,14 +1168,21 @@ class TreeCache:
         )
 
     def get(self, requested):
+        self.expire()
         return self.entries.get(self.key(requested))
 
     def put(self, requested, entry):
         key = self.key(requested)
         self.entries.pop(key, None)
         self.entries[key] = entry
+        self.expire()
         while len(self.entries) > TREE_CACHE_MAX_ENTRIES:
             self.entries.popitem(last=False)
+
+    def expire(self):
+        oldest = self.clock() - TREE_CACHE_MAX_SECONDS
+        for key in [key for key, entry in self.entries.items() if entry.walked_at < oldest]:
+            del self.entries[key]
 
     def drop(self, requested):
         self.entries.pop(self.key(requested), None)
@@ -1386,7 +1402,7 @@ class Session:
         self.pids = PidCache()
         self.toolkits = ApplicationFacts()
         self.monitor = EventMonitor(self.clock)
-        self.trees = TreeCache()
+        self.trees = TreeCache(self.clock)
         self.events_enabled = (
             events if events is not None else self.environ.get("SYNARA_ATSPI_EVENTS") != "0"
         )
@@ -1547,7 +1563,8 @@ class Session:
                 tree["status"] = "unavailable"
                 tree["reason"] = reason
             trees[requested["id"]] = tree
-            if not incomplete and reason is None:
+            # Without events nothing can vouch for a cached tree, so none is kept.
+            if not incomplete and reason is None and self.events_enabled:
                 self.trees.put(requested, CachedTree(tree, window.dest, window.path, started,
                                                      generation))
             else:
