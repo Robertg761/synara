@@ -564,7 +564,7 @@ export interface ProvisionDependencies {
   /** Files already in the plugin directory, for the version suffix. */
   readonly listInstalled: () => Promise<readonly string[]>;
   /**
-   * The KWin installed on disk (`kwin_wayland --version`), which is what the
+   * The KWin installed on disk (its shared library's versioned name), which is what the
    * headers and any prebuilt have to match, or undefined if it cannot be read.
    */
   readonly kwinVersion: () => Promise<string | undefined>;
