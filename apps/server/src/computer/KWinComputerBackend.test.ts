@@ -4374,6 +4374,38 @@ describe("KWinComputerBackend reconnect timer", () => {
     }
   });
 
+  it("counts a batched keys delivery as the input that proves a connection", async () => {
+    vi.useFakeTimers();
+    try {
+      const dbus = new FakeDbus();
+      dbus.plugin.features = ["keys"];
+      let connects = 0;
+      const connectPlugin = dbus.connectPlugin;
+      dbus.connectPlugin = async () => {
+        connects += 1;
+        return connectPlugin();
+      };
+      const backend = makeBackend(dbus, { random: () => 1 });
+      await backend.availability();
+      // Lost at once twice: the next retry would wait 1 s.
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(250);
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(backend.health().status).toBe("connected");
+
+      await backend.typeText("hi");
+      expect(dbus.plugin.calls.some((call) => call.method === "keys")).toBe(true);
+      const afterTyping = connects;
+      dbus.disconnect();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(connects).toBeGreaterThan(afterTyping);
+      await backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("halves the delay at the low end of the jitter range", async () => {
     vi.useFakeTimers();
     try {

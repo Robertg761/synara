@@ -1832,12 +1832,18 @@ export class KWinComputerBackend implements ComputerBackend {
         events.length,
       );
     const delivered = await send();
-    if (delivered > 0) return delivered;
+    if (delivered > 0) return this.noteBatchDelivered(delivered);
     if (await this.restartAfterExternalStop()) {
       const retried = await send();
-      if (retried > 0) return retried;
+      if (retried > 0) return this.noteBatchDelivered(retried);
     }
     throw this.keyRefusedError();
+  }
+
+  /** A delivered batch is an input the connection carried, as a single key is (R5). */
+  private noteBatchDelivered(delivered: number): number {
+    this.connectionProven = true;
+    return delivered;
   }
 
   private keyRefusedError(): ComputerBackendError {
