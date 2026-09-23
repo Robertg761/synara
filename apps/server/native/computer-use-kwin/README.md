@@ -791,7 +791,9 @@ package (it is written last by a package upgrade), and the service sleeps 20
 seconds before running so the rest of the upgrade transaction has landed
 instead of firing once per rewritten file. The timer checks every six hours.
 The installer also includes the KWin RPM query and library metadata in its
-signature, so an unchanged system is a no-op.
+signature, so on an unchanged system whose compositor is already running the
+installed build a run is a no-op: nothing is rebuilt, unloaded or reloaded,
+and the agent's session on the plugin survives the timer.
 
 The service only runs inside a Wayland session: it carries
 `ConditionEnvironment=WAYLAND_DISPLAY` and `Requisite=graphical-session.target`,

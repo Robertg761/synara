@@ -203,4 +203,62 @@ describe("KWin install-and-load.sh", () => {
       expect((await sandbox.calls()).filter((call) => call.startsWith("kwin_wayland"))).toEqual([]);
     });
   });
+
+  describe("rebuild timer on an unchanged install (P2)", () => {
+    const pluginCalls = async () =>
+      (await sandbox.calls()).filter((call) => /\b(Unload|Load)Plugin\b/.test(call));
+
+    it("leaves the loaded plugin alone when nothing changed", async () => {
+      const source = await sourceCopy("source");
+      const tree = await fakeKwinTree();
+      const script = join(source, "scripts", "install-and-load.sh");
+      expect(sandbox.run(script, [], scriptEnv(tree)).status).toBe(0);
+      const installed = /^plugin_id=(.*)$/m.exec(
+        await readFile(join(stateRoot(), "install.stamp"), "utf8"),
+      )?.[1];
+      expect(installed).toMatch(/^SynaraComputerUsePluginV\d+$/);
+      const before = (await pluginCalls()).length;
+
+      // What the timer's service runs every six hours.
+      const rerun = sandbox.run(script, [], scriptEnv(tree));
+
+      expect(rerun.status).toBe(0);
+      expect(rerun.stdout).toContain("nothing to do");
+      expect((await pluginCalls()).slice(before)).toEqual([]);
+      expect(await readFile(join(sandbox.stubState, "loaded"), "utf8")).toBe(`${installed}\n`);
+      expect((await sandbox.calls()).filter((call) => call.startsWith("cmake"))).toHaveLength(2);
+    });
+
+    it("still loads the installed plugin when the compositor is not running it", async () => {
+      const source = await sourceCopy("source");
+      const tree = await fakeKwinTree();
+      const script = join(source, "scripts", "install-and-load.sh");
+      expect(sandbox.run(script, [], scriptEnv(tree)).status).toBe(0);
+      // A KWin restart that did not pick the plugin up again.
+      await writeFile(join(sandbox.stubState, "loaded"), "");
+
+      const rerun = sandbox.run(script, [], scriptEnv(tree));
+
+      expect(rerun.status).toBe(0);
+      expect(rerun.stdout).toContain("signature is unchanged");
+      expect((await readFile(join(sandbox.stubState, "loaded"), "utf8")).trim()).toMatch(
+        /^SynaraComputerUsePluginV\d+$/,
+      );
+    });
+
+    it("replaces a loaded plugin that is not the installed one", async () => {
+      const source = await sourceCopy("source");
+      const tree = await fakeKwinTree();
+      const script = join(source, "scripts", "install-and-load.sh");
+      expect(sandbox.run(script, [], scriptEnv(tree)).status).toBe(0);
+      const installed = (await readFile(join(sandbox.stubState, "loaded"), "utf8")).trim();
+      await writeFile(join(sandbox.stubState, "loaded"), `${installed}\nSynaraComputerUsePlugin\n`);
+
+      const rerun = sandbox.run(script, [], scriptEnv(tree));
+
+      expect(rerun.status).toBe(0);
+      expect(rerun.stdout).not.toContain("nothing to do");
+      expect(await readFile(join(sandbox.stubState, "loaded"), "utf8")).toBe(`${installed}\n`);
+    });
+  });
 });

@@ -550,6 +550,32 @@ if [[ -n "$built_version" && -n "$running_version" && "$built_version" != "$runn
     exit 0
 fi
 
+# Loaded-plugin discovery differs by KWin version: prefer the LoadedPlugins
+# property, fall back to the loadedPlugins method. Prints the Synara ids KWin
+# reports as loaded; fails when neither query is answered.
+query_loaded_plugin_ids() {
+    local response
+    if response="$(busctl --user get-property org.kde.KWin /Plugins org.kde.KWin.Plugins LoadedPlugins 2>/dev/null)" ||
+        response="$(busctl --user call org.kde.KWin /Plugins org.kde.KWin.Plugins loadedPlugins 2>/dev/null)"; then
+        extract_plugin_ids "$response"
+        return 0
+    fi
+    return 1
+}
+
+# The timer's periodic run (and any other run on an unchanged install) ends
+# here when the compositor is already running exactly the installed build and
+# it holds the service: unloading and reloading it would drop the agent's
+# session and seat for nothing. Anything else - the installed id not loaded,
+# another Synara id loaded beside it, nobody owning the service, loaded state
+# that cannot be queried - falls through to the full load below.
+if (( needs_install == 0 )) && loaded_now="$(query_loaded_plugin_ids)" &&
+    [[ "$loaded_now" == "$plugin_id" ]] &&
+    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s "$SERVICE_NAME" >/dev/null 2>&1; then
+    log "$plugin_id is already loaded and serving $SERVICE_NAME; nothing to do. Nothing was unloaded or loaded."
+    exit 0
+fi
+
 # Before touching anything that is loaded, make sure the running compositor can
 # actually see the file that was just installed. AvailablePlugins rescans the
 # plugin roots on read, so a fresh install shows up immediately - unless the
@@ -563,15 +589,10 @@ if available_response="$(busctl --user get-property org.kde.KWin /Plugins org.kd
     fi
 fi
 
-# Loaded-plugin discovery also differs by KWin version: prefer the
-# LoadedPlugins property, fall back to the loadedPlugins method, then to every
-# Synara id we could have installed.
+# When KWin answers neither loaded-plugin query, every Synara id we could have
+# installed is unloaded instead.
 old_plugin_ids=""
-if loaded_response="$(busctl --user get-property org.kde.KWin /Plugins org.kde.KWin.Plugins LoadedPlugins 2>&1)"; then
-    old_plugin_ids="$(extract_plugin_ids "$loaded_response")"
-    log "queried the LoadedPlugins property"
-elif loaded_response="$(busctl --user call org.kde.KWin /Plugins org.kde.KWin.Plugins loadedPlugins 2>&1)"; then
-    old_plugin_ids="$(extract_plugin_ids "$loaded_response")"
+if old_plugin_ids="$(query_loaded_plugin_ids)"; then
     log "queried loaded KWin plugin ids"
 else
     old_plugin_ids="$(known_plugin_ids)"
