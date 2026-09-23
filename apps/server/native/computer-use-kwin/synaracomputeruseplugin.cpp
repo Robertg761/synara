@@ -1827,6 +1827,13 @@ QString SynaraComputerUsePlugin::windowsStateJson() const
     };
     if (Workspace::self()) {
         state.insert(QStringLiteral("workspace"), rectToJson(RectF(Workspace::self()->geometry())));
+        // Each monitor's rect, so the server can photograph the one the agent
+        // is working on instead of every screen squeezed into one image.
+        QJsonArray outputs;
+        for (LogicalOutput *output : Workspace::self()->outputs()) {
+            outputs.append(rectToJson(output->geometryF()));
+        }
+        state.insert(QStringLiteral("outputs"), outputs);
     }
     return toJson(state);
 }

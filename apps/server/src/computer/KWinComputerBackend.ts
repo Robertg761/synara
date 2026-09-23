@@ -67,6 +67,7 @@ import {
   parseWindows,
   pointerClampResult,
   readPngDimensions,
+  rectContainsPoint,
   requireWindowBounds,
   screenSizeFromWindows,
   screenshotFromPng,
@@ -721,6 +722,11 @@ export class KWinComputerBackend implements ComputerBackend {
    * that operation's later reads until any input, focus or raise changes the
    * desktop; see `readWindows`.
    */
+  /**
+   * Each monitor's rect in global coordinates, as the last combined window
+   * read reported them; `undefined` on a plugin that does not report them.
+   */
+  private outputs: readonly ComputerRect[] | undefined;
   private windowSnapshot:
     | {
         readonly operation: object;
@@ -1273,6 +1279,11 @@ export class KWinComputerBackend implements ComputerBackend {
     if (workspace && workspace.width > 0 && workspace.height > 0 && this.pluginHealth) {
       this.pluginHealth = { ...this.pluginHealth, workspace };
     }
+    this.outputs = Array.isArray(document.outputs)
+      ? document.outputs
+          .map((output) => parseComputerRect(output))
+          .filter((output): output is ComputerRect => output !== undefined && output.width > 0)
+      : undefined;
     return {
       payload: Array.isArray(document.windows) ? document.windows : [],
       targetWindowId: asString(document.targetWindowId) ?? null,
@@ -1337,7 +1348,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
     const screenshot =
       options.includeScreenshot && this.pluginHealth?.capture === true
-        ? await this.captureWorkspaceScreenshot(origin).catch((error: unknown) => {
+        ? await this.captureWorkspaceScreenshot(windows, origin).catch((error: unknown) => {
             // A dropped screenshot must leave a trace: the health failure is
             // what a pane shows next to the frame that never arrived.
             this.recordHealthFailure(error);
@@ -3163,10 +3174,49 @@ export class KWinComputerBackend implements ComputerBackend {
    * reported region is that same rect in agent space, which is what every
    * caller maps screenshot pixels against.
    */
-  private async captureWorkspaceScreenshot(origin: ComputerPoint): Promise<ComputerScreenshot> {
-    const global = await this.workspaceRect();
+  private async captureWorkspaceScreenshot(
+    windows: readonly ComputerWindow[],
+    origin: ComputerPoint,
+  ): Promise<ComputerScreenshot> {
+    // Scoped the way the manager scopes an unaimed observation: on a
+    // multi-monitor desktop, the screen the agent is working on.
+    const scope = this.observationScope(windows, origin);
+    const global = scope ? shiftRect(scope, origin.x, origin.y) : await this.workspaceRect();
     const bytes = await this.captureRegion(global.x, global.y, global.width, global.height);
     return this.screenshot(bytes, shiftRect(global, -origin.x, -origin.y));
+  }
+
+  /**
+   * The monitor a model observation that names no window photographs: the one
+   * holding the agent's target window, else the agent's cursor. The whole
+   * workspace of a multi-monitor desktop, downscaled into one model image, is
+   * several screens too small to read. `undefined` — the whole workspace — on
+   * a single screen, on a plugin that does not report its monitors, or with
+   * nothing to anchor on.
+   */
+  async defaultObservationRegion(): Promise<ComputerRect | undefined> {
+    const [windows, origin] = await this.readWindows();
+    return this.observationScope(windows, origin);
+  }
+
+  private observationScope(
+    windows: readonly ComputerWindow[],
+    origin: ComputerPoint,
+  ): ComputerRect | undefined {
+    const outputs = this.outputs;
+    if (!outputs || outputs.length < 2) return undefined;
+    const target = windows.find((window) => window.focused && window.bounds);
+    const anchor = target?.bounds
+      ? {
+          x: target.bounds.x + target.bounds.width / 2,
+          y: target.bounds.y + target.bounds.height / 2,
+        }
+      : this.currentPoint;
+    if (!anchor) return undefined;
+    const output = outputs
+      .map((rect) => alignRect(shiftRect(rect, -origin.x, -origin.y)))
+      .find((rect) => rectContainsPoint(rect, anchor));
+    return output;
   }
 
   private screenshot(bytes: Uint8Array, region: ComputerRect): ComputerScreenshot {

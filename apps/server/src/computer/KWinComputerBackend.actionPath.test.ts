@@ -710,3 +710,89 @@ describe("paste-once clipboard", () => {
     }
   });
 });
+
+describe("observation scope on a multi-monitor desktop", () => {
+  /** Two 1920x1080 monitors side by side, the left one at a negative x. */
+  function twoMonitors(plugin: FakePlugin, outputs?: readonly unknown[]): void {
+    plugin.features = ["windowsStateJson"];
+    plugin.workspace = { x: -1_920, y: 0, width: 3_840, height: 1_080 };
+    plugin.windowsStateJson = async () =>
+      JSON.stringify({
+        windows: plugin.windows,
+        targetWindowId: plugin.targetWindowId,
+        workspace: plugin.workspace,
+        outputs: outputs ?? [
+          { x: -1_920, y: 0, width: 1_920, height: 1_080 },
+          { x: 0, y: 0, width: 1_920, height: 1_080 },
+        ],
+        locked: false,
+      });
+    plugin.windows = [
+      {
+        id: "right-window",
+        title: "Editor",
+        appName: "org.kde.kate",
+        pid: 7,
+        bounds: { x: 200, y: 100, width: 800, height: 600 },
+        focused: false,
+        minimized: false,
+        visible: true,
+      },
+    ];
+  }
+
+  it("names the monitor holding the agent's target window, in agent space", async () => {
+    const plugin = new FakePlugin();
+    twoMonitors(plugin);
+    plugin.targetWindowId = "right-window";
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    await expect(backend.defaultObservationRegion()).resolves.toEqual({
+      x: 1_920,
+      y: 0,
+      width: 1_920,
+      height: 1_080,
+    });
+  });
+
+  it("falls back to the monitor under the agent's cursor", async () => {
+    const plugin = new FakePlugin();
+    twoMonitors(plugin);
+    plugin.targetWindowId = null;
+    const backend = makeBackend(plugin, { glideDurationMs: 0 });
+    await backend.availability();
+    await backend.moveCursor({ x: 300, y: 300 });
+    await expect(backend.defaultObservationRegion()).resolves.toEqual({
+      x: 0,
+      y: 0,
+      width: 1_920,
+      height: 1_080,
+    });
+  });
+
+  it("scopes getState's own screenshot the same way", async () => {
+    const plugin = new FakePlugin();
+    twoMonitors(plugin);
+    plugin.targetWindowId = "right-window";
+    const backend = makeBackend(plugin);
+    await backend.availability();
+    const state = await backend.getState({ includeScreenshot: true });
+    expect(plugin.calls).toContainEqual({
+      method: "captureRegion",
+      args: [0, 0, 1_920, 1_080, 1_536],
+    });
+    expect(state.screenshot?.region).toEqual({ x: 1_920, y: 0, width: 1_920, height: 1_080 });
+  });
+
+  it("keeps the whole workspace on one screen or a plugin that reports no monitors", async () => {
+    const single = new FakePlugin();
+    twoMonitors(single, [{ x: -1_920, y: 0, width: 3_840, height: 1_080 }]);
+    const one = makeBackend(single);
+    await one.availability();
+    await expect(one.defaultObservationRegion()).resolves.toBeUndefined();
+
+    const old = makeBackend(new FakePlugin());
+    await old.availability();
+    await expect(old.defaultObservationRegion()).resolves.toBeUndefined();
+  });
+});

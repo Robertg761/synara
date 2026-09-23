@@ -49,8 +49,9 @@
     </method>
     <!-- Feature windowsStateJson: {"windows": <windowsJson's array>,
          "targetWindowId": <id or null>, "workspace": {x, y, width, height},
-         "locked": <bool>} in one call. Locked, it answers with no windows and
-         a null target instead of refusing. -->
+         "outputs": [{x, y, width, height}, ...], "locked": <bool>} in one
+         call. Locked, it answers with no windows and a null target instead
+         of refusing. -->
     <method name="windowsStateJson">
       <arg name="json" type="s" direction="out"/>
     </method>

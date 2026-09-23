@@ -134,7 +134,8 @@ plugin keeps working with a newer server. Every version 1 method is unchanged.
 - `windowsStateJson() -> s` (feature `windowsStateJson`) replaces a
   `stateJson` and `windowsJson` pair with one call. It answers an object with
   `windows` (the `windowsJson` array), `targetWindowId` (an id or null),
-  `workspace` (`x`, `y`, `width`, `height`) and `locked`. While the session is
+  `workspace` (`x`, `y`, `width`, `height`), `outputs` (one such rect per
+  monitor, in the same global space) and `locked`. While the session is
   locked it answers with no windows and a null target instead of refusing.
 - `captureWindowEx(s windowId, u maxDimension, u flags)` and
   `captureRegionEx(i x, i y, u width, u height, u maxDimension, u flags)`
