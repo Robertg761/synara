@@ -1953,7 +1953,7 @@ export class KWinComputerBackend implements ComputerBackend {
         { dormant: true, retryable: true },
       );
     }
-    let plan = resolveSynaraPluginLoad({ loaded, installed: await this.installedPluginIds() });
+    let plan = await this.planPluginLoad(loaded);
     if (ownerBefore && authenticationFailed) {
       const installed = await this.provisionOnce(false, true).catch((error: unknown) => {
         throw new PluginProvisioningError(describeErrorMessage(error, "the installer failed"), {
@@ -2002,7 +2002,21 @@ export class KWinComputerBackend implements ComputerBackend {
           }
           refusedId = candidate;
         }
-        if (!accepted) throw new PluginProvisioningError(await this.describeLoadRefusal(refusedId));
+        // N5: nothing new loads, and the unload above already took the
+        // generation that was serving. Put it back rather than leave the
+        // desktop with no plugin at all: it loaded into this compositor
+        // before, and the refusal is still reported through health.
+        if (!accepted) {
+          const refusal = await this.describeLoadRefusal(refusedId);
+          const previous = newestPluginId(plan.unload);
+          if (previous === undefined || previous === refusedId) {
+            throw new PluginProvisioningError(refusal);
+          }
+          await dbus.unloadPlugin(refusedId).catch(() => false);
+          if (!(await dbus.loadPlugin(previous))) throw new PluginProvisioningError(refusal);
+          this.recordHealthFailure(new PluginProvisioningError(refusal));
+          accepted = previous;
+        }
         plan = { kind: "replace", unload: plan.unload, pluginId: accepted };
       }
       // Reloads share KWin's D-Bus connection. The authenticated plugin instance
@@ -2060,6 +2074,34 @@ export class KWinComputerBackend implements ComputerBackend {
       return new ComputerBackendError(message, { dormant: true, retryable: true });
     }
     return new ComputerBackendError(message, { retryable: true });
+  }
+
+  /**
+   * `resolveSynaraPluginLoad` over what is loaded and installed, with one
+   * exception (N5): a replace of a loaded plugin by the one install known to
+   * be for another compositor version — the stamped one, after a package
+   * upgrade the session has not restarted into — is planned without it. The
+   * running compositor refuses that build, and replacing to it would unload
+   * the generation that works today; the next login's compositor gets it.
+   */
+  private async planPluginLoad(
+    loaded: readonly string[],
+  ): Promise<SynaraPluginLoadPlan | undefined> {
+    const installed = await this.installedPluginIds();
+    const plan = resolveSynaraPluginLoad({ loaded, installed });
+    // Only a replace of a loaded plugin can lose a working one.
+    if (plan?.kind !== "replace" || !loaded.some(isSynaraPluginId)) return plan;
+    const [stamp, running] = await Promise.all([
+      this.readInstallStamp().catch(() => undefined),
+      this.probeRunningKwinVersion(),
+    ]);
+    const builtFor = stampKwinVersion(stamp);
+    const stampedId = stampPluginId(stamp);
+    if (stampedId !== plan.pluginId || !builtFor || !running || builtFor === running) return plan;
+    return resolveSynaraPluginLoad({
+      loaded,
+      installed: installed.filter((id) => id !== stampedId),
+    });
   }
 
   private async pruneOlderBuilds(loadedId: string): Promise<void> {
@@ -2245,7 +2287,7 @@ export class KWinComputerBackend implements ComputerBackend {
 
   /** The version installed on disk, which is what a build compiles against. */
   protected probeInstalledKwinVersion(): Promise<string | undefined> {
-    // Probed once: the connect retry loop must not spawn a process per attempt.
+    // Memoised per connection, like the running version (see `invalidateConnection`).
     this.installedKwinVersionPromise ??= this.installedKwinVersion().catch(() => undefined);
     return this.installedKwinVersionPromise;
   }
@@ -2287,7 +2329,10 @@ export class KWinComputerBackend implements ComputerBackend {
     this.plugin = undefined;
     this.pluginHealth = undefined;
     this.pluginId = undefined;
+    // Both version reads are per connection: the one running may be a
+    // restarted compositor, and the one on disk may have been upgraded.
     this.runningKwinVersionPromise = undefined;
+    this.installedKwinVersionPromise = undefined;
     this.disconnect?.();
     this.disconnect = undefined;
     this.unsubscribeOwnerChanges?.();

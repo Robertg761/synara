@@ -1414,6 +1414,55 @@ describe("KWinComputerBackend", () => {
     await backend.dispose();
   });
 
+  it("keeps the loaded plugin instead of replacing it with a build for the upgraded KWin (N5)", async () => {
+    const dbus = new FakeDbus();
+    dbus.loaded = ["SynaraComputerUsePluginV5"];
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => ["SynaraComputerUsePluginV6", "SynaraComputerUsePluginV5"],
+      // The rebuild timer built V6 for the KWin now on disk; the session still
+      // runs the one V5 was built for.
+      readInstallStamp: async () =>
+        "plugin_id=SynaraComputerUsePluginV6\nkwin_version=6.7.4\nlinux_distribution=arch\n",
+      runningKwinVersion: async () => "6.7.3",
+      installedKwinVersion: async () => "6.7.4",
+    });
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    const pluginCalls = dbus.calls
+      .filter((call) => call.method === "LoadPlugin" || call.method === "UnloadPlugin")
+      .map((call) => `${call.method} ${String(call.args[0])}`);
+    expect(pluginCalls).toEqual([]);
+    expect(dbus.loaded).toEqual(["SynaraComputerUsePluginV5"]);
+    await backend.dispose();
+  });
+
+  it("reloads the generation it unloaded when the compositor refuses every replacement (N5)", async () => {
+    const dbus = new FakeDbus();
+    dbus.loaded = ["SynaraComputerUsePluginV5"];
+    const loadPlugin = dbus.loadPlugin;
+    dbus.loadPlugin = async (pluginId: string) => {
+      if (pluginId !== "SynaraComputerUsePluginV5") {
+        dbus.calls.push({ method: "LoadPlugin", args: [pluginId] });
+        return false;
+      }
+      return loadPlugin(pluginId);
+    };
+    const backend = makeBackend(dbus, {
+      installedPluginIds: async () => ["SynaraComputerUsePluginV6", "SynaraComputerUsePluginV5"],
+      provisionPlugin: async () => {
+        throw new Error("no toolchain");
+      },
+    });
+
+    await expect(backend.availability()).resolves.toMatchObject({ kind: "available" });
+    expect(dbus.loaded).toEqual(["SynaraComputerUsePluginV5"]);
+    expect(backend.health()).toMatchObject({
+      status: "connected",
+      lastFailure: { message: expect.stringContaining("refused to load SynaraComputerUsePluginV6") },
+    });
+    await backend.dispose();
+  });
+
   /**
    * The pre-fix memo replayed a failed provision forever: one transient
    * failure (an OOM-killed compiler, a full disk) and every future connect
