@@ -77,6 +77,7 @@ import { DEFAULT_HUMAN_ACTIVE_THRESHOLD_MS, HUMAN_ACTIVE_REFUSAL } from "./human
 import {
   COMPUTER_AUTH_THROTTLED_ERROR,
   COMPUTER_SERVICE,
+  COMPUTER_SERVICE_OWNER_MISMATCH_ERROR,
   createSessionKWinComputerDbus,
   isCaptureMethod,
   KWIN_SERVICE,
@@ -2147,6 +2148,7 @@ export class KWinComputerBackend implements ComputerBackend {
     if (
       isConnectionLevelFailure(error) ||
       dbusErrorType(error) === COMPUTER_AUTH_THROTTLED_ERROR ||
+      dbusErrorType(error) === COMPUTER_SERVICE_OWNER_MISMATCH_ERROR ||
       (dbusErrorType(error) === undefined && !/authentication failed/i.test(dbusErrorText(error)))
     ) {
       throw error;
@@ -3442,7 +3444,7 @@ function isDormantBackendError(error: unknown): boolean {
  * re-checks ownership from scratch.
  */
 class ServiceOwnerMismatchError extends ComputerBackendError {
-  readonly type = "org.synara.ComputerUse.Error.ServiceOwnerMismatch";
+  readonly type = COMPUTER_SERVICE_OWNER_MISMATCH_ERROR;
 
   constructor(message: string) {
     super(message);

@@ -284,6 +284,13 @@ export interface KWinComputerDbusOptions {
  * generation nor a refusal: wait out the cooldown and ask again.
  */
 export const COMPUTER_AUTH_THROTTLED_ERROR = "org.synara.ComputerUse.Error.Throttled";
+/**
+ * `org.synara.ComputerUse` answered from a process that is not the one it has
+ * to be — on KWin, anything but KWin's own bus connection, which is where the
+ * plugin registers it. A server-side verdict, never sent by a plugin.
+ */
+export const COMPUTER_SERVICE_OWNER_MISMATCH_ERROR =
+  "org.synara.ComputerUse.Error.ServiceOwnerMismatch";
 const AUTH_THROTTLE_RETRY_DELAY_MS = 1_100;
 const AUTH_THROTTLE_MAX_ATTEMPTS = 3;
 
@@ -533,7 +540,26 @@ export async function createSessionKWinComputerDbus(
         const result = await invoke(plugins, "UnloadPlugin", pluginId);
         return readOptionalBoolean(result) ?? true;
       },
-      connectPlugin: session.connectPlugin,
+      connectPlugin: async () => {
+        // The plugin lives inside KWin and registers the service on KWin's
+        // own bus connection, so the service's owner and KWin's are one
+        // unique name. Any other owner is a process pretending to be the
+        // plugin, and it is never sent the session token.
+        const [serviceOwner, kwinOwner] = await Promise.all([
+          session.nameOwner(COMPUTER_SERVICE),
+          session.nameOwner(KWIN_SERVICE),
+        ]);
+        if (serviceOwner !== undefined && serviceOwner !== kwinOwner) {
+          throw Object.assign(
+            new Error(
+              `${COMPUTER_SERVICE} is owned by ${serviceOwner}, which is not KWin's bus connection ` +
+                `(${kwinOwner ?? "KWin has none"}), so it was not trusted with the session.`,
+            ),
+            { type: COMPUTER_SERVICE_OWNER_MISMATCH_ERROR },
+          );
+        }
+        return await session.connectPlugin();
+      },
       onDisconnect: session.onDisconnect,
       pingOwner: session.pingOwner,
       onServiceOwnerChanged: session.onServiceOwnerChanged,

@@ -15,6 +15,7 @@ import {
   parseKwinSupportVersion,
   readStringArray,
   COMPUTER_AUTH_THROTTLED_ERROR,
+  COMPUTER_SERVICE_OWNER_MISMATCH_ERROR,
 } from "./kwinDbus.ts";
 
 describe("KWin D-Bus calls", () => {
@@ -94,7 +95,7 @@ describe("connectPlugin owner pinning", () => {
   // it next, so a squatter or stale generation taking the name after the
   // backend's ownership check would receive every input and capture call.
   // These pin the proxy's destination to the unique name resolved at connect.
-  function fakeBus(options: { readonly owner?: string }) {
+  function fakeBus(options: { readonly owner?: string; readonly kwinOwner?: string }) {
     const proxied: string[] = [];
     const bus = {
       proxied,
@@ -110,7 +111,10 @@ describe("connectPlugin owner pinning", () => {
                   }),
                 );
               }
-              return Promise.resolve(name === COMPUTER_SERVICE ? options.owner : ":0.0");
+              // The plugin registers on KWin's own connection: one unique name.
+              if (name === COMPUTER_SERVICE) return Promise.resolve(options.owner);
+              if (name === "org.kde.KWin") return Promise.resolve(options.kwinOwner ?? options.owner);
+              return Promise.resolve(":0.0");
             },
             RequestName: async () => 1,
             GetId: async () => `test-${process.pid}`,
@@ -172,6 +176,20 @@ describe("connectPlugin owner pinning", () => {
     expect(bus.proxied.at(-1)).toBe(":1.42");
     expect(bus.proxied).not.toContain(COMPUTER_SERVICE);
     expect(bus.proxied.filter((service) => service === COMPUTER_OBJECT_PATH)).toEqual([]);
+    await dbus.close();
+  });
+
+  it("never authenticates to a service owner that is not KWin's own connection", async () => {
+    const bus = fakeBus({ owner: ":1.99", kwinOwner: ":1.42" });
+    const dbus = await createSessionKWinComputerDbus({
+      dbusModule: { sessionBus: () => bus as never },
+    });
+
+    await expect(dbus.connectPlugin()).rejects.toMatchObject({
+      type: COMPUTER_SERVICE_OWNER_MISMATCH_ERROR,
+      message: expect.stringContaining("not KWin's bus connection"),
+    });
+    expect(bus.proxied).not.toContain(":1.99");
     await dbus.close();
   });
 
