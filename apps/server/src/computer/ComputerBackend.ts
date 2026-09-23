@@ -598,6 +598,22 @@ export interface ComputerBackend {
    * back to the PNG baseline. Absent means every baseline is a screenshot.
    */
   captureLuma?(request: ComputerCaptureRequest): Promise<ComputerLumaCapture>;
+  /**
+   * The desktop rect a model observation photographs when it names no window
+   * and no window holds the agent's focus — for a multi-monitor desktop, the
+   * one output the agent is working on (the output of its focus target or its
+   * cursor, the scoping the preview's stills already use), because the whole
+   * workspace downscaled into one model image is several screens squeezed too
+   * small to read.
+   *
+   * `ComputerManager.captureFocusedWindow` asks it before falling back to the
+   * whole workspace, and refuses the region only where a visible denied window
+   * intersects it. `undefined` (or a throw) keeps the workspace. The unscoped
+   * `getState` screenshot is the backend's own capture, not the manager's: a
+   * backend that implements this should scope that shot the same way.
+   * Absent means the workspace, which is right for a single screen.
+   */
+  defaultObservationRegion?(): Promise<ComputerRect | undefined>;
   /** Pin or release the plugin's per-seat target window when supported. */
   focusWindow?(windowId: string): Promise<void>;
   /**

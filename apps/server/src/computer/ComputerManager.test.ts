@@ -27,6 +27,7 @@ import {
 } from "./computerCallContext.ts";
 import { withComputerTask } from "./computerTaskContext.ts";
 import type { ComputerCaptureRequest } from "./ComputerBackend.ts";
+import { ComputerDenylistError } from "./computerDenylist.ts";
 import { FakeComputerBackend } from "./FakeComputerBackend.ts";
 import type { FrameSink } from "@synara/shared/frameTransport";
 
@@ -2807,6 +2808,43 @@ describe("ComputerManager and FakeComputerBackend", () => {
     });
 
     await manager.dispose();
+  });
+
+  it("narrows the untargeted fallback to the backend's observation region", async () => {
+    const rightMonitor = { x: 960, y: 0, width: 960, height: 1_080 };
+    const backend = Object.assign(new FakeComputerBackend(), {
+      defaultObservationRegion: async () => rightMonitor,
+    });
+    const manager = new ComputerManager({ backend, actionSettleMs: 0 });
+    try {
+      const vault = {
+        id: "vault",
+        title: "Vault",
+        appName: "1Password",
+        bounds: { x: 0, y: 0, width: 500, height: 500 },
+        focused: false,
+        minimized: false,
+        visible: true,
+      };
+      // Nothing holds the agent's focus; the human's denied window sits on the
+      // other monitor, which the scoped shot does not photograph.
+      backend.emitWindowsChanged([vault]);
+      const scoped = await manager.captureFocusedWindow(1_024, { agentFocusOnly: true });
+      expect(scoped.windowId).toBeUndefined();
+      expect(backend.callsFor("captureScreenshot").at(-1)?.args[0]).toEqual({
+        kind: "region",
+        region: rightMonitor,
+        maxDimension: 1_024,
+      });
+
+      // On the observed monitor it refuses, exactly as a region capture does.
+      backend.emitWindowsChanged([{ ...vault, bounds: { ...vault.bounds, x: 1_000 } }]);
+      await expect(
+        manager.captureFocusedWindow(1_024, { agentFocusOnly: true }),
+      ).rejects.toBeInstanceOf(ComputerDenylistError);
+    } finally {
+      await manager.dispose();
+    }
   });
 
   it("captures the action's window on a hint, reports a vanished target, and never throws", async () => {

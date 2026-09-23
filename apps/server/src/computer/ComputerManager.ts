@@ -1435,15 +1435,20 @@ export class ComputerManager {
     if (request.kind === "window") {
       await this.assertWindowContentAllowed(request.windowId);
     } else {
-      // A region photographs whatever its rect covers: it is refused only
-      // where a visible denied window's bounds actually intersect it.
-      const denied = (await this.deniedVisibleWindows()).find(
-        (entry) =>
-          entry.window.bounds !== undefined && rectsOverlap(entry.window.bounds, request.region),
-      );
-      if (denied) throw new ComputerDenylistError(denied.match.app, denied.match.matched);
+      await this.assertRegionContentAllowed(request.region);
     }
     return await this.backend.captureScreenshot(request);
+  }
+
+  /**
+   * A region photographs whatever its rect covers: it is refused only where a
+   * visible denied window's bounds actually intersect it.
+   */
+  private async assertRegionContentAllowed(region: ComputerRect): Promise<void> {
+    const denied = (await this.deniedVisibleWindows()).find(
+      (entry) => entry.window.bounds !== undefined && rectsOverlap(entry.window.bounds, region),
+    );
+    if (denied) throw new ComputerDenylistError(denied.match.app, denied.match.matched);
   }
 
   /**
@@ -1506,6 +1511,10 @@ export class ComputerManager {
    * what a perception request with no explicit target means: "show me where
    * input is going", at window resolution rather than as a workspace-wide
    * downscale that loses small text.
+   *
+   * A backend that names a `defaultObservationRegion` narrows the fallback to
+   * it: on a multi-monitor desktop the workspace is several screens wide, and
+   * one downscaled picture of all of them is too small to read.
    */
   async captureFocusedWindow(
     maxDimension?: number,
@@ -1524,6 +1533,17 @@ export class ComputerManager {
           ...limit,
         }),
         windowId: window.id,
+      };
+    }
+    const scoped = await this.backend.defaultObservationRegion?.().catch(() => undefined);
+    if (scoped !== undefined) {
+      await this.assertRegionContentAllowed(scoped);
+      return {
+        screenshot: await this.backend.captureScreenshot({
+          kind: "region",
+          region: scoped,
+          ...limit,
+        }),
       };
     }
     // The whole-workspace fallback photographs every visible window, so a
