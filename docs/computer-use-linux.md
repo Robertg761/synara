@@ -481,9 +481,17 @@ keybind hook with the same latch semantics as KWin.
 
 `hyprlandPluginHost.ts` implements `KWinComputerDbus` on top of `hyprctl`,
 translating between KWin's id vocabulary and Hyprland's path vocabulary so the
-engine never learns the difference; `hyprctl` always exits 0, so every answer
-is parsed from reply text, and a load refusal's reason is passed into the
-backend's refusal message. `hyprlandPluginProvisioning.ts` installs under
+engine never learns the difference; `hyprctl` exits 0 whatever the compositor
+answered, so every answer is parsed from reply text (a non-zero exit means no
+answer at all), and a load refusal's reason is passed into the backend's
+refusal message. The instance is resolved on every connect: the pinned one
+alone, else the inherited one while it is live, else the one live instance
+that replaced it; none is the engine's missing-compositor path, and a new one
+gets the plugin loaded again. Every `hyprctl` call names it with `-i`.
+Launched apps and `wl-clipboard` get its `HYPRLAND_INSTANCE_SIGNATURE` and
+the `WAYLAND_DISPLAY` from its `hyprland.lock`; for any instance other than
+the inherited one the inherited `WAYLAND_DISPLAY` and `DISPLAY` are dropped,
+never reused. `hyprlandPluginProvisioning.ts` installs under
 `$XDG_DATA_HOME/synara/hyprland-computer-use/plugins` as
 `SynaraComputerUsePluginV<n>.so` with the stamp under `$XDG_STATE_HOME`; there
 is no env script and no relogin, since `hyprctl plugin load` takes effect live.
@@ -508,7 +516,8 @@ failing fixture exits non-zero instead of aborting, so it dumps no core. The
 backend and host tests drive `hyprctl` and the plugin through fakes.
 Development runs against a disposable Hyprland nested inside a headless
 `kwin_wayland --virtual` (`scripts/dev-instance.sh`: its own Lua config,
-private bus without service activation, scrubbed environment), never the
+private bus without service activation, scrubbed environment, no core dumps,
+no lock screen), never the
 desktop the developer is sitting at. `install-and-load.sh` stamps the running
 compositor's version, the one the server compares, and stops before building
 for a Hyprland upgraded on disk but not restarted.
