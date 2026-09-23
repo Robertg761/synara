@@ -1647,10 +1647,11 @@ export class ComputerManager {
       this.backend.waitForSettle !== undefined
     ) {
       try {
+        const policy = this.backend.actionSettle;
         const outcome = await this.backend.waitForSettle({
           windowId,
-          timeoutMs: COMPUTER_ACTION_OBSERVER_SETTLE_TIMEOUT_MS,
-          quietMs: this.actionSettleMs,
+          timeoutMs: policy?.timeoutMs ?? COMPUTER_ACTION_OBSERVER_SETTLE_TIMEOUT_MS,
+          quietMs: Math.min(this.actionSettleMs, policy?.quietMs ?? this.actionSettleMs),
         });
         this.observerSettle = "supported";
         currentComputerCall()?.timing?.count(

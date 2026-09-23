@@ -689,17 +689,32 @@ export interface ComputerBackend {
    * Pure read — no input, no mutation lease — so it is safe to run between an
    * action's dispatch and its observation. Optional because only the macOS
    * driver exposes an AX observer; callers must fall back to a fixed wait
-   * when it is absent or refused.
+   * when it is absent or refused. Read by presence on every use, so a backend
+   * may offer it only while what it drives can answer (a getter returning
+   * `undefined` for an older compositor plugin).
    */
-  waitForSettle?(options: {
-    readonly windowId: string;
-    readonly timeoutMs: number;
-    readonly quietMs: number;
-  }): Promise<{
-    readonly settled: boolean;
-    readonly waitedMs: number;
-    readonly eventsSeen?: number;
-  }>;
+  readonly waitForSettle?:
+    | ((options: {
+        readonly windowId: string;
+        readonly timeoutMs: number;
+        readonly quietMs: number;
+      }) => Promise<{
+        readonly settled: boolean;
+        readonly waitedMs: number;
+        readonly eventsSeen?: number;
+      }>)
+    | undefined;
+  /**
+   * The post-action settle this backend's `waitForSettle` is tuned for, when
+   * it is not the AX observer's. A compositor that answers from surface
+   * commits sees an update the frame it lands, so a short quiet window after
+   * the first commit is enough, and a window that keeps repainting (a video,
+   * a spinner) should not hold the observation for the observer's full bound.
+   * The manager waits `min(quietMs, its configured settle)` of quiet, capped
+   * at `timeoutMs`, after an action; an explicit `computer_wait` keeps its
+   * own timeout. Absent means the manager's defaults.
+   */
+  readonly actionSettle?: { readonly quietMs: number; readonly timeoutMs: number };
   /**
    * The process-level app list — name, pid, bundle id, active state — for
    * backends that can enumerate it. Optional because a compositor plugin may

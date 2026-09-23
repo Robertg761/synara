@@ -1423,6 +1423,24 @@ describe("ComputerManager and FakeComputerBackend", () => {
       await manager.dispose();
     });
 
+    it("uses the backend's own post-action settle policy when it names one", async () => {
+      setEnv("SYNARA_CUA_CONDITIONAL_SETTLE", undefined);
+      const backend = new ProvenBackend({ waitForSettle: true });
+      Object.assign(backend, { actionSettle: { quietMs: 25, timeoutMs: 1_500 } });
+      const manager = new ComputerManager({ backend, actionSettleMs: 60 });
+      await pressThenObserveWindow(manager);
+      expect(backend.callsFor("waitForSettle")[0]?.args[0]).toMatchObject({
+        windowId: "fake-terminal",
+        timeoutMs: 1_500,
+        quietMs: 25,
+      });
+      // The configured settle stays a ceiling on the quiet window.
+      Object.assign(backend, { actionSettle: { quietMs: 500, timeoutMs: 1_500 } });
+      await pressThenObserveWindow(manager);
+      expect(backend.callsFor("waitForSettle")[1]?.args[0]).toMatchObject({ quietMs: 60 });
+      await manager.dispose();
+    });
+
     it("a busy verdict from the observer still ends the wait — the timeout already covered the bound", async () => {
       setEnv("SYNARA_CUA_CONDITIONAL_SETTLE", undefined);
       const backend = new ProvenBackend({
