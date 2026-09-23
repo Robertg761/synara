@@ -253,7 +253,9 @@ describe("the pkexec runner", () => {
       await vi.advanceTimersByTimeAsync(300_000);
       expect(state.signals).toEqual(["SIGTERM"]);
       await expect(outcome).resolves.toMatchObject({
-        message: expect.stringContaining("Nobody answered the system authorization dialog within 5 minutes"),
+        message: expect.stringContaining(
+          "Nobody answered the system authorization dialog within 5 minutes",
+        ),
         retryable: true,
       });
     } finally {

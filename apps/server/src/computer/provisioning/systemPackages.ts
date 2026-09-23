@@ -277,10 +277,12 @@ export function awaitingAuthorization(pid: number): boolean {
 export function createPkexecRunner(dependencies: PkexecRunnerDependencies = {}): PrivilegedRunner {
   const spawnPkexec =
     dependencies.spawnPkexec ??
-    ((args: readonly string[]) => spawn("pkexec", [...args], { stdio: ["ignore", "pipe", "pipe"] }));
+    ((args: readonly string[]) =>
+      spawn("pkexec", [...args], { stdio: ["ignore", "pipe", "pipe"] }));
   const stillAwaiting = dependencies.awaitingAuthorization ?? awaitingAuthorization;
   const signalProcess =
-    dependencies.signalProcess ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+    dependencies.signalProcess ??
+    ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
   const timeoutMs = dependencies.authorizationTimeoutMs ?? AUTHORIZATION_TIMEOUT_MS;
   return (command, args, options = {}) =>
     new Promise<PrivilegedRunResult>((resolve, reject) => {
@@ -321,7 +323,9 @@ export function createPkexecRunner(dependencies: PkexecRunnerDependencies = {}):
       child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
       child.once("error", (error: NodeJS.ErrnoException) => {
         settle();
-        reject(new PrivilegedRunFailure(error.code ?? "spawn-failed", stdout.text(), stderr.text()));
+        reject(
+          new PrivilegedRunFailure(error.code ?? "spawn-failed", stdout.text(), stderr.text()),
+        );
       });
       child.once("close", (code, exitSignal) => {
         settle();
@@ -333,7 +337,9 @@ export function createPkexecRunner(dependencies: PkexecRunnerDependencies = {}):
           resolve({ stdout: stdout.text(), stderr: stderr.text() });
           return;
         }
-        reject(new PrivilegedRunFailure(code ?? exitSignal ?? "unknown", stdout.text(), stderr.text()));
+        reject(
+          new PrivilegedRunFailure(code ?? exitSignal ?? "unknown", stdout.text(), stderr.text()),
+        );
       });
     });
 }
