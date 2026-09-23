@@ -79,7 +79,12 @@ struct SynaraComputerUsePlugin {
         return true;
     }
     bool inputReady() const { return true; }
-    bool updateKeyboardFocus() { return true; }
+    // Focusing the target is the first wire event a key sends (an enter, the
+    // modifiers, a borrowed activation); the model counts it.
+    int focusUpdates = 0;
+    Window* resolveKeyboardWindow() const { return m_keyboardWindow; }
+    bool directPathFor(const Window*, const Window*, bool currentDirect) const { return currentDirect; }
+    bool updateKeyboardFocus() { ++focusUpdates; return true; }
     bool requireReachableClient(const Window*, bool) { return true; }
     bool refuseIfHumanActive(const Window*, bool, InputKind) {
         const bool active = refuseFrom >= 0 && int(sent.size()) >= refuseFrom;
@@ -127,6 +132,7 @@ int main() {
             plugin.refuseFrom = 0;
             const uint delivered = plugin.keys(word(2));
             check(delivered == 0 && plugin.sent.empty(), "a refused first stroke sends nothing");
+            check(plugin.focusUpdates == 0, "not even the focus change: the refusal comes before any wire event");
             check(plugin.errors.size() == 1 && plugin.errors[0] == "org.synara.ComputerUse.Error.HumanActive", "and is key()'s error");
         }
         {
@@ -137,6 +143,7 @@ int main() {
             plugin.refuseFrom = 2;
             const uint delivered = plugin.keys(word(3));
             check(delivered == 2 && plugin.sent.size() == 2, "a batch stops at the first stroke not delivered");
+            check(plugin.focusUpdates == 2, "the refused third stroke focused nothing");
             check(plugin.errors.empty(), "a refusal after the first stroke is the count, not an error");
             check(!plugin.m_quietRefusals, "the quiet flag never outlives the batch");
             plugin.refuseFrom = 0;

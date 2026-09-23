@@ -298,7 +298,7 @@ struct SynaraComputerUsePlugin {
     bool m_pointerDirect = false, m_keyboardDirect = false;
     bool m_targetRequested = false;
     QPointF m_pos;
-    QPointer<Window> m_pointerWindow, m_keyboardWindow, m_targetWindow;
+    QPointer<Window> m_pointerWindow, m_keyboardWindow, m_targetWindow, m_activatedWindow;
     QPointer<SurfaceInterface> m_directPointerSurface, m_directKeyboardSurface;
     QPointer<PointerInterface> m_watchedHumanPointer;
     QPointer<SurfaceInterface> m_humanPointerFocus;
@@ -306,6 +306,12 @@ struct SynaraComputerUsePlugin {
     QList<quint32> m_pressedKeys;
     double m_directAxisRemainderH = 0, m_directAxisRemainderV = 0;
     int m_directInjectionDepth = 0;
+    // Serial concealment has its own fixture (human_guard); here it only has
+    // to happen once per outermost burst.
+    quint32 m_burstStartSerial = 0;
+    int conceals = 0;
+    quint32 displaySerial() const { return server.displayObject.serial; }
+    void concealAgentSerials() { ++conceals; }
     SeatInterface* m_seat = nullptr;
     xkb_state agentXkb;
     xkb_state* m_xkbState = &agentXkb;
@@ -340,6 +346,7 @@ struct SynaraComputerUsePlugin {
     void sendKey(quint32 keyCode, bool pressed);
     void releasePressedButtons();
     void releasePressedKeys();
+    Window* resolvePointerWindow() const;
     void clearPointerDelivery();
     void clearKeyboardDelivery();
     void clearKeyboardFocus();

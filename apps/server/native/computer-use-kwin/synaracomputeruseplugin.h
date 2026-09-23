@@ -280,6 +280,9 @@ private:
     // Refuses a mutating action that collides with the human, sending the
     // D-Bus error the server turns into a retryable refusal.
     bool refuseIfHumanActive(const Window *window, bool directInjection, InputKind kind);
+    // raiseWindow's guard: the human's window a raise would bury, if any.
+    const Window *humanWindowCoveredByRaise(const Window *window) const;
+    bool refuseIfRaiseCoversHuman(const Window *window);
     // The D-Bus error for a refusal, unless a batch is past its first element:
     // keys() answers a later refusal with the count delivered, not an error.
     void sendRefusal(const QString &name, const QString &message) const;
@@ -314,6 +317,10 @@ private:
     // The outermost DirectInjectionScope's exit: hands back every seat0 object
     // the human's seat is using in the agent's clients and nothing is held on.
     void restoreHumanDelivery();
+    // The outermost scope's other exit duty: no serial the burst minted may
+    // pass for the human's interaction (see the .cpp).
+    quint32 displaySerial() const;
+    void concealAgentSerials();
     // The human's own next event of that class, from the spy, before KWin
     // delivers it: releases what the agent holds on a shared object and hands
     // it back.
@@ -346,8 +353,15 @@ private:
     QString keyboardLayoutName() const;
     void clearPointerDelivery();
     void clearKeyboardDelivery();
+    // Where the next pointer event or key would go, decided without sending
+    // anything, so every refusal comes before the first wire event; and the
+    // path that window takes.
+    Window *resolvePointerWindow() const;
+    Window *resolveKeyboardWindow() const;
+    bool directPathFor(const Window *window, const Window *current, bool currentDirect) const;
     bool updatePointerFocus();
     bool updateKeyboardFocus();
+    bool humanKeyboardInSiblingOf(const Window *window) const;
     void clearKeyboardFocus();
     void updateWindowActivation(Window *window);
     void clearWindowActivation();
@@ -433,6 +447,8 @@ private:
     // Open DirectInjectionScopes; the outermost closing restores the human's
     // delivery.
     int m_directInjectionDepth = 0;
+    // The display serial when the outermost scope opened.
+    quint32 m_burstStartSerial = 0;
     // Set while keys() delivers anything after its first stroke; see
     // sendRefusal.
     bool m_quietRefusals = false;

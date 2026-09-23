@@ -1408,12 +1408,15 @@ public:
     explicit DirectInjectionScope(SynaraComputerUsePlugin *plugin)
         : m_plugin(plugin)
     {
-        ++m_plugin->m_directInjectionDepth;
+        if (m_plugin->m_directInjectionDepth++ == 0) {
+            m_plugin->m_burstStartSerial = m_plugin->displaySerial();
+        }
     }
     ~DirectInjectionScope()
     {
         if (--m_plugin->m_directInjectionDepth == 0) {
             m_plugin->restoreHumanDelivery();
+            m_plugin->concealAgentSerials();
         }
     }
     Q_DISABLE_COPY_MOVE(DirectInjectionScope)
@@ -2260,6 +2263,9 @@ bool SynaraComputerUsePlugin::raiseWindow(const QString &windowId)
     if (!usableWindow(window)) {
         return false;
     }
+    if (refuseIfRaiseCoversHuman(window)) {
+        return false;
+    }
     // Restack only. `activateWindow` would move the human's keyboard focus,
     // and the agent already has its own seat, so raising is the whole point:
     // it makes the window the agent is driving the one the user can see.
@@ -2340,17 +2346,28 @@ bool SynaraComputerUsePlugin::button(uint button, bool pressed)
     if (!inputReady()) {
         return false;
     }
-    if (!updatePointerFocus()) {
+    // Every refusal is decided on where the event would go, before anything
+    // is sent to get it there: a refused click must not leave an enter, a
+    // focus change or a borrowed activation behind in the human's client.
+    Window *target = resolvePointerWindow();
+    if (!target) {
+        // updatePointerFocus tears down what the old target held, which is a
+        // leave and never an intrusion.
+        updatePointerFocus();
         return false;
     }
-    if (!requireReachableClient(m_pointerWindow, m_pointerDirect)) {
+    const bool direct = directPathFor(target, m_pointerWindow, m_pointerDirect);
+    if (!requireReachableClient(target, direct)) {
         return false;
     }
     // The release half of a press the agent already delivered is never refused:
     // the client is holding that button down because of us, and leaving it held
     // is worse than the press was.
     const bool completingPress = !pressed && m_pressedButtons.contains(button);
-    if (!completingPress && refuseIfHumanActive(m_pointerWindow, m_pointerDirect, InputKind::Pointer)) {
+    if (!completingPress && refuseIfHumanActive(target, direct, InputKind::Pointer)) {
+        return false;
+    }
+    if (!updatePointerFocus()) {
         return false;
     }
     if (!m_ownsCompositor) {
@@ -2448,13 +2465,19 @@ bool SynaraComputerUsePlugin::axis(double horizontal, double vertical)
     if (!std::isfinite(horizontal) || !std::isfinite(vertical)) {
         return false;
     }
+    Window *target = resolvePointerWindow();
+    if (!target) {
+        updatePointerFocus();
+        return false;
+    }
+    const bool direct = directPathFor(target, m_pointerWindow, m_pointerDirect);
+    if (!requireReachableClient(target, direct)) {
+        return false;
+    }
+    if (refuseIfHumanActive(target, direct, InputKind::Pointer)) {
+        return false;
+    }
     if (!updatePointerFocus()) {
-        return false;
-    }
-    if (!requireReachableClient(m_pointerWindow, m_pointerDirect)) {
-        return false;
-    }
-    if (refuseIfHumanActive(m_pointerWindow, m_pointerDirect, InputKind::Pointer)) {
         return false;
     }
 
@@ -2561,16 +2584,28 @@ bool SynaraComputerUsePlugin::deliverKey(uint keyCode, bool pressed)
     if (!inputReady()) {
         return false;
     }
-    if (!updateKeyboardFocus()) {
+    // Refusals first, on the window the key would go to: focusing it is an
+    // enter, a modifiers event and a borrowed activation, all of which the
+    // human's window of the same client notices, so none may precede a
+    // refusal (audit P2).
+    Window *target = resolveKeyboardWindow();
+    if (!target) {
+        // updateKeyboardFocus drops a lost target's keys and focus, which is
+        // cleanup, not delivery.
+        updateKeyboardFocus();
         return false;
     }
-    if (!requireReachableClient(m_keyboardWindow, m_keyboardDirect)) {
+    const bool direct = directPathFor(target, m_keyboardWindow, m_keyboardDirect);
+    if (!requireReachableClient(target, direct)) {
         return false;
     }
     // Same exemption the pointer makes, and it matters more here: refusing the
     // release of a held Ctrl leaves the client believing a modifier is down.
     const bool completingPress = !pressed && m_pressedKeys.contains(keyCode);
-    if (!completingPress && refuseIfHumanActive(m_keyboardWindow, m_keyboardDirect, InputKind::Keyboard)) {
+    if (!completingPress && refuseIfHumanActive(target, direct, InputKind::Keyboard)) {
+        return false;
+    }
+    if (!updateKeyboardFocus()) {
         return false;
     }
 
@@ -4240,6 +4275,41 @@ void SynaraComputerUsePlugin::sendHumanKeyboardModifiers(SurfaceInterface *surfa
     keyboard->sendModifiers(modifiers.depressed, modifiers.latched, modifiers.locked, xkb->currentLayout(), surface->client());
 }
 
+quint32 SynaraComputerUsePlugin::displaySerial() const
+{
+    return waylandServer() && waylandServer()->display() ? waylandServer()->display()->serial() : 0;
+}
+
+/**
+ * Keeps the serials a burst minted from counting as the human's interaction.
+ *
+ * KWin grants an xdg_activation token for any serial at or after the last
+ * interaction it saw on a real device (XdgActivationV1Integration::requestToken:
+ * `lastInteractionSerial() <= serial`), and every event the agent sends - on
+ * either path - carries a fresh display serial, which is always newer. So a
+ * client could turn the agent's click into real activation: measured on KWin
+ * 6.7.4, Chromium answers a click into one of its windows by requesting a
+ * token with that click's serial while another of its windows has the
+ * human's focus, KWin granted it, and seat0's keyboard - the human's - moved
+ * to the agent's window. Moving KWin's last interaction past everything the
+ * burst minted makes every such token "not granted", and costs the human
+ * nothing: their own next press or key sets it back to theirs. A compositor
+ * the agent owns has no human focus to steal, and keeps KWin's behaviour.
+ */
+void SynaraComputerUsePlugin::concealAgentSerials()
+{
+    if (m_ownsCompositor || !input()) {
+        return;
+    }
+    const quint32 latest = displaySerial();
+    if (latest == m_burstStartSerial) {
+        return;
+    }
+    if (input()->lastInteractionSerial() <= latest) {
+        input()->setLastInteractionSerial(latest + 1);
+    }
+}
+
 /**
  * Hands borrowed seat0 objects back at the end of a burst; see the invariant
  * above usePointerDirectInjection. Only an object the human's seat is using in
@@ -4372,6 +4442,13 @@ void SynaraComputerUsePlugin::handleHumanPointerFocusChanged()
  */
 void SynaraComputerUsePlugin::handleHumanKeyboardFocusAboutToChange(SurfaceInterface *nextSurface)
 {
+    // The human is moving into another window of the application the agent
+    // borrowed activation in: give it back first, or the client is told two
+    // of its windows are active and may hand the agent's one their focus.
+    if (Window *borrowed = m_activatedWindow; borrowed && borrowed->surface() && nextSurface
+        && nextSurface->client() == borrowed->surface()->client() && nextSurface != borrowed->surface()) {
+        clearWindowActivation();
+    }
     SurfaceInterface *agent = m_directKeyboardSurface;
     if (!agent) {
         return;
@@ -4792,6 +4869,65 @@ bool SynaraComputerUsePlugin::refuseIfHumanActive(const Window *window, bool dir
 }
 
 /**
+ * The window the human is working in that raising @p window would cover, or
+ * null when the raise is theirs to ignore.
+ *
+ * A restack moves no focus, but it can bury the window someone is typing in
+ * under the agent's: their keys still go there, and they can no longer see
+ * what they type. So while they are active (the same recency as every other
+ * refusal) a raise is refused when it would put the window above theirs where
+ * the two overlap. Nothing changes for them when the window is already above
+ * theirs, sits in a lower layer that cannot rise past theirs, does not overlap
+ * it, or owns it as a transient (KWin keeps a transient above its parent).
+ */
+const Window *SynaraComputerUsePlugin::humanWindowCoveredByRaise(const Window *window) const
+{
+    if (m_ownsCompositor || m_humanActiveGuardMs == 0 || !window || !Workspace::self()) {
+        return nullptr;
+    }
+    const qint64 age = humanInputAgeMilliseconds();
+    if (age < 0 || age > qint64(m_humanActiveGuardMs)) {
+        return nullptr;
+    }
+    const Window *human = humanFocusWindow();
+    while (human && human->isPopupWindow() && human->transientFor()) {
+        human = human->transientFor();
+    }
+    if (!human || human == window || window->hasTransient(human, true)) {
+        return nullptr;
+    }
+    const QList<Window *> &stacking = Workspace::self()->stackingOrder();
+    const qsizetype windowIndex = stacking.indexOf(const_cast<Window *>(window));
+    const qsizetype humanIndex = stacking.indexOf(const_cast<Window *>(human));
+    if (windowIndex < 0 || humanIndex < 0 || windowIndex > humanIndex || window->layer() < human->layer()) {
+        return nullptr;
+    }
+    return window->frameGeometry().intersects(human->frameGeometry()) ? human : nullptr;
+}
+
+bool SynaraComputerUsePlugin::refuseIfRaiseCoversHuman(const Window *window)
+{
+    const Window *human = humanWindowCoveredByRaise(window);
+    if (!human) {
+        return false;
+    }
+    QString title = human->caption();
+    if (title.isEmpty()) {
+        title = human->resourceClass();
+    }
+    if (title.isEmpty()) {
+        title = QStringLiteral("the focused window");
+    }
+    sendRefusal(s_humanActiveErrorName,
+                QStringLiteral("The human is using %1 right now, and raising this window would cover it where the two "
+                               "overlap, so nothing was restacked. Focus the window instead (it takes the agent's input "
+                               "without being raised), or retry once they have been idle for %2 ms.")
+                    .arg(title)
+                    .arg(m_humanActiveGuardMs));
+    return true;
+}
+
+/**
  * On screen, on this desktop, and finished enough to be aimed at.
  *
  * Everything except whether the window takes input at all, which is the one
@@ -4905,9 +5041,12 @@ bool SynaraComputerUsePlugin::popupInTransientTree(const Window *ancestor, const
     return false;
 }
 
-bool SynaraComputerUsePlugin::updatePointerFocus()
+/**
+ * The window the pointer's next event goes to, or null when it must be
+ * refused: the rule updatePointerFocus delivers by, with nothing sent.
+ */
+Window *SynaraComputerUsePlugin::resolvePointerWindow() const
 {
-    Window *window = nullptr;
     if (m_targetRequested) {
         // An explicit target owns the pointer, exactly as it owns the keyboard.
         // Falling back to whatever the stacking order puts under the cursor is
@@ -4925,17 +5064,32 @@ bool SynaraComputerUsePlugin::updatePointerFocus()
         // concerned, and taking it first is what makes the menu item, rather
         // than what it covers, receive the press.
         if (Window *popup = popupTransientAt(m_targetWindow, m_pos)) {
-            window = popup;
-        } else if (!pointerUsableWindow(m_targetWindow) || !m_targetWindow->hitTest(m_pos)) {
-            clearPointerDelivery();
-            return false;
-        } else {
-            window = m_targetWindow;
+            return popup;
         }
-    } else {
-        window = windowAt(m_pos, InputKind::Pointer);
+        if (!pointerUsableWindow(m_targetWindow) || !m_targetWindow->hitTest(m_pos)) {
+            return nullptr;
+        }
+        return m_targetWindow;
     }
+    return windowAt(m_pos, InputKind::Pointer);
+}
 
+/**
+ * The path a window is driven on: the one decided when the input arrived on
+ * it while it is still there (@p current, @p currentDirect), else what a
+ * fresh arrival would decide.
+ */
+bool SynaraComputerUsePlugin::directPathFor(const Window *window, const Window *current, bool currentDirect) const
+{
+    if (m_ownsCompositor || !window) {
+        return false;
+    }
+    return window == current ? currentDirect : usePointerDirectInjection(window);
+}
+
+bool SynaraComputerUsePlugin::updatePointerFocus()
+{
+    Window *window = resolvePointerWindow();
     if (!window) {
         clearPointerDelivery();
         return false;
@@ -5012,34 +5166,40 @@ void SynaraComputerUsePlugin::clearPointerDelivery()
     m_pointerDirect = false;
 }
 
-bool SynaraComputerUsePlugin::updateKeyboardFocus()
+/**
+ * The window the keyboard's next key goes to, or null when it must be
+ * refused: the rule updateKeyboardFocus delivers by, with nothing sent.
+ */
+Window *SynaraComputerUsePlugin::resolveKeyboardWindow() const
 {
-    Window *window = nullptr;
     if (m_targetRequested) {
         // An explicit target that has gone away has to fail loudly. Silently
         // falling back to whatever sits under the ghost cursor is how a Ctrl+Q
         // aimed at a closing window ends up quitting an unrelated one, and it
         // reads to the caller as input being delivered late.
-        if (!usableWindow(m_targetWindow)) {
+        return usableWindow(m_targetWindow) ? m_targetWindow.data() : nullptr;
+    }
+    if (usableWindow(m_pointerWindow)) {
+        return m_pointerWindow;
+    }
+    // Reached whenever the pointer sits on a popup, among other things: a
+    // menu cannot be focused, so the keyboard stays on the focusable window
+    // under the cursor, which is where it was before the menu opened, and the
+    // toolkit routes the keys to its open menu from there. KWin's popup
+    // filter plays no part: it would move seat0's keyboard - the human's -
+    // onto any grabbing popup, so an agent popup is never let grab (see
+    // watchPopups).
+    return windowAt(m_pos, InputKind::Keyboard);
+}
+
+bool SynaraComputerUsePlugin::updateKeyboardFocus()
+{
+    Window *window = resolveKeyboardWindow();
+    if (!window) {
+        if (m_targetRequested) {
             forgetPressedKeys();
             clearKeyboardFocus();
-            return false;
         }
-        window = m_targetWindow;
-    } else if (usableWindow(m_pointerWindow)) {
-        window = m_pointerWindow;
-    } else {
-        // Reached whenever the pointer sits on a popup, among other things: a
-        // menu cannot be focused, so the keyboard stays on the focusable window
-        // under the cursor, which is where it was before the menu opened, and
-        // the toolkit routes the keys to its open menu from there. KWin's
-        // popup filter plays no part: it would move seat0's keyboard - the
-        // human's - onto any grabbing popup, so an agent popup is never let
-        // grab (see watchPopups).
-        window = windowAt(m_pos, InputKind::Keyboard);
-    }
-
-    if (!window) {
         return false;
     }
 
@@ -5103,8 +5263,10 @@ bool SynaraComputerUsePlugin::updateKeyboardFocus()
     // Verified live: re-sending xdg `activated` alone leaves Qt's shortcut
     // matcher dead, while a fresh enter on our seat revives it. So cycle our
     // keyboard focus too, carrying any held keys, and let updateWindowActivation
-    // re-assert the flag.
-    if (!window->isActive() && window->surface()) {
+    // re-assert the flag - unless no flag will be re-asserted, because the
+    // human is typing in another window of this client: then the cycle would
+    // be a focus-out and focus-in per key for nothing.
+    if (!window->isActive() && window->surface() && !humanKeyboardInSiblingOf(window)) {
         m_seat->setFocusedKeyboardSurface(nullptr);
         m_seat->setFocusedKeyboardSurface(window->surface(), m_pressedKeys);
     }
@@ -5131,8 +5293,33 @@ void SynaraComputerUsePlugin::clearKeyboardFocus()
     clearWindowActivation();
 }
 
+/**
+ * Whether seat0's keyboard is in another window of @p window's client.
+ *
+ * A toolkit tracks one active window per application: activating this one
+ * tells the client the human's window lost activation, which is a FocusOut in
+ * the window they are typing in (and a committed or lost IME pre-edit). So
+ * no activation is borrowed while this holds; the agent's keys still arrive,
+ * and only shortcuts that need an active window wait until the human leaves
+ * the application.
+ */
+bool SynaraComputerUsePlugin::humanKeyboardInSiblingOf(const Window *window) const
+{
+    if (m_ownsCompositor || !window || !window->surface()) {
+        return false;
+    }
+    const SurfaceInterface *human = humanKeyboardSurfaceInClientOf(window->surface());
+    return human && human != window->surface();
+}
+
 void SynaraComputerUsePlugin::updateWindowActivation(Window *window)
 {
+    if (window && humanKeyboardInSiblingOf(window)) {
+        if (m_activatedWindow == window) {
+            clearWindowActivation();
+        }
+        return;
+    }
     if (m_activatedWindow == window) {
         // A borrow is not durable: KWin revokes the window's active flag when the
         // human moves real activation through it (activate the borrowed window,

@@ -21,6 +21,7 @@ MEMBERS = [
     "clearPointerDelivery",
     "clearKeyboardDelivery",
     "clearKeyboardFocus",
+    "resolvePointerWindow",
     "updatePointerFocus",
     "directPointerEnter",
     "directPointerLeave",

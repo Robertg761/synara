@@ -115,7 +115,12 @@ unclaimed rather than given a backend that refuses forever.
   a surface whose client the human is active in.
 - When the human is active in a window, agent actions aimed at that window
   are refused with the retryable token `computer_human_active`, whether the
-  compositor or the server raised it.
+  compositor or the server raised it. Every refusal is decided before the
+  plugin sends anything; a raise that would bury their window is refused too,
+  and no activation is borrowed in an application they are typing in. Serials
+  the agent's events carry never count as the human's interaction, so a
+  client cannot use an agent click to obtain an activation token and take the
+  human's keyboard (Chromium did, between two of its windows).
 - `Meta+Shift+Esc` stops the session and latches until pressed again; a plugin
   that could not register the shortcut is reported as a setup blocker rather
   than advertising a hotkey that does not exist.
