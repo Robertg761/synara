@@ -13,6 +13,9 @@ set -euo pipefail
 # inside a headless `kwin_wayland --virtual`, which needs no seat at all. That
 # parent is the only reason KWin appears in a Hyprland script.
 #
+# Core dumps are off for the whole unit (LimitCORE=0): a test compositor that
+# crashes must not raise a crash notification on the developer's desktop.
+#
 # Started through `systemd-run --user` rather than from this shell on purpose:
 # a compositor launched as a descendant of a terminal (or of an agent's sandbox)
 # dies with it, and a half-killed compositor leaves sockets behind that look
@@ -178,6 +181,7 @@ LUA
         --virtual \
         --xwayland \
         --no-global-shortcuts \
+        --no-lockscreen \
         --socket "$UNIT-parent" \
         --width "$WIDTH" \
         --height "$HEIGHT" \
@@ -244,6 +248,7 @@ systemd-run --user \
     --description="Synara Hyprland plugin development instance" \
     --collect \
     --quiet \
+    -p LimitCORE=0 \
     -- env -i \
     HOME="$HOME" \
     USER="${USER:-$(id -un)}" \

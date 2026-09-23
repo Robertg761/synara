@@ -279,5 +279,27 @@ class IntrospectionTest(unittest.TestCase):
         self.assertEqual(signatures(ROOT / "org.synara.ComputerUse.xml"), signatures(kwin))
 
 
+
+class DevInstanceTest(unittest.TestCase):
+    """scripts/dev-instance.sh stays a disposable, isolated test compositor.
+
+    A crash in a test compositor must not dump core (every core dump raises a
+    desktop notification on the developer's machine), and its parent KWin must
+    not lock along with the developer's own session.
+    """
+    def test_units_never_dump_core(self):
+        script = (ROOT / "scripts" / "dev-instance.sh").read_text()
+        invocations = re.findall(r"^systemd-run\b(?:[^\n]*\\\n)*[^\n]*", script, re.M)
+        self.assertTrue(invocations)
+        for invocation in invocations:
+            self.assertRegex(invocation, r"-p LimitCORE=0\b")
+
+    def test_parent_kwin_has_no_lock_screen(self):
+        script = (ROOT / "scripts" / "dev-instance.sh").read_text()
+        kwin = re.search(r"exec kwin_wayland\b(?:[^\n]*\\\n)*[^\n]*", script)
+        self.assertIsNotNone(kwin)
+        self.assertIn("--no-lockscreen", kwin.group(0))
+
+
 if __name__ == "__main__":
     unittest.main()
