@@ -829,6 +829,48 @@ function spawnedAs(pid: number): () => ChildProcess {
   };
 }
 
+describe("the driven session's environment", () => {
+  it("launches apps with the session environment a subclass names", async () => {
+    class ElsewhereBackend extends KWinComputerBackend {
+      protected override async desktopSessionEnvironment() {
+        return { WAYLAND_DISPLAY: "wayland-9", DISPLAY: undefined };
+      }
+    }
+    const spawned: NodeJS.ProcessEnv[] = [];
+    const plugin = new FakePlugin();
+    const dbus = new FakeDbus(plugin);
+    dbus.loaded = ["SynaraComputerUsePluginV10"];
+    const backend = new ElsewhereBackend({
+      clipboardToolsPresent: () => true,
+      linuxDistribution: () => ({ id: "arch" }),
+      atspi,
+      platform: "linux",
+      sessionType: "wayland",
+      installedPluginIds: async () => ["SynaraComputerUsePluginV10"],
+      sleep: async () => undefined,
+      resolveApp: (app, args) => ({ command: app, args: [...args], via: "path" }),
+      installStampPath: join(tmpdir(), "synara-absent-install.stamp"),
+      runningKwinVersion: async () => undefined,
+      installedKwinVersion: async () => undefined,
+      busNamesHaveOwners: async (names) => names.map(() => false),
+      prebuiltRoot: () => undefined,
+      buildToolingPresent: () => false,
+      env: { HOME: "/home/test", WAYLAND_DISPLAY: "wayland-1", DISPLAY: ":0", PATH: "/usr/bin" },
+      spawnProcess: (command, args, options) => {
+        spawned.push(options.env);
+        return spawnedAs(4_242)();
+      },
+      dbus,
+    });
+    backends.push(backend);
+    await backend.availability();
+    await backend.launchApp("kate", []);
+    expect(spawned[0]).toMatchObject({ WAYLAND_DISPLAY: "wayland-9", PATH: "/usr/bin" });
+    expect(spawned[0]).not.toHaveProperty("DISPLAY");
+    expect(spawned[0]?.ACCESSIBILITY_ENABLED).toBe("1");
+  });
+});
+
 describe("launch results", () => {
   it.each([
     [

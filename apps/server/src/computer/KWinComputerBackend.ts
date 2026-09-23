@@ -820,7 +820,9 @@ export class KWinComputerBackend implements ComputerBackend {
       ((app, args, spawnOptions) =>
         spawn(app, [...args], { ...spawnOptions, detached: true, stdio: "ignore" }));
     this.resolveApp = options.resolveApp ?? resolveAppLaunchOnHost;
-    this.runClipboardCommand = options.runClipboardCommand ?? spawnClipboardCommand;
+    this.runClipboardCommand =
+      options.runClipboardCommand ??
+      (async (spec) => spawnClipboardCommand(spec, await this.desktopSessionEnvironment()));
     this.glideDurationMs = Math.max(0, options.glideDurationMs ?? DEFAULT_GLIDE_DURATION_MS);
     this.stillIntervalMs = Math.max(100, options.stillIntervalMs ?? DEFAULT_STILL_INTERVAL_MS);
     // The core's model image budget: an image past it is downscaled by the
@@ -1390,6 +1392,19 @@ export class KWinComputerBackend implements ComputerBackend {
   }
 
   /**
+   * Where this environment's session variables differ from the desktop this
+   * backend drives, as overrides for what launched apps and the clipboard
+   * helpers are given (`undefined` removes a variable). KWin drives the
+   * session it was started in: nothing. The Hyprland backend follows the live
+   * instance, which a compositor restart moves away from the inherited one.
+   */
+  protected async desktopSessionEnvironment(): Promise<
+    Readonly<Record<string, string | undefined>>
+  > {
+    return {};
+  }
+
+  /**
    * The compositor-observed settle, offered only while the loaded plugin
    * advertises `waitForSettle`: the manager reads this member by presence and
    * falls back to its fixed post-action wait when it is absent, which is what
@@ -1594,6 +1609,7 @@ export class KWinComputerBackend implements ComputerBackend {
     // Which window was active before, so a launch that takes activation is
     // reported (the manager pauses background input on it).
     const activeBefore = await this.activeWindow().catch(() => undefined);
+    const session = await this.desktopSessionEnvironment();
     // The last moment to refuse: after this the process exists whatever the
     // caller does with the cancellation.
     assertDesktopOperationActive();
@@ -1607,7 +1623,10 @@ export class KWinComputerBackend implements ComputerBackend {
       // the server's — no auth token, no Electron control variables — and
       // starts in the user's home, not wherever the server happens to run.
       child = this.spawnProcess(launch.command, launch.args, {
-        env: desktopApplicationEnvironment(this.env, AGENT_ACCESSIBILITY_ENVIRONMENT),
+        env: desktopApplicationEnvironment(this.env, {
+          ...session,
+          ...AGENT_ACCESSIBILITY_ENVIRONMENT,
+        }),
         cwd: this.env.HOME || homedir(),
       });
     } catch (error) {
